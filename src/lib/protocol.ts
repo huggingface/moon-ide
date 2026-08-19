@@ -1785,6 +1785,15 @@ export type CoderEvent =
 			session_cache_hits: number;
 			session_requests: number;
 	  }
+	| {
+			kind: 'retry_backoff';
+			model: string;
+			status: number;
+			attempt: number;
+			max_attempts: number;
+			delay_ms: number;
+			rotated_to?: string;
+	  }
 	| { kind: 'compaction_started'; messages_compacted: number }
 	| { kind: 'compaction_progress'; chunks_done: number; chunks_total: number; summary_tokens: number }
 	| { kind: 'compaction_complete'; summary: string; prompt_tokens_after: number }

@@ -528,6 +528,20 @@ class CompanionState {
 	 * an error and the panel is idle" rule. Cleared by any later
 	 * transcript activity (a new turn ran past it). */
 	turnError = $state<string | null>(null);
+
+	/** Live transient-error notice for the open session: the
+	 * provider 429/503'd and the runner is sleeping before a retry
+	 * (or rotating to a fallback). Cleared by the next live event
+	 * of any other kind; never persisted, so replays can't set it. */
+	retryNotice = $state<{
+		model: string;
+		status: number;
+		attempt: number;
+		maxAttempts: number;
+		delayMs: number;
+		rotatedTo: string | null;
+		at: number;
+	} | null>(null);
 	/** Rendered transcript rows for the active session. */
 	rows = $state<TranscriptRow[]>([]);
 	/** True when the open session has older history on disk beyond
@@ -1663,6 +1677,7 @@ class CompanionState {
 		this.rows = [];
 		this.busy = false;
 		this.turnError = null;
+		this.retryNotice = null;
 		this.awaitingInput = false;
 		this.pendingPrompt = null;
 		this.hasMoreHistory = false;
@@ -1884,21 +1899,28 @@ class CompanionState {
 		}
 	}
 
-	/** 0-based ordinal of a user row among all non-queued user rows
-	 * — the backend's `User`-record count matches this (same walk
-	 * as the desktop's `#userOrdinalForRow`). */
-	#userOrdinal(rowId: string): number | null {
-		let ordinal = 0;
-		for (const row of this.rows) {
-			if (row.kind !== 'user' || row.queued) {
+	/** 0-based index of a user row counted from the transcript's
+	 * END (last user row = 0). The phone's transcript is windowed —
+	 * the head may not be loaded — so an absolute start-counted
+	 * ordinal silently undercounts and once truncated a session at
+	 * the wrong message. The window always includes the tail, so
+	 * counting backwards is exact; the backend translates to the
+	 * absolute ordinal against the on-disk record count. */
+	#userFromEnd(rowId: string): number | null {
+		let fromEnd = 0;
+		let seen = false;
+		for (let i = this.rows.length - 1; i >= 0; i -= 1) {
+			const row = this.rows[i];
+			if (!row || row.kind !== 'user' || row.queued) {
 				continue;
 			}
 			if (row.id === rowId) {
-				return ordinal;
+				seen = true;
+				break;
 			}
-			ordinal += 1;
+			fromEnd += 1;
 		}
-		return null;
+		return seen ? fromEnd : null;
 	}
 
 	/** Revert the open session to just before the user message with
@@ -1912,8 +1934,8 @@ class CompanionState {
 		if (!this.activeWorkspace || !this.activeSession || this.busy) {
 			return null;
 		}
-		const ordinal = this.#userOrdinal(rowId);
-		if (ordinal === null) {
+		const fromEnd = this.#userFromEnd(rowId);
+		if (fromEnd === null) {
 			return null;
 		}
 		const sessionId = this.activeSession;
@@ -1921,7 +1943,7 @@ class CompanionState {
 			const reverted = await this.#call<{ text: string }>(
 				this.activeWorkspace,
 				'coder_revert_to_message',
-				{ session_id: sessionId, user_ordinal: ordinal },
+				{ session_id: sessionId, user_from_end: fromEnd },
 				this.activeIde,
 			);
 			// Repaint from the truncated JSONL.
@@ -2208,7 +2230,26 @@ class CompanionState {
 			return;
 		}
 		const rows = this.#rowsOverride ?? this.rows;
+		// Any other live event supersedes a pending retry notice —
+		// deltas mean the retry worked, terminators mean it settled.
+		if (!fromReplay && ev.kind !== 'retry_backoff' && this.retryNotice !== null && !this.#rowsOverride) {
+			this.retryNotice = null;
+		}
 		switch (ev.kind) {
+			case 'retry_backoff': {
+				if (!fromReplay && !this.#rowsOverride) {
+					this.retryNotice = {
+						model: str(ev, 'model'),
+						status: num(ev, 'status'),
+						attempt: num(ev, 'attempt'),
+						maxAttempts: num(ev, 'max_attempts'),
+						delayMs: num(ev, 'delay_ms'),
+						rotatedTo: str(ev, 'rotated_to') || null,
+						at: Date.now(),
+					};
+				}
+				break;
+			}
 			case 'user_message': {
 				this.turnError = null;
 				const evImages = ev['images'];

@@ -1812,6 +1812,30 @@
 		return Boolean(visibleSessionSummary?.interrupted) && visibleSessionSummary?.id === id;
 	});
 
+	// 1 Hz tick for the retry-backoff countdown; only runs while a
+	// notice is showing.
+	let backoffNowTick = $state(Date.now());
+	$effect(() => {
+		if (!coder.retryNotice) {
+			return;
+		}
+		const timer = setInterval(() => {
+			backoffNowTick = Date.now();
+		}, 1000);
+		return () => clearInterval(timer);
+	});
+	const retryCountdown = $derived.by(() => {
+		const n = coder.retryNotice;
+		if (!n) {
+			return null;
+		}
+		const remaining = Math.max(0, Math.ceil((n.at + n.delayMs - backoffNowTick) / 1000));
+		if (n.rotatedTo) {
+			return `${n.status} on ${n.model} — trying fallback ${n.rotatedTo}…`;
+		}
+		return `${n.status} from the provider — retrying in ${remaining}s (attempt ${n.attempt}/${n.maxAttempts})`;
+	});
+
 	function relaunchInterrupted(): void {
 		relaunchDismissedFor = coder.current.visibleSessionId;
 		coder.retryLastTurn();
@@ -2780,6 +2804,11 @@
 			{#each windowedRows as row (row.id)}
 				{@render rowMarkup(row, true)}
 			{/each}
+			{#if retryCountdown}
+				<div class="relaunch-bar" role="status">
+					<span>{retryCountdown}</span>
+				</div>
+			{/if}
 			{#if showRelaunchBar}
 				<div class="relaunch-bar" role="status">
 					<span>This turn never finished (interrupted by a restart or stop).</span>

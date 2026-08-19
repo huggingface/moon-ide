@@ -184,6 +184,28 @@ pub enum CoderEvent {
 
 	/// The whole turn ended cleanly.
 	TurnComplete,
+	/// Live-only heads-up that the provider returned a transient
+	/// error (429/502/503/504) and the runner is sleeping before a
+	/// retry — or rotating to a fallback model. Never persisted or
+	/// replayed; the frontends render a countdown bar and clear it
+	/// on the next live event of any other kind.
+	#[serde(rename = "retry_backoff")]
+	RetryBackoff {
+		/// Wire model the failing request targeted.
+		model: String,
+		/// HTTP status that triggered the wait (429, 503, …).
+		status: u16,
+		/// 1-based retry attempt about to run after the sleep.
+		attempt: u32,
+		/// Ladder size, so the UI can render "attempt 3/7".
+		max_attempts: u32,
+		/// Sleep length before that attempt, in milliseconds.
+		delay_ms: u64,
+		/// Set when this notice is a rotation to a fallback model
+		/// (the sleep already happened; `delay_ms` is 0).
+		#[serde(skip_serializing_if = "Option::is_none")]
+		rotated_to: Option<String>,
+	},
 
 	/// The user (or `Coder::abort`) cancelled the turn.
 	Aborted,

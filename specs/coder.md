@@ -676,7 +676,20 @@ the workspace has no enabled servers, and neither is mode-gated
   each time (recovery clears the stickiness). The stickiness
   evaporates at turn end — the next turn starts from the user's
   pick. If the whole chain fails, the original error surfaces as
-  before.
+  before. Backoff sleeps and rotations emit a live-only
+  `retry_backoff` event (model, status, attempt/max, delay_ms,
+  rotated_to) — both frontends render it as a countdown bar,
+  cleared by the next live event of any other kind.
+- **Windowed-safe reverts.** `coder_revert_to_message` accepts
+  `user_from_end` (index counted from the last user message
+  backwards) alongside the absolute `user_ordinal`. The companion
+  must use from-end: its windowed transcript clips the head, and
+  counting rows in the window undercuts the absolute ordinal —
+  a live bug truncated a 3000-message session at message ~70.
+  `truncate_before_user_record` now also writes a rolling
+  `<id>.jsonl.bak` before rewriting (and refuses to truncate if the
+  backup fails), so an ordinal bug can no longer destroy a
+  transcript unrecoverably.
 - **JSONL append integrity.** Appends to a session file are
   serialized per-path and written record+newline in a single
   buffer — parallel sub-agent spawns append `SubagentSpawned` to

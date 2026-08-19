@@ -558,6 +558,22 @@ struct TurnState {
 	cancel: Option<CancellationToken>,
 }
 
+tokio::task_local! {
+	/// Turn-scoped event sink so layers without a sink parameter
+	/// (the inference client's backoff/rotation loop) can surface
+	/// live UI notices. Scoped by `spawn_turn_loop`; deliberately
+	/// not scoped for sub-agent loops (their events need inner-
+	/// wrapping, and a backoff bar in the pop-out isn't worth that
+	/// plumbing yet).
+	pub(crate) static TURN_EVENT_SINK: FolderEventSink;
+}
+
+/// Send `event` through the current turn's sink, if any. No-op
+/// outside a turn scope (probes, title passes, sub-agents).
+pub(crate) fn emit_turn_event(event: CoderEvent) {
+	let _ = TURN_EVENT_SINK.try_with(|sink| sink.send(event));
+}
+
 /// Pre-tagged event sender. One `FolderEventSink` per running
 /// turn / sub-agent / auto-rename pass — captures the
 /// `(folder, session_id)` pair once so emit sites don't have to
@@ -2547,6 +2563,34 @@ impl CoderHandle {
 			text: reverted.dropped_text,
 			images: reverted.dropped_images,
 		})
+	}
+
+	/// [`Self::revert_to_message_in`] addressed from the **end** of
+	/// the transcript: `from_end = 0` is the last user message,
+	/// `1` the one before it, and so on. The companion's windowed
+	/// transcript can't compute an absolute ordinal (its window
+	/// clips the head, and counting rows in the window silently
+	/// undercounts — a bug that truncated a 3000-message session
+	/// at message ~70). The window always includes the tail, so a
+	/// from-end index is exact; the translation to the absolute
+	/// ordinal happens here against the on-disk record count.
+	pub async fn revert_to_message_from_end_in(
+		&self,
+		session_id: &str,
+		user_from_end: usize,
+	) -> Result<RevertedMessage, CoderError> {
+		let (rt, folder_path) = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
+		let header_id = rt.session.lock().await.header.id.clone();
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		let total = sessions::count_user_records(&dir, &header_id).await?;
+		let ordinal = total
+			.checked_sub(1 + user_from_end)
+			.ok_or_else(|| CoderError::Internal(format!("from-end index {user_from_end} exceeds {total} user messages")))?;
+		self.revert_to_message_in(session_id, ordinal).await
 	}
 
 	/// Replay from a specific user message: truncate the
@@ -5540,136 +5584,140 @@ fn spawn_turn_loop(
 	resume_tool_calls: Option<Vec<crate::inference::ToolCall>>,
 ) {
 	let session_hint = sink_for_turn.session_id.clone();
+	let sink_for_backoff = sink_for_turn.clone();
 	tokio::spawn(crate::inference::SESSION_HINT.scope(
 		session_hint,
-		crate::inference::TURN_STICKY_MODEL.scope(std::sync::Mutex::new(None), async move {
-			// Scope-tied so every exit path (success, abort, error,
-			// steer-drain re-loop) decrements exactly once, even on
-			// panic.
-			let _running_guard = RunningTurnGuard::acquire(&state.running_turns);
-			// Loop wrapper closes the race between `run_turn` returning
-			// `Ok(())` and the spawn task clearing `turn.cancel`: a steer
-			// queued in that window lands in `pending_steers` but would
-			// otherwise be orphaned. Re-checking here under both the
-			// `turn` and `session` locks linearises with `send`'s
-			// turn→session take order.
-			let mut cancel_outer = cancel;
-			let mut resume = resume_tool_calls;
-			let result = loop {
-				let format_queue = Arc::new(crate::tools::FormatQueue::default());
-				let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
-				// Capture the baseline SHA at turn start for per-turn
-				// diff attribution (ADR 0030). `git stash create`
-				// snapshots the working tree without touching it; HEAD
-				// is the fallback when the tree is clean. Best-effort —
-				// `None` means no git repo / git unavailable, in which
-				// case we skip the diff computation at turn end.
-				let baseline_sha = capture_baseline(&state, &folder_for_turn).await;
-				let result = run_turn(
-					&state,
-					&rt_for_turn,
-					&folder_for_turn,
-					&sink_for_turn,
-					cancel_outer.clone(),
-					format_queue.clone(),
-					background.clone(),
-					// Only the first run_turn call gets the resume
-					// tool calls; subsequent loop iterations (steer
-					// drains after an abort) start fresh.
-					resume.take(),
-				)
-				.await;
-				let flushed_files = flush_format_queue(&state, &format_queue).await;
-				// Kill + reap any detached background processes still
-				// running at turn end (ADR 0034). Runs on every
-				// termination path, same as `flush_format_queue`.
-				background.cleanup().await;
-				// Compute + emit the per-turn diff on a successful turn
-				// that touched files. Best-effort — a git failure or no
-				// baseline just means no diff row, not an error.
-				if matches!(result, Ok(())) {
-					if let Some(sha) = &baseline_sha {
-						if !flushed_files.is_empty() {
-							emit_turn_diff(
-								&state,
-								&rt_for_turn,
-								&sink_for_turn,
-								&folder_for_turn,
-								sha,
-								&flushed_files,
-							)
-							.await;
+		crate::inference::TURN_STICKY_MODEL.scope(
+			std::sync::Mutex::new(None),
+			TURN_EVENT_SINK.scope(sink_for_backoff, async move {
+				// Scope-tied so every exit path (success, abort, error,
+				// steer-drain re-loop) decrements exactly once, even on
+				// panic.
+				let _running_guard = RunningTurnGuard::acquire(&state.running_turns);
+				// Loop wrapper closes the race between `run_turn` returning
+				// `Ok(())` and the spawn task clearing `turn.cancel`: a steer
+				// queued in that window lands in `pending_steers` but would
+				// otherwise be orphaned. Re-checking here under both the
+				// `turn` and `session` locks linearises with `send`'s
+				// turn→session take order.
+				let mut cancel_outer = cancel;
+				let mut resume = resume_tool_calls;
+				let result = loop {
+					let format_queue = Arc::new(crate::tools::FormatQueue::default());
+					let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
+					// Capture the baseline SHA at turn start for per-turn
+					// diff attribution (ADR 0030). `git stash create`
+					// snapshots the working tree without touching it; HEAD
+					// is the fallback when the tree is clean. Best-effort —
+					// `None` means no git repo / git unavailable, in which
+					// case we skip the diff computation at turn end.
+					let baseline_sha = capture_baseline(&state, &folder_for_turn).await;
+					let result = run_turn(
+						&state,
+						&rt_for_turn,
+						&folder_for_turn,
+						&sink_for_turn,
+						cancel_outer.clone(),
+						format_queue.clone(),
+						background.clone(),
+						// Only the first run_turn call gets the resume
+						// tool calls; subsequent loop iterations (steer
+						// drains after an abort) start fresh.
+						resume.take(),
+					)
+					.await;
+					let flushed_files = flush_format_queue(&state, &format_queue).await;
+					// Kill + reap any detached background processes still
+					// running at turn end (ADR 0034). Runs on every
+					// termination path, same as `flush_format_queue`.
+					background.cleanup().await;
+					// Compute + emit the per-turn diff on a successful turn
+					// that touched files. Best-effort — a git failure or no
+					// baseline just means no diff row, not an error.
+					if matches!(result, Ok(())) {
+						if let Some(sha) = &baseline_sha {
+							if !flushed_files.is_empty() {
+								emit_turn_diff(
+									&state,
+									&rt_for_turn,
+									&sink_for_turn,
+									&folder_for_turn,
+									sha,
+									&flushed_files,
+								)
+								.await;
+							}
 						}
 					}
+					if matches!(result, Err(CoderError::Aborted)) && !rt_for_turn.session.lock().await.pending_steers.is_empty() {
+						recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
+						cancel_outer = fresh_cancel(&rt_for_turn).await;
+						continue;
+					}
+					if !matches!(result, Ok(())) {
+						rt_for_turn.turn.lock().await.cancel = None;
+						break result;
+					}
+					let mut turn = rt_for_turn.turn.lock().await;
+					if rt_for_turn.session.lock().await.pending_steers.is_empty() {
+						turn.cancel = None;
+						break result;
+					}
+					let fresh = CancellationToken::new();
+					turn.cancel = Some(fresh.clone());
+					drop(turn);
+					cancel_outer = fresh;
+				};
+				match &result {
+					Ok(()) => {
+						sink_for_turn.send(CoderEvent::TurnComplete);
+						maybe_autosync_to_hub(&state, &rt_for_turn, &folder_for_turn).await;
+					}
+					Err(CoderError::Aborted) => {
+						recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
+						sink_for_turn.send(CoderEvent::Aborted);
+					}
+					Err(err) => {
+						tracing::warn!(error = %err, "coder turn failed");
+						persist_error_record(&rt_for_turn, &err.to_string()).await;
+						sink_for_turn.send(CoderEvent::Error {
+							message: err.to_string(),
+						});
+					}
 				}
-				if matches!(result, Err(CoderError::Aborted)) && !rt_for_turn.session.lock().await.pending_steers.is_empty() {
-					recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
-					cancel_outer = fresh_cancel(&rt_for_turn).await;
-					continue;
+				// A turn's `bash` can remove a worktree checkout behind the
+				// registry's back (ADR 0063) — reconcile on every exit path
+				// so the project bar drops dead rows at turn end instead of
+				// waiting for a manual unbind.
+				if !prune_missing_worktrees(&state).await.is_empty() {
+					sink_for_turn.send(CoderEvent::WorkspaceFoldersChanged);
 				}
-				if !matches!(result, Ok(())) {
-					rt_for_turn.turn.lock().await.cancel = None;
-					break result;
+				if auto_rename_after {
+					spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
 				}
-				let mut turn = rt_for_turn.turn.lock().await;
-				if rt_for_turn.session.lock().await.pending_steers.is_empty() {
-					turn.cancel = None;
-					break result;
-				}
-				let fresh = CancellationToken::new();
-				turn.cancel = Some(fresh.clone());
-				drop(turn);
-				cancel_outer = fresh;
-			};
-			match &result {
-				Ok(()) => {
-					sink_for_turn.send(CoderEvent::TurnComplete);
-					maybe_autosync_to_hub(&state, &rt_for_turn, &folder_for_turn).await;
-				}
-				Err(CoderError::Aborted) => {
-					recover_in_memory_orphans(&rt_for_turn, &sink_for_turn).await;
-					sink_for_turn.send(CoderEvent::Aborted);
-				}
-				Err(err) => {
-					tracing::warn!(error = %err, "coder turn failed");
-					persist_error_record(&rt_for_turn, &err.to_string()).await;
-					sink_for_turn.send(CoderEvent::Error {
-						message: err.to_string(),
-					});
-				}
-			}
-			// A turn's `bash` can remove a worktree checkout behind the
-			// registry's back (ADR 0063) — reconcile on every exit path
-			// so the project bar drops dead rows at turn end instead of
-			// waiting for a manual unbind.
-			if !prune_missing_worktrees(&state).await.is_empty() {
-				sink_for_turn.send(CoderEvent::WorkspaceFoldersChanged);
-			}
-			if auto_rename_after {
-				spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
-			}
-			// Idle-grace MCP reaper: kill this session's MCP server
-			// instances (headless browsers, per-session since the
-			// tab-fight fix) if no new turn starts within the grace
-			// window. Anchored at turn end rather than a periodic
-			// sweep: active back-and-forth keeps the browser (and the
-			// page the user is iterating on), abandoned standalone
-			// sessions get cleaned instead of leaking a chromium until
-			// process exit. Workers get this too, on top of the
-			// immediate reap at retire.
-			let reaper_session = rt_for_turn.session.lock().await.header.id.clone();
-			tokio::spawn(async move {
-				tokio::time::sleep(MCP_IDLE_GRACE).await;
-				// A newer turn is running (or just started): its own
-				// end will schedule a fresh reaper. Racing the check
-				// against a turn that starts a moment later is
-				// harmless - the next MCP call just respawns.
-				if rt_for_turn.turn.lock().await.cancel.is_some() {
-					return;
-				}
-				state.tools.mcp().drop_session_connections(&reaper_session).await;
-			});
-		}),
+				// Idle-grace MCP reaper: kill this session's MCP server
+				// instances (headless browsers, per-session since the
+				// tab-fight fix) if no new turn starts within the grace
+				// window. Anchored at turn end rather than a periodic
+				// sweep: active back-and-forth keeps the browser (and the
+				// page the user is iterating on), abandoned standalone
+				// sessions get cleaned instead of leaking a chromium until
+				// process exit. Workers get this too, on top of the
+				// immediate reap at retire.
+				let reaper_session = rt_for_turn.session.lock().await.header.id.clone();
+				tokio::spawn(async move {
+					tokio::time::sleep(MCP_IDLE_GRACE).await;
+					// A newer turn is running (or just started): its own
+					// end will schedule a fresh reaper. Racing the check
+					// against a turn that starts a moment later is
+					// harmless - the next MCP call just respawns.
+					if rt_for_turn.turn.lock().await.cancel.is_some() {
+						return;
+					}
+					state.tools.mcp().drop_session_connections(&reaper_session).await;
+				});
+			}),
+		),
 	));
 }
 

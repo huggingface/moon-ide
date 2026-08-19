@@ -2504,6 +2504,20 @@ pub struct ResumeResult {
 	pub resume_tool_calls: Vec<ToolCall>,
 }
 
+/// Total `User` records in a session's on-disk transcript. The
+/// windowed frontends can't count this from their loaded rows (the
+/// window clips the head), so from-end gestures translate through
+/// this instead.
+pub async fn count_user_records(dir: &Utf8Path, id: &str) -> Result<usize, CoderError> {
+	let LoadedSession { records, .. } = load(dir, id).await?;
+	Ok(
+		records
+			.iter()
+			.filter(|r| matches!(r, SessionRecord::User { .. }))
+			.count(),
+	)
+}
+
 pub async fn truncate_before_user_record(
 	dir: &Utf8Path,
 	header: &SessionHeader,
@@ -2513,6 +2527,18 @@ pub async fn truncate_before_user_record(
 	if !tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false) {
 		return Err(CoderError::Internal(
 			"session has no on-disk transcript to revert".into(),
+		));
+	}
+	// Rolling single backup before the destructive rewrite. Cheap
+	// insurance: a caller-side ordinal bug (a windowed frontend
+	// counting wrong — happened live, cost a 3000-message session)
+	// must never be able to destroy a transcript unrecoverably.
+	// `.bak` doesn't match `SESSION_EXT`, so listings skip it.
+	let backup = path.with_extension("jsonl.bak");
+	if let Err(err) = tokio::fs::copy(path.as_std_path(), backup.as_std_path()).await {
+		tracing::warn!(error = %err, "revert: could not write pre-truncate backup; aborting");
+		return Err(CoderError::Internal(
+			"could not write the pre-revert backup; refusing to truncate".into(),
 		));
 	}
 	let LoadedSession { records, .. } = load(dir, &header.id).await?;

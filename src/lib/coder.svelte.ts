@@ -277,6 +277,18 @@ export type TerminalAttachment = {
  *  the IPC alongside `text`. */
 export type ComposerAttachment = SelectionAttachment | ImageComposerAttachment | TerminalAttachment;
 
+/** Mirror of the `retry_backoff` live event (see `protocol.ts`),
+ *  plus `at` (receipt time) so the bar can count down. */
+export type RetryNotice = {
+	model: string;
+	status: number;
+	attempt: number;
+	maxAttempts: number;
+	delayMs: number;
+	rotatedTo: string | null;
+	at: number;
+};
+
 /**
  * One entry in the agent's session-scoped todo list. Mirrors
  * `moon_coder::TodoItem`. The pill in the panel header and the
@@ -349,6 +361,11 @@ function extractTodos(result: unknown): TodoItem[] | null {
 class SessionViewState {
 	rows = $state<CoderRow[]>([]);
 	busy = $state(false);
+	/** Live transient-error notice: the provider 429/503'd and the
+	 *  runner is sleeping before a retry (or rotating to a fallback
+	 *  model). Rendered as a countdown bar; cleared by the next
+	 *  session event of any other kind. Never persisted/replayed. */
+	retryNotice = $state<RetryNotice | null>(null);
 	/** "This session's turn is parked on an `ask_user` prompt and
 	 *  is waiting for the human to answer (or skip)." Distinct from
 	 *  `busy`: the turn is still technically in flight (`busy`
@@ -1319,6 +1336,9 @@ export class CoderPanelState {
 
 	get busy(): boolean {
 		return this.currentSession.busy;
+	}
+	get retryNotice(): RetryNotice | null {
+		return this.currentSession.retryNotice;
 	}
 	set busy(value: boolean) {
 		this.currentSession.busy = value;
@@ -3267,7 +3287,25 @@ export class CoderPanelState {
 		sessionId: string,
 		event: CoderEvent,
 	): void {
+		// Any other session event supersedes a pending retry notice —
+		// deltas mean the retry worked, terminators mean the turn
+		// settled. (`retry_backoff` is live-only, so replays simply
+		// never set one.)
+		if (event.kind !== 'retry_backoff' && session.retryNotice !== null) {
+			session.retryNotice = null;
+		}
 		switch (event.kind) {
+			case 'retry_backoff':
+				session.retryNotice = {
+					model: event.model,
+					status: event.status,
+					attempt: event.attempt,
+					maxAttempts: event.max_attempts,
+					delayMs: event.delay_ms,
+					rotatedTo: event.rotated_to ?? null,
+					at: Date.now(),
+				};
+				return;
 			case 'user_message':
 				// In-place `push` rather than `rows = [...rows, x]`:
 				// `$state` arrays are deep proxies, so `push` is

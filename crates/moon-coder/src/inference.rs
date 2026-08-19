@@ -101,6 +101,7 @@ fn retry_after_of(response: &reqwest::Response) -> Option<Duration> {
 /// replayed.
 pub(crate) async fn send_with_rate_limit_retry(
 	endpoint: &str,
+	model: &str,
 	builder: reqwest::RequestBuilder,
 	max_retries: u32,
 	cancel: &tokio_util::sync::CancellationToken,
@@ -133,6 +134,15 @@ pub(crate) async fn send_with_rate_limit_retry(
 			delay_s = delay.as_secs(),
 			"provider returned a transient error; backing off before retrying"
 		);
+		// Live UI notice ("retrying in Xs") — no-op outside a turn.
+		crate::runner::emit_turn_event(crate::CoderEvent::RetryBackoff {
+			model: model.to_owned(),
+			status: response.status().as_u16(),
+			attempt,
+			max_attempts: max_retries,
+			delay_ms: delay.as_millis() as u64,
+			rotated_to: None,
+		});
 		tokio::select! {
 			biased;
 			_ = cancel.cancelled() => return Err(CoderError::Aborted),
@@ -1746,11 +1756,11 @@ impl InferenceClient {
 		let first_model = sticky.clone().unwrap_or_else(|| original.to_owned());
 		let Ok(mut wire) = serde_json::to_value(body) else {
 			let builder = self.request_builder(endpoint, route, streaming).json(body);
-			return send_with_rate_limit_retry(endpoint, builder, RATE_LIMIT_MAX_RETRIES, cancel).await;
+			return send_with_rate_limit_retry(endpoint, original, builder, RATE_LIMIT_MAX_RETRIES, cancel).await;
 		};
 		wire["model"] = serde_json::Value::String(first_model.clone());
 		let builder = self.request_builder(endpoint, route, streaming).json(&wire);
-		let response = send_with_rate_limit_retry(endpoint, builder, RATE_LIMIT_MAX_RETRIES, cancel).await?;
+		let response = send_with_rate_limit_retry(endpoint, &first_model, builder, RATE_LIMIT_MAX_RETRIES, cancel).await?;
 		if !is_transient_status(response.status()) {
 			return Ok(response);
 		}
@@ -1772,9 +1782,19 @@ impl InferenceClient {
 				rotated_to = %fallback,
 				"transient error persisted through backoff; rotating to fallback model"
 			);
+			// Rotation notice for the UI (`delay_ms: 0` — the wait
+			// already happened on the failing model).
+			crate::runner::emit_turn_event(crate::CoderEvent::RetryBackoff {
+				model: first_model.clone(),
+				status: response.status().as_u16(),
+				attempt: 0,
+				max_attempts: 0,
+				delay_ms: 0,
+				rotated_to: Some(fallback.clone()),
+			});
 			wire["model"] = serde_json::Value::String(fallback.clone());
 			let builder = self.request_builder(endpoint, route, streaming).json(&wire);
-			let resp = send_with_rate_limit_retry(endpoint, builder, ROTATION_MAX_RETRIES, cancel).await?;
+			let resp = send_with_rate_limit_retry(endpoint, &fallback, builder, ROTATION_MAX_RETRIES, cancel).await?;
 			if resp.status().is_success() {
 				// Remember the rescuer for the rest of the turn
 				// (clears when the rescuer IS the pinned model —

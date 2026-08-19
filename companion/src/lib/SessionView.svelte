@@ -56,6 +56,18 @@
 	// showing. Tap a user bubble to toggle; any action clears it.
 	let actionsFor = $state<string | null>(null);
 
+	// 1 Hz tick for the retry-backoff countdown (only while shown).
+	let backoffNow = $state(Date.now());
+	$effect(() => {
+		if (!app.retryNotice) {
+			return;
+		}
+		const timer = setInterval(() => {
+			backoffNow = Date.now();
+		}, 1000);
+		return () => clearInterval(timer);
+	});
+
 	/** Tooltip timestamp for a bubble, mirroring the desktop: time
 	 * only for today, date + time otherwise. Hover on desktop
 	 * browsers, long-press on mobile ones that surface titles. */
@@ -1165,6 +1177,17 @@
 		</div>
 	{/if}
 
+	{#if app.retryNotice}
+		{@const n = app.retryNotice}
+		<div class="retry-backoff-bar" role="status">
+			{#if n.rotatedTo}
+				{n.status} on {n.model} — trying fallback {n.rotatedTo}…
+			{:else}
+				{n.status} from the provider — retrying in {Math.max(0, Math.ceil((n.at + n.delayMs - backoffNow) / 1000))}s
+				(attempt {n.attempt}/{n.maxAttempts})
+			{/if}
+		</div>
+	{/if}
 	{#if app.turnError && !app.busy}
 		<div class="turn-error" role="alert">
 			<span class="turn-error-text">{app.turnError}</span>
@@ -1647,6 +1670,14 @@
 		margin-top: 0.3rem;
 		max-height: 250px;
 		overflow-y: auto;
+	}
+	.retry-backoff-bar {
+		margin: 0.3rem 0.75rem;
+		padding: 0.4rem 0.65rem;
+		border: 1px solid var(--warn, #d4a017);
+		border-radius: 8px;
+		color: var(--warn, #d4a017);
+		font-size: 0.8rem;
 	}
 	.token-widget {
 		flex: none;

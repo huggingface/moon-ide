@@ -311,11 +311,19 @@ impl BridgeRpcHandler for BridgeRpc {
 			// The phone re-opens the session afterwards to repaint.
 			"coder_revert_to_message" => {
 				let p: RevertParams = parse_params(params)?;
-				let reverted = self
-					.coder
-					.revert_to_message_in(&p.session_id, p.user_ordinal)
-					.await
-					.map_err(|e| e.to_string())?;
+				let reverted = match (p.user_from_end, p.user_ordinal) {
+					(Some(from_end), _) => self
+						.coder
+						.revert_to_message_from_end_in(&p.session_id, from_end)
+						.await
+						.map_err(|e| e.to_string())?,
+					(None, Some(ordinal)) => self
+						.coder
+						.revert_to_message_in(&p.session_id, ordinal)
+						.await
+						.map_err(|e| e.to_string())?,
+					(None, None) => return Err("missing user_from_end / user_ordinal".to_string()),
+				};
 				Ok(serde_json::json!({ "text": reverted.text }))
 			}
 			"coder_abort" => {
@@ -842,7 +850,17 @@ struct SwitchBranchParams {
 #[derive(serde::Deserialize)]
 struct RevertParams {
 	session_id: String,
-	user_ordinal: usize,
+	/// Absolute 0-based user-message ordinal. Only safe when the
+	/// caller sees the *whole* transcript (desktop). Windowed
+	/// callers must use `user_from_end` instead.
+	#[serde(default)]
+	user_ordinal: Option<usize>,
+	/// 0-based index counted from the transcript's last user
+	/// message backwards — exact under windowing because the
+	/// window always includes the tail. Wins over `user_ordinal`
+	/// when both are present.
+	#[serde(default)]
+	user_from_end: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
