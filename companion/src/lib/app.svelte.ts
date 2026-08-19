@@ -531,6 +531,13 @@ class CompanionState {
 	 * transcript activity (a new turn ran past it). */
 	turnError = $state<string | null>(null);
 
+	/** Edit-and-resend in flight: the user row the next send should
+	 * rewind to. Deferred on purpose — trimming when the user taps
+	 * "edit" destroyed the tail before they'd committed to
+	 * anything, with no undo. Cleared by `cancelPendingRevert` and
+	 * by the send that consumes it. */
+	pendingRevertRowId = $state<string | null>(null);
+
 	/** Live transient-error notice for the open session: the
 	 * provider 429/503'd and the runner is sleeping before a retry
 	 * (or rotating to a fallback). Cleared by the next live event
@@ -1851,6 +1858,17 @@ class CompanionState {
 		if (!this.activeWorkspace || !this.activeSession || (!text.trim() && images.length === 0)) {
 			return;
 		}
+		// Consume a prepared edit-and-resend: the truncation happens
+		// now, at commit time. A failure leaves the transcript
+		// intact and the text in the composer.
+		const rewindTo = this.pendingRevertRowId;
+		if (rewindTo !== null) {
+			this.pendingRevertRowId = null;
+			const reverted = await this.revertToMessage(rewindTo);
+			if (reverted === null) {
+				return;
+			}
+		}
 		const entry: PendingSend = {
 			id: `send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
 			sessionId: this.activeSession,
@@ -1943,6 +1961,35 @@ class CompanionState {
 	 * ("edit & resend") or re-send it verbatim ("replay"). Refused
 	 * by the backend mid-turn; the UI hides the affordance while
 	 * busy. */
+	/** Prepare an edit-and-resend without touching the transcript:
+	 * returns the row's text for the composer and marks the rewind
+	 * point for the next send. */
+	prepareEditAndResend(rowId: string): { text: string; images: string[] } | null {
+		const row = this.rows.find((r) => r.kind === 'user' && r.id === rowId);
+		if (!row || row.kind !== 'user') {
+			return null;
+		}
+		this.pendingRevertRowId = rowId;
+		return { text: row.text, images: row.images };
+	}
+
+	/** Back out of a prepared edit-and-resend. Nothing was written,
+	 * so this is just dropping the marker. */
+	cancelPendingRevert(): void {
+		this.pendingRevertRowId = null;
+	}
+
+	/** Rows a prepared edit-and-resend would drop (target row and
+	 * everything after) — for the warning bar's count. */
+	get pendingRevertDropCount(): number {
+		const id = this.pendingRevertRowId;
+		if (!id) {
+			return 0;
+		}
+		const idx = this.rows.findIndex((r) => r.kind === 'user' && r.id === id);
+		return idx === -1 ? 0 : this.rows.length - idx;
+	}
+
 	async revertToMessage(rowId: string): Promise<string | null> {
 		if (!this.activeWorkspace || !this.activeSession || this.busy) {
 			return null;

@@ -2156,10 +2156,24 @@
 	 *  reads as "edit", which a modal would make feel heavier than
 	 *  it is. */
 	async function onEditAndResend(rowId: string): Promise<void> {
+		// Non-destructive: seeds the composer and marks the rewind
+		// point. The transcript is trimmed only if/when the user
+		// actually sends (see `coder.send`), so this is cancellable.
 		await coder.revertToMessage(rowId, { resend: true });
 		await tick();
 		composer?.focus();
 	}
+
+	/** Index of the first row an in-flight edit-and-resend will drop
+	 *  (its target user row); everything from here down renders
+	 *  struck-through as a preview of the rewind. */
+	const pendingRevertFromIndex = $derived.by(() => {
+		const id = coder.pendingRevertRowId;
+		if (!id) {
+			return -1;
+		}
+		return coder.rows.findIndex((r) => r.kind === 'user' && r.id === id);
+	});
 
 	/** Re-run the turn that started at `rowId`: truncate the session
 	 *  to just before that user message and re-send the original prompt
@@ -2802,8 +2816,22 @@
 				</button>
 			{/if}
 			{#each windowedRows as row (row.id)}
-				{@render rowMarkup(row, true)}
+				{@const doomed = pendingRevertFromIndex !== -1 && coder.rows.indexOf(row) >= pendingRevertFromIndex}
+				<div class="row-wrap" class:doomed>
+					{@render rowMarkup(row, true)}
+				</div>
 			{/each}
+			{#if coder.pendingRevertRowId}
+				<div class="pending-revert-bar" role="status">
+					<span>
+						Editing an earlier message — sending will drop {coder.pendingRevertDropCount} row{coder.pendingRevertDropCount ===
+						1
+							? ''
+							: 's'} below it.
+					</span>
+					<button type="button" class="error-retry" onclick={() => coder.cancelPendingRevert()}>keep them</button>
+				</div>
+			{/if}
 			{#if retryCountdown}
 				<div class="relaunch-bar" role="status">
 					<span>{retryCountdown}</span>
@@ -4695,6 +4723,22 @@
 		&:hover {
 			color: var(--m-fg);
 		}
+	}
+	.pending-revert-bar {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin: 6px 0;
+		padding: 6px 10px;
+		border: 1px solid var(--m-warning, #d4a017);
+		border-radius: 6px;
+		color: var(--m-warning, #d4a017);
+		font-size: 12px;
+	}
+	/* Preview of what an uncommitted edit-and-resend would drop. */
+	.row-wrap.doomed {
+		opacity: 0.45;
+		text-decoration: line-through;
 	}
 	.relaunch-bar {
 		display: flex;

@@ -398,6 +398,12 @@ class SessionViewState {
 	subagentTranscripts = $state<Map<string, SubagentTranscript>>(new Map());
 	draft = $state('');
 	attachments = $state<ComposerAttachment[]>([]);
+	/** Edit-and-resend in flight: the user row the next send should
+	 *  rewind to. The truncation is deliberately deferred to the
+	 *  send — trimming on the *click* destroyed the tail before the
+	 *  user had committed to anything, with no way back. Cleared by
+	 *  `cancelPendingRevert` (and by the send that consumes it). */
+	pendingRevertRowId = $state<string | null>(null);
 	/** Latest token usage report from the parent loop for this
 	 *  session. `null` before the first turn; populated from
 	 *  `token_usage` events and used by [`ContextRing`] in the
@@ -1393,6 +1399,14 @@ export class CoderPanelState {
 	}
 	set draft(value: string) {
 		this.currentSession.draft = value;
+	}
+	/** Per-session, like `draft`: switching sessions must not carry
+	 *  a rewind marker across. */
+	get pendingRevertRowId(): string | null {
+		return this.currentSession.pendingRevertRowId;
+	}
+	set pendingRevertRowId(value: string | null) {
+		this.currentSession.pendingRevertRowId = value;
 	}
 
 	get attachments(): ComposerAttachment[] {
@@ -2675,6 +2689,25 @@ export class CoderPanelState {
 		await this.refreshStatus();
 	}
 
+	/** Back out of a prepared edit-and-resend: the transcript was
+	 *  never touched, so this only drops the rewind marker. The
+	 *  draft is left alone — the user may still want the text. */
+	cancelPendingRevert(): void {
+		this.pendingRevertRowId = null;
+	}
+
+	/** Rows an in-flight edit-and-resend will drop once sent: the
+	 *  target user row and everything after it. Drives the "will
+	 *  drop N messages" warning + the struck-through rendering. */
+	get pendingRevertDropCount(): number {
+		const id = this.pendingRevertRowId;
+		if (!id) {
+			return 0;
+		}
+		const idx = this.rows.findIndex((r) => r.kind === 'user' && r.id === id);
+		return idx === -1 ? 0 : this.rows.length - idx;
+	}
+
 	async send(): Promise<void> {
 		const text = this.draft.trim();
 		const attachments = this.attachments;
@@ -2687,6 +2720,31 @@ export class CoderPanelState {
 		// without the user having to abort and restart.
 		if (text.length === 0 && attachments.length === 0) {
 			return;
+		}
+		// Consume a prepared edit-and-resend: the destructive
+		// truncation happens here, at the moment the user commits,
+		// not when they clicked "edit". A failure leaves the
+		// transcript intact and the draft in the composer.
+		const rewindTo = this.pendingRevertRowId;
+		if (rewindTo !== null) {
+			const ordinal = this.#userOrdinalForRow(rewindTo);
+			this.pendingRevertRowId = null;
+			if (ordinal !== null) {
+				try {
+					await ipc.coder.revertToMessage(ordinal);
+					await this.refreshSessions();
+				} catch (err) {
+					this.rows = [
+						...this.rows,
+						{
+							kind: 'error',
+							id: `local-${Date.now()}`,
+							text: formatError(err),
+						},
+					];
+					return;
+				}
+			}
 		}
 		const selectionAttachments: SelectionAttachment[] = [];
 		const imageAttachments: ImageComposerAttachment[] = [];
@@ -2820,30 +2878,34 @@ export class CoderPanelState {
 		if (ordinal === null) {
 			return;
 		}
-		try {
-			const dropped = await ipc.coder.revertToMessage(ordinal);
-			if (options.resend) {
-				this.draft = dropped.text;
-				// The dropped message's images come back as composer
-				// attachments so an edit-and-resend keeps them by
-				// default — losing a screenshot because you fixed a
-				// typo was silent data loss. Each renders as a normal
-				// removable chip, so dropping one is an explicit ✕.
-				const images = dropped.images ?? [];
-				this.attachments = [
-					...this.attachments,
-					...images.map(
-						(img, i): ImageComposerAttachment => ({
-							kind: 'image',
-							id: `reverted-${Date.now()}-${i}`,
-							dataUrl: img.data_url,
-							mime: img.mime,
-							name: `image ${i + 1}`,
-							sizeBytes: img.data_url.length,
-						}),
-					),
-				];
+		if (options.resend) {
+			// Deferred: seed the composer from the row we already
+			// have and remember the rewind point. Nothing is written
+			// (or destroyed) until `send` consumes it, so backing out
+			// is just clearing the draft.
+			const row = this.rows.find((r) => r.kind === 'user' && r.id === rowId);
+			if (!row || row.kind !== 'user') {
+				return;
 			}
+			this.draft = row.text;
+			this.attachments = [
+				...this.attachments,
+				...row.images.map(
+					(img, i): ImageComposerAttachment => ({
+						kind: 'image',
+						id: `reverted-${Date.now()}-${i}`,
+						dataUrl: img.data_url,
+						mime: img.mime,
+						name: `image ${i + 1}`,
+						sizeBytes: img.data_url.length,
+					}),
+				),
+			];
+			this.pendingRevertRowId = rowId;
+			return;
+		}
+		try {
+			await ipc.coder.revertToMessage(ordinal);
 			await this.refreshSessions();
 		} catch (err) {
 			this.rows = [

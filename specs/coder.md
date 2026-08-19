@@ -677,11 +677,11 @@ the workspace has no enabled servers, and neither is mode-gated
   evaporates at turn end — the next turn starts from the user's
   pick. If the whole chain fails, the original error surfaces as
   before. Backoff sleeps and rotations emit a live-only
-  `retry_backoff` event (model, status, attempt/max, delay_ms,
+  `retry_backoff` event (model, status, attempt/max, delay*ms,
   rotated_to) — both frontends render it as a countdown bar,
   cleared by the next live event of any other kind. The runner also
   keeps the current wait per session in memory and re-emits it (with
-  the _remaining_ delay) when a client opens the session mid-backoff,
+  the \_remaining* delay) when a client opens the session mid-backoff,
   so arriving during a two-minute sleep explains itself instead of
   showing a bare spinner. `token_usage` carries the **effective
   model** for the round-trip (the pick, or the turn's sticky

@@ -87,11 +87,13 @@
 		actionsFor = actionsFor === rowId ? null : rowId;
 	}
 
-	async function editAndResend(rowId: string): Promise<void> {
+	function editAndResend(rowId: string): void {
 		actionsFor = null;
-		const text = await app.revertToMessage(rowId);
-		if (text !== null) {
-			draft = text;
+		// Non-destructive until send: seeds the composer and marks
+		// the rewind point, so backing out costs nothing.
+		const prepared = app.prepareEditAndResend(rowId);
+		if (prepared) {
+			draft = prepared.text;
 		}
 	}
 
@@ -1182,6 +1184,12 @@
 		</div>
 	{/if}
 
+	{#if app.pendingRevertRowId}
+		<div class="pending-revert-bar" role="status">
+			<span>Sending will drop {app.pendingRevertDropCount} row{app.pendingRevertDropCount === 1 ? '' : 's'}.</span>
+			<button class="ghost" onclick={() => app.cancelPendingRevert()}>Keep them</button>
+		</div>
+	{/if}
 	{#if app.retryNotice}
 		{@const n = app.retryNotice}
 		<div class="retry-backoff-bar" role="status">
@@ -1675,6 +1683,17 @@
 		margin-top: 0.3rem;
 		max-height: 250px;
 		overflow-y: auto;
+	}
+	.pending-revert-bar {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin: 0.3rem 0.75rem;
+		padding: 0.4rem 0.65rem;
+		border: 1px solid var(--warn, #d4a017);
+		border-radius: 8px;
+		color: var(--warn, #d4a017);
+		font-size: 0.8rem;
 	}
 	.retry-backoff-bar {
 		margin: 0.3rem 0.75rem;

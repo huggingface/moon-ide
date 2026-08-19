@@ -747,3 +747,9 @@ Prose, not commitments — revisit when someone asks:
   a per-slug list with up/down reorder and remove buttons plus an
   append field; every action persists immediately through
   `coder_set_model_settings`.
+- **Edit & resend is deferred**: tapping edit only seeds the composer
+  (text + images) and marks a rewind point; the destructive
+  truncation runs when the message is actually sent. A warning bar
+  shows how many rows the send will drop, with a "keep them" cancel
+  (desktop additionally renders the doomed rows struck-through).
+  Previously the trim happened on the click, with no way back.
