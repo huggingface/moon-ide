@@ -1981,6 +1981,12 @@ export type CoderModelSettings = {
 	 *  (usage ring, auto-compaction). Use case: capping a 1M-window
 	 *  model at 250k where quality degrades past that point. */
 	context_window_overrides: Record<string, number>;
+	/** Rate-limit fallback chain: full wire slugs tried in order
+	 *  when a request's transient-error backoff is exhausted.
+	 *  Required (not optional) on purpose: a save literal that
+	 *  omitted it would silently clear the persisted chain via
+	 *  serde's default. */
+	rotation: string[];
 	/** Per-workspace lock on the active provider. `null` (or
 	 *  missing) means "no lock — follow the global default and
 	 *  let modal saves write the global". Non-null pins the

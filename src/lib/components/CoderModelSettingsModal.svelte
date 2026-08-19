@@ -100,6 +100,10 @@
 	let standardModel = $state('');
 	let cheapModel = $state('');
 	let billTo = $state('');
+	// Rate-limit fallback chain (HF-route rotation). Edited as an
+	// ordered list; saved verbatim.
+	let rotation = $state<string[]>([]);
+	let rotationAddDraft = $state('');
 	let activeProviderId = $state<string | null>(null);
 	let providers = $state<CoderProviderConfig[]>([]);
 	let saving = $state(false);
@@ -299,6 +303,7 @@
 		// whole map; mutating in place wouldn't notify
 		// `slugCapInput`.
 		slugCaps = { ...settings.context_window_overrides };
+		rotation = [...(settings.rotation ?? [])];
 		providerLocked = settings.provider_lock !== null && settings.provider_lock !== undefined;
 	}
 
@@ -957,6 +962,7 @@
 			context_window_overrides: Object.fromEntries(
 				Object.entries(slugCaps).filter(([, v]) => Number.isFinite(v) && v > 0),
 			),
+			rotation: rotation.map((m) => m.trim()).filter((m) => m.length > 0),
 			provider_lock: providerLock,
 			// Read-only field; the runner ignores it on write and
 			// recomputes it on the post-save re-read.
@@ -970,6 +976,25 @@
 		} finally {
 			saving = false;
 		}
+	}
+
+	function moveFallback(i: number, delta: number): void {
+		const j = i + delta;
+		if (j < 0 || j >= rotation.length) {
+			return;
+		}
+		const next = [...rotation];
+		[next[i], next[j]] = [next[j] as string, next[i] as string];
+		rotation = next;
+	}
+
+	function addFallback(): void {
+		const slug = rotationAddDraft.trim();
+		if (!slug) {
+			return;
+		}
+		rotationAddDraft = '';
+		rotation = [...rotation, slug];
 	}
 
 	function onCancel(): void {
@@ -1323,6 +1348,58 @@
 							tick it at the OAuth consent screen.
 						</span>
 					</label>
+
+					<div class="field">
+						<span class="label-row">
+							<span class="label-name">Fallbacks</span>
+						</span>
+						{#each rotation as slug, i (slug + i)}
+							<div class="rotation-row">
+								<span class="rotation-slug" title={slug}>{slug}</span>
+								<button
+									type="button"
+									class="rot-btn"
+									title="Try earlier"
+									disabled={i === 0}
+									onclick={() => moveFallback(i, -1)}>↑</button
+								>
+								<button
+									type="button"
+									class="rot-btn"
+									title="Try later"
+									disabled={i === rotation.length - 1}
+									onclick={() => moveFallback(i, 1)}>↓</button
+								>
+								<button
+									type="button"
+									class="rot-btn danger"
+									title="Remove from the chain"
+									onclick={() => (rotation = rotation.toSpliced(i, 1))}>✕</button
+								>
+							</div>
+						{/each}
+						<div class="rotation-row">
+							<input
+								class="rotation-add"
+								bind:value={rotationAddDraft}
+								onkeydown={(e) => {
+									if (e.key === 'Enter') {
+										e.preventDefault();
+										addFallback();
+									}
+								}}
+								placeholder="owner/name[:provider] to append"
+								spellcheck="false"
+							/>
+							<button type="button" class="rot-btn" onclick={addFallback} disabled={!rotationAddDraft.trim()}
+								>Add</button
+							>
+						</div>
+						<span class="hint">
+							Tried in order when the active model stays rate-limited (or 502/503/504) through the whole backoff. A
+							rescue sticks for the rest of the turn; the next turn starts from your pick again. Applied on save.
+						</span>
+					</div>
 				{/if}
 			</section>
 
@@ -1804,6 +1881,29 @@
 		border-color: var(--m-accent);
 	}
 	.field input,
+	.rotation-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-bottom: 4px;
+	}
+	.rotation-slug {
+		flex: 1;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 12px;
+	}
+	.rotation-add {
+		flex: 1;
+	}
+	.rot-btn {
+		padding: 2px 8px;
+	}
+	.rot-btn.danger {
+		color: var(--m-danger, #c62828);
+	}
 	.field select {
 		background: var(--m-bg-overlay);
 		border: 1px solid var(--m-border);

@@ -652,7 +652,9 @@ the workspace has no enabled servers, and neither is mode-gated
   otherwise impossible).
 - **Model rotation on transient errors.** A user-authored fallback chain
   (`CoderModelSettings.rotation`, persisted in `state.json`; edited
-  via the companion provider card's "Fallbacks" row or
+  via the companion provider card's "Fallbacks" row, the desktop
+  model modal's Fallbacks editor (HF section; reorder/remove/add,
+  applied on save), or
   `moon-remote model --rotation "a,b,c"`): full wire slugs — any
   models, any `:provider` flavors — tried in order when a request's
   transient-status backoff schedule (429 and the 502/503/504
