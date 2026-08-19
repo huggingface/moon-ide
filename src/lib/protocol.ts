@@ -1784,6 +1784,9 @@ export type CoderEvent =
 			 */
 			session_cache_hits: number;
 			session_requests: number;
+			/** Wire model that actually served this round-trip (the
+			 *  pick, or the turn's sticky rotation fallback). */
+			model: string;
 	  }
 	| {
 			kind: 'retry_backoff';

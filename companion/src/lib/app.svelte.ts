@@ -187,6 +187,8 @@ export type TranscriptRow =
 			cacheRead: number;
 			sessionHits: number;
 			sessionReqs: number;
+			/** Wire model that served the last round-trip. */
+			model: string;
 	  }
 	| {
 			kind: 'compaction';
@@ -568,7 +570,13 @@ class CompanionState {
 	 * from the transcript's tokens row (updated in place by the
 	 * `token_usage` event handler). The SessionView renders this in
 	 * a sticky bar so it stays visible during streaming. */
-	get tokenUsage(): { total: number; contextWindow: number; pct: number; cacheScore: string | null } | null {
+	get tokenUsage(): {
+		total: number;
+		contextWindow: number;
+		pct: number;
+		cacheScore: string | null;
+		model: string;
+	} | null {
 		const row = this.rows.findLast((r) => r.kind === 'tokens');
 		if (!row || row.kind !== 'tokens' || row.total === 0) {
 			return null;
@@ -581,6 +589,11 @@ class CompanionState {
 			// hit the prompt cache out of all made — "is caching
 			// working for this session?", not just the last request.
 			cacheScore: row.sessionReqs > 0 ? `${row.sessionHits}/${row.sessionReqs}` : null,
+			// Effective model for the last round-trip — the configured
+			// pick, or the sticky rotation fallback that rescued this
+			// turn. The phone has no picker on screen, so this is the
+			// only place "who is answering me" is visible.
+			model: row.model,
 		};
 	}
 
@@ -2431,6 +2444,7 @@ class CompanionState {
 				const isEstimate = str(ev, 'source') === 'estimate';
 				const sessionHits = num(ev, 'session_cache_hits');
 				const sessionReqs = num(ev, 'session_requests');
+				const usageModel = str(ev, 'model');
 				if (total > 0) {
 					// Update the existing tokens row in place rather
 					// than appending a new one each time — the coder
@@ -2442,6 +2456,9 @@ class CompanionState {
 						existing.contextWindow = ctx;
 						existing.sessionHits = sessionHits;
 						existing.sessionReqs = sessionReqs;
+						if (usageModel) {
+							existing.model = usageModel;
+						}
 						if (!isEstimate) {
 							existing.promptTokens = promptTokens;
 							existing.cacheRead = cacheRead;
@@ -2455,6 +2472,7 @@ class CompanionState {
 							cacheRead,
 							sessionHits,
 							sessionReqs,
+							model: usageModel,
 							contextWindow: ctx,
 						});
 					}

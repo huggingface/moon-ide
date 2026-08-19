@@ -804,6 +804,11 @@
 	{#if app.tokenUsage}
 		{@const usage = app.tokenUsage}
 		<div class="token-widget">
+			{#if usage.model}
+				<!-- Short form: the owner prefix eats the phone's width
+				     and the model+provider tail is the useful part. -->
+				<span class="usage-model" title={usage.model}>{usage.model.split('/').at(-1)}</span>
+			{/if}
 			<button
 				class="token-bar"
 				class:cap-open={capOpen}
@@ -1678,6 +1683,15 @@
 		border-radius: 8px;
 		color: var(--warn, #d4a017);
 		font-size: 0.8rem;
+	}
+	.usage-model {
+		display: block;
+		padding: 0 0.75rem 0.15rem;
+		font-size: 0.7rem;
+		color: var(--fg-muted);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.token-widget {
 		flex: none;

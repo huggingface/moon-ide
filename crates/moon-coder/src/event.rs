@@ -423,6 +423,11 @@ pub enum CoderEvent {
 		/// sub-agent inner events, which don't track it).
 		session_cache_hits: u32,
 		session_requests: u32,
+		/// Wire model that actually served this round-trip —
+		/// the user's pick, or the turn's sticky fallback when
+		/// rotation rescued it. Lets the UI show which provider
+		/// is really answering rather than what's configured.
+		model: String,
 		#[serde(default)]
 		cache_read_tokens: u32,
 		#[serde(default)]

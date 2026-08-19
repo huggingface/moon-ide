@@ -572,6 +572,11 @@ export type TokenUsageState = {
 	 *  across the whole session, not just the last request. */
 	sessionCacheHits: number;
 	sessionRequests: number;
+	/** Wire model that served the last round-trip — the configured
+	 *  pick, or the sticky rotation fallback when one rescued this
+	 *  turn. Shown next to the ring so "which model is answering"
+	 *  is never a guess. */
+	model: string;
 };
 
 /**
@@ -3810,6 +3815,7 @@ export class CoderPanelState {
 					cacheCreationTokens: event.cache_creation_tokens,
 					sessionCacheHits: event.session_cache_hits,
 					sessionRequests: event.session_requests,
+					model: event.model,
 				};
 				return;
 			case 'compaction_started':

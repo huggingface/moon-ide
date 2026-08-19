@@ -719,6 +719,14 @@ fn sticky_start_model(original: &str) -> Option<String> {
 		.flatten()
 }
 
+/// The model that requests pinned to `original` are actually going
+/// to right now — the turn's sticky fallback when rotation rescued
+/// this turn, else `original`. Drives the UI's "which model is
+/// serving me" indicator.
+pub fn effective_model(original: &str) -> String {
+	sticky_start_model(original).unwrap_or_else(|| original.to_owned())
+}
+
 /// Record (or clear, with `fallback == original`) the turn's sticky
 /// fallback. No-op outside a turn scope.
 fn set_sticky_model(original: &str, fallback: &str) {

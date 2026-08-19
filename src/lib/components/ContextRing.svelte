@@ -115,6 +115,9 @@
 			}
 			lines.push(`cache (last request): ${parts.join(' · ')}`);
 		}
+		if (usage.model) {
+			lines.push(`model: ${usage.model}`);
+		}
 		if (usage.sessionRequests > 0) {
 			lines.push(`cache hits this session: ${usage.sessionCacheHits} of ${usage.sessionRequests} requests`);
 		}

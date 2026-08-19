@@ -1481,6 +1481,7 @@ fn emit_subagent_token_usage(
 			// 0/0 renders as "no data" on both frontends.
 			session_cache_hits: 0,
 			session_requests: 0,
+			model: model_slug.to_owned(),
 		},
 	));
 }

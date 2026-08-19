@@ -574,6 +574,60 @@ pub(crate) fn emit_turn_event(event: CoderEvent) {
 	let _ = TURN_EVENT_SINK.try_with(|sink| sink.send(event));
 }
 
+/// A backoff/rotation notice that's still "current" for a session:
+/// the wait hasn't elapsed and no later event has superseded it.
+/// `until_ms` is the wall-clock deadline so a client that connects
+/// mid-wait gets the *remaining* time, not the original delay.
+#[derive(Clone)]
+pub(crate) struct ActiveRetry {
+	pub(crate) model: String,
+	pub(crate) status: u16,
+	pub(crate) attempt: u32,
+	pub(crate) max_attempts: u32,
+	pub(crate) until_ms: i64,
+	pub(crate) rotated_to: Option<String>,
+}
+
+/// Live retry state per session. `retry_backoff` is a live-only
+/// event, so a phone that opens a session *during* a two-minute
+/// backoff would otherwise see a spinner with no explanation —
+/// the open path replays the current entry as a fresh live event.
+fn active_retries() -> &'static std::sync::Mutex<HashMap<String, ActiveRetry>> {
+	static MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ActiveRetry>>> = std::sync::OnceLock::new();
+	MAP.get_or_init(Default::default)
+}
+
+/// Fast path for the hot `send` funnel: skip locking when nothing
+/// is waiting anywhere.
+static ACTIVE_RETRY_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn record_active_retry(session_id: &str, entry: ActiveRetry) {
+	let mut map = active_retries().lock().expect("active retries poisoned");
+	map.insert(session_id.to_owned(), entry);
+	ACTIVE_RETRY_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn clear_active_retry(session_id: &str) {
+	if ACTIVE_RETRY_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+		return;
+	}
+	let mut map = active_retries().lock().expect("active retries poisoned");
+	if map.remove(session_id).is_some() {
+		ACTIVE_RETRY_COUNT.store(map.len(), std::sync::atomic::Ordering::Relaxed);
+	}
+}
+
+pub(crate) fn active_retry_for(session_id: &str) -> Option<ActiveRetry> {
+	if ACTIVE_RETRY_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+		return None;
+	}
+	active_retries()
+		.lock()
+		.expect("active retries poisoned")
+		.get(session_id)
+		.cloned()
+}
+
 /// Pre-tagged event sender. One `FolderEventSink` per running
 /// turn / sub-agent / auto-rename pass — captures the
 /// `(folder, session_id)` pair once so emit sites don't have to
@@ -602,6 +656,35 @@ impl FolderEventSink {
 	}
 
 	pub(crate) fn send(&self, event: CoderEvent) {
+		// Single funnel for session events, so retry bookkeeping
+		// lives here: a backoff notice becomes the session's live
+		// retry state, and *any* later event supersedes it (a delta
+		// means the retry landed; a terminator means the turn
+		// settled). Keeps a mid-backoff reopen honest without a
+		// second cleanup path.
+		match &event {
+			CoderEvent::RetryBackoff {
+				model,
+				status,
+				attempt,
+				max_attempts,
+				delay_ms,
+				rotated_to,
+			} => {
+				record_active_retry(
+					&self.session_id,
+					ActiveRetry {
+						model: model.clone(),
+						status: *status,
+						attempt: *attempt,
+						max_attempts: *max_attempts,
+						until_ms: current_time_ms() + i64::try_from(*delay_ms).unwrap_or(0),
+						rotated_to: rotated_to.clone(),
+					},
+				);
+			}
+			_ => clear_active_retry(&self.session_id),
+		}
 		let _ = self.sender.send(CoderEventEnvelope {
 			folder: self.folder.clone(),
 			session_id: self.session_id.clone(),
@@ -1448,6 +1531,7 @@ impl CoderHandle {
 					cache_creation_tokens: usage.cache_creation_input_tokens,
 					session_cache_hits: cache_stats.hits,
 					session_requests: cache_stats.requests,
+					model: active_model.clone(),
 				});
 			}
 		}
@@ -3693,6 +3777,7 @@ impl CoderHandle {
 			cache_creation_tokens: restore_cache_creation,
 			session_cache_hits: cache_stats.hits,
 			session_requests: cache_stats.requests,
+			model: restore_standard.clone(),
 		});
 		// Clear the busy state on the frontend. Replayed `UserMessage`
 		// events flip `coder.busy = true` (mirroring the live-turn
@@ -3757,6 +3842,25 @@ impl CoderHandle {
 		} else {
 			Some((replay_events, in_flight, has_more))
 		};
+		// Mid-backoff open: re-announce the wait as a *live* event
+		// with the remaining time, so a client that arrives during
+		// a two-minute sleep sees "retrying in 47s" instead of an
+		// unexplained spinner. Live (not part of the replay batch)
+		// because the frontends deliberately ignore replayed
+		// notices — a stale one from a settled turn must never
+		// show. Sent after the replay so it isn't cleared by the
+		// batch's own terminator.
+		if let Some(retry) = active_retry_for(sink.session_id()) {
+			let remaining = retry.until_ms.saturating_sub(current_time_ms()).max(0);
+			sink.send(CoderEvent::RetryBackoff {
+				model: retry.model,
+				status: retry.status,
+				attempt: retry.attempt,
+				max_attempts: retry.max_attempts,
+				delay_ms: u64::try_from(remaining).unwrap_or(0),
+				rotated_to: retry.rotated_to,
+			});
+		}
 		// Cold-resume an interrupted `ask_user`: spawn a fresh turn
 		// loop whose first iteration re-dispatches the parked prompt.
 		// `handle_ask_user` registers a new oneshot on the
@@ -6068,6 +6172,7 @@ async fn run_turn(
 			cache_creation_tokens: 0,
 			session_cache_hits: cache_stats_snapshot.hits,
 			session_requests: cache_stats_snapshot.requests,
+			model: crate::inference::effective_model(&standard_model),
 		});
 		// `Mutex` rather than `Cell` because the future the
 		// closure participates in is required to be `Send` —
@@ -6101,6 +6206,7 @@ async fn run_turn(
 							prompt_estimate,
 							context_window,
 							cache_stats_snapshot,
+							&standard_model,
 						);
 					}
 					StreamEvent::ThinkingDelta { delta } => {
@@ -6127,6 +6233,7 @@ async fn run_turn(
 							prompt_estimate,
 							context_window,
 							cache_stats_snapshot,
+							&standard_model,
 						);
 					}
 					// Tool-call deltas are intentionally not surfaced.
@@ -10820,6 +10927,7 @@ pub(crate) fn emit_token_usage(
 		cache_creation_tokens,
 		session_cache_hits: cache_stats.hits,
 		session_requests: cache_stats.requests,
+		model: crate::inference::effective_model(model_slug),
 	});
 }
 
@@ -10830,6 +10938,7 @@ pub(crate) fn emit_token_usage(
 /// Cheap enough to call on every content / thinking delta — the
 /// throttle keeps the event rate to ~2 Hz no matter how fast
 /// the provider streams.
+#[allow(clippy::too_many_arguments)]
 fn maybe_emit_stream_usage(
 	sink: &FolderEventSink,
 	state: &std::sync::Mutex<(u32, std::time::Instant)>,
@@ -10838,6 +10947,7 @@ fn maybe_emit_stream_usage(
 	prompt_estimate: u32,
 	context_window: u32,
 	cache_stats: SessionCacheStats,
+	model_slug: &str,
 ) {
 	let len = u32::try_from(delta_len).unwrap_or(u32::MAX);
 	let now = std::time::Instant::now();
@@ -10867,6 +10977,7 @@ fn maybe_emit_stream_usage(
 		cache_creation_tokens: 0,
 		session_cache_hits: cache_stats.hits,
 		session_requests: cache_stats.requests,
+		model: crate::inference::effective_model(model_slug),
 	});
 }
 
