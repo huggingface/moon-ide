@@ -662,10 +662,15 @@ the workspace has no enabled servers, and neither is mode-gated
   (bad slug, wrong route) is skipped. Explicit rather than derived
   from catalog siblings: the user knows which providers they trust.
   When the failed model is itself in the chain the order starts
-  after it and wraps. Per-request only: the pick is untouched and
-  the next round-trip starts from it again (that provider holds the
-  session's prompt cache). If the whole chain fails, the original
-  429 surfaces as before.
+  after it and wraps. A rescue **sticks for the rest of the
+  turn** (task-local, like the session-affinity hint): subsequent
+  round-trips go straight to the fallback instead of re-eating the
+  primary's ladder every iteration, which also keeps the fallback's
+  prompt cache warm; the primary re-enters at the end of the chain
+  each time (recovery clears the stickiness). The stickiness
+  evaporates at turn end — the next turn starts from the user's
+  pick. If the whole chain fails, the original error surfaces as
+  before.
 - **JSONL append integrity.** Appends to a session file are
   serialized per-path and written record+newline in a single
   buffer — parallel sub-agent spawns append `SubagentSpawned` to

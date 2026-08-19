@@ -787,18 +787,21 @@ async fn run_subagent_wrapped(
 	let outcome = crate::inference::SESSION_HINT
 		.scope(
 			id.clone(),
-			run_subagent_loop(
-				tools,
-				inference,
-				sink,
-				models,
-				spec,
-				&session_dir,
-				&header,
-				state,
-				cancel,
-				format_queue.clone(),
-				background.clone(),
+			crate::inference::TURN_STICKY_MODEL.scope(
+				std::sync::Mutex::new(None),
+				run_subagent_loop(
+					tools,
+					inference,
+					sink,
+					models,
+					spec,
+					&session_dir,
+					&header,
+					state,
+					cancel,
+					format_queue.clone(),
+					background.clone(),
+				),
 			),
 		)
 		.await;

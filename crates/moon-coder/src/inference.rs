@@ -648,6 +648,51 @@ tokio::task_local! {
 	pub static SESSION_HINT: String;
 }
 
+tokio::task_local! {
+	/// Turn-scoped sticky fallback, set when rotation lands on a
+	/// working model: `(original, fallback)`. Later dispatches in
+	/// the same turn whose wire model equals `original` go straight
+	/// to `fallback` instead of re-eating the primary's whole
+	/// backoff ladder every round-trip — and staying put keeps the
+	/// fallback provider's prompt cache warm across the turn's
+	/// iterations. Scoped (with a fresh `None`) around each turn /
+	/// sub-agent loop, so it evaporates at turn end and the next
+	/// turn starts from the user's pick again. The `original` guard
+	/// keeps a standard-model stickiness from hijacking cheap-model
+	/// calls made mid-turn.
+	pub static TURN_STICKY_MODEL: std::sync::Mutex<Option<(String, String)>>;
+}
+
+/// The model dispatch should *start* with for a request pinned to
+/// `original` — the turn's sticky fallback when one is set, else
+/// `original` itself. `None`-scope (calls outside a turn) means no
+/// stickiness.
+fn sticky_start_model(original: &str) -> Option<String> {
+	TURN_STICKY_MODEL
+		.try_with(|slot| {
+			let guard = slot.lock().expect("sticky model lock poisoned");
+			match guard.as_ref() {
+				Some((orig, fallback)) if orig == original => Some(fallback.clone()),
+				_ => None,
+			}
+		})
+		.ok()
+		.flatten()
+}
+
+/// Record (or clear, with `fallback == original`) the turn's sticky
+/// fallback. No-op outside a turn scope.
+fn set_sticky_model(original: &str, fallback: &str) {
+	let _ = TURN_STICKY_MODEL.try_with(|slot| {
+		let mut guard = slot.lock().expect("sticky model lock poisoned");
+		*guard = if fallback == original {
+			None
+		} else {
+			Some((original.to_owned(), fallback.to_owned()))
+		};
+	});
+}
+
 /// Deterministic RFC-shaped UUID from the scoped session hint.
 /// The router validates with `z.uuid()`, so the version/variant
 /// nibbles are forced to `4`/`8`. `None` outside a turn scope
@@ -1662,21 +1707,38 @@ impl InferenceClient {
 		streaming: bool,
 		cancel: &tokio_util::sync::CancellationToken,
 	) -> Result<reqwest::Response, CoderError> {
-		let builder = self.request_builder(endpoint, route, streaming).json(body);
+		let original = body.model;
+		// A fallback that already rescued this turn goes first —
+		// re-eating the primary's whole ladder on every subsequent
+		// round-trip would stall the turn for minutes each
+		// iteration, and staying on the fallback keeps its prompt
+		// cache warm.
+		let sticky = sticky_start_model(original);
+		let first_model = sticky.clone().unwrap_or_else(|| original.to_owned());
+		let Ok(mut wire) = serde_json::to_value(body) else {
+			let builder = self.request_builder(endpoint, route, streaming).json(body);
+			return send_with_rate_limit_retry(endpoint, builder, RATE_LIMIT_MAX_RETRIES, cancel).await;
+		};
+		wire["model"] = serde_json::Value::String(first_model.clone());
+		let builder = self.request_builder(endpoint, route, streaming).json(&wire);
 		let response = send_with_rate_limit_retry(endpoint, builder, RATE_LIMIT_MAX_RETRIES, cancel).await?;
 		if !is_transient_status(response.status()) {
 			return Ok(response);
 		}
-		let candidates = { self.models.read().await.rotation_candidates(body.model) };
-		if candidates.is_empty() {
+		// Rotation chain for the *pinned* model; when a sticky
+		// fallback took the first slot, the pinned model itself
+		// re-enters at the end of the chain (it may have recovered).
+		let mut chain = { self.models.read().await.rotation_candidates(original) };
+		if sticky.is_some() {
+			chain.push(original.to_owned());
+		}
+		chain.retain(|m| m != &first_model);
+		if chain.is_empty() {
 			return Ok(response);
 		}
-		let Ok(mut wire) = serde_json::to_value(body) else {
-			return Ok(response);
-		};
-		for fallback in candidates {
+		for fallback in chain {
 			tracing::warn!(
-				model = body.model,
+				model = first_model,
 				status = %response.status(),
 				rotated_to = %fallback,
 				"transient error persisted through backoff; rotating to fallback model"
@@ -1685,6 +1747,10 @@ impl InferenceClient {
 			let builder = self.request_builder(endpoint, route, streaming).json(&wire);
 			let resp = send_with_rate_limit_retry(endpoint, builder, ROTATION_MAX_RETRIES, cancel).await?;
 			if resp.status().is_success() {
+				// Remember the rescuer for the rest of the turn
+				// (clears when the rescuer IS the pinned model —
+				// the primary recovered).
+				set_sticky_model(original, &fallback);
 				return Ok(resp);
 			}
 			tracing::warn!(
@@ -2308,6 +2374,25 @@ mod provider_catalog {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn sticky_fallback_is_turn_scoped_and_model_guarded() {
+		let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+		rt.block_on(super::TURN_STICKY_MODEL.scope(std::sync::Mutex::new(None), async {
+			assert_eq!(super::sticky_start_model("a"), None);
+			super::set_sticky_model("a", "b");
+			assert_eq!(super::sticky_start_model("a").as_deref(), Some("b"));
+			// Guard: a different pinned model isn't hijacked.
+			assert_eq!(super::sticky_start_model("cheap-model"), None);
+			// Rescuer == pinned clears the stickiness (primary recovered).
+			super::set_sticky_model("a", "a");
+			assert_eq!(super::sticky_start_model("a"), None);
+		}));
+		// Outside any turn scope: inert.
+		assert_eq!(super::sticky_start_model("a"), None);
+		super::set_sticky_model("a", "b");
+		assert_eq!(super::sticky_start_model("a"), None);
+	}
+
 	#[test]
 	fn session_affinity_uuid_is_rfc_shaped_and_deterministic() {
 		let scope = super::SESSION_HINT.scope("sess-abc123".to_string(), async {
