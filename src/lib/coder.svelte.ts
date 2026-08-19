@@ -2799,6 +2799,25 @@ export class CoderPanelState {
 			const dropped = await ipc.coder.revertToMessage(ordinal);
 			if (options.resend) {
 				this.draft = dropped.text;
+				// The dropped message's images come back as composer
+				// attachments so an edit-and-resend keeps them by
+				// default — losing a screenshot because you fixed a
+				// typo was silent data loss. Each renders as a normal
+				// removable chip, so dropping one is an explicit ✕.
+				const images = dropped.images ?? [];
+				this.attachments = [
+					...this.attachments,
+					...images.map(
+						(img, i): ImageComposerAttachment => ({
+							kind: 'image',
+							id: `reverted-${Date.now()}-${i}`,
+							dataUrl: img.data_url,
+							mime: img.mime,
+							name: `image ${i + 1}`,
+							sizeBytes: img.data_url.length,
+						}),
+					),
+				];
 			}
 			await this.refreshSessions();
 		} catch (err) {

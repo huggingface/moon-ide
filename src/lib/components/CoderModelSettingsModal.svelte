@@ -979,6 +979,20 @@
 	}
 
 	function moveFallback(i: number, delta: number): void {
+		// `↑` from the top of the chain promotes the fallback to be
+		// the main model, demoting the current pick into its slot —
+		// the chain is conceptually `[main, ...fallbacks]`, so the
+		// arrows work across that boundary too.
+		if (i === 0 && delta === -1) {
+			const promoted = rotation[0];
+			if (!promoted) {
+				return;
+			}
+			const demoted = standardModel.trim() || (coder.modelSettings?.resolved_standard_model ?? '');
+			standardModel = promoted;
+			rotation = demoted ? [demoted, ...rotation.slice(1)] : rotation.slice(1);
+			return;
+		}
 		const j = i + delta;
 		if (j < 0 || j >= rotation.length) {
 			return;
@@ -1359,8 +1373,7 @@
 								<button
 									type="button"
 									class="rot-btn"
-									title="Try earlier"
-									disabled={i === 0}
+									title={i === 0 ? 'Make this the main model (current pick becomes the first fallback)' : 'Try earlier'}
 									onclick={() => moveFallback(i, -1)}>↑</button
 								>
 								<button
