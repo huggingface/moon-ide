@@ -56,6 +56,16 @@
 	// showing. Tap a user bubble to toggle; any action clears it.
 	let actionsFor = $state<string | null>(null);
 
+	/** Assistant row awaiting a restart-from-here confirmation.
+	 * Two-tap because it drops everything below the message — the
+	 * user-row gestures get the same treatment. */
+	let confirmResumeFor = $state<string | null>(null);
+
+	async function resumeFrom(rowId: string): Promise<void> {
+		confirmResumeFor = null;
+		await app.resumeFromAssistant(rowId);
+	}
+
 	// 1 Hz tick for the retry-backoff countdown (only while shown).
 	let backoffNow = $state(Date.now());
 	$effect(() => {
@@ -966,6 +976,26 @@
 						>
 						<Markdown text={row.text} repoUrl={app.repoUrl} />
 					</div>
+					<!-- Restart the turn from this agent message: its tool
+					     calls re-run against current workspace state and
+					     everything after it is dropped. Hidden while a turn
+					     is running (the backend refuses mid-turn anyway). -->
+					{#if !app.busy}
+						<div class="assistant-actions">
+							{#if confirmResumeFor === row.id}
+								<button class="ghost action-chip danger" onclick={() => void resumeFrom(row.id)}
+									>Confirm — drop what follows</button
+								>
+								<button class="ghost action-chip" onclick={() => (confirmResumeFor = null)}>Cancel</button>
+							{:else}
+								<button
+									class="ghost action-chip"
+									title="Re-run this message's tool calls and continue from here"
+									onclick={() => (confirmResumeFor = row.id)}>↻ Restart from here</button
+								>
+							{/if}
+						</div>
+					{/if}
 				{/if}
 			{:else if row.kind === 'tool'}
 				{@const body = toolBody(row.name, row.args, row.result)}
@@ -1694,6 +1724,14 @@
 		border-radius: 8px;
 		color: var(--warn, #d4a017);
 		font-size: 0.8rem;
+	}
+	.assistant-actions {
+		display: flex;
+		gap: 0.35rem;
+		margin: 0 0.75rem 0.4rem;
+	}
+	.assistant-actions .danger {
+		color: var(--danger, #e5484d);
 	}
 	.retry-backoff-bar {
 		margin: 0.3rem 0.75rem;

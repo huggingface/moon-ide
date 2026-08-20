@@ -2019,6 +2019,54 @@ class CompanionState {
 	/** Replay from the user message with `rowId`: revert to just
 	 * before it, then immediately re-send the dropped prompt
 	 * verbatim — "re-run this turn". */
+	/** 0-based index of an assistant row counted from the END of the
+	 * transcript. Windowed-safe, same rationale as
+	 * `#userFromEnd` — and it must count only rows the backend
+	 * persisted as `Assistant` records, which is every assistant
+	 * row we render. */
+	#assistantFromEnd(rowId: string): number | null {
+		let fromEnd = 0;
+		for (let i = this.rows.length - 1; i >= 0; i -= 1) {
+			const row = this.rows[i];
+			if (!row || row.kind !== 'assistant') {
+				continue;
+			}
+			if (row.id === rowId) {
+				return fromEnd;
+			}
+			fromEnd += 1;
+		}
+		return null;
+	}
+
+	/** Re-run the tool calls of a mid-turn agent message: the
+	 * transcript is truncated to just after it, its tool results
+	 * are dropped, and the turn continues with the calls
+	 * re-dispatched against current workspace state. The phone's
+	 * "restart from here" on an assistant bubble. */
+	async resumeFromAssistant(rowId: string): Promise<void> {
+		if (!this.activeWorkspace || !this.activeSession || this.busy) {
+			return;
+		}
+		const fromEnd = this.#assistantFromEnd(rowId);
+		if (fromEnd === null) {
+			return;
+		}
+		const sessionId = this.activeSession;
+		try {
+			await this.#call(
+				this.activeWorkspace,
+				'coder_resume_from_assistant',
+				{ session_id: sessionId, assistant_from_end: fromEnd },
+				this.activeIde,
+			);
+			this.busy = true;
+			this.#markBusy(sessionId, true);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	async replayFromMessage(rowId: string): Promise<void> {
 		const text = await this.revertToMessage(rowId);
 		if (text !== null && text.trim()) {

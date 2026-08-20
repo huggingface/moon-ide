@@ -2677,6 +2677,31 @@ impl CoderHandle {
 		self.revert_to_message_in(session_id, ordinal).await
 	}
 
+	/// [`Self::resume_from_assistant_in`] addressed from the end of
+	/// the transcript (`0` = last assistant message with tool
+	/// calls). Same windowing rationale as
+	/// [`Self::revert_to_message_from_end_in`].
+	pub async fn resume_from_assistant_from_end_in(
+		&self,
+		session_id: &str,
+		assistant_from_end: usize,
+	) -> Result<(), CoderError> {
+		let (rt, folder_path) = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
+		let header_id = rt.session.lock().await.header.id.clone();
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		let total = sessions::count_assistant_records(&dir, &header_id).await?;
+		let ordinal = total.checked_sub(1 + assistant_from_end).ok_or_else(|| {
+			CoderError::Internal(format!(
+				"from-end index {assistant_from_end} exceeds {total} assistant messages"
+			))
+		})?;
+		self.resume_from_assistant_in(session_id, ordinal).await
+	}
+
 	/// Replay from a specific user message: truncate the
 	/// session to just before that message (exactly
 	/// [`revert_to_message`]) and immediately re-send the dropped
@@ -2720,8 +2745,21 @@ impl CoderHandle {
 	/// turn loop then runs on the same `rt`, so `abort` / `send`
 	/// target the right runtime.
 	pub async fn resume_from_assistant(&self, assistant_ordinal: usize) -> Result<(), CoderError> {
+		let (_, session_id, _) = self.state.active_visible_runtime().await?;
+		self.resume_from_assistant_in(&session_id, assistant_ordinal).await
+	}
+
+	/// [`Self::resume_from_assistant`] against an explicit session —
+	/// the bridge path, where the phone drives a session the desktop
+	/// isn't showing.
+	pub async fn resume_from_assistant_in(&self, session_id: &str, assistant_ordinal: usize) -> Result<(), CoderError> {
 		self.ensure_can_send().await?;
-		let (rt, session_id, folder_path) = self.state.active_visible_runtime().await?;
+		let (rt, folder_path) = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
+		let session_id = session_id.to_owned();
 		{
 			// Refuse mid-turn — same guard as `revert_to_message`.
 			let turn = rt.turn.lock().await;

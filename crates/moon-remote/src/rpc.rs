@@ -309,6 +309,19 @@ impl BridgeRpcHandler for BridgeRpc {
 			// phone's "edit & resend" / "replay" gesture. Session-
 			// targeted; the desktop's visible session is untouched.
 			// The phone re-opens the session afterwards to repaint.
+			// Re-run the tool calls of a mid-turn agent message: keep
+			// everything up to and including it, drop its results and
+			// what followed, then continue the turn. From-end index
+			// for the same windowing reason as revert.
+			"coder_resume_from_assistant" => {
+				let p: ResumeAssistantParams = parse_params(params)?;
+				self
+					.coder
+					.resume_from_assistant_from_end_in(&p.session_id, p.assistant_from_end)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(serde_json::Value::Null)
+			}
 			"coder_revert_to_message" => {
 				let p: RevertParams = parse_params(params)?;
 				let reverted = match (p.user_from_end, p.user_ordinal) {
@@ -848,6 +861,14 @@ struct SwitchBranchParams {
 }
 
 #[derive(serde::Deserialize)]
+struct ResumeAssistantParams {
+	session_id: String,
+	/// 0-based index of the assistant message counted backwards
+	/// from the transcript's last one.
+	assistant_from_end: usize,
+}
+
+#[derive(serde::Deserialize)]
 struct RevertParams {
 	session_id: String,
 	/// Absolute 0-based user-message ordinal. Only safe when the
@@ -923,6 +944,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_new_coordinator_session",
 	"coder_delete_session",
 	"coder_respond_to_prompt",
+	"coder_resume_from_assistant",
 	"coder_revert_to_message",
 	"coder_get_model_settings",
 	"coder_set_model_settings",

@@ -2518,6 +2518,19 @@ pub async fn count_user_records(dir: &Utf8Path, id: &str) -> Result<usize, Coder
 	)
 }
 
+/// Total `Assistant` records in a session's transcript — the
+/// from-end translation for [resume-from-assistant]. Mirrors
+/// [`count_user_records`].
+pub async fn count_assistant_records(dir: &Utf8Path, id: &str) -> Result<usize, CoderError> {
+	let LoadedSession { records, .. } = load(dir, id).await?;
+	Ok(
+		records
+			.iter()
+			.filter(|r| matches!(r, SessionRecord::Assistant { .. }))
+			.count(),
+	)
+}
+
 pub async fn truncate_before_user_record(
 	dir: &Utf8Path,
 	header: &SessionHeader,

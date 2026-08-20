@@ -753,3 +753,9 @@ Prose, not commitments — revisit when someone asks:
   shows how many rows the send will drop, with a "keep them" cancel
   (desktop additionally renders the doomed rows struck-through).
   Previously the trim happened on the click, with no way back.
+- **Restart from an agent message**: assistant bubbles carry a
+  "↻ Restart from here" chip (two-tap confirm — it drops everything
+  below). Drives `coder_resume_from_assistant` with an
+  `assistant_from_end` index: the message's tool calls re-run
+  against current workspace state and the turn continues from
+  there. Hidden while a turn is running.
