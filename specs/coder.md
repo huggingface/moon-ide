@@ -687,6 +687,12 @@ the workspace has no enabled servers, and neither is mode-gated
   model** for the round-trip (the pick, or the turn's sticky
   rotation fallback); the companion shows it above the token bar and
   the desktop ring's tooltip lists it.
+- **`/models` shape tolerance.** Provider probes and catalog fetches
+  accept OpenAI's `{"data": [...]}`, a bare `[...]` (Together, some
+  vLLM builds), and `{"models": [...]}` (Ollama-flavoured gateways).
+  Probe and catalog share the tolerance on purpose: a probe that
+  rejects a shape the catalog accepts blocks the provider from
+  being added at all.
 - **Windowed-safe reverts.** `coder_revert_to_message` accepts
   `user_from_end` (index counted from the last user message
   backwards) alongside the absolute `user_ordinal`. The companion

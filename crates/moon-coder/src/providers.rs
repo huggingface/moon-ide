@@ -252,6 +252,34 @@ pub async fn probe_provider(
 	}
 }
 
+/// Model ids out of a `/models` body, tolerating the three shapes
+/// seen in the wild: OpenAI's `{ "data": [...] }`, a bare `[...]`
+/// (Together, some vLLM builds), and `{ "models": [...] }`
+/// (Ollama-flavoured gateways). `None` when the body is none of
+/// them. Must stay in sync with the catalog fetch's `ListBody` —
+/// a probe that rejects a shape the catalog accepts would block
+/// the provider from being added at all.
+fn probe_model_ids(body: &str) -> Option<Vec<String>> {
+	#[derive(Deserialize)]
+	#[serde(untagged)]
+	enum ModelsBody {
+		Wrapped {
+			#[serde(default, alias = "models")]
+			data: Vec<ModelEntry>,
+		},
+		Bare(Vec<ModelEntry>),
+	}
+	#[derive(Deserialize)]
+	struct ModelEntry {
+		id: String,
+	}
+	let parsed: ModelsBody = serde_json::from_str(body).ok()?;
+	Some(match parsed {
+		ModelsBody::Wrapped { data } => data.into_iter().map(|m| m.id).collect(),
+		ModelsBody::Bare(models) => models.into_iter().map(|m| m.id).collect(),
+	})
+}
+
 async fn probe_models(
 	http: &reqwest::Client,
 	base_url: &str,
@@ -270,20 +298,15 @@ async fn probe_models(
 		return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 	}
 
-	#[derive(Deserialize)]
-	struct ModelsBody {
-		#[serde(default)]
-		data: Vec<ModelEntry>,
-	}
-	#[derive(Deserialize)]
-	struct ModelEntry {
-		id: String,
-	}
-
-	let parsed: ModelsBody = serde_json::from_str(&body)
-		.map_err(|err| CoderError::decode(&endpoint, format!("could not parse /models body: {err}")))?;
-	let model_count = u32::try_from(parsed.data.len()).unwrap_or(u32::MAX);
-	let sample_model_ids = parsed.data.into_iter().take(PROBE_SAMPLE_LIMIT).map(|m| m.id).collect();
+	let ids = probe_model_ids(&body).ok_or_else(|| {
+		CoderError::decode(
+			&endpoint,
+			"could not parse /models body: expected a list of models (`{\"data\": [...]}`, `[...]`, or `{\"models\": [...]}`)"
+				.to_owned(),
+		)
+	})?;
+	let model_count = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+	let sample_model_ids = ids.into_iter().take(PROBE_SAMPLE_LIMIT).collect();
 	Ok(ProviderProbeResult {
 		model_count,
 		sample_model_ids,
@@ -326,6 +349,20 @@ async fn probe_chat_ping(
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn models_body_accepts_wrapped_bare_and_models_key() {
+		// OpenAI / HF / OpenRouter.
+		let wrapped = r#"{"object":"list","data":[{"id":"a"},{"id":"b"}]}"#;
+		// Together returns a bare array.
+		let bare = r#"[{"id":"a"},{"id":"b"}]"#;
+		// Ollama-flavoured gateways.
+		let models_key = r#"{"models":[{"id":"a"},{"id":"b"}]}"#;
+		for raw in [wrapped, bare, models_key] {
+			let ids = super::probe_model_ids(raw).unwrap_or_else(|| panic!("failed to parse: {raw}"));
+			assert_eq!(ids, vec!["a".to_owned(), "b".to_owned()], "shape: {raw}");
+		}
+	}
+
 	use super::*;
 
 	#[test]

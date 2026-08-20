@@ -1463,7 +1463,7 @@ impl InferenceClient {
 		}
 
 		let raw: provider_catalog::ListBody = crate::auth::decode_body(&endpoint, &body)?;
-		Ok(raw.data.into_iter().map(provider_catalog::flatten).collect())
+		Ok(raw.into_models().into_iter().map(provider_catalog::flatten).collect())
 	}
 
 	/// OpenRouter credit status: `GET {base_url}/key` (per-key
@@ -2205,10 +2205,29 @@ mod provider_catalog {
 
 	use moon_protocol::coder_models::ProviderModelSummary;
 
+	/// `/models` comes in three shapes in the wild: OpenAI's
+	/// `{ "data": [...] }`, a bare `[...]` (Together, some vLLM
+	/// builds), and `{ "models": [...] }` (Ollama-flavoured
+	/// gateways). Accept all three — the alternative is a provider
+	/// that probes fine but shows an empty picker, or a confusing
+	/// "invalid type" decode error at add time.
 	#[derive(Deserialize)]
-	pub(super) struct ListBody {
-		#[serde(default)]
-		pub(super) data: Vec<RawModel>,
+	#[serde(untagged)]
+	pub(super) enum ListBody {
+		Wrapped {
+			#[serde(default, alias = "models")]
+			data: Vec<RawModel>,
+		},
+		Bare(Vec<RawModel>),
+	}
+
+	impl ListBody {
+		pub(super) fn into_models(self) -> Vec<RawModel> {
+			match self {
+				ListBody::Wrapped { data } => data,
+				ListBody::Bare(models) => models,
+			}
+		}
 	}
 
 	#[derive(Deserialize)]
@@ -2365,7 +2384,7 @@ mod provider_catalog {
 				}]
 			}"#;
 			let parsed: ListBody = serde_json::from_str(raw).unwrap();
-			let row = flatten(parsed.data.into_iter().next().unwrap());
+			let row = flatten(parsed.into_models().into_iter().next().unwrap());
 			assert_eq!(row.id, "anthropic/claude-3.5-sonnet");
 			assert_eq!(row.name.as_deref(), Some("Anthropic: Claude 3.5 Sonnet"));
 			assert_eq!(row.context_length, Some(200_000));
@@ -2383,7 +2402,7 @@ mod provider_catalog {
 				}]
 			}"#;
 			let parsed: ListBody = serde_json::from_str(raw).unwrap();
-			let row = flatten(parsed.data.into_iter().next().unwrap());
+			let row = flatten(parsed.into_models().into_iter().next().unwrap());
 			assert_eq!(row.supports_image_input, Some(false));
 		}
 
@@ -2393,7 +2412,7 @@ mod provider_catalog {
 				"data": [{"id": "llama3.2", "owned_by": "library"}]
 			}"#;
 			let parsed: ListBody = serde_json::from_str(raw).unwrap();
-			let row = flatten(parsed.data.into_iter().next().unwrap());
+			let row = flatten(parsed.into_models().into_iter().next().unwrap());
 			assert_eq!(row.id, "llama3.2");
 			assert_eq!(row.owned_by.as_deref(), Some("library"));
 			assert!(row.pricing_in_per_million.is_none());
@@ -2408,7 +2427,7 @@ mod provider_catalog {
 				"data": [{"id": "qwen2.5-72b", "max_model_len": 32768}]
 			}"#;
 			let parsed: ListBody = serde_json::from_str(raw).unwrap();
-			let row = flatten(parsed.data.into_iter().next().unwrap());
+			let row = flatten(parsed.into_models().into_iter().next().unwrap());
 			assert_eq!(row.context_length, Some(32_768));
 		}
 
@@ -2422,7 +2441,7 @@ mod provider_catalog {
 				}]
 			}"#;
 			let parsed: ListBody = serde_json::from_str(raw).unwrap();
-			let row = flatten(parsed.data.into_iter().next().unwrap());
+			let row = flatten(parsed.into_models().into_iter().next().unwrap());
 			assert!((row.pricing_in_per_million.unwrap() - 0.15).abs() < 1e-9);
 			assert!((row.pricing_out_per_million.unwrap() - 0.60).abs() < 1e-9);
 		}
@@ -2470,6 +2489,22 @@ mod tests {
 			.block_on(scope);
 		// Outside any scope: no hint, no header.
 		assert!(super::session_affinity_uuid().is_none());
+	}
+
+	#[test]
+	fn provider_catalog_accepts_bare_array_and_models_key() {
+		use super::provider_catalog::ListBody;
+		// Together's `/v1/models` is a bare array; Ollama-flavoured
+		// gateways use `models`. Both must yield the same rows as
+		// the OpenAI `data` shape.
+		for raw in [
+			r#"{"data":[{"id":"a"}]}"#,
+			r#"[{"id":"a"}]"#,
+			r#"{"models":[{"id":"a"}]}"#,
+		] {
+			let parsed: ListBody = serde_json::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+			assert_eq!(parsed.into_models().len(), 1, "shape: {raw}");
+		}
 	}
 
 	#[test]
