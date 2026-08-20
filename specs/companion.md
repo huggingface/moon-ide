@@ -757,7 +757,16 @@ Prose, not commitments — revisit when someone asks:
   reveals a "↻ Restart from here" chip (two-tap confirm — it drops
   everything below); hidden by default so a destructive action
   isn'''t sitting under every message. Only shown on messages that
-  issued tool calls — the only kind a resume can target. Drives `coder_resume_from_assistant` with an
-  `assistant_from_end` index: the message's tool calls re-run
+  issued tool calls — the only kind a resume can target. Drives `coder_resume_from_assistant` anchored on the **tool-call
+  id** the message issued (persisted + unique, so nothing can drift
+  between the phone's windowed transcript and the on-disk records —
+  index-based addressing did drift, and broke resumes from
+  scrolled-back history): the message's tool calls re-run
   against current workspace state and the turn continues from
   there. Hidden while a turn is running.
+- **Older-history pages are inert**: reducing a `load older` page
+  builds rows only — it must not touch session-level live state.
+  Those pages carry `assistant_message_start` (and `ask_user`)
+  events with no trailing terminator, so they used to leave `busy`
+  stuck on after scrolling back, silently disabling every
+  idle-gated affordance (the restart-from-here chip, notably).

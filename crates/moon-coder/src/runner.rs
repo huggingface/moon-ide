@@ -2677,6 +2677,28 @@ impl CoderHandle {
 		self.revert_to_message_in(session_id, ordinal).await
 	}
 
+	/// [`Self::resume_from_assistant_in`] anchored on a **tool-call
+	/// id** instead of an index: the resume targets the assistant
+	/// record that issued `tool_call_id`. Tool-call ids are
+	/// persisted and globally unique, so this needs no counting on
+	/// either side — the two index-based variants had to agree on
+	/// exactly which assistant records were countable (only ones
+	/// with tool calls) and drifted, which broke resumes from
+	/// scrolled-back history. Frontends should prefer this.
+	pub async fn resume_from_tool_call_in(&self, session_id: &str, tool_call_id: &str) -> Result<(), CoderError> {
+		let (rt, folder_path) = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
+		let header_id = rt.session.lock().await.header.id.clone();
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
+		let ordinal = sessions::resumable_ordinal_of_tool_call(&dir, &header_id, tool_call_id)
+			.await?
+			.ok_or_else(|| CoderError::Internal(format!("no assistant message issued tool call `{tool_call_id}`")))?;
+		self.resume_from_assistant_in(session_id, ordinal).await
+	}
+
 	/// [`Self::resume_from_assistant_in`] addressed from the end of
 	/// the transcript, counting **only assistant messages that
 	/// carry tool calls** — the same set the absolute ordinal

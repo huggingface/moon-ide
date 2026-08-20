@@ -315,11 +315,20 @@ impl BridgeRpcHandler for BridgeRpc {
 			// for the same windowing reason as revert.
 			"coder_resume_from_assistant" => {
 				let p: ResumeAssistantParams = parse_params(params)?;
-				self
-					.coder
-					.resume_from_assistant_from_end_in(&p.session_id, p.assistant_from_end)
-					.await
-					.map_err(|e| e.to_string())?;
+				match (&p.tool_call_id, p.assistant_from_end) {
+					// Preferred: anchor on the persisted tool-call id.
+					(Some(tool_call_id), _) => self
+						.coder
+						.resume_from_tool_call_in(&p.session_id, tool_call_id)
+						.await
+						.map_err(|e| e.to_string())?,
+					(None, Some(from_end)) => self
+						.coder
+						.resume_from_assistant_from_end_in(&p.session_id, from_end)
+						.await
+						.map_err(|e| e.to_string())?,
+					(None, None) => return Err("missing tool_call_id / assistant_from_end".to_string()),
+				}
 				Ok(serde_json::Value::Null)
 			}
 			"coder_revert_to_message" => {
@@ -863,9 +872,14 @@ struct SwitchBranchParams {
 #[derive(serde::Deserialize)]
 struct ResumeAssistantParams {
 	session_id: String,
-	/// 0-based index of the assistant message counted backwards
-	/// from the transcript's last one.
-	assistant_from_end: usize,
+	/// Id of any tool call the target assistant message issued —
+	/// exact and index-free; what the companion sends.
+	#[serde(default)]
+	tool_call_id: Option<String>,
+	/// Legacy fallback: 0-based index counted backwards over
+	/// assistant messages *with tool calls*.
+	#[serde(default)]
+	assistant_from_end: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]

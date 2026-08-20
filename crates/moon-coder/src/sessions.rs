@@ -2524,6 +2524,33 @@ pub async fn count_user_records(dir: &Utf8Path, id: &str) -> Result<usize, Coder
 /// assistant records here would skew the from-end translation by
 /// however many plain answers the session holds — the resume then
 /// lands on the wrong checkpoint (or errors as out-of-range).
+/// Position of the assistant record that issued `tool_call_id`
+/// within the *resumable* set (assistants carrying tool calls) —
+/// the ordinal [`truncate_before_assistant_record`] expects.
+/// `None` when no record claims that id. Anchoring on the id keeps
+/// callers out of the counting business entirely.
+pub async fn resumable_ordinal_of_tool_call(
+	dir: &Utf8Path,
+	id: &str,
+	tool_call_id: &str,
+) -> Result<Option<usize>, CoderError> {
+	let LoadedSession { records, .. } = load(dir, id).await?;
+	let mut seen = 0usize;
+	for record in &records {
+		let SessionRecord::Assistant { tool_calls, .. } = record else {
+			continue;
+		};
+		if tool_calls.is_empty() {
+			continue;
+		}
+		if tool_calls.iter().any(|c| c.id == tool_call_id) {
+			return Ok(Some(seen));
+		}
+		seen += 1;
+	}
+	Ok(None)
+}
+
 pub async fn count_resumable_assistant_records(dir: &Utf8Path, id: &str) -> Result<usize, CoderError> {
 	let LoadedSession { records, .. } = load(dir, id).await?;
 	Ok(
@@ -2987,6 +3014,64 @@ mod tests {
 		let weird = json.replace("\"host\"", "\"someday-container\"");
 		let back: SessionHeader = serde_json::from_str(&weird).unwrap();
 		assert_eq!(back.bash_target_override, None);
+	}
+
+	#[tokio::test]
+	async fn resume_anchor_maps_tool_call_id_to_resumable_ordinal() {
+		let dir = tempfile::tempdir().unwrap();
+		let dir = Utf8Path::from_path(dir.path()).unwrap();
+		let header = make_test_header("sess-anchor");
+		let call = |id: &str| crate::inference::ToolCall {
+			id: id.to_owned(),
+			kind: "function".to_owned(),
+			function: crate::inference::FunctionCall {
+				name: "read_file".to_owned(),
+				arguments: "{}".to_owned(),
+			},
+		};
+		// A plain answer between two tool-calling assistants: the
+		// ordinal must skip it (that mismatch is what broke resumes
+		// from scrolled-back history).
+		for record in [
+			SessionRecord::Assistant {
+				content: Some("first".into()),
+				tool_calls: vec![call("call-a")],
+				thinking_blocks: Vec::new(),
+				thinking: None,
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::Assistant {
+				content: Some("plain answer".into()),
+				tool_calls: Vec::new(),
+				thinking_blocks: Vec::new(),
+				thinking: None,
+				model: None,
+				stop_reason: None,
+			},
+			SessionRecord::Assistant {
+				content: Some("second".into()),
+				tool_calls: vec![call("call-b")],
+				thinking_blocks: Vec::new(),
+				thinking: None,
+				model: None,
+				stop_reason: None,
+			},
+		] {
+			append_record(dir, &header, &record).await.unwrap();
+		}
+		assert_eq!(
+			resumable_ordinal_of_tool_call(dir, &header.id, "call-a").await.unwrap(),
+			Some(0)
+		);
+		assert_eq!(
+			resumable_ordinal_of_tool_call(dir, &header.id, "call-b").await.unwrap(),
+			Some(1)
+		);
+		assert_eq!(
+			resumable_ordinal_of_tool_call(dir, &header.id, "nope").await.unwrap(),
+			None
+		);
 	}
 
 	#[tokio::test]

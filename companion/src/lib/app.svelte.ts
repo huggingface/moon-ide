@@ -2019,47 +2019,26 @@ class CompanionState {
 	/** Replay from the user message with `rowId`: revert to just
 	 * before it, then immediately re-send the dropped prompt
 	 * verbatim — "re-run this turn". */
-	/** True when an assistant row issued tool calls — i.e. the
-	 * backend persisted it as an `Assistant` record with a
-	 * non-empty `tool_calls`, which is the only kind a resume can
-	 * target. Derived from the row stream: the tool rows that
-	 * follow it, up to the next assistant/user row. */
-	isResumableAssistantRow(rowId: string): boolean {
+	/** Id of the first tool call an assistant row issued, or null
+	 * when it issued none (a plain answer, which a resume can't
+	 * target). This id — persisted and unique — is the resume
+	 * anchor: no index, so nothing can drift between what the
+	 * phone counts in its windowed transcript and what the backend
+	 * counts on disk. Scans the rows that follow the bubble up to
+	 * the next assistant/user row. */
+	resumeAnchorFor(rowId: string): string | null {
 		const start = this.rows.findIndex((r) => r.kind === 'assistant' && r.id === rowId);
 		if (start === -1) {
-			return false;
+			return null;
 		}
 		for (let i = start + 1; i < this.rows.length; i += 1) {
 			const row = this.rows[i];
 			if (!row || row.kind === 'assistant' || row.kind === 'user') {
-				return false;
+				return null;
 			}
 			if (row.kind === 'tool') {
-				return true;
+				return row.id;
 			}
-		}
-		return false;
-	}
-
-	/** 0-based index of an assistant row counted from the END of the
-	 * transcript, over **tool-call-bearing assistant rows only** —
-	 * the exact set the backend's resume ordinal indexes. Counting
-	 * every assistant row instead skewed the index by however many
-	 * plain answers preceded it, which is why resuming from an
-	 * older (scrolled-back) message missed or errored. Windowed-safe
-	 * for the same reason as `#userFromEnd`: the window always
-	 * holds the tail. */
-	#assistantFromEnd(rowId: string): number | null {
-		let fromEnd = 0;
-		for (let i = this.rows.length - 1; i >= 0; i -= 1) {
-			const row = this.rows[i];
-			if (!row || row.kind !== 'assistant' || !this.isResumableAssistantRow(row.id)) {
-				continue;
-			}
-			if (row.id === rowId) {
-				return fromEnd;
-			}
-			fromEnd += 1;
 		}
 		return null;
 	}
@@ -2073,8 +2052,11 @@ class CompanionState {
 		if (!this.activeWorkspace || !this.activeSession || this.busy) {
 			return;
 		}
-		const fromEnd = this.#assistantFromEnd(rowId);
-		if (fromEnd === null) {
+		const anchor = this.resumeAnchorFor(rowId);
+		if (anchor === null) {
+			// Shouldn't happen (the chip is gated on the same check),
+			// but say so rather than no-op silently.
+			this.turnError = 'That message issued no tool calls, so there is nothing to re-run from it.';
 			return;
 		}
 		const sessionId = this.activeSession;
@@ -2082,13 +2064,18 @@ class CompanionState {
 			await this.#call(
 				this.activeWorkspace,
 				'coder_resume_from_assistant',
-				{ session_id: sessionId, assistant_from_end: fromEnd },
+				{ session_id: sessionId, tool_call_id: anchor },
 				this.activeIde,
 			);
 			this.busy = true;
 			this.#markBusy(sessionId, true);
 		} catch (e) {
-			this.error = e instanceof Error ? e.message : String(e);
+			// Surface in the transcript's own error bar, not just the
+			// transient toast — a failed restart that looks like
+			// "nothing happened" is worse than a loud message.
+			const msg = e instanceof Error ? e.message : String(e);
+			this.turnError = `Restart failed: ${msg}`;
+			this.error = msg;
 		}
 	}
 
@@ -2363,6 +2350,14 @@ class CompanionState {
 			return;
 		}
 		const rows = this.#rowsOverride ?? this.rows;
+		// Hydrating an older history page into a throwaway buffer:
+		// build rows, touch **no** session-level live state. Those
+		// pages are historical and carry no terminator, so their
+		// `assistant_message_start` / `ask_user` events would leave
+		// `busy` (and the prompt parking) stuck on — which silently
+		// disabled every affordance gated on "idle", including the
+		// restart-from-here chip and the composer's send path.
+		const hydrating = this.#rowsOverride !== null;
 		// Any other live event supersedes a pending retry notice —
 		// deltas mean the retry worked, terminators mean it settled.
 		if (!fromReplay && ev.kind !== 'retry_backoff' && this.retryNotice !== null && !this.#rowsOverride) {
@@ -2430,8 +2425,10 @@ class CompanionState {
 				break;
 			}
 			case 'assistant_message_start':
-				this.turnError = null;
-				this.busy = true;
+				if (!hydrating) {
+					this.turnError = null;
+					this.busy = true;
+				}
 				rows.push({ kind: 'assistant', id: str(ev, 'id'), text: '', thinking: '', at: Date.now() });
 				break;
 			case 'assistant_message_delta':
@@ -2471,7 +2468,7 @@ class CompanionState {
 					}
 					// An already-answered prompt must not re-park the
 					// composer when its `tool_call` is re-observed.
-					if (known?.kind !== 'ask_user' || !known.answered) {
+					if (!hydrating && (known?.kind !== 'ask_user' || !known.answered)) {
 						this.awaitingInput = true;
 						this.pendingPrompt = { callId, questions };
 					}
@@ -2510,6 +2507,11 @@ class CompanionState {
 			}
 			case 'turn_complete':
 			case 'aborted':
+				if (hydrating) {
+					// Historical terminator from an older page: it says
+					// nothing about the session's current state.
+					break;
+				}
 				this.busy = false;
 				this.awaitingInput = false;
 				this.pendingPrompt = null;
@@ -2524,6 +2526,9 @@ class CompanionState {
 				}
 				break;
 			case 'error':
+				if (hydrating) {
+					break;
+				}
 				this.busy = false;
 				this.turnError = str(ev, 'message') || 'coder error';
 				// The inline retry bar above the composer carries the

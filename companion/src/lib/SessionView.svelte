@@ -998,7 +998,7 @@
 					     calls re-run against current workspace state and
 					     everything after it is dropped. Hidden while a turn
 					     is running (the backend refuses mid-turn anyway). -->
-					{#if !app.busy && assistantActionsFor === row.id && app.isResumableAssistantRow(row.id)}
+					{#if !app.busy && assistantActionsFor === row.id && app.resumeAnchorFor(row.id) !== null}
 						<div class="assistant-actions">
 							{#if confirmResumeFor === row.id}
 								<button class="ghost action-chip danger" onclick={() => void resumeFrom(row.id)}
