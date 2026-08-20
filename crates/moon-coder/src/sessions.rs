@@ -2518,15 +2518,18 @@ pub async fn count_user_records(dir: &Utf8Path, id: &str) -> Result<usize, Coder
 	)
 }
 
-/// Total `Assistant` records in a session's transcript — the
-/// from-end translation for [resume-from-assistant]. Mirrors
-/// [`count_user_records`].
-pub async fn count_assistant_records(dir: &Utf8Path, id: &str) -> Result<usize, CoderError> {
+/// Assistant records a resume can target: only those carrying tool
+/// calls, matching exactly what
+/// [`truncate_before_assistant_record`] indexes. Counting *all*
+/// assistant records here would skew the from-end translation by
+/// however many plain answers the session holds — the resume then
+/// lands on the wrong checkpoint (or errors as out-of-range).
+pub async fn count_resumable_assistant_records(dir: &Utf8Path, id: &str) -> Result<usize, CoderError> {
 	let LoadedSession { records, .. } = load(dir, id).await?;
 	Ok(
 		records
 			.iter()
-			.filter(|r| matches!(r, SessionRecord::Assistant { .. }))
+			.filter(|r| matches!(r, SessionRecord::Assistant { tool_calls, .. } if !tool_calls.is_empty()))
 			.count(),
 	)
 }

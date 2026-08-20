@@ -60,6 +60,9 @@
 	 * Two-tap because it drops everything below the message — the
 	 * user-row gestures get the same treatment. */
 	let confirmResumeFor = $state<string | null>(null);
+	/** Assistant row whose actions are revealed (tap to toggle) —
+	 * mirrors `actionsFor` for user rows. */
+	let assistantActionsFor = $state<string | null>(null);
 
 	async function resumeFrom(rowId: string): Promise<void> {
 		confirmResumeFor = null;
@@ -970,7 +973,22 @@
 					</details>
 				{/if}
 				{#if row.text.trim()}
-					<div class="bubble assistant" title={whenTitle(row.at)}>
+					<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+					<div
+						class="bubble assistant"
+						title={whenTitle(row.at)}
+						onclick={(e) => {
+							// Tap toggles the row's actions, except on links
+							// and the copy button — those keep their own
+							// behaviour. Actions are hidden by default: a
+							// destructive "restart" chip under every agent
+							// message is too easy to hit by accident.
+							if ((e.target as HTMLElement).closest('a, button')) {
+								return;
+							}
+							assistantActionsFor = assistantActionsFor === row.id ? null : row.id;
+						}}
+					>
 						<button class="copy-md" title="Copy raw markdown" onclick={() => void copyMarkdown(row.id, row.text)}
 							>{copiedMd === row.id ? '✓' : '⧉'}</button
 						>
@@ -980,7 +998,7 @@
 					     calls re-run against current workspace state and
 					     everything after it is dropped. Hidden while a turn
 					     is running (the backend refuses mid-turn anyway). -->
-					{#if !app.busy}
+					{#if !app.busy && assistantActionsFor === row.id && app.isResumableAssistantRow(row.id)}
 						<div class="assistant-actions">
 							{#if confirmResumeFor === row.id}
 								<button class="ghost action-chip danger" onclick={() => void resumeFrom(row.id)}

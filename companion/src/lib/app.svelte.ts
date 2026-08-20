@@ -2019,16 +2019,41 @@ class CompanionState {
 	/** Replay from the user message with `rowId`: revert to just
 	 * before it, then immediately re-send the dropped prompt
 	 * verbatim — "re-run this turn". */
+	/** True when an assistant row issued tool calls — i.e. the
+	 * backend persisted it as an `Assistant` record with a
+	 * non-empty `tool_calls`, which is the only kind a resume can
+	 * target. Derived from the row stream: the tool rows that
+	 * follow it, up to the next assistant/user row. */
+	isResumableAssistantRow(rowId: string): boolean {
+		const start = this.rows.findIndex((r) => r.kind === 'assistant' && r.id === rowId);
+		if (start === -1) {
+			return false;
+		}
+		for (let i = start + 1; i < this.rows.length; i += 1) {
+			const row = this.rows[i];
+			if (!row || row.kind === 'assistant' || row.kind === 'user') {
+				return false;
+			}
+			if (row.kind === 'tool') {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** 0-based index of an assistant row counted from the END of the
-	 * transcript. Windowed-safe, same rationale as
-	 * `#userFromEnd` — and it must count only rows the backend
-	 * persisted as `Assistant` records, which is every assistant
-	 * row we render. */
+	 * transcript, over **tool-call-bearing assistant rows only** —
+	 * the exact set the backend's resume ordinal indexes. Counting
+	 * every assistant row instead skewed the index by however many
+	 * plain answers preceded it, which is why resuming from an
+	 * older (scrolled-back) message missed or errored. Windowed-safe
+	 * for the same reason as `#userFromEnd`: the window always
+	 * holds the tail. */
 	#assistantFromEnd(rowId: string): number | null {
 		let fromEnd = 0;
 		for (let i = this.rows.length - 1; i >= 0; i -= 1) {
 			const row = this.rows[i];
-			if (!row || row.kind !== 'assistant') {
+			if (!row || row.kind !== 'assistant' || !this.isResumableAssistantRow(row.id)) {
 				continue;
 			}
 			if (row.id === rowId) {

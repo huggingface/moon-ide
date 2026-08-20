@@ -2678,8 +2678,9 @@ impl CoderHandle {
 	}
 
 	/// [`Self::resume_from_assistant_in`] addressed from the end of
-	/// the transcript (`0` = last assistant message with tool
-	/// calls). Same windowing rationale as
+	/// the transcript, counting **only assistant messages that
+	/// carry tool calls** — the same set the absolute ordinal
+	/// indexes (`0` = the last one). Same windowing rationale as
 	/// [`Self::revert_to_message_from_end_in`].
 	pub async fn resume_from_assistant_from_end_in(
 		&self,
@@ -2693,7 +2694,7 @@ impl CoderHandle {
 			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
 		let header_id = rt.session.lock().await.header.id.clone();
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
-		let total = sessions::count_assistant_records(&dir, &header_id).await?;
+		let total = sessions::count_resumable_assistant_records(&dir, &header_id).await?;
 		let ordinal = total.checked_sub(1 + assistant_from_end).ok_or_else(|| {
 			CoderError::Internal(format!(
 				"from-end index {assistant_from_end} exceeds {total} assistant messages"
