@@ -447,6 +447,36 @@
 		return null;
 	}
 
+	/** The full call as issued, for the expanded tool row: the
+	 * collapsed summary truncates hard, so an expanded `bash` used
+	 * to show output with no way to see the command that produced
+	 * it. Bash gets its command verbatim (multi-line heredocs
+	 * intact); everything else gets pretty-printed arguments.
+	 * Fields the body renders below (file content, edit find/
+	 * replace) are elided to a size note instead of duplicated. */
+	function toolInvocation(name: string, argsStr: string): string {
+		let args: Record<string, unknown>;
+		try {
+			args = JSON.parse(argsStr) as Record<string, unknown>;
+		} catch {
+			// Unparseable (or streamed-partial) arguments: show the
+			// raw string rather than nothing.
+			return argsStr;
+		}
+		if (name === 'bash' && typeof args['cmd'] === 'string') {
+			const extras = ['target', 'timeout_ms', 'detach']
+				.filter((k) => args[k] !== undefined)
+				.map((k) => `${k}: ${JSON.stringify(args[k])}`);
+			return extras.length > 0 ? `${args['cmd'] as string}\n\n[${extras.join(', ')}]` : (args['cmd'] as string);
+		}
+		const elide = new Set(name === 'write_file' ? ['content'] : name === 'edit_file' ? ['find', 'replace'] : []);
+		const shown: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(args)) {
+			shown[k] = elide.has(k) && typeof v === 'string' ? `<${v.length} chars, shown below>` : v;
+		}
+		return JSON.stringify(shown, null, 2);
+	}
+
 	/** Extract the most useful preview from a tool result string.
 	 * Tool-specific parsing where the JSON shape is known, falling
 	 * back to a plain-text truncation. */
@@ -1026,6 +1056,9 @@
 								class="tool-check">✗</span
 							>{/if}
 					</summary>
+					{#if toolInvocation(row.name, row.args)}
+						<pre class="tool-invocation">{truncate(toolInvocation(row.name, row.args), 4000)}</pre>
+					{/if}
 					{#if body?.kind === 'diff'}
 						<div class="tool-diff">
 							{#if body.find}
@@ -1552,6 +1585,17 @@
 	.tool-check {
 		flex: none;
 		font-size: 0.7rem;
+	}
+	.tool-invocation {
+		margin: 0.35rem 0 0.25rem;
+		padding: 0.4rem 0.5rem;
+		background: var(--bg-inset, rgba(127, 127, 127, 0.12));
+		border-radius: 6px;
+		font-family: var(--font-mono, ui-monospace, monospace);
+		font-size: 0.72rem;
+		line-height: 1.35;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
 	}
 	.tool-result-preview {
 		font-size: 0.72rem;

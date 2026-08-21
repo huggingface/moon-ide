@@ -770,3 +770,9 @@ Prose, not commitments — revisit when someone asks:
   events with no trailing terminator, so they used to leave `busy`
   stuck on after scrolling back, silently disabling every
   idle-gated affordance (the restart-from-here chip, notably).
+- **Expanded tool rows show the invocation**: the call as issued
+  (bash: the command verbatim, heredocs intact, plus target/timeout;
+  others: pretty-printed arguments) above the result. Fields the
+  body already renders — write content, edit find/replace — are
+  elided to a size note instead of duplicated. Previously expanding
+  a bash call showed output with no way to see the command.
