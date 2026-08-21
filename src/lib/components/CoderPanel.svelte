@@ -1831,9 +1831,9 @@
 		}
 		const remaining = Math.max(0, Math.ceil((n.at + n.delayMs - backoffNowTick) / 1000));
 		if (n.rotatedTo) {
-			return `${n.status} on ${n.model} — trying fallback ${n.rotatedTo}…`;
+			return `${n.model} hit ${n.status} — trying ${n.rotatedTo}…`;
 		}
-		return `${n.status} from the provider — retrying in ${remaining}s (attempt ${n.attempt}/${n.maxAttempts})`;
+		return `${n.model} returned ${n.status} — retrying in ${remaining}s (attempt ${n.attempt}/${n.maxAttempts})`;
 	});
 
 	function relaunchInterrupted(): void {

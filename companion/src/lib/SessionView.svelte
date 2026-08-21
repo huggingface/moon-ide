@@ -81,6 +81,12 @@
 		return () => clearInterval(timer);
 	});
 
+	/** `owner/name:provider` → `name:provider`: the owner prefix
+	 * eats phone width and the provider tail is the useful half. */
+	function shortModel(slug: string): string {
+		return slug.split('/').at(-1) ?? slug;
+	}
+
 	/** Tooltip timestamp for a bubble, mirroring the desktop: time
 	 * only for today, date + time otherwise. Hover on desktop
 	 * browsers, long-press on mobile ones that surface titles. */
@@ -1274,11 +1280,17 @@
 	{#if app.retryNotice}
 		{@const n = app.retryNotice}
 		<div class="retry-backoff-bar" role="status">
+			<!-- Name the model/provider: with a rotation chain in play,
+			     "the provider" is ambiguous — and knowing *which* one
+			     is throttling is the whole point of the notice. Short
+			     form (owner prefix trimmed) with the full slug on
+			     long-press. -->
 			{#if n.rotatedTo}
-				{n.status} on {n.model} — trying fallback {n.rotatedTo}…
+				<span title={n.model}>{shortModel(n.model)}</span> hit {n.status} — trying
+				<span title={n.rotatedTo}>{shortModel(n.rotatedTo)}</span>…
 			{:else}
-				{n.status} from the provider — retrying in {Math.max(0, Math.ceil((n.at + n.delayMs - backoffNow) / 1000))}s
-				(attempt {n.attempt}/{n.maxAttempts})
+				<span title={n.model}>{shortModel(n.model)}</span> returned {n.status} — retrying in
+				{Math.max(0, Math.ceil((n.at + n.delayMs - backoffNow) / 1000))}s (attempt {n.attempt}/{n.maxAttempts})
 			{/if}
 		</div>
 	{/if}
