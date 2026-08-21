@@ -930,6 +930,39 @@ class CompanionState {
 
 	/** Open a workspace: load its folder list (the project switcher),
 	 * coder status, and the active folder's session list. */
+	/** Per-workspace "last project I was on" memory. The IDE's own
+	 * active folder is a desktop concern; the phone remembers its
+	 * own targeting so a refresh or a workspace re-open lands on
+	 * the project the user was actually working in. */
+	#lastFolderFor(workspace: string): string | null {
+		try {
+			const raw = localStorage.getItem('moon-companion-last-folders');
+			if (!raw) {
+				return null;
+			}
+			const parsed: unknown = JSON.parse(raw);
+			if (parsed === null || typeof parsed !== 'object') {
+				return null;
+			}
+			const entry: unknown = Reflect.get(parsed, workspace);
+			return typeof entry === 'string' ? entry : null;
+		} catch {
+			return null;
+		}
+	}
+
+	#rememberFolder(workspace: string, folder: string): void {
+		try {
+			const raw = localStorage.getItem('moon-companion-last-folders');
+			const parsed: unknown = raw ? JSON.parse(raw) : {};
+			const map: object = parsed !== null && typeof parsed === 'object' ? parsed : {};
+			Reflect.set(map, workspace, folder);
+			localStorage.setItem('moon-companion-last-folders', JSON.stringify(map));
+		} catch {
+			// Quota/parse failures just lose the convenience.
+		}
+	}
+
 	async openWorkspace(workspace: string, ide = '', name = ''): Promise<void> {
 		this.activeWorkspace = workspace;
 		this.activeWorkspaceName = name || workspace;
@@ -946,8 +979,15 @@ class CompanionState {
 			// Default to the workspace's active folder when it's a
 			// switchable project; a worktree active folder falls back
 			// to the first project.
+			// Precedence: the project this phone last used in this
+			// workspace (if still bound) > the IDE's active folder >
+			// first project. The desktop's active folder reflects
+			// whatever the desktop user is doing, which is rarely
+			// what *this* phone was working on.
+			const remembered = this.#lastFolderFor(workspace);
+			const rememberedEntry = remembered ? this.folders.find((f) => f.path === remembered) : undefined;
 			const active = this.folders.find((f) => f.path === snap.active_folder);
-			this.activeFolder = active?.path ?? this.folders[0]?.path ?? null;
+			this.activeFolder = rememberedEntry?.path ?? active?.path ?? this.folders[0]?.path ?? null;
 			this.#seedRepoUrl(this.activeFolder);
 			this.coderStatus = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
 			// Subscribe to the event stream immediately so the
@@ -974,6 +1014,7 @@ class CompanionState {
 			return;
 		}
 		this.activeFolder = path;
+		this.#rememberFolder(this.activeWorkspace, path);
 		this.#seedRepoUrl(path);
 		this.closeSession();
 		this.sessions = [];

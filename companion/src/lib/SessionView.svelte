@@ -944,6 +944,19 @@
 						}
 					}}
 				>
+					<!-- Same copy affordance as assistant bubbles — most
+					     useful on coordinator-authored messages (long
+					     markdown task briefs), but any prompt is worth
+					     copying. stopPropagation so it doesn't toggle the
+					     row's action chips. -->
+					<button
+						class="copy-md"
+						title="Copy raw markdown"
+						onclick={(e) => {
+							e.stopPropagation();
+							void copyMarkdown(row.id, row.text);
+						}}>{copiedMd === row.id ? '✓' : '⧉'}</button
+					>
 					{#if row.fromCoordinator}<span class="coordinator-tag" title="Sent by the coordinator, not by you"
 							>coordinator</span
 						>
@@ -1506,6 +1519,10 @@
 		max-width: 85%;
 		/* User text is plain (not markdown) — keep typed newlines. */
 		white-space: pre-wrap;
+		/* Anchor for the absolutely-positioned copy button; padding
+		   keeps short messages from sliding under it. */
+		position: relative;
+		padding-right: 2.2rem;
 	}
 	.bubble.user.queued {
 		opacity: 0.6;

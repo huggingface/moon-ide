@@ -776,3 +776,8 @@ Prose, not commitments — revisit when someone asks:
   body already renders — write content, edit find/replace — are
   elided to a size note instead of duplicated. Previously expanding
   a bash call showed output with no way to see the command.
+- **Copy-markdown on user bubbles** (incl. coordinator-authored
+  messages) and **per-workspace last-project memory**: the phone
+  remembers which project it was on per workspace (localStorage)
+  and re-opens it on refresh/workspace open, taking precedence over
+  the IDE's active folder; an explicit `f` route param still wins.
