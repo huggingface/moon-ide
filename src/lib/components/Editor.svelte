@@ -860,7 +860,7 @@
 		});
 	}
 
-	// Right-click menu: "Rename symbol" + "Copy GitHub link". Shared
+	// Right-click menu: "Rename symbol" + "Copy repo link". Shared
 	// with the diff view's editable pane via `EditorContextMenu`.
 	const editorMenu = new EditorContextMenu();
 

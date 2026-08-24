@@ -9,6 +9,7 @@
 
 pub mod app_state;
 pub mod editorconfig;
+pub mod forge;
 pub mod format;
 pub mod host;
 pub mod lint_staged;

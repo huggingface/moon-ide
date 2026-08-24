@@ -71,8 +71,8 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::compose::{
-	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, GhConfigMount, HostGhToken, HostGitIdentity,
-	MoonEditSocketMount, SshAgentForward, SshConfigMount, SshKnownHostsMount, SshPublicKeyMount,
+	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, FjDataMount, GhConfigMount, HostGhToken,
+	HostGitIdentity, MoonEditSocketMount, SshAgentForward, SshConfigMount, SshKnownHostsMount, SshPublicKeyMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
 use crate::port_forward::stop_forwards;
@@ -286,6 +286,7 @@ impl Workspace {
 		let identity = detect_host_git_identity();
 		let gh_config = detect_host_gh_config();
 		let gh_token = detect_host_gh_token();
+		let fj_data = detect_host_fj_data_dir();
 		// The IDE's per-workspace focus socket lives in the
 		// `run/` subdir of `state_dir`. moon-ide creates that
 		// directory before any compose call runs (pre-Tauri in
@@ -312,6 +313,7 @@ impl Workspace {
 			git_identity: identity.as_ref(),
 			gh_config: gh_config.as_ref(),
 			gh_token: gh_token.as_ref(),
+			fj_data: fj_data.as_ref(),
 			moon_edit_socket: Some(&moon_edit),
 		})
 	}
@@ -947,6 +949,47 @@ pub(crate) fn detect_host_gh_token() -> Option<HostGhToken> {
 		return None;
 	}
 	Some(HostGhToken { token: value })
+}
+
+/// Resolve the host's `fj` (forgejo-cli) data directory so its
+/// `keys.json` — fj's entire credential store — rides read-only
+/// into the dev container. fj has no env-var token path, so the
+/// mount is the only way to authenticate an in-container `fj`
+/// (and moon-ide's own Forgejo REST calls).
+///
+/// Candidates, first hit wins — but only when the directory
+/// exists *and* holds a `keys.json`. An empty dir carries no
+/// credentials, and mounting it would shadow a later host login
+/// until the container is recreated (same rule as
+/// [`detect_host_gh_config`]):
+///
+/// 1. `$XDG_DATA_HOME/forgejo-cli` when the var is set,
+/// 2. `~/.local/share/forgejo-cli` (the Linux default),
+/// 3. `~/Library/Application Support/forgejo-cli.forgejo-cli`
+///    (macOS), then the legacy
+///    `~/Library/Application Support/Cyborus.forgejo-cli`.
+///
+/// Re-evaluated every time we render or write `compose.yaml`,
+/// matching `detect_host_gh_config`'s "rebuild container to pick
+/// it up" cadence.
+pub(crate) fn detect_host_fj_data_dir() -> Option<FjDataMount> {
+	let mut candidates: Vec<Utf8PathBuf> = Vec::new();
+	if let Some(xdg) = std::env::var("XDG_DATA_HOME").ok().filter(|s| !s.is_empty()) {
+		candidates.push(Utf8PathBuf::from(xdg).join("forgejo-cli"));
+	}
+	if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+		let home = Utf8PathBuf::from(home);
+		candidates.push(home.join(".local/share/forgejo-cli"));
+		// macOS keeps app data under Application Support; the
+		// Cyborus.* name is what older forgejo-cli builds used.
+		candidates.push(home.join("Library/Application Support/forgejo-cli.forgejo-cli"));
+		candidates.push(home.join("Library/Application Support/Cyborus.forgejo-cli"));
+	}
+	let Some(path) = candidates.into_iter().find(|dir| dir.join("keys.json").is_file()) else {
+		tracing::debug!("no fj data dir with keys.json found; skipping fj auth pass-through into the container");
+		return None;
+	};
+	Some(FjDataMount { host_path: path })
 }
 
 fn read_git_global_config(key: &str) -> Option<String> {

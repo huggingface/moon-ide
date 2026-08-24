@@ -387,14 +387,31 @@ function externalLink(href: string, text: string): HTMLAnchorElement {
  * catching the obvious vulnerability.
  *
  * Match shapes handled:
- * - `#123` (repo-local) → `${remoteUrl}/pull/123`
- * - `owner/repo#123` (cross-repo) → `https://github.com/owner/repo/pull/123`
+ * - `#123` (repo-local) → `${remoteUrl}/issues/123` — both GitHub
+ *   and Forgejo redirect the issues path to the PR page when the
+ *   number is a PR, so one shape covers both forges.
+ * - `owner/repo#123` (cross-repo) → `<origin of remoteUrl>/owner/repo/issues/123`,
+ *   falling back to `github.com` when no remote is recognised —
+ *   cross-repo refs overwhelmingly point at the same forge.
  *
  * The 1-7 digit cap is loose enough to cover any realistic PR number
  * (GitHub's largest is ~300k today) but rejects hex SHAs, colour
  * codes, and similar false positives that start with `#` and run
  * long.
  */
+/**
+ * Origin (`https://host`) of the repo's recognised remote web URL,
+ * for building cross-repo reference links on the same forge.
+ * Falls back to GitHub when the remote is empty/unparsable.
+ */
+function forgeOrigin(remoteUrl: string): string {
+	try {
+		return new URL(remoteUrl).origin;
+	} catch {
+		return 'https://github.com';
+	}
+}
+
 function linkifyCommitText(text: string, remoteUrl: string): DocumentFragment {
 	const frag = document.createDocumentFragment();
 	if (!text) {
@@ -419,7 +436,11 @@ function linkifyCommitText(text: string, remoteUrl: string): DocumentFragment {
 		if (/[A-Za-z0-9]/.test(next)) {
 			continue;
 		}
-		const href = repo ? `https://github.com/${repo}/pull/${num}` : remoteUrl ? `${remoteUrl}/pull/${num}` : null;
+		const href = repo
+			? `${forgeOrigin(remoteUrl)}/${repo}/issues/${num}`
+			: remoteUrl
+				? `${remoteUrl}/issues/${num}`
+				: null;
 		if (!href) {
 			continue;
 		}

@@ -3,7 +3,7 @@
 /**
  * Why the PR section of [`BranchList`] is empty. Surfaced in the
  * palette as the section's empty-state row so the user knows
- * whether to install gh, run `gh auth login`, or accept that
- * their remote isn't on GitHub.
+ * whether to install gh, run `gh auth login` / `fj auth login`,
+ * or accept that their remote isn't on a supported forge.
  */
-export type PrListStatus = { "kind": "ok" } | { "kind": "gh_missing" } | { "kind": "gh_not_authed" } | { "kind": "not_github" } | { "kind": "failed", detail: string, };
+export type PrListStatus = { "kind": "ok" } | { "kind": "gh_missing" } | { "kind": "gh_not_authed" } | { "kind": "unsupported_remote" } | { "kind": "failed", detail: string, };

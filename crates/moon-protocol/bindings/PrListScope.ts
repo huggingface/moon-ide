@@ -16,6 +16,11 @@
  * - `state:open review-requested:@me` — review explicitly
  *   requested from the user. Not covered by `involves:`.
  *
+ * On Forgejo remotes the list comes from the instance's REST API
+ * and `Participating` filters client-side to PRs the user
+ * authored, is assigned to, or is requested to review — the API
+ * has no `involves:` equivalent, so mentions/comments don't count.
+ *
  * The default (`All`) matches the previous slice's behaviour so
  * flipping the toggle in the palette is the gesture, not the
  * other way around.

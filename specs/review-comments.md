@@ -154,9 +154,10 @@ appearing never shifts the code horizontally.
   a Publish button. Drift reconciliation (which comments land / drift / are
   lost) happens at publish time in the backend against the PR head, not as a
   pre-flight preview here.
-- **No-PR state.** If `gh pr view` finds no PR for the branch, the dialog shows
-  "No open PR for `<branch>`" and links to the create-PR URL the SCM panel
-  already builds (`<repo>/pull/new/<branch>`). Comments stay as local drafts.
+- **No-PR state.** If the PR resolution (`gh pr view` / Forgejo open-PR list)
+  finds no PR for the branch, the dialog shows "No open PR for `<branch>`" and
+  links to the create-PR URL the SCM panel already builds. Comments stay as
+  local drafts.
 
 State plumbing follows the existing review pattern: comment CRUD lives on
 `WorkspaceState` proxying the active `FolderState` (alongside `reviewVisibleFile`,
@@ -170,7 +171,15 @@ five-step chain `git_permalink` uses (trait decl in `crates/moon-core/src/host.r
 → `LocalHost` impl → `fs_publish_pr_review` Tauri command → register in
 `src-tauri/src/lib.rs` → `ipc.ts` wrapper). The `LocalHost` impl shells out to
 `gh` — never a raw token or `reqwest` — inheriting the host-`gh`-token auth model
-(`detect_host_gh_token`, see [containers.md](containers.md)). GitHub-only.
+(`detect_host_gh_token`, see [containers.md](containers.md)).
+
+On Forgejo remotes the same flow runs against the instance's REST API instead
+(`crates/moon-core/src/forge.rs`): resolve the PR from the open-PR list by head
+ref, then POST the review to `/api/v1/repos/{owner}/{repo}/pulls/{n}/reviews`
+with the token the fj CLI stores — fj has no `api` passthrough or review
+command, see [ADR 0073](decisions/0073-forgejo-support.md). Forgejo comments
+are single-line (`new_position` / `old_position`), so a multi-line draft
+anchors on its last line.
 
 Steps inside `publish_pr_review`:
 
@@ -243,7 +252,8 @@ Carried from [ADR 0027](decisions/0027-review-comments.md):
 - **No threading / replies / resolve**, and **no displaying other people's
   comments**. This is a write-my-own-review tool, not a GitHub review-thread
   client.
-- **No GitLab / Bitbucket / Gitea** — GitHub-only, matching `remote_web_url`.
+- **No GitLab / Bitbucket** — GitHub and Forgejo only, matching
+  `detect_forge_remote` ([ADR 0073](decisions/0073-forgejo-support.md)).
 - **No `gh pr create`** — link to the create-PR URL and stop.
 - **No APPROVE / REQUEST_CHANGES** initially — every review posts as
   `event: COMMENT`. The `event` field is the seam to add them later.

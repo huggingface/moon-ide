@@ -240,11 +240,12 @@ pub struct GitBranchInfo {
 }
 
 /// One row in the branch-switcher palette. Two kinds today: a
-/// local branch (or remote-tracking ref already fetched) and a
-/// GitHub PR sourced from `gh pr list`. The discriminant drives
-/// the switch verb on the backend — `git switch <name>` for
-/// `Local`, `gh pr checkout <number>` for `Pr` (so cross-fork PRs
-/// get the fork-fetching dance for free).
+/// local branch (or remote-tracking ref already fetched) and an
+/// open PR sourced from `gh pr list` (GitHub) or the Forgejo REST
+/// API. The discriminant drives the switch verb on the backend —
+/// `git switch <name>` for `Local`, `gh pr checkout <number>` /
+/// `fj pr checkout <number>` for `Pr` (so cross-fork PRs get the
+/// fork-fetching dance for free).
 ///
 /// Frontend renders both in a single list with a section header
 /// per kind; type-to-filter spans both. See
@@ -285,15 +286,16 @@ pub enum BranchListEntry {
 		/// common destination.
 		is_default: bool,
 	},
-	/// A GitHub pull request, as reported by `gh pr list`.
+	/// An open pull request, as reported by `gh pr list`
+	/// (GitHub) or the Forgejo `/pulls` API.
 	Pr {
 		/// PR number (the `#42` segment). 32-bit fits every
-		/// realistic GitHub repo's PR count.
+		/// realistic repo's PR count.
 		number: u32,
 		/// PR title verbatim. Rendered with mono accent on the
 		/// number, then a separator, then the title.
 		title: String,
-		/// GitHub login of the PR's author (no `@` prefix). The
+		/// Forge login of the PR's author (no `@` prefix). The
 		/// frontend prepends `@` itself so the wire format
 		/// stays clean.
 		author: String,
@@ -316,8 +318,8 @@ pub enum BranchListEntry {
 
 /// Why the PR section of [`BranchList`] is empty. Surfaced in the
 /// palette as the section's empty-state row so the user knows
-/// whether to install gh, run `gh auth login`, or accept that
-/// their remote isn't on GitHub.
+/// whether to install gh, run `gh auth login` / `fj auth login`,
+/// or accept that their remote isn't on a supported forge.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
@@ -336,10 +338,11 @@ pub enum PrListStatus {
 	/// terminal pinned to the active folder.
 	GhNotAuthed,
 	/// The active folder's `origin` (or `upstream`) isn't a
-	/// GitHub remote, so PRs aren't applicable. Frontend
-	/// suppresses the section entirely (no "empty" row, no
-	/// "missing" row — just no PR section).
-	NotGithub,
+	/// recognised forge (GitHub or a known Forgejo host), so PRs
+	/// aren't applicable. Frontend suppresses the section
+	/// entirely (no "empty" row, no "missing" row — just no PR
+	/// section).
+	UnsupportedRemote,
 	/// `gh pr list` ran but exited non-zero (network error, API
 	/// rate limit, scope refused, …). Frontend surfaces the
 	/// detail verbatim so the user gets the actionable hint.
@@ -358,7 +361,7 @@ pub struct BranchList {
 	/// capped at a small number (today's slice ships 20 — bumps
 	/// when a real project hits the cap).
 	pub local: Vec<BranchListEntry>,
-	/// Open GitHub PRs against the active folder's repo. Empty
+	/// Open PRs against the active folder's repo. Empty
 	/// when [`pr_status`](Self::pr_status) is anything other
 	/// than `Ok`; capped at 30. Sub-filters (`@me`, "review
 	/// requested") are deferred — type-to-filter handles the
@@ -421,6 +424,11 @@ pub struct GitWorktree {
 /// - `state:open review-requested:@me` — review explicitly
 ///   requested from the user. Not covered by `involves:`.
 ///
+/// On Forgejo remotes the list comes from the instance's REST API
+/// and `Participating` filters client-side to PRs the user
+/// authored, is assigned to, or is requested to review — the API
+/// has no `involves:` equivalent, so mentions/comments don't count.
+///
 /// The default (`All`) matches the previous slice's behaviour so
 /// flipping the toggle in the palette is the gesture, not the
 /// other way around.
@@ -437,8 +445,9 @@ pub enum PrListScope {
 }
 
 /// Argument for `branch_switch`. `Local` runs `git switch
-/// <name>`; `Pr` runs `gh pr checkout <number>` so cross-fork
-/// PRs work without manual remote / fetch fiddling.
+/// <name>`; `Pr` runs `gh pr checkout <number>` (GitHub) or
+/// `fj pr checkout <number>` (Forgejo) so cross-fork PRs work
+/// without manual remote / fetch fiddling.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
@@ -448,8 +457,9 @@ pub enum BranchSwitchTarget {
 	/// files would be overwritten by checkout") so the user gets
 	/// the actionable hint.
 	Local { name: String },
-	/// Check out a GitHub PR by number via `gh pr checkout`.
-	/// gh's stderr propagates the same way — auth missing,
+	/// Check out a PR by number via `gh pr checkout` /
+	/// `fj pr checkout` (picked from the remote's forge). The
+	/// CLI's stderr propagates the same way — auth missing,
 	/// network failure, dirty tree, etc.
 	Pr { number: u32 },
 }
@@ -577,21 +587,23 @@ pub struct CommitDiff {
 	pub entries: Vec<GitStatusEntry>,
 }
 
-/// A GitHub permalink for a path + line range, ready to paste into
-/// a PR comment, issue, or chat. Built from the active folder's
+/// A permalink for a path + line range, ready to paste into a PR
+/// comment, issue, or chat. Built from the active folder's
 /// `origin` / `upstream` remote and the current `HEAD` commit SHA,
 /// so the link survives later commits (the SHA pins the blob, not a
 /// branch ref that moves under it). `None` is returned when the
-/// folder isn't a GitHub-remote repo, has no commits yet, or `git`
-/// itself isn't on PATH — the editor's "Copy GitHub link" menu
-/// items go disabled in that case.
+/// folder's remote isn't a recognised forge (GitHub or a known
+/// Forgejo host), the repo has no commits yet, or `git` itself
+/// isn't on PATH — the editor's "Copy repo link" menu items go
+/// disabled in that case.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub struct GitPermalink {
-	/// Plain URL — `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>(-L<end>)`.
-	/// Single-line selections drop the `-L<end>` suffix to match
-	/// what GitHub's own "Copy permalink" produces.
+	/// Plain URL — `https://github.com/<owner>/<repo>/blob/<sha>/<path>#L<start>(-L<end>)`
+	/// on GitHub, `…/<owner>/<repo>/src/commit/<sha>/<path>#L…` on
+	/// Forgejo. Single-line selections drop the `-L<end>` suffix to
+	/// match what GitHub's own "Copy permalink" produces.
 	pub url: String,
 	/// Markdown form: `[<path>#L<start>(-L<end>)](<url>)`. The link
 	/// text is the workspace-relative path plus the line range so a

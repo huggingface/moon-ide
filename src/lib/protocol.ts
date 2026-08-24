@@ -410,12 +410,12 @@ export type GitBranchInfo = {
 	behind: number;
 	/**
 	 * Pre-built URL for opening a PR against the repo's primary
-	 * remote (e.g. `https://github.com/owner/repo/pull/new/<branch>`).
-	 * `null` when the remote isn't a recognised host (currently
-	 * only `github.com` is supported), HEAD is detached, or the
-	 * folder isn't a git repo. The SCM panel still gates the
-	 * "Open PR" button on UI policy (non-main / non-master,
-	 * `hasUpstream`).
+	 * remote (`https://github.com/owner/repo/pull/new/<branch>` on
+	 * GitHub, the `compare/<default>...<branch>` page on Forgejo).
+	 * `null` when the remote isn't a recognised forge, HEAD is
+	 * detached, or the folder isn't a git repo. The SCM panel still
+	 * gates the "Open PR" button on UI policy (non-main /
+	 * non-master, `hasUpstream`).
 	 */
 	prUrl: string | null;
 	/**
@@ -498,9 +498,9 @@ export type GitWorktree = {
 };
 
 /**
- * GitHub permalink (plain URL + Markdown form) for a path + line
- * range, pinned to the current HEAD commit SHA. Mirrors
- * `moon_protocol::git::GitPermalink`.
+ * Repo permalink (plain URL + Markdown form) for a path + line
+ * range, pinned to the current HEAD commit SHA. GitHub and Forgejo
+ * remotes are supported. Mirrors `moon_protocol::git::GitPermalink`.
  */
 export type GitPermalink = {
 	url: string;
@@ -510,8 +510,9 @@ export type GitPermalink = {
 /**
  * One row in the branch-switcher palette. Discriminated union over
  * `kind`: `local` runs `git switch <name>`, `pr` runs
- * `gh pr checkout <number>` so cross-fork PRs work without manual
- * remote / fetch fiddling. Mirrors `moon_protocol::git::BranchListEntry`.
+ * `gh pr checkout <number>` / `fj pr checkout <number>` so
+ * cross-fork PRs work without manual remote / fetch fiddling.
+ * Mirrors `moon_protocol::git::BranchListEntry`.
  */
 export type BranchListEntry =
 	| {
@@ -535,14 +536,14 @@ export type BranchListEntry =
 /**
  * Why the PR section of `BranchList.prs` is empty. The frontend
  * uses this to render the right empty-state row (or suppress the
- * section entirely for `notGithub`). Mirrors
+ * section entirely for `unsupportedRemote`). Mirrors
  * `moon_protocol::git::PrListStatus`.
  */
 export type PrListStatus =
 	| { kind: 'ok' }
 	| { kind: 'gh_missing' }
 	| { kind: 'gh_not_authed' }
-	| { kind: 'not_github' }
+	| { kind: 'unsupported_remote' }
 	| { kind: 'failed'; detail: string };
 
 /**

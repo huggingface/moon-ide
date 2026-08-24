@@ -19,6 +19,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::editorconfig::EditorConfigService;
+use crate::forge::{
+	detect_forge_remote, forgejo_current_user, forgejo_list_open_prs, forgejo_post_review, remote_web_url, ForgeKind,
+	ForgeRemote,
+};
 use crate::format;
 use crate::lint_staged::{LintStagedRules, LintStagedService};
 use crate::pre_save;
@@ -252,16 +256,19 @@ pub trait WorkspaceHost: Send + Sync {
 	/// implementation is a contained change behind this trait method.
 	async fn git_blame(&self, path: &Utf8Path) -> MoonResult<Option<GitFileBlame>>;
 
-	/// Build a GitHub permalink for `path` spanning lines
+	/// Build a permalink for `path` spanning lines
 	/// `start_line..=end_line` (1-based, inclusive). The link pins
 	/// the current `HEAD` commit SHA (not a branch ref) so it keeps
 	/// pointing at the same bytes after later commits — matching what
-	/// GitHub's own "Copy permalink" does.
+	/// GitHub's own "Copy permalink" does. GitHub and Forgejo
+	/// remotes are supported (the pinned-blob path segment differs
+	/// per forge).
 	///
 	/// Returns `Ok(None)` for every case the UI should treat as "no
 	/// link available, grey the menu item out": the folder's
-	/// `origin` / `upstream` remote isn't a recognised host
-	/// (currently `github.com`), the repo has no commits yet, or
+	/// `origin` / `upstream` remote isn't a recognised forge
+	/// (`github.com`, `codeberg.org`, or a host with an fj login —
+	/// see `crate::forge`), the repo has no commits yet, or
 	/// `git` isn't on PATH. Path containment is enforced the same way
 	/// as [`Self::git_blame`] (no absolute paths, no `..` escapes).
 	async fn git_permalink(&self, path: &Utf8Path, start_line: u32, end_line: u32) -> MoonResult<Option<GitPermalink>>;
@@ -280,14 +287,19 @@ pub trait WorkspaceHost: Send + Sync {
 	async fn git_blob_sha(&self, path: &Utf8Path) -> MoonResult<Option<String>>;
 
 	/// Publish a batch of local review-comment drafts to the current
-	/// branch's GitHub PR as a single review (Phase 5.7.2). Shells
-	/// out to `gh` (never a raw token), so auth is inherited from the
-	/// user's `gh` login / the container's forwarded `GH_TOKEN`.
+	/// branch's PR as a single review (Phase 5.7.2). GitHub remotes
+	/// shell out to `gh` (never a raw token), so auth is inherited
+	/// from the user's `gh` login / the container's forwarded
+	/// `GH_TOKEN`. Forgejo remotes POST to the instance's REST API
+	/// with the token the fj CLI stores (fj has no `api`
+	/// passthrough); comments there are single-line, anchored on the
+	/// range's last line.
 	///
-	/// The flow: resolve the PR + head SHA via `gh pr view`; for each
-	/// comment re-anchor its content fingerprint against the PR-head
-	/// version of the file (`git show <head>:<path>`); post the
-	/// survivors as one `event: COMMENT` review via `gh api`. Returns
+	/// The flow: resolve the PR + head SHA (`gh pr view` / Forgejo
+	/// open-PR list); for each comment re-anchor its content
+	/// fingerprint against the PR-head version of the file
+	/// (`git show <head>:<path>`); post the survivors as one
+	/// `event: COMMENT` review (`gh api` / REST). Returns
 	/// [`PublishReviewResult::NoPr`] when the branch has no open PR,
 	/// or [`PublishReviewResult::Published`] with the count posted,
 	/// the ids that couldn't be placed at the head (kept as local
@@ -629,18 +641,20 @@ pub trait WorkspaceHost: Send + Sync {
 	///    its row carries `is_default = true` so the palette can
 	///    keep it visible — switching back to it is the most
 	///    common destination.
-	/// 2. `prs` — open GitHub PRs via `gh pr list` (capped at
+	/// 2. `prs` — open PRs via `gh pr list` (capped at
 	///    30). `pr_scope == All` is "every open PR";
 	///    `Participating` runs two `--search` queries
 	///    (`involves:@me` + `review-requested:@me`) in parallel
 	///    and merges them.
 	///    Empty when `gh` isn't installed (`pr_status =
 	///    GhMissing`), when `gh` isn't authenticated (`GhNotAuthed`),
-	///    when the active folder's `origin` / `upstream` isn't
-	///    GitHub (`NotGithub`), or when the call exited non-zero
-	///    (`Failed { detail }`). The frontend uses
+	///    when the active folder's `origin` / `upstream` isn't a
+	///    recognised forge (`UnsupportedRemote`), or when the call
+	///    failed (`Failed { detail }`). The frontend uses
 	///    [`PrListStatus`] verbatim to render the section's
-	///    empty-state row.
+	///    empty-state row. Forgejo remotes skip `gh` entirely and
+	///    fetch the same data from the instance's REST API using
+	///    the fj CLI's stored token (see `crate::forge`).
 	///
 	/// Both sections are produced in parallel — local always
 	/// returns in single-digit milliseconds; the gh probe can take
@@ -650,17 +664,18 @@ pub trait WorkspaceHost: Send + Sync {
 	/// taking down the whole call.
 	async fn branch_list(&self, pr_scope: PrListScope) -> MoonResult<BranchList>;
 
-	/// URL of the open GitHub PR whose head ref matches the active
+	/// URL of the open PR whose head ref matches the active
 	/// folder's current branch, if one exists. Single
 	/// `gh pr list --head <branch> --state open --json url --limit 1`
-	/// call — much cheaper than [`Self::branch_list`]'s full PR
-	/// fetch, but still a network round-trip, so callers should
-	/// refresh on branch change rather than on every status pass.
+	/// call (GitHub) or one Forgejo open-PR list fetch — much
+	/// cheaper than [`Self::branch_list`]'s full PR fetch, but still
+	/// a network round-trip, so callers should refresh on branch
+	/// change rather than on every status pass.
 	///
 	/// Returns `Ok(None)` for every "no existing PR" case the SCM
-	/// panel needs to fall back from: detached HEAD, non-GitHub
-	/// remote, `gh` missing or not authenticated, `gh` exited
-	/// non-zero, no PR open for this branch, or the call timed out.
+	/// panel needs to fall back from: detached HEAD, unsupported
+	/// remote, CLI missing or not authenticated, the call failed,
+	/// no PR open for this branch, or the call timed out.
 	/// The intent is "give me a URL to navigate to if you have
 	/// one"; ambiguity collapses to `None` so the UI's create-PR
 	/// fallback stays consistent.
@@ -668,8 +683,9 @@ pub trait WorkspaceHost: Send + Sync {
 
 	/// Switch the active folder to `target`. `Local { name }` runs
 	/// `git switch <name>`; `Pr { number }` runs
-	/// `gh pr checkout <number>` so cross-fork PRs get the
-	/// fork-fetching dance for free.
+	/// `gh pr checkout <number>` (GitHub) or `fj pr checkout
+	/// <number>` (Forgejo) so cross-fork PRs get the fork-fetching
+	/// dance for free.
 	///
 	/// Errors propagate stderr verbatim (dirty-tree refusal,
 	/// missing branch, gh auth required, network failure) so the
@@ -2574,16 +2590,37 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 		})
 		.unwrap_or((0, 0));
 
-	// Compose the GitHub PR-create URL when we have both inputs:
-	// a recognised remote + a non-detached branch. URL-escaping
+	// Compose the PR-create URL when we have both inputs: a
+	// recognised remote + a non-detached branch. URL-escaping
 	// follows GitHub's "branch name in path segment" rules: `/`
 	// stays literal (forward slashes appear in `feat/foo` style
 	// branches), the rest of the disallowed-in-path set goes
 	// percent-encoded. The frontend gates visibility on UI
 	// policy (`has_upstream`, non-main/master); we just produce
-	// the URL whenever it's well-defined.
-	let pr_url = match (remote_web_url(root), name.as_deref()) {
-		(Some(base), Some(branch)) => Some(format!("{base}/pull/new/{}", encode_branch_segment(branch))),
+	// the URL whenever it's well-defined. Forgejo has no
+	// `/pull/new/` route; its compare page (`base...head`) carries
+	// the "New pull request" button, and it needs the base branch
+	// spelled out — no default branch resolvable means no URL.
+	let pr_url = match (detect_forge_remote(root), name.as_deref()) {
+		(Some(remote), Some(branch)) => match remote.kind {
+			ForgeKind::GitHub => Some(format!(
+				"{}/pull/new/{}",
+				remote.web_base,
+				encode_branch_segment(branch)
+			)),
+			ForgeKind::Forgejo => resolve_default_remote_ref(root).map(|remote_ref| {
+				let default = remote_ref
+					.split_once('/')
+					.map(|(_, b)| b)
+					.unwrap_or(remote_ref.as_str());
+				format!(
+					"{}/compare/{}...{}",
+					remote.web_base,
+					encode_branch_segment(default),
+					encode_branch_segment(branch)
+				)
+			}),
+		},
 		_ => None,
 	};
 
@@ -4708,6 +4745,26 @@ async fn gh_pr_head(root: &Utf8Path) -> MoonResult<Option<(u64, String)>> {
 	}
 }
 
+/// Forgejo counterpart of [`gh_pr_head`]: the open PR whose head
+/// ref is the current branch. API failures are real errors (auth /
+/// network problems must surface, not read as "no PR"); an empty
+/// match is `Ok(None)`.
+async fn forgejo_pr_head(remote: &ForgeRemote, branch: &str) -> MoonResult<Option<(u64, String)>> {
+	if branch.is_empty() {
+		return Ok(None);
+	}
+	let prs = forgejo_list_open_prs(remote, BRANCH_LIST_PR_CAP)
+		.await
+		.map_err(MoonError::IoError)?;
+	Ok(
+		prs
+			.into_iter()
+			.find(|pr| pr.head_ref == branch)
+			.filter(|pr| !pr.head_sha.is_empty())
+			.map(|pr| (pr.number, pr.head_sha)),
+	)
+}
+
 /// Fetch the PR-head version of `path` (`git show <head>:<path>`).
 /// `None` when the path isn't in the head tree (a comment on a file
 /// the head doesn't have → every comment on it goes "lost").
@@ -4730,11 +4787,21 @@ async fn git_show_at(root: &Utf8Path, rev: &str, path: &str) -> Option<String> {
 
 /// `WorkspaceHost::publish_pr_review` body. See the trait doc for
 /// the flow. Kept as a free async fn so it composes the `gh` / `git`
-/// subprocess calls without holding the blocking pool.
+/// subprocess calls (or the Forgejo REST calls) without holding the
+/// blocking pool.
 async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -> MoonResult<PublishReviewResult> {
-	// 1. Resolve the PR + head SHA. No PR → caller shows create-PR CTA.
+	// 1. Resolve the PR + head SHA. No PR → caller shows create-PR
+	//    CTA. An unrecognised remote has no PR to resolve, which is
+	//    the same "nothing to publish to" outcome.
 	let branch = run_git_branch(root).name.unwrap_or_default();
-	let Some((number, head_sha)) = gh_pr_head(root).await? else {
+	let Some(remote) = detect_forge_remote(root) else {
+		return Ok(PublishReviewResult::NoPr { branch });
+	};
+	let head = match remote.kind {
+		ForgeKind::GitHub => gh_pr_head(root).await?,
+		ForgeKind::Forgejo => forgejo_pr_head(&remote, &branch).await?,
+	};
+	let Some((number, head_sha)) = head else {
 		return Ok(PublishReviewResult::NoPr { branch });
 	};
 
@@ -4765,18 +4832,34 @@ async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -
 			&comment.anchor.fingerprint,
 		) {
 			Some((start, end)) => {
-				let side = match comment.anchor.side {
-					ReviewSide::Base => "LEFT",
-					ReviewSide::Working => "RIGHT",
-				};
 				let mut obj = serde_json::Map::new();
 				obj.insert("path".to_owned(), serde_json::Value::String(path.clone()));
 				obj.insert("body".to_owned(), serde_json::Value::String(comment.body.clone()));
-				obj.insert("line".to_owned(), serde_json::Value::Number(end.into()));
-				obj.insert("side".to_owned(), serde_json::Value::String(side.to_owned()));
-				if end > start {
-					obj.insert("start_line".to_owned(), serde_json::Value::Number(start.into()));
-					obj.insert("start_side".to_owned(), serde_json::Value::String(side.to_owned()));
+				match remote.kind {
+					ForgeKind::GitHub => {
+						let side = match comment.anchor.side {
+							ReviewSide::Base => "LEFT",
+							ReviewSide::Working => "RIGHT",
+						};
+						obj.insert("line".to_owned(), serde_json::Value::Number(end.into()));
+						obj.insert("side".to_owned(), serde_json::Value::String(side.to_owned()));
+						if end > start {
+							obj.insert("start_line".to_owned(), serde_json::Value::Number(start.into()));
+							obj.insert("start_side".to_owned(), serde_json::Value::String(side.to_owned()));
+						}
+					}
+					ForgeKind::Forgejo => {
+						// Forgejo review comments are single-line,
+						// positioned by an old/new file line number.
+						// A multi-line selection anchors on its last
+						// line — the line GitHub would render the
+						// comment on too.
+						let key = match comment.anchor.side {
+							ReviewSide::Base => "old_position",
+							ReviewSide::Working => "new_position",
+						};
+						obj.insert(key.to_owned(), serde_json::Value::Number(end.into()));
+					}
 				}
 				review_comments.push(serde_json::Value::Object(obj));
 			}
@@ -4794,7 +4877,9 @@ async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -
 		});
 	}
 
-	// 3. Post one atomic COMMENT review via `gh api`.
+	// 3. Post one atomic COMMENT review. Both forges take the same
+	//    top-level payload shape (`commit_id` / `event` / `body` /
+	//    `comments`); only the transport differs.
 	let mut payload = serde_json::Map::new();
 	payload.insert("commit_id".to_owned(), serde_json::Value::String(head_sha.clone()));
 	payload.insert("event".to_owned(), serde_json::Value::String("COMMENT".to_owned()));
@@ -4803,10 +4888,17 @@ async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -
 	}
 	let posted_count = review_comments.len() as u32;
 	payload.insert("comments".to_owned(), serde_json::Value::Array(review_comments));
-	let body_json = serde_json::Value::Object(payload).to_string();
+	let payload = serde_json::Value::Object(payload);
 
-	let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
-	let review_url = gh_api_post_review(root, &endpoint, &body_json).await?;
+	let review_url = match remote.kind {
+		ForgeKind::GitHub => {
+			let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
+			gh_api_post_review(root, &endpoint, &payload.to_string()).await?
+		}
+		ForgeKind::Forgejo => forgejo_post_review(&remote, number, &payload)
+			.await
+			.map_err(|detail| MoonError::IoError(format!("Forgejo review POST failed: {detail}")))?,
+	};
 
 	Ok(PublishReviewResult::Published {
 		posted: posted_count,
@@ -5046,13 +5138,17 @@ fn run_branch_list_local_one(root: &Utf8Path, name: &str, current: Option<&str>)
 	})
 }
 
-/// PR section: probe the active folder's remote for GitHub-ness,
-/// then `gh pr list --json … --limit <cap>`. Returns the rows
-/// plus a [`PrListStatus`] so the frontend renders the right
+/// PR section: probe the active folder's remote for a recognised
+/// forge, then fetch open PRs — `gh pr list --json … --limit <cap>`
+/// for GitHub, the instance's REST API for Forgejo. Returns the
+/// rows plus a [`PrListStatus`] so the frontend renders the right
 /// empty-state row when the section is empty.
 async fn run_branch_list_prs(root: &Utf8Path, scope: PrListScope) -> (Vec<BranchListEntry>, PrListStatus) {
-	if remote_web_url(root).is_none() {
-		return (Vec::new(), PrListStatus::NotGithub);
+	let Some(remote) = detect_forge_remote(root) else {
+		return (Vec::new(), PrListStatus::UnsupportedRemote);
+	};
+	if remote.kind == ForgeKind::Forgejo {
+		return run_forgejo_branch_list_prs(&remote, scope).await;
 	}
 	match scope {
 		PrListScope::All => {
@@ -5086,7 +5182,7 @@ async fn run_branch_list_prs(root: &Utf8Path, scope: PrListScope) -> (Vec<Branch
 			let ((involves_rows, involves_status), (review_rows, review_status)) = tokio::join!(involves, review);
 			// Status reconciliation: if both calls landed on the
 			// same hard error (`GhMissing` / `GhNotAuthed` /
-			// `NotGithub`) report it; if one succeeded and the
+			// `UnsupportedRemote`) report it; if one succeeded and the
 			// other transient-failed we still return the
 			// successful slice with `Ok` so the user sees
 			// something rather than a blank failure.
@@ -5113,6 +5209,46 @@ async fn run_branch_list_prs(root: &Utf8Path, scope: PrListScope) -> (Vec<Branch
 			(dropped, status)
 		}
 	}
+}
+
+/// Forgejo half of the PR section. One `/pulls?state=open` call —
+/// the API sorts by `recentupdate` server-side, so no re-sort is
+/// needed. `Participating` additionally resolves the fj login's
+/// user and filters to author / assignee / requested-reviewer
+/// client-side: the API has no `involves:` search, so mentions and
+/// comments don't count (documented on [`PrListScope`]).
+async fn run_forgejo_branch_list_prs(remote: &ForgeRemote, scope: PrListScope) -> (Vec<BranchListEntry>, PrListStatus) {
+	let prs = match forgejo_list_open_prs(remote, BRANCH_LIST_PR_CAP).await {
+		Ok(prs) => prs,
+		Err(detail) => return (Vec::new(), PrListStatus::Failed { detail }),
+	};
+	let me = match scope {
+		PrListScope::All => None,
+		PrListScope::Participating => match forgejo_current_user(remote).await {
+			Ok(login) => Some(login),
+			Err(detail) => return (Vec::new(), PrListStatus::Failed { detail }),
+		},
+	};
+	let now = SystemTime::now();
+	let mut rows = Vec::new();
+	for pr in prs {
+		if let Some(me) = &me {
+			let involved =
+				pr.author == *me || pr.assignees.iter().any(|a| a == me) || pr.requested_reviewers.iter().any(|r| r == me);
+			if !involved {
+				continue;
+			}
+		}
+		rows.push(BranchListEntry::Pr {
+			number: pr.number.min(u32::MAX as u64) as u32,
+			title: pr.title,
+			author: pr.author,
+			head_ref: pr.head_ref,
+			is_draft: pr.is_draft,
+			updated_at_relative: format_iso8601_relative(&pr.updated_at, now).unwrap_or_default(),
+		});
+	}
+	(rows, PrListStatus::Ok)
 }
 
 /// One `gh pr list --json …` invocation. `search` is forwarded as
@@ -5256,11 +5392,12 @@ fn parse_gh_pr_list(stdout: &[u8], now: SystemTime) -> Vec<(BranchListEntry, Opt
 	rows
 }
 
-/// `gh pr list --head <branch> --state open --json url --limit 1` —
+/// `gh pr list --head <branch> --state open --json url --limit 1`
+/// (GitHub) or the Forgejo open-PR list filtered by head ref —
 /// the single open PR (if any) whose head ref matches the active
 /// folder's current branch. Returns `None` for every failure case
 /// the SCM panel needs to fall back from: not on a branch,
-/// non-GitHub remote, `gh` missing or unauthenticated, non-zero
+/// unsupported remote, CLI missing or unauthenticated, non-zero
 /// exit, timeout, parse error, no matching PR.
 ///
 /// The bound is `--limit 1` because the SCM panel button only
@@ -5272,7 +5409,7 @@ async fn run_git_existing_pr_url(root: &Utf8Path) -> Option<String> {
 	// Short-circuit on the cheap local checks. Same gates as the
 	// SCM panel's `prUrl` derived value, applied server-side so we
 	// don't spawn `gh` for branches we'd never link to anyway.
-	remote_web_url(root)?;
+	let remote = detect_forge_remote(root)?;
 	let branch = std::process::Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
@@ -5283,6 +5420,18 @@ async fn run_git_existing_pr_url(root: &Utf8Path) -> Option<String> {
 		.and_then(|o| String::from_utf8(o.stdout).ok())
 		.map(|s| s.trim().to_owned())
 		.filter(|s| !s.is_empty())?;
+
+	if remote.kind == ForgeKind::Forgejo {
+		// No head-filter param worth trusting across Forgejo
+		// versions — the open-PR list is capped and cheap, so
+		// match the branch client-side.
+		let prs = forgejo_list_open_prs(&remote, BRANCH_LIST_PR_CAP).await.ok()?;
+		return prs
+			.into_iter()
+			.find(|pr| pr.head_ref == branch)
+			.map(|pr| pr.html_url)
+			.filter(|url| !url.is_empty());
+	}
 
 	let mut cmd = tokio::process::Command::new("gh");
 	cmd
@@ -5385,10 +5534,11 @@ fn format_iso8601_relative(iso: &str, now: SystemTime) -> Option<String> {
 	Some(formatted)
 }
 
-/// Parse `YYYY-MM-DDTHH:MM:SSZ` into Unix seconds. We accept the
-/// trailing `Z` (UTC) as gh always emits it, and a fractional-
-/// seconds `.` segment which gh sometimes emits — anything else
-/// is rejected. No timezone offsets, no locale parsing.
+/// Parse `YYYY-MM-DDTHH:MM:SS(.f*)?(Z|±HH:MM)` into Unix seconds.
+/// gh always emits UTC `Z` (sometimes with fractional seconds);
+/// Forgejo emits RFC 3339 with the instance's local offset, so an
+/// explicit offset is honoured. Anything else is rejected. No
+/// locale parsing.
 fn parse_iso8601_utc(iso: &str) -> Option<i64> {
 	let bytes = iso.as_bytes();
 	if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
@@ -5411,7 +5561,32 @@ fn parse_iso8601_utc(iso: &str) -> Option<i64> {
 	// to year-1, then add days-of-year up to month-1, then add day
 	// (1-based). Plenty of room (i64) for any date gh would emit.
 	let days = days_from_civil(year, month, day);
-	let secs = days * 86_400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
+	// Skip fractional seconds, then honour an explicit UTC offset —
+	// the wall-clock fields above are in that offset's local time.
+	let mut idx = 19;
+	if bytes.get(idx) == Some(&b'.') {
+		idx += 1;
+		while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
+			idx += 1;
+		}
+	}
+	let offset_secs = match bytes.get(idx) {
+		Some(b'Z') => 0,
+		Some(sign @ (b'+' | b'-')) => {
+			let tail = std::str::from_utf8(bytes.get(idx + 1..)?).ok()?;
+			let (h, m) = tail.split_once(':')?;
+			let h: i64 = h.parse().ok()?;
+			let m: i64 = m.parse().ok()?;
+			let total = h * 3600 + m * 60;
+			if *sign == b'+' {
+				total
+			} else {
+				-total
+			}
+		}
+		_ => return None,
+	};
+	let secs = days * 86_400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64 - offset_secs;
 	Some(secs)
 }
 
@@ -5429,23 +5604,29 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 	era * 146_097 + doe as i64 - 719_468
 }
 
-/// `git switch <name>` / `gh pr checkout <number>` dispatcher.
-/// Surfaces stderr verbatim on non-zero exit so the user sees
-/// git / gh's actionable hint without us re-wrapping it.
+/// `git switch <name>` / `gh pr checkout <number>` /
+/// `fj pr checkout <number>` dispatcher. Surfaces stderr verbatim
+/// on non-zero exit so the user sees the CLI's actionable hint
+/// without us re-wrapping it.
 fn run_branch_switch(root: &Utf8Path, target: &BranchSwitchTarget) -> MoonResult<()> {
 	use std::process::Command;
 
-	let mut cmd = Command::new(match target {
+	// Both PR CLIs resolve the PR's head ref via their forge's API
+	// (so fork PRs work too) and run the equivalent `git fetch` +
+	// `git switch` against the active folder. The repo is inferred
+	// from `git remote` in the cwd — neither CLI has a `-C <dir>`
+	// flag, so the dispatcher below uses `current_dir()` for the
+	// PR branch.
+	let pr_cli = match target {
 		BranchSwitchTarget::Local { .. } => "git",
-		// `gh pr checkout` resolves the PR's head ref via the
-		// GitHub API (so it works for fork PRs too) and runs
-		// the equivalent `git fetch` + `git switch` against the
-		// active folder. The repo is inferred from `git remote`
-		// in the cwd — gh has no `-C <dir>` flag, so the
-		// dispatcher below uses `current_dir()` for the gh
-		// branch.
-		BranchSwitchTarget::Pr { .. } => "gh",
-	});
+		BranchSwitchTarget::Pr { .. } => match detect_forge_remote(root).map(|remote| remote.kind) {
+			Some(ForgeKind::Forgejo) => "fj",
+			// GitHub, or an unrecognised remote where gh's own
+			// error is the most useful thing we can surface.
+			_ => "gh",
+		},
+	};
+	let mut cmd = Command::new(pr_cli);
 	let label = match target {
 		BranchSwitchTarget::Local { name } => {
 			let trimmed = name.trim();
@@ -5459,7 +5640,7 @@ fn run_branch_switch(root: &Utf8Path, target: &BranchSwitchTarget) -> MoonResult
 			cmd
 				.current_dir(root.as_std_path())
 				.args(["pr", "checkout", &number.to_string()]);
-			format!("gh pr checkout {number}")
+			format!("{pr_cli} pr checkout {number}")
 		}
 	};
 
@@ -5995,36 +6176,15 @@ fn normalize_fork_pr_remote_to_ssh(root: &Utf8Path, branch: &str) {
 	}
 }
 
-/// Resolve the primary remote's web URL, normalised for link-
-/// building. Returns `None` when no remote is configured, the
-/// configured remote uses an unrecognised host, or the command fails
-/// for any other reason.
-///
-/// Preference order for which remote to pick:
-///
-/// 1. `origin` — the near-universal default set by `git clone`.
-/// 2. `upstream` — the second-most-common convention on forks.
-/// 3. First remote from `git remote` output — last-resort fallback.
-///
-/// Normalisation handles the three common URL shapes:
-///
-/// - `git@github.com:owner/repo.git` → `https://github.com/owner/repo`
-/// - `https://github.com/owner/repo.git` → `https://github.com/owner/repo`
-/// - `ssh://git@github.com/owner/repo` → `https://github.com/owner/repo`
-///
-/// Only `github.com` is recognised for now — GitLab, Bitbucket, and
-/// self-hosted hosts get `None` until someone wires their PR-URL
-/// convention. Matches the scope discipline in AGENTS.md: add the
-/// other platforms when a user asks.
-/// Build a GitHub permalink (URL + Markdown) for `rel` spanning
+/// Build a permalink (URL + Markdown) for `rel` spanning
 /// `start_line..=end_line`. Returns `None` when the remote isn't a
-/// recognised host, the repo has no `HEAD` commit, or `git` is
+/// recognised forge, the repo has no `HEAD` commit, or `git` is
 /// missing — every "nothing to link to" case the editor menu
 /// collapses to a disabled item.
 fn run_git_permalink(root: &Utf8Path, rel: &Utf8Path, start_line: u32, end_line: u32) -> Option<GitPermalink> {
 	use std::process::Command;
 
-	let web = remote_web_url(root)?;
+	let remote = detect_forge_remote(root)?;
 	let sha = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
@@ -6051,122 +6211,16 @@ fn run_git_permalink(root: &Utf8Path, rel: &Utf8Path, start_line: u32, end_line:
 	// nested path.
 	let encoded_path = encode_branch_segment(rel.as_str());
 
-	let url = format!("{web}/blob/{sha}/{encoded_path}#{fragment}");
+	// The pinned-blob path segment is the one URL shape the two
+	// forges disagree on.
+	let url = match remote.kind {
+		ForgeKind::GitHub => format!("{}/blob/{sha}/{encoded_path}#{fragment}", remote.web_base),
+		ForgeKind::Forgejo => format!("{}/src/commit/{sha}/{encoded_path}#{fragment}", remote.web_base),
+	};
 	// Link text uses the un-encoded relative path + line range: it's
 	// display text in Markdown, so readability beats URL-safety.
 	let markdown = format!("[{rel}#{fragment}]({url})");
 	Some(GitPermalink { url, markdown })
-}
-
-fn remote_web_url(root: &Utf8Path) -> Option<String> {
-	for candidate in ["origin", "upstream"] {
-		if let Some(url) = git_config_remote_url(root, candidate) {
-			if let Some(web) = normalize_remote_url(&url) {
-				return Some(web);
-			}
-			// Remote exists but isn't a supported host; keep looking
-			// — the repo may have a GitHub upstream behind a custom
-			// origin.
-		}
-	}
-	None
-}
-
-/// Read `remote.<name>.url` straight from the repo's config file,
-/// **without invoking git**: the URL is plain file data, and the
-/// host's git binary can be older than the repo. Concretely, the dev
-/// container's git ≥ 2.48 writes `extensions.relativeWorktrees` into
-/// the parent repo config when a worker worktree is created, after
-/// which a 2.43 host git refuses to open the repo at all — even for
-/// `git config --get`. Handles the worktree case too: a `.git`
-/// *file* is a `gitdir:` pointer, and a linked worktree's config
-/// lives in the common dir named by its `commondir` file.
-fn git_config_remote_url(root: &Utf8Path, remote: &str) -> Option<String> {
-	let git_path = root.join(".git");
-	let config_path = if git_path.is_file() {
-		let pointer = std::fs::read_to_string(&git_path).ok()?;
-		let gitdir = pointer.strip_prefix("gitdir:")?.trim();
-		let gitdir = if Utf8Path::new(gitdir).is_absolute() {
-			Utf8PathBuf::from(gitdir)
-		} else {
-			root.join(gitdir)
-		};
-		let common = match std::fs::read_to_string(gitdir.join("commondir")) {
-			Ok(rel) => gitdir.join(rel.trim()),
-			Err(_) => gitdir,
-		};
-		common.join("config")
-	} else {
-		git_path.join("config")
-	};
-	parse_git_config_remote_url(&std::fs::read_to_string(config_path).ok()?, remote)
-}
-
-/// Minimal INI walk for the one key we need. Not a general git
-/// config parser: no includes, no quoting/escape handling beyond
-/// git's own literal section headers — `git remote add` writes
-/// exactly `[remote "name"]` and `\turl = <raw url>`.
-fn parse_git_config_remote_url(config: &str, remote: &str) -> Option<String> {
-	let header = format!("[remote \"{remote}\"]");
-	let mut in_section = false;
-	for line in config.lines() {
-		let line = line.trim();
-		if line.starts_with('[') {
-			in_section = line == header;
-			continue;
-		}
-		if !in_section {
-			continue;
-		}
-		if let Some(rest) = line.strip_prefix("url") {
-			if let Some(value) = rest.trim_start().strip_prefix('=') {
-				let value = value.trim();
-				if !value.is_empty() {
-					return Some(value.to_string());
-				}
-			}
-		}
-	}
-	None
-}
-
-/// URL-normalising half of `remote_web_url`, broken out for unit
-/// tests. Returns `None` for any URL we can't confidently map to a
-/// web base.
-fn normalize_remote_url(raw: &str) -> Option<String> {
-	// `git@github.com:owner/repo(.git)?` — SCP-style SSH.
-	if let Some(rest) = raw.strip_prefix("git@") {
-		if let Some((host, path)) = rest.split_once(':') {
-			if host == "github.com" {
-				return Some(github_web_url(path));
-			}
-		}
-	}
-	// `ssh://git@github.com/owner/repo(.git)?`
-	if let Some(rest) = raw.strip_prefix("ssh://") {
-		let rest = rest.strip_prefix("git@").unwrap_or(rest);
-		if let Some((host, path)) = rest.split_once('/') {
-			if host == "github.com" {
-				return Some(github_web_url(path));
-			}
-		}
-	}
-	// `https://github.com/owner/repo(.git)?` — already HTTPS.
-	if let Some(rest) = raw.strip_prefix("https://").or_else(|| raw.strip_prefix("http://")) {
-		if let Some((host, path)) = rest.split_once('/') {
-			if host == "github.com" {
-				return Some(github_web_url(path));
-			}
-		}
-	}
-	None
-}
-
-fn github_web_url(owner_repo: &str) -> String {
-	// Strip any trailing slash and the conventional `.git` suffix
-	// that both HTTPS and SSH shapes carry.
-	let trimmed = owner_repo.trim_end_matches('/').trim_end_matches(".git");
-	format!("https://github.com/{trimmed}")
 }
 
 /// Parse `git blame --porcelain` output into line-indexed records.
@@ -7516,6 +7570,52 @@ mod tests {
 		);
 	}
 
+	/// Forgejo pins blobs under `/src/commit/<sha>/` rather than
+	/// GitHub's `/blob/<sha>/`; codeberg.org needs no fj login to be
+	/// recognised, so the test runs hermetically.
+	#[tokio::test]
+	async fn git_permalink_uses_forgejo_path_for_codeberg_remote() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping forgejo permalink test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		std::fs::write(dir.path().join("x.txt"), "one\ntwo\n").unwrap();
+		run_git(&git, dir.path(), &["init", "-q"]);
+		run_git(&git, dir.path(), &["config", "user.email", "a@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "A"]);
+		run_git(&git, dir.path(), &["add", "x.txt"]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "init"]);
+		run_git(
+			&git,
+			dir.path(),
+			&["remote", "add", "origin", "git@codeberg.org:moon/ide.git"],
+		);
+
+		let sha = String::from_utf8(
+			std::process::Command::new(&git)
+				.arg("-C")
+				.arg(dir.path())
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.unwrap()
+				.stdout,
+		)
+		.unwrap()
+		.trim()
+		.to_owned();
+
+		let link = host(&dir)
+			.git_permalink(Utf8Path::new("x.txt"), 1, 2)
+			.await
+			.unwrap()
+			.expect("permalink should be Some for a codeberg repo");
+		assert_eq!(
+			link.url,
+			format!("https://codeberg.org/moon/ide/src/commit/{sha}/x.txt#L1-L2")
+		);
+	}
+
 	#[tokio::test]
 	async fn git_permalink_returns_none_without_github_remote() {
 		let Some(git) = which_git() else {
@@ -7645,73 +7745,6 @@ mod tests {
 		let lines = ["head", "head", "first", "second", "tail"];
 		let fp = super::review_fingerprint("first\nsecond");
 		assert_eq!(super::resolve_anchor_in(&lines, 1, 2, &fp), Some((3, 4)));
-	}
-
-	#[test]
-	fn parse_git_config_remote_url_finds_the_right_section() {
-		let config = "[core]\n\
-			\trepositoryformatversion = 1\n\
-			[extensions]\n\
-			\trelativeworktrees = true\n\
-			[remote \"origin\"]\n\
-			\turl = git@github.com:moon/ide.git\n\
-			\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
-			[remote \"upstream\"]\n\
-			\turl = https://github.com/moon/upstream.git\n\
-			[branch \"main\"]\n\
-			\tremote = origin\n";
-		assert_eq!(
-			super::parse_git_config_remote_url(config, "origin"),
-			Some("git@github.com:moon/ide.git".into()),
-		);
-		assert_eq!(
-			super::parse_git_config_remote_url(config, "upstream"),
-			Some("https://github.com/moon/upstream.git".into()),
-		);
-		assert_eq!(super::parse_git_config_remote_url(config, "fork"), None);
-		// A `url` key outside any remote section must not match.
-		assert_eq!(
-			super::parse_git_config_remote_url("[core]\n\turl = x\n", "origin"),
-			None
-		);
-	}
-
-	#[test]
-	fn normalize_remote_url_handles_all_shapes() {
-		// SCP-style SSH is what `git clone git@github.com:...` leaves
-		// behind.
-		assert_eq!(
-			super::normalize_remote_url("git@github.com:moon/ide.git"),
-			Some("https://github.com/moon/ide".into()),
-		);
-		assert_eq!(
-			super::normalize_remote_url("git@github.com:moon/ide"),
-			Some("https://github.com/moon/ide".into()),
-		);
-		// Explicit SSH URL with and without the `git@` user.
-		assert_eq!(
-			super::normalize_remote_url("ssh://git@github.com/moon/ide.git"),
-			Some("https://github.com/moon/ide".into()),
-		);
-		assert_eq!(
-			super::normalize_remote_url("ssh://github.com/moon/ide.git"),
-			Some("https://github.com/moon/ide".into()),
-		);
-		// HTTPS is already close to right, we just trim `.git`.
-		assert_eq!(
-			super::normalize_remote_url("https://github.com/moon/ide.git"),
-			Some("https://github.com/moon/ide".into()),
-		);
-		assert_eq!(
-			super::normalize_remote_url("https://github.com/moon/ide"),
-			Some("https://github.com/moon/ide".into()),
-		);
-		// Unknown hosts are rejected until we add mapping for them —
-		// better to leave the frontend un-linkified than to guess at
-		// a URL convention.
-		assert_eq!(super::normalize_remote_url("https://gitlab.com/moon/ide.git"), None);
-		assert_eq!(super::normalize_remote_url("git@bitbucket.org:moon/ide.git"), None);
-		assert_eq!(super::normalize_remote_url(""), None);
 	}
 
 	#[test]
@@ -10488,9 +10521,9 @@ mod tests {
 			BranchListEntry::Local { is_current: true, name, .. } if name == "feat/newer"
 		));
 
-		// No remote configured → not a GitHub repo, so the PR
+		// No remote configured → no recognised forge, so the PR
 		// section is suppressed without contacting gh.
-		assert!(matches!(result.pr_status, PrListStatus::NotGithub));
+		assert!(matches!(result.pr_status, PrListStatus::UnsupportedRemote));
 		assert!(result.prs.is_empty());
 	}
 
@@ -10598,9 +10631,9 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn branch_list_pr_section_signals_not_github_for_non_github_remote() {
+	async fn branch_list_pr_section_signals_unsupported_for_unrecognised_remote() {
 		let Some(git) = which_git() else {
-			eprintln!("git not on PATH — skipping non-github remote test");
+			eprintln!("git not on PATH — skipping unrecognised remote test");
 			return;
 		};
 		let root = TempDir::new().unwrap();
@@ -10619,11 +10652,11 @@ mod tests {
 
 		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
 		let result = LocalHost::new(utf8).branch_list(PrListScope::All).await.unwrap();
-		// A non-GitHub remote short-circuits before we ever spawn
+		// An unrecognised remote short-circuits before we ever spawn
 		// `gh`, regardless of whether gh is installed.
 		assert!(
-			matches!(result.pr_status, PrListStatus::NotGithub),
-			"expected NotGithub, got {:?}",
+			matches!(result.pr_status, PrListStatus::UnsupportedRemote),
+			"expected UnsupportedRemote, got {:?}",
 			result.pr_status
 		);
 		assert!(result.prs.is_empty());

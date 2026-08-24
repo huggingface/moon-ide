@@ -1,7 +1,7 @@
 // Shared right-click menu for the code editors. Mounted by both
 // `Editor.svelte` and the diff view's editable right-hand pane so
 // the two surfaces offer the same actions (Rename symbol, Copy
-// GitHub link) with one implementation.
+// repo link) with one implementation.
 //
 // The menu reuses `ContextMenu.svelte` portaled onto `document.body`
 // — same approach as the tab strip's menu — so the popover isn't
@@ -54,11 +54,11 @@ async function copyToClipboard(text: string, label: string): Promise<void> {
 
 async function copyPermalink(view: EditorView, path: string): Promise<void> {
 	const { startLine, endLine } = selectedLineRange(view);
-	const label = 'GitHub link';
+	const label = 'repo link';
 	try {
 		const link = await ipc.fs.gitPermalink(path, startLine, endLine);
 		if (link === null) {
-			workspace.flash('No GitHub link (not a GitHub repo or no commits)');
+			workspace.flash('No repo link (unsupported remote or no commits)');
 			return;
 		}
 		await copyToClipboard(link.url, label);
@@ -104,7 +104,7 @@ export class EditorContextMenu {
 
 		// Place the caret at the click position unless the click lands
 		// inside the existing selection, so "Rename symbol" / "Copy
-		// GitHub link" target what the user actually right-clicked on
+		// repo link" target what the user actually right-clicked on
 		// rather than wherever the caret happened to be.
 		const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
 		const sel = view.state.selection.main;
@@ -123,8 +123,8 @@ export class EditorContextMenu {
 				},
 			},
 			{
-				id: 'copy-github-link',
-				label: 'Copy GitHub link',
+				id: 'copy-repo-link',
+				label: 'Copy repo link',
 				onSelect: () => {
 					void copyPermalink(view, path);
 				},

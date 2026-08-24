@@ -74,6 +74,10 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
   its dependency tree stays isolated from any project venv.
 - **`gh`** from GitHub's official apt repo (Debian's `gh`
   trails upstream by a release or two).
+- **`fj`** (forgejo-cli, pinned) — the `gh` counterpart for
+  Forgejo / Codeberg-hosted repos. Built from source in a
+  dedicated builder stage because upstream's release binaries
+  need glibc >= 2.38 and bookworm ships 2.36.
 - **`mongosh`** (the MongoDB shell) and the **MongoDB
   database tools** (`mongodump`, `mongorestore`,
   `mongoexport`, `mongoimport`, `bsondump`, `mongostat`,

@@ -343,12 +343,13 @@ pub async fn fs_git_blame(state: State<'_, AppState>, path: String) -> Result<Op
 	entry.host.git_blame(&path).await
 }
 
-/// GitHub permalink (URL + Markdown) for `path` over the inclusive,
+/// Repo permalink (URL + Markdown) for `path` over the inclusive,
 /// 1-based line range `start_line..=end_line`. Pins the current
 /// `HEAD` commit SHA so the link survives later commits. Returns
-/// `None` (serialised as `null`) when the folder isn't a GitHub-remote
-/// repo, has no commits, or `git` isn't available — the editor's
-/// "Copy GitHub link" menu items grey out in that case.
+/// `None` (serialised as `null`) when the folder's remote isn't a
+/// recognised forge (GitHub / Forgejo), has no commits, or `git`
+/// isn't available — the editor's "Copy repo link" menu items grey
+/// out in that case.
 #[tauri::command]
 pub async fn fs_git_permalink(
 	state: State<'_, AppState>,
@@ -375,10 +376,12 @@ pub async fn fs_git_blob_sha(state: State<'_, AppState>, path: String) -> Result
 }
 
 /// Publish a batch of local review-comment drafts to the current
-/// branch's GitHub PR as one review (Phase 5.7.2). Shells out to
-/// `gh`; returns `NoPr` when the branch has no open PR, else
-/// `Published` with the posted count, the ids that couldn't be
-/// placed at the PR head, and the review URL.
+/// branch's PR as one review (Phase 5.7.2). Shells out to `gh` on
+/// GitHub remotes, POSTs to the instance's REST API (with the fj
+/// CLI's stored token) on Forgejo remotes; returns `NoPr` when the
+/// branch has no open PR, else `Published` with the posted count,
+/// the ids that couldn't be placed at the PR head, and the review
+/// URL.
 #[tauri::command]
 pub async fn fs_publish_pr_review(
 	state: State<'_, AppState>,
@@ -585,22 +588,24 @@ pub async fn fs_git_merge_abort(state: State<'_, AppState>) -> Result<(), MoonEr
 	entry.host.git_merge_abort().await
 }
 
-/// Recent local branches + open GitHub PRs for the branch-switcher
+/// Recent local branches + open PRs for the branch-switcher
 /// palette. Local branches always populate (single-digit ms `git
-/// for-each-ref`); the PR section depends on `gh` being installed,
-/// signed in, and the active folder's remote being on GitHub —
-/// each "no" surfaces as a [`PrListStatus`](moon_protocol::git::PrListStatus)
-/// the frontend renders as the section's empty-state row.
+/// for-each-ref`); the PR section depends on the active folder's
+/// remote being a recognised forge and its data path being usable
+/// (`gh` installed + signed in for GitHub, the fj CLI's token for
+/// Forgejo) — each "no" surfaces as a
+/// [`PrListStatus`](moon_protocol::git::PrListStatus) the frontend
+/// renders as the section's empty-state row.
 #[tauri::command]
 pub async fn fs_branch_list(state: State<'_, AppState>, pr_scope: PrListScope) -> Result<BranchList, MoonError> {
 	let entry = state.workspaces.require_active_folder().await?;
 	entry.host.branch_list(pr_scope).await
 }
 
-/// URL of the open GitHub PR for the active folder's current
-/// branch, or `null` when there's no matching PR / `gh` isn't
-/// available. The SCM panel uses this to retarget the "Open PR"
-/// button at the existing PR when one exists, instead of the
+/// URL of the open PR for the active folder's current branch, or
+/// `null` when there's no matching PR / the forge's data path
+/// isn't available. The SCM panel uses this to retarget the "Open
+/// PR" button at the existing PR when one exists, instead of the
 /// create-PR URL `GitBranchInfo.prUrl` always carries.
 #[tauri::command]
 pub async fn fs_git_existing_pr_url(state: State<'_, AppState>) -> Result<Option<String>, MoonError> {
@@ -608,9 +613,10 @@ pub async fn fs_git_existing_pr_url(state: State<'_, AppState>) -> Result<Option
 	entry.host.git_existing_pr_url().await
 }
 
-/// `git switch <name>` (Local) or `gh pr checkout <number>` (Pr).
-/// Errors propagate git / gh stderr verbatim — dirty-tree refusal,
-/// missing branch, gh auth required, network failure — so the
+/// `git switch <name>` (Local) or `gh pr checkout <number>` /
+/// `fj pr checkout <number>` (Pr, picked from the remote's forge).
+/// Errors propagate the CLI's stderr verbatim — dirty-tree refusal,
+/// missing branch, auth required, network failure — so the
 /// frontend's flash carries the actionable hint without us
 /// re-wrapping it.
 #[tauri::command]

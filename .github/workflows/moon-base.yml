@@ -95,6 +95,7 @@ jobs:
             uv --version
             hf --version
             gh --version | head -1
+            fj version
             rg --version | head -1
             fzf --version
             jq --version

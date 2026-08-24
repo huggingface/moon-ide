@@ -6,7 +6,7 @@
 # moon-ide checkout is buildable per ADR 0005), a recent git (>= 2.48,
 # prebuilt from the git-core PPA — for relative-path worktrees, ADR
 # 0029), rustup with the stable toolchain, bun, the polyglot CLIs we
-# use across most repos in the org (gh, uv, hf) plus comfort tooling
+# use across most repos in the org (gh, fj, uv, hf) plus comfort tooling
 # (ripgrep, fzf, bat, jq), a Playwright browser runtime for the
 # coder's MCP preset (system deps + one pre-installed chromium,
 # ADR 0033), and a non-root `dev` user with passwordless
@@ -19,6 +19,20 @@
 # Specs: ../../specs/containers.md
 # ADRs:  ../../specs/decisions/0007-compose-and-moon-base.md
 #        ../../specs/decisions/0008-host-shared-daemon.md
+
+# Builder stage for fj (forgejo-cli). Upstream's release binaries
+# are linked against glibc 2.38/2.39 and refuse to start on
+# bookworm's 2.36 (`GLIBC_2.38 not found`), so we build from
+# source on a bookworm-based rust image — same glibc as the
+# final image below. CI builds each arch on a native runner
+# (no QEMU), so this stage compiles natively per-arch; no
+# cross-compilation setup needed. The stage is discarded after
+# the `COPY --from` — its toolchain and caches never reach the
+# published image. Pin the rust tag and the crate version;
+# bumps are intentional, same as the Go / uv / helm pins.
+FROM rust:1.98.0-bookworm AS fj-build
+ARG FJ_VERSION=0.6.0
+RUN cargo install forgejo-cli --version "${FJ_VERSION}" --locked
 
 FROM debian:bookworm-slim
 
@@ -150,6 +164,20 @@ RUN install -m 0755 -d /etc/apt/keyrings \
  && apt-get update \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
+
+# fj (forgejo-cli) — the `gh` counterpart for the Forgejo /
+# Codeberg-hosted repos we touch. Built from source in the
+# fj-build stage at the top of this file because upstream's
+# release binaries need glibc >= 2.38 and bookworm ships 2.36;
+# see the stage comment for details. Runtime link deps are
+# already satisfied: libssl3 via the tauri build-dep layer,
+# zlib in the base image.
+COPY --from=fj-build /usr/local/cargo/bin/fj /usr/local/bin/fj
+# `fj version` (there is no `--version` flag) creates a keys file
+# under $HOME on first run; point it at a scratch dir so the
+# sanity check doesn't bake root-owned state into the layer.
+RUN HOME=/tmp/fj-smoke fj version \
+ && rm -rf /tmp/fj-smoke
 
 # mongosh (the MongoDB shell) plus the database tools
 # (`mongodump` / `mongorestore` / `mongoexport` / ...) from

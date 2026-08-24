@@ -2,11 +2,12 @@
 
 /**
  * One row in the branch-switcher palette. Two kinds today: a
- * local branch (or remote-tracking ref already fetched) and a
- * GitHub PR sourced from `gh pr list`. The discriminant drives
- * the switch verb on the backend — `git switch <name>` for
- * `Local`, `gh pr checkout <number>` for `Pr` (so cross-fork PRs
- * get the fork-fetching dance for free).
+ * local branch (or remote-tracking ref already fetched) and an
+ * open PR sourced from `gh pr list` (GitHub) or the Forgejo REST
+ * API. The discriminant drives the switch verb on the backend —
+ * `git switch <name>` for `Local`, `gh pr checkout <number>` /
+ * `fj pr checkout <number>` for `Pr` (so cross-fork PRs get the
+ * fork-fetching dance for free).
  *
  * Frontend renders both in a single list with a section header
  * per kind; type-to-filter spans both. See
@@ -51,7 +52,7 @@ isCurrent: boolean,
 isDefault: boolean, } | { "kind": "pr", 
 /**
  * PR number (the `#42` segment). 32-bit fits every
- * realistic GitHub repo's PR count.
+ * realistic repo's PR count.
  */
 number: number, 
 /**
@@ -60,7 +61,7 @@ number: number,
  */
 title: string, 
 /**
- * GitHub login of the PR's author (no `@` prefix). The
+ * Forge login of the PR's author (no `@` prefix). The
  * frontend prepends `@` itself so the wire format
  * stays clean.
  */

@@ -135,7 +135,7 @@
 	const reviewEnabled = $derived(workspace.isReviewableBranch && !file.isDeleted);
 
 	// Right-click menu on the editable right-hand (working-tree) pane —
-	// same "Rename symbol" + "Copy GitHub link" actions as the regular
+	// same "Rename symbol" + "Copy repo link" actions as the regular
 	// editor, shared via `EditorContextMenu`. Left-pane (HEAD) clicks
 	// fall through to the platform menu.
 	const editorMenu = new EditorContextMenu();

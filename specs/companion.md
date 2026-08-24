@@ -280,8 +280,8 @@ requested surface:
   the list, a session that fails to replay falls back to its
   workspace.
 - **Issue-reference autolinks.** Assistant markdown linkifies
-  standalone `#123` to `<repo web url>/issues/123` (GitHub
-  redirects PRs), where the repo URL comes from the active folder's
+  standalone `#123` to `<repo web url>/issues/123` (GitHub and
+  Forgejo redirect PRs), where the repo URL comes from the active folder's
   origin/upstream remote (`remote_url` on `workspace_scm_status`,
   via `WorkspaceHost::git_remote_web_url`). Token-stream rule, so
   references inside existing links or code spans are untouched.

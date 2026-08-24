@@ -227,7 +227,9 @@ What it ships:
 - **Debian stable** (not the Microsoft devcontainers family — we'd
   rather control the base for a long-lived workspace container).
 - **Polyglot toolchain**: `bun`, rustup + stable, `fnm` + Node LTS +
-  Corepack, `uv`, Go (user-mode, pinned), the `hf` CLI, `gh`, plus
+  Corepack, `uv`, Go (user-mode, pinned), the `hf` CLI, `gh`,
+  `fj` (forgejo-cli, built from source — upstream binaries need a
+  newer glibc than bookworm's), plus
   comfort tooling (`git`, `ripgrep`, `fzf`, `bat`, `jq`). Projects
   pin their own versions via `.nvmrc` / `rust-toolchain.toml` /
   `pyproject.toml` / `go.mod`.
@@ -627,6 +629,25 @@ per-workspace re-login; `gh auth logout` skips it. A non-zero
 The IDE's own `gh pr list` / `checkout` (branch-switcher palette)
 runs against the host's `gh`; the forward exists so a container
 terminal feels the same.
+
+## `fj` (Forgejo) credential forwarding
+
+The host's `fj` (forgejo-cli) data dir bind-mounts read-only at
+`/home/dev/.local/share/forgejo-cli` (resolved
+`$XDG_DATA_HOME/forgejo-cli` → `~/.local/share/forgejo-cli` → macOS
+`~/Library/Application Support/forgejo-cli.forgejo-cli` → legacy
+`~/Library/Application Support/Cyborus.forgejo-cli`; skipped if
+absent or missing `keys.json`). `keys.json` is fj's whole credential
+store — there is no env-var token path — and both the in-container
+`fj` and moon-ide's own Forgejo REST calls read it. Read-only for
+the same reason gh's config is: an in-container `fj auth login`
+mutating host state would be surprising.
+
+Consequence: OAuth-style fj logins cannot refresh their token from
+inside the container (the refresh rewrites `keys.json`), so
+token-based fj logins are the reliable path for containers; a
+host-side `fj` run refreshes OAuth tokens for the container to pick
+up.
 
 ## Editor forwarding
 

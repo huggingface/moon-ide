@@ -16,7 +16,7 @@ export type BranchList = {
  */
 local: Array<BranchListEntry>, 
 /**
- * Open GitHub PRs against the active folder's repo. Empty
+ * Open PRs against the active folder's repo. Empty
  * when [`pr_status`](Self::pr_status) is anything other
  * than `Ok`; capped at 30. Sub-filters (`@me`, "review
  * requested") are deferred — type-to-filter handles the

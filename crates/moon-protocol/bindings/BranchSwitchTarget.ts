@@ -2,7 +2,8 @@
 
 /**
  * Argument for `branch_switch`. `Local` runs `git switch
- * <name>`; `Pr` runs `gh pr checkout <number>` so cross-fork
- * PRs work without manual remote / fetch fiddling.
+ * <name>`; `Pr` runs `gh pr checkout <number>` (GitHub) or
+ * `fj pr checkout <number>` (Forgejo) so cross-fork PRs work
+ * without manual remote / fetch fiddling.
  */
 export type BranchSwitchTarget = { "kind": "local", name: string, } | { "kind": "pr", number: number, };

@@ -67,6 +67,7 @@ fn workspace_compose_is_dev_only_with_one_mount_per_folder() {
 		git_identity: None,
 		gh_config: None,
 		gh_token: None,
+		fj_data: None,
 		moon_edit_socket: None,
 	});
 

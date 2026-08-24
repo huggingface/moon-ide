@@ -344,6 +344,39 @@ pub struct HostGhToken {
 	pub token: String,
 }
 
+/// In-container path the host's `fj` (forgejo-cli) data dir is
+/// mounted at. Pinned to the Linux default (`dev`'s
+/// `~/.local/share/forgejo-cli`) so the in-container `fj` finds
+/// `keys.json` without any override, wherever the host keeps the
+/// dir (XDG data dir, macOS Application Support).
+pub const FJ_DATA_CONTAINER_PATH: &str = "/home/dev/.local/share/forgejo-cli";
+
+/// Bind-mount of the host's `fj` (forgejo-cli) data directory
+/// into the dev container, read-only. The `keys.json` inside is
+/// fj's whole credential store — fj has no env-var token path
+/// like `GH_TOKEN` — so this mount alone carries the auth for
+/// both an in-container `fj` and moon-ide's own Forgejo REST
+/// calls.
+///
+/// Read-only for the same reasons as [`GhConfigMount`]: the host
+/// owns the auth, and an in-container `fj auth login` silently
+/// rewriting the host's `keys.json` would be surprising. Known
+/// cost: OAuth-style fj logins refresh their token by rewriting
+/// `keys.json`, which a read-only mount forbids — token-based fj
+/// logins are the reliable shape for containers, and a host-side
+/// `fj` run refreshes OAuth state for the container to pick up.
+///
+/// The lifecycle layer skips the mount when no host candidate
+/// dir holds a `keys.json` (see
+/// [`crate::lifecycle::detect_host_fj_data_dir`]) — mounting an
+/// empty or missing dir would let Docker auto-create it and
+/// shadow a later host login, same rule as the gh config mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FjDataMount {
+	/// Absolute host-side path to the fj data directory.
+	pub host_path: Utf8PathBuf,
+}
+
 /// The host's `git config --global user.{name,email}`, projected
 /// into the dev container as `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
 /// environment variables.
@@ -422,6 +455,11 @@ pub struct ComposeRenderOptions<'a> {
 	/// dependent on whatever the bind-mounted config contains —
 	/// which is empty when the host uses the system keyring.
 	pub gh_token: Option<&'a HostGhToken>,
+	/// Optional host `fj` (forgejo-cli) data-dir bind mount.
+	/// `None` skips the volume entirely (the in-container `fj`
+	/// is then unauthenticated). No companion env var — fj reads
+	/// credentials only from `keys.json`.
+	pub fj_data: Option<&'a FjDataMount>,
 	/// Optional bind-mount of the workspace's socket directory
 	/// for editor forwarding. The lifecycle layer typically
 	/// populates this unconditionally — the `run/` directory is
@@ -488,11 +526,13 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 		|| options.ssh_config.is_some()
 		|| options.ssh_known_hosts.is_some()
 		|| options.gh_config.is_some()
+		|| options.fj_data.is_some()
 		|| options.moon_edit_socket.is_some();
 	if options.bound_mounts.is_empty() && !has_extra_mount {
 		// Empty list is valid YAML and compose accepts it; this
 		// keeps the structure consistent for the no-folder /
-		// no-ssh-agent / no-ssh-config / no-gh-config edge case.
+		// no-ssh-agent / no-ssh-config / no-gh-config /
+		// no-fj-data edge case.
 		let _ = writeln!(yaml, "      []");
 	} else {
 		for mount in options.bound_mounts {
@@ -571,6 +611,16 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				"      - {host}:{container}:ro",
 				host = gh.host_path.as_str(),
 				container = GH_CONFIG_CONTAINER_PATH,
+			);
+		}
+		if let Some(fj) = options.fj_data {
+			// Read-only by design — same one-source-of-truth
+			// rule as the gh config mount.
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}:ro",
+				host = fj.host_path.as_str(),
+				container = FJ_DATA_CONTAINER_PATH,
 			);
 		}
 		if let Some(edit) = options.moon_edit_socket {
@@ -660,6 +710,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -698,6 +749,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("    init: true"));
@@ -721,6 +773,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -746,6 +799,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		};
 		let a = generate_compose(opts.clone());
@@ -768,6 +822,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
@@ -787,6 +842,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
@@ -809,6 +865,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -846,6 +903,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 		assert!(render
@@ -880,6 +938,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -910,6 +969,7 @@ mod tests {
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -945,6 +1005,7 @@ mod tests {
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -976,6 +1037,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1009,6 +1071,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1043,6 +1106,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1073,6 +1137,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1111,6 +1176,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1137,6 +1203,7 @@ mod tests {
 			git_identity: None,
 			gh_config: Some(&gh),
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1164,12 +1231,43 @@ mod tests {
 			git_identity: None,
 			gh_config: Some(&gh),
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
 		assert!(!render.yaml.contains("    volumes:\n      []"));
 		assert!(
 			render.yaml.contains("- /home/me/.config/gh:/home/dev/.config/gh:ro"),
+			"got:\n{}",
+			render.yaml
+		);
+	}
+
+	#[test]
+	fn fj_data_mount_renders_read_only_volume() {
+		let project = project();
+		let fj = FjDataMount {
+			host_path: Utf8PathBuf::from("/home/me/.local/share/forgejo-cli"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			ssh_public_keys: &[],
+			ssh_config: None,
+			ssh_known_hosts: None,
+			git_identity: None,
+			gh_config: None,
+			gh_token: None,
+			fj_data: Some(&fj),
+			moon_edit_socket: None,
+		});
+
+		assert!(
+			render
+				.yaml
+				.contains("- /home/me/.local/share/forgejo-cli:/home/dev/.local/share/forgejo-cli:ro"),
 			"got:\n{}",
 			render.yaml
 		);
@@ -1192,6 +1290,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: Some(&token),
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1220,6 +1319,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: Some(&token),
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 
@@ -1248,6 +1348,7 @@ mod tests {
 			git_identity: Some(&identity),
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: None,
 		});
 		// Double-quoted scalar with `"` → `\"` and `\` → `\\`.
@@ -1277,6 +1378,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: Some(&edit),
 		});
 		// Read-write (no `:ro` suffix) — Unix-socket connect needs
@@ -1317,6 +1419,7 @@ mod tests {
 			git_identity: None,
 			gh_config: None,
 			gh_token: None,
+			fj_data: None,
 			moon_edit_socket: Some(&edit),
 		});
 		assert!(!render.yaml.contains("volumes:\n      []"));

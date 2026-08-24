@@ -1704,8 +1704,9 @@ rows render as markdown (the task is model-authored prose with
 headings / bullets / fences); parent user rows stay plain text.
 
 Transcript markdown autolinks standalone `#123` issue/PR references
-to the active folder's remote (`fs_git_remote_web_url`, GitHub-style
-`/issues/N`); references inside existing links or code spans are
+to the active folder's remote (`fs_git_remote_web_url`, `/issues/N`
+— GitHub and Forgejo both redirect PRs); references inside existing
+links or code spans are
 untouched, and the render caches key off the repo URL so a folder
 swap can't serve another repo's links. Same rule as the companion.
 

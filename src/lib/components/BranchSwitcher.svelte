@@ -201,7 +201,7 @@
 	});
 
 	// PR section's empty-state message. The frontend treats
-	// `not_github` as "suppress the section entirely" — no
+	// `unsupported_remote` as "suppress the section entirely" — no
 	// header, no message.
 	const prEmptyMessage: string | null = $derived.by(() => {
 		const status = workspace.branchSwitcher.list.prStatus;
@@ -215,12 +215,14 @@
 			return 'gh is signed out. Run `gh auth login` in a terminal.';
 		}
 		if (status.kind === 'failed') {
-			return `gh pr list failed: ${status.detail}`;
+			return `PR list failed: ${status.detail}`;
 		}
 		return null;
 	});
 
-	const showPrSection: boolean = $derived.by(() => workspace.branchSwitcher.list.prStatus.kind !== 'not_github');
+	const showPrSection: boolean = $derived.by(
+		() => workspace.branchSwitcher.list.prStatus.kind !== 'unsupported_remote',
+	);
 </script>
 
 {#snippet localRow(entry: Extract<BranchListEntry, { kind: 'local' }>, idx: number)}
