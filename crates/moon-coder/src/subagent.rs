@@ -776,8 +776,15 @@ async fn run_subagent_wrapped(
 	let format_queue = Arc::new(crate::tools::FormatQueue::default());
 	// Per-turn background-process registry (ADR 0034). Same
 	// lifetime as the format queue — cleaned up regardless of how
-	// the sub-agent ended.
+	// the sub-agent ended. Settlement notices ride the parent's
+	// sink wrapped in `SubagentEvent` so the pop-out transcript
+	// flips its `bash` rows like the parent's does.
 	let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
+	{
+		let sink = sink.clone();
+		let id_for_sink = id.clone();
+		background.set_event_sink(Arc::new(move |event| sink.send(wrap_inner(&id_for_sink, event))));
+	}
 
 	// Scoped per sub-agent id, not inherited from the parent turn:
 	// each sub-agent has its own stable prompt prefix, so pinning it
@@ -1196,7 +1203,9 @@ async fn run_subagent_loop(
 				// registry dispatch.
 				handle_subagent_todo_write(&mut todos, &args, session_dir, header).await
 			} else {
-				tools.dispatch(&call.function.name, &args, &cx, &cancel).await
+				tools
+					.dispatch_with_call_id(&call.function.name, &args, &cx, &cancel, &call.id)
+					.await
 			};
 			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
 			// Same image convention as the parent runner: a

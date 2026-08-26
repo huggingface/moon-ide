@@ -376,14 +376,31 @@ impl FormatQueue {
 /// expected to poll `read_process` until completion before finishing
 /// its answer. Processes that are still running when the turn ends
 /// are killed as a safety net.
+///
+/// When a sink is attached ([`Self::set_event_sink`]), every
+/// settlement — natural exit observed by `read_process`, a
+/// `stop_process` kill, or the turn-end cleanup — emits a live-only
+/// [`CoderEvent::BackgroundProcessExited`] so the panel can flip the
+/// spawning `bash` row out of its "detached, still running" state.
+/// Settlement-event sink for a [`BackgroundProcessRegistry`]: the
+/// runner installs one per turn (sub-agent runs wrap theirs in
+/// `SubagentEvent` so the pop-out sees the same updates).
+type BgEventSink = Arc<dyn Fn(crate::event::CoderEvent) + Send + Sync>;
+
 #[derive(Default)]
 pub struct BackgroundProcessRegistry {
 	entries: Mutex<Vec<BackgroundProcess>>,
+	/// Event sink for settlement notifications. Set by the runner
+	/// right after construction.
+	event_sink: Mutex<Option<BgEventSink>>,
 }
 
 struct BackgroundProcess {
 	/// Opaque id returned to the model (e.g. `"bg_0"`, `"bg_1"`).
 	id: String,
+	/// The spawning `bash` tool call's id — carried onto the
+	/// settlement event so the panel can find the row.
+	tool_call_id: String,
 	/// The original command string — echoed back in `read_process`
 	/// results so the model doesn't have to track it separately.
 	cmd: String,
@@ -398,9 +415,43 @@ struct BackgroundProcess {
 	/// Exit code captured when the process was reaped, so subsequent
 	/// `read_process` calls after completion can still report it.
 	exit_code: Option<i32>,
+	/// Settlement event already emitted. Guards against
+	/// double-reporting when `cleanup` follows a `read_process`
+	/// that already observed the exit.
+	notified: bool,
 }
 
 impl BackgroundProcessRegistry {
+	/// Attach the settlement-event sink. Called once by the runner
+	/// right after construction, before any `bash` call can spawn
+	/// into the registry.
+	pub fn set_event_sink(&self, sink: BgEventSink) {
+		if let Ok(mut guard) = self.event_sink.lock() {
+			*guard = Some(sink);
+		}
+	}
+
+	/// Emit the settlement event for `proc` if not already sent.
+	/// Callers must hold the `entries` lock. `killed` distinguishes
+	/// `stop_process` / turn-end-cleanup kills from natural exits.
+	fn notify_exit_locked(&self, proc: &mut BackgroundProcess, killed: bool) {
+		if proc.notified {
+			return;
+		}
+		proc.notified = true;
+		let Ok(sink_guard) = self.event_sink.lock() else {
+			return;
+		};
+		if let Some(sink) = sink_guard.as_ref() {
+			sink(crate::event::CoderEvent::BackgroundProcessExited {
+				tool_call_id: proc.tool_call_id.clone(),
+				id: proc.id.clone(),
+				killed,
+				exit_code: proc.exit_code,
+			});
+		}
+	}
+
 	/// Allocate the next monotonic id for a background process.
 	/// Uses the current entry count so ids are unique within a turn
 	/// (`bg_0`, `bg_1`, …). Concurrent calls are serialized by the
@@ -418,6 +469,7 @@ impl BackgroundProcessRegistry {
 	fn spawn(
 		&self,
 		id: String,
+		tool_call_id: String,
 		mut command: tokio::process::Command,
 		cmd: String,
 		target: &'static str,
@@ -449,11 +501,13 @@ impl BackgroundProcessRegistry {
 		};
 		guard.push(BackgroundProcess {
 			id: id.clone(),
+			tool_call_id,
 			cmd,
 			target,
 			log_path: log_path.clone(),
 			child: Some(child),
 			exit_code: None,
+			notified: false,
 		});
 		Ok((id, log_path, pid))
 	}
@@ -569,8 +623,18 @@ impl BackgroundProcessRegistry {
 			exit_code = self.stored_exit_code(id);
 		}
 
-		// Store the exit code for future `read_process` calls.
+		// Store the exit code for future `read_process` calls, then
+		// report the settlement — same flip a natural exit or the
+		// turn-end cleanup produces.
 		self.store_exit_code(id, exit_code);
+		{
+			let Ok(mut guard) = self.entries.lock() else {
+				return Err(CoderError::tool_failed("stop_process", "registry lock poisoned"));
+			};
+			if let Some(proc) = guard.iter_mut().find(|p| p.id == id) {
+				self.notify_exit_locked(proc, killed);
+			}
+		}
 
 		Ok(json!({
 			"id": id,
@@ -591,11 +655,45 @@ impl BackgroundProcessRegistry {
 			std::mem::take(&mut *guard)
 		};
 		for mut proc in entries {
+			// A live child at turn end is killed; a `None` child means
+			// the process already exited (reaped by a poll) — that
+			// settle was a natural exit.
+			let mut killed = false;
 			if let Some(child) = &mut proc.child {
-				let _ = child.start_kill();
-				// Reap with a short timeout so a stuck process
-				// doesn't hang turn-end indefinitely.
-				let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+				// A process that exited on its own but was never
+				// polled still holds its handle — check before
+				// killing so it reports as a natural exit.
+				match child.try_wait() {
+					Ok(Some(status)) => {
+						proc.exit_code = status.code();
+					}
+					_ => {
+						killed = true;
+						let _ = child.start_kill();
+						// Reap with a short timeout so a stuck
+						// process doesn't hang turn-end
+						// indefinitely.
+						if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+							proc.exit_code = status.code();
+						}
+					}
+				}
+				proc.child = None;
+			}
+			// Report the settlement (natural exit seen only now, or
+			// the cleanup's own kill) unless a poll already did.
+			if !proc.notified {
+				let Ok(guard) = self.event_sink.lock() else {
+					continue;
+				};
+				if let Some(sink) = guard.as_ref() {
+					sink(crate::event::CoderEvent::BackgroundProcessExited {
+						tool_call_id: proc.tool_call_id.clone(),
+						id: proc.id.clone(),
+						killed,
+						exit_code: proc.exit_code,
+					});
+				}
 			}
 			let _ = std::fs::remove_file(&proc.log_path);
 		}
@@ -620,6 +718,7 @@ impl BackgroundProcessRegistry {
 					// stays so `read_process` can still report.
 					proc.exit_code = status.code();
 					proc.child = None;
+					self.notify_exit_locked(proc, false);
 					return true;
 				}
 				Ok(None) => return false,
@@ -645,6 +744,7 @@ impl BackgroundProcessRegistry {
 				Ok(Some(status)) => {
 					proc.exit_code = status.code();
 					proc.child = None;
+					self.notify_exit_locked(proc, false);
 					(false, status.code())
 				}
 				Ok(None) => (true, None),
@@ -1590,6 +1690,21 @@ impl ToolRegistry {
 		cx: &ToolContext,
 		cancel: &CancellationToken,
 	) -> Result<Value, CoderError> {
+		self.dispatch_with_call_id(name, args, cx, cancel, "").await
+	}
+
+	/// [`Self::dispatch`] with the provider's tool-call id, needed
+	/// by `bash` so a detached spawn can stamp its settlement event
+	/// with the row that launched it. Callers without the id (tests,
+	/// future internal dispatches) use `dispatch`, which passes `""`.
+	pub async fn dispatch_with_call_id(
+		&self,
+		name: &str,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+		tool_call_id: &str,
+	) -> Result<Value, CoderError> {
 		match name {
 			"read_file" => self.read_file(args, cx).await,
 			"list_dir" => self.list_dir(args, cx).await,
@@ -1599,7 +1714,7 @@ impl ToolRegistry {
 			// `cargo check`, `pytest --collect-only`, …). The
 			// "don't mutate" half is enforced via the sub-agent's
 			// system prompt — see Phase C's `run_subagent`.
-			"bash" => self.bash(args, cx, cancel).await,
+			"bash" => self.bash(args, cx, cancel, tool_call_id).await,
 			"read_process" => self.read_process(args, cx, cancel).await,
 			"stop_process" => self.stop_process(args, cx).await,
 			// Reading a terminal is read-only against the user's own
@@ -1929,7 +2044,13 @@ impl ToolRegistry {
 		}))
 	}
 
-	async fn bash(&self, args: &Value, cx: &ToolContext, cancel: &CancellationToken) -> Result<Value, CoderError> {
+	async fn bash(
+		&self,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+		tool_call_id: &str,
+	) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct BashArgs {
 			cmd: String,
@@ -1950,7 +2071,9 @@ impl ToolRegistry {
 		// model polls via `read_process` and kills via `stop_process`.
 		if parsed.detach {
 			let id = cx.background.next_id();
-			let (id, log_path, pid) = cx.background.spawn(id, command, parsed.cmd.clone(), target_kind)?;
+			let (id, log_path, pid) =
+				cx.background
+					.spawn(id, tool_call_id.to_string(), command, parsed.cmd.clone(), target_kind)?;
 			return Ok(json!({
 				"detached": true,
 				"id": id,
@@ -4765,6 +4888,94 @@ mod tests {
 				.expect("nested bound folder path should resolve to the inner folder");
 			assert_eq!(out, "file.rs");
 			assert!(Arc::ptr_eq(&target, &inner_entry));
+		}
+	}
+
+	mod background_registry {
+		use crate::event::CoderEvent;
+		use crate::tools::BackgroundProcessRegistry;
+		use std::sync::{Arc, Mutex};
+
+		/// One settlement event, flattened for assertions:
+		/// `(tool_call_id, killed, exit_code)`.
+		type Collected = Arc<Mutex<Vec<(String, bool, Option<i32>)>>>;
+
+		/// Collect settlement events the registry emits.
+		fn collector() -> (crate::tools::BgEventSink, Collected) {
+			let events: Collected = Arc::new(Mutex::new(Vec::new()));
+			let events_clone = events.clone();
+			let sink = Arc::new(move |event: CoderEvent| {
+				if let CoderEvent::BackgroundProcessExited {
+					tool_call_id,
+					killed,
+					exit_code,
+					..
+				} = event
+				{
+					events_clone.lock().unwrap().push((tool_call_id, killed, exit_code));
+				}
+			});
+			(sink, events)
+		}
+
+		#[tokio::test]
+		async fn natural_exit_notifies_with_exit_code() {
+			let registry = BackgroundProcessRegistry::default();
+			let (sink, events) = collector();
+			registry.set_event_sink(sink);
+			let command = tokio::process::Command::new("true");
+			let (id, _log, _pid) = registry
+				.spawn("bg_0".into(), "call-1".into(), command, "true".into(), "host")
+				.unwrap();
+			assert_eq!(id, "bg_0");
+			// Wait for the child to exit, then observe it via the
+			// registry's poll path (the same one `read_process` uses).
+			for _ in 0..50 {
+				if registry.try_reap("bg_0") {
+					break;
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+			}
+			let got = events.lock().unwrap().clone();
+			assert_eq!(got, vec![("call-1".to_string(), false, Some(0))]);
+			// Idempotent: a later cleanup doesn't re-report.
+			registry.cleanup().await;
+			assert_eq!(events.lock().unwrap().len(), 1);
+		}
+
+		#[tokio::test]
+		async fn turn_end_cleanup_reports_kill_for_still_running() {
+			let registry = BackgroundProcessRegistry::default();
+			let (sink, events) = collector();
+			registry.set_event_sink(sink);
+			let mut command = tokio::process::Command::new("sleep");
+			command.arg("30");
+			registry
+				.spawn("bg_0".into(), "call-9".into(), command, "sleep 30".into(), "host")
+				.unwrap();
+			registry.cleanup().await;
+			let got = events.lock().unwrap().clone();
+			assert_eq!(got.len(), 1);
+			assert_eq!(got[0].0, "call-9");
+			assert!(got[0].1, "expected killed=true, got {got:?}");
+		}
+
+		#[tokio::test]
+		async fn stop_process_reports_kill() {
+			let registry = BackgroundProcessRegistry::default();
+			let (sink, events) = collector();
+			registry.set_event_sink(sink);
+			let mut command = tokio::process::Command::new("sleep");
+			command.arg("30");
+			registry
+				.spawn("bg_0".into(), "call-5".into(), command, "sleep 30".into(), "host")
+				.unwrap();
+			let result = registry.stop("bg_0").await.unwrap();
+			assert_eq!(result["killed"], true);
+			let got = events.lock().unwrap().clone();
+			assert_eq!(got.len(), 1);
+			assert_eq!(got[0].0, "call-5");
+			assert!(got[0].1, "expected killed=true, got {got:?}");
 		}
 	}
 

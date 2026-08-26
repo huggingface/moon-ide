@@ -490,10 +490,16 @@
 		if (!result) {
 			return '';
 		}
-		// bash returns {cmd, target, exit_code, stdout, stderr}.
+		// bash returns {cmd, target, exit_code, stdout, stderr} — or a
+		// detached-spawn shape when `detach: true` (ADR 0034).
 		if (name === 'bash') {
 			try {
 				const parsed = JSON.parse(result) as Record<string, unknown>;
+				if (parsed['detached'] === true) {
+					const id = typeof parsed['id'] === 'string' ? parsed['id'] : '?';
+					const pid = typeof parsed['pid'] === 'number' ? ` · pid ${parsed['pid']}` : '';
+					return `detached · id ${id}${pid}`;
+				}
 				const stdout = typeof parsed['stdout'] === 'string' ? (parsed['stdout'] as string) : '';
 				const stderr = typeof parsed['stderr'] === 'string' ? (parsed['stderr'] as string) : '';
 				const code = typeof parsed['exit_code'] === 'number' ? parsed['exit_code'] : null;
@@ -1069,8 +1075,12 @@
 				{@const workerId = workerSessionId(row.name, row.args, row.result)}
 				<details class="tool" class:error={row.status === 'error'}>
 					<summary>
-						<span class="pip" class:live={row.status === 'running'}></span>
+						<span class="pip" class:live={row.status === 'running' || row.bgStatus?.state === 'running'}></span>
 						<span class="tool-name">{toolSummary(row.name, row.args)}</span>
+						{#if row.bgStatus?.state === 'running'}<span class="tool-bg">detached · running</span
+							>{:else if row.bgStatus?.state === 'exited'}<span class="tool-bg"
+								>detached · exit {row.bgStatus.exitCode ?? '?'}</span
+							>{:else if row.bgStatus?.state === 'killed'}<span class="tool-bg">detached · killed</span>{/if}
 						{#if row.status === 'done'}<span class="tool-check">✓</span>{:else if row.status === 'error'}<span
 								class="tool-check">✗</span
 							>{/if}
@@ -1090,7 +1100,12 @@
 					{:else if body?.kind === 'content'}
 						<pre class="tool-content">{truncate(body.text, 400)}</pre>
 					{:else if row.result}
-						<div class="tool-result-preview">{toolResultPreview(row.name, row.result)}</div>
+						<div class="tool-result-preview">
+							{toolResultPreview(row.name, row.result)}{#if row.bgStatus?.state === 'running'}
+								{'\n'}still running…{:else if row.bgStatus?.state === 'exited'}
+								{'\n'}exit {row.bgStatus.exitCode ?? '?'}{:else if row.bgStatus?.state === 'killed'}
+								{'\n'}killed{/if}
+						</div>
 					{/if}
 					{#if row.images.length > 0}
 						<!-- Screenshots / image-file reads the tool
@@ -1614,6 +1629,14 @@
 	.tool-check {
 		flex: none;
 		font-size: 0.7rem;
+	}
+	/* Live state of a detached background process (ADR 0075),
+	   shown between the tool name and the done/error check. */
+	.tool-bg {
+		flex: none;
+		font-size: 0.65rem;
+		opacity: 0.7;
+		font-family: var(--mono, monospace);
 	}
 	.tool-invocation {
 		margin: 0.35rem 0 0.25rem;

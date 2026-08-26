@@ -169,6 +169,14 @@ export type TranscriptRow =
 			 *  text never carries the base64. */
 			images: ToolImage[];
 			status: 'running' | 'done' | 'error';
+			/** Live state of a detached background process this row
+			 *  spawned (`bash` with `detach: true`, ADR 0034). `null`
+			 *  for every other tool call. `'running'` is set when the
+			 *  spawn result lands; a `background_process_exited` event
+			 *  flips it to its terminal state (ADR 0075). Absent on
+			 *  replay — the event is live-only, so a reopened session
+			 *  shows the plain detached preview with no live claim. */
+			bgStatus: { state: 'running' } | { state: 'exited'; exitCode: number | null } | { state: 'killed' } | null;
 	  }
 	| {
 			kind: 'ask_user';
@@ -221,8 +229,15 @@ export type AskUserQuestion = {
 };
 
 /** One image a tool returned, in renderable form. Mirrors the
- * runner's `"images": [{ data_url, mime }]` convention. */
+ *  runner's `"images": [{ data_url, mime }]` convention. */
 export type ToolImage = { dataUrl: string; mime: string };
+
+/** Detect a detached `bash` spawn result — shape is
+ *  `{ detached: true, id, pid, log_path, cmd, target }` (ADR 0034).
+ *  Flips the row into its live process-running state (ADR 0075). */
+function isDetachedBashResult(result: unknown): boolean {
+	return typeof result === 'object' && result !== null && 'detached' in result && result.detached === true;
+}
 
 /** Extract the `images` key of a tool-result payload. `[]` for
  * anything else — error envelopes, text-only results, old
@@ -2524,6 +2539,7 @@ class CompanionState {
 						result: '',
 						images: [],
 						status: 'running',
+						bgStatus: null,
 					});
 				}
 				break;
@@ -2543,6 +2559,31 @@ class CompanionState {
 					const stripped = withoutToolImages(result);
 					const resultStr = typeof stripped === 'string' ? stripped : JSON.stringify(stripped);
 					this.#setToolResult(id, resultStr, isError ? 'error' : 'done', images);
+					// A detached `bash` spawn returns immediately —
+					// mark the row's process as still running until a
+					// `background_process_exited` event settles it
+					// (ADR 0075).
+					if (isDetachedBashResult(result)) {
+						const toolRow = rows.find((r) => r.kind === 'tool' && r.id === id);
+						if (toolRow && toolRow.kind === 'tool') {
+							toolRow.bgStatus = { state: 'running' };
+						}
+					}
+				}
+				break;
+			}
+			case 'background_process_exited': {
+				// Live-only settlement notice for a detached `bash`
+				// process (ADR 0075): natural exit, `stop_process`
+				// kill, or the turn-end cleanup reaping a
+				// still-running child.
+				const callId = str(ev, 'tool_call_id');
+				const toolRow = rows.find((r) => r.kind === 'tool' && r.id === callId);
+				if (toolRow && toolRow.kind === 'tool' && toolRow.bgStatus?.state === 'running') {
+					const exitCode = ev['exit_code'];
+					toolRow.bgStatus = bool(ev, 'killed')
+						? { state: 'killed' }
+						: { state: 'exited', exitCode: typeof exitCode === 'number' ? exitCode : null };
 				}
 				break;
 			}

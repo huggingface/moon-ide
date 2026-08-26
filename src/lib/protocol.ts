@@ -1710,6 +1710,14 @@ export type CoderEvent =
 			 *  records persisted before the field shipped. */
 			duration_ms?: number;
 	  }
+	/** A detached background process (a `bash` call with
+	 *  `detach: true`, ADR 0034) settled: natural exit, a
+	 *  `stop_process` kill, or the turn-end cleanup. Live-only —
+	 *  never persisted or replayed. `tool_call_id` is the spawning
+	 *  `bash` call's row id; `killed` distinguishes a kill from a
+	 *  natural exit; `exit_code` is whatever status was collected
+	 *  (`null` when a kill couldn't reap one). */
+	| { kind: 'background_process_exited'; tool_call_id: string; id: string; killed: boolean; exit_code: number | null }
 	| { kind: 'turn_complete' }
 	| { kind: 'aborted' }
 	| { kind: 'error'; message: string }

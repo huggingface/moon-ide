@@ -5850,6 +5850,14 @@ fn spawn_turn_loop(
 				let result = loop {
 					let format_queue = Arc::new(crate::tools::FormatQueue::default());
 					let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
+					// Live settlement notices for detached background
+					// processes (ADR 0034): the panel flips the spawning
+					// `bash` row out of "detached, still running" the
+					// moment the process exits or is reaped.
+					{
+						let sink = sink_for_turn.clone();
+						background.set_event_sink(Arc::new(move |event| sink.send(event)));
+					}
 					// Capture the baseline SHA at turn start for per-turn
 					// diff attribution (ADR 0030). `git stash create`
 					// snapshots the working tree without touching it; HEAD
@@ -6905,7 +6913,10 @@ async fn dispatch_tool_calls(
 			} else if call.function.name == "add_folder" {
 				handle_add_folder(state, sink, &args).await
 			} else {
-				state.tools.dispatch(&call.function.name, &args, cx, cancel).await
+				state
+					.tools
+					.dispatch_with_call_id(&call.function.name, &args, cx, cancel, &call.id)
+					.await
 			};
 			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
 			finish_tool_call(rt, sink, &call.id, &call.function.name, outcome, duration_ms).await?;

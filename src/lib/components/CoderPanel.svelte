@@ -3447,7 +3447,19 @@
 							 full payload. -->
 						<span class="tool-hint" title={hint}>{hint}</span>
 					{/if}
-					<span class="tool-status">{!row.hasResult ? 'running…' : row.isError ? 'error' : 'ok'}</span>
+					<span class="tool-status"
+						>{!row.hasResult
+							? 'running…'
+							: row.isError
+								? 'error'
+								: row.bgStatus?.state === 'running'
+									? 'detached · running'
+									: row.bgStatus?.state === 'exited'
+										? `detached · exit ${row.bgStatus.exitCode ?? '?'}`
+										: row.bgStatus?.state === 'killed'
+											? 'detached · killed'
+											: 'ok'}</span
+					>
 					<!-- Live elapsed counter while running, precise
 						 final duration once the tool settles. Reads
 						 the panel-level `nowTick` so every running
@@ -3474,16 +3486,31 @@
 							<!-- Detached result (ADR 0034): the command was
 							 spawned as a background process. Show the
 							 command + the process id the model uses to
-							 poll via `read_process`. -->
+							 poll via `read_process`, plus the live
+							 settlement state when the row is fresh (the
+							 `background_process_exited` event is live-only,
+							 so a replayed row shows no live claim). -->
 							<div class="bash-block">
 								<div class="bash-cmd">
 									<span class="bash-prompt" aria-hidden="true">$</span>
 									<span class="bash-cmd-text">{bashCmd}</span>
 								</div>
-								<div class="bash-exit">
+								<div
+									class="bash-exit"
+									class:err={row.bgStatus?.state === 'exited' &&
+										row.bgStatus.exitCode !== 0 &&
+										row.bgStatus.exitCode !== null}
+								>
 									detached · id={bDetached.id}{#if bDetached.pid !== null}
 										· pid={bDetached.pid}{/if}{#if bDetached.target}
 										<span class="bash-target"> · {bDetached.target}</span>
+									{/if}
+									{#if row.bgStatus?.state === 'running'}
+										· still running
+									{:else if row.bgStatus?.state === 'exited'}
+										· exit {row.bgStatus.exitCode ?? '?'}
+									{:else if row.bgStatus?.state === 'killed'}
+										· killed
 									{/if}
 								</div>
 							</div>

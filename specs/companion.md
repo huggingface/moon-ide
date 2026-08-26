@@ -776,6 +776,13 @@ Prose, not commitments — revisit when someone asks:
   body already renders — write content, edit find/replace — are
   elided to a size note instead of duplicated. Previously expanding
   a bash call showed output with no way to see the command.
+- **Detached `bash` rows show live process state** (ADR 0075): the
+  spawn result renders a `detached · id bg_N · pid …` preview
+  instead of an empty stdout block, a `detached · running` chip sits
+  on the collapsed row while the process is live, and the live-only
+  `background_process_exited` event flips it to `detached · exit N`
+  / `detached · killed`. Replayed rows show the plain detached
+  preview with no live claim (the event is never persisted).
 - **Copy-markdown on user bubbles** (incl. coordinator-authored
   messages) and **per-workspace last-project memory**: the phone
   remembers which project it was on per workspace (localStorage)

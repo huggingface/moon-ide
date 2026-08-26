@@ -114,6 +114,14 @@ export type CoderRow =
 			isError: boolean;
 			startedAt: number;
 			durationMs: number | null;
+			/** Live state of a detached background process this row
+			 *  spawned (`bash` with `detach: true`, ADR 0034). `null`
+			 *  for every other tool call. `'running'` is set when the
+			 *  spawn result lands; a `background_process_exited` event
+			 *  flips it to its terminal state. Absent on replay (the
+			 *  event is live-only), so a reopened session shows the
+			 *  plain detached body with no live claim. */
+			bgStatus: { state: 'running' } | { state: 'exited'; exitCode: number | null } | { state: 'killed' } | null;
 	  }
 	| { kind: 'error'; id: string; text: string }
 	| { kind: 'aborted'; id: string }
@@ -3514,6 +3522,12 @@ export class CoderPanelState {
 					// `tool_call` / `tool_result` events land
 					// back-to-back regardless of the original run time.
 					toolRow.durationMs = event.duration_ms ?? Date.now() - toolRow.startedAt;
+					// A detached `bash` spawn returns immediately —
+					// mark the row's process as still running until a
+					// `background_process_exited` event settles it.
+					if (toolRow.name === 'bash' && isDetachedBashResult(event.result)) {
+						toolRow.bgStatus = { state: 'running' };
+					}
 					// The parked `ask_user` prompt just resolved
 					// (answered or skipped) — drop the "needs input"
 					// cue; the turn either continues working or ends.
@@ -3537,6 +3551,19 @@ export class CoderPanelState {
 					if (next !== null) {
 						session.todos = next;
 					}
+				}
+				return;
+			}
+			case 'background_process_exited': {
+				// Live-only settlement notice for a detached `bash`
+				// process (ADR 0034): natural exit, `stop_process`
+				// kill, or the turn-end cleanup reaping a
+				// still-running child.
+				const toolRow = findRowById(session.rows, event.tool_call_id);
+				if (toolRow?.kind === 'tool' && toolRow.bgStatus?.state === 'running') {
+					toolRow.bgStatus = event.killed
+						? { state: 'killed' }
+						: { state: 'exited', exitCode: event.exit_code ?? null };
 				}
 				return;
 			}
@@ -4140,6 +4167,16 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 				// Backend-measured when available — see the parent
 				// reducer's `tool_result` case.
 				row.durationMs = event.duration_ms ?? Date.now() - row.startedAt;
+				if (row.name === 'bash' && isDetachedBashResult(event.result)) {
+					row.bgStatus = { state: 'running' };
+				}
+			}
+			return;
+		}
+		case 'background_process_exited': {
+			const row = findRowById(rows, event.tool_call_id);
+			if (row?.kind === 'tool' && row.bgStatus?.state === 'running') {
+				row.bgStatus = event.killed ? { state: 'killed' } : { state: 'exited', exitCode: event.exit_code ?? null };
 			}
 			return;
 		}
@@ -4440,8 +4477,21 @@ function upsertToolCallRow(rows: CoderRow[], event: Extract<CoderEvent, { kind: 
 		isError: false,
 		startedAt: event.started_at_ms ?? Date.now(),
 		durationMs: null,
+		bgStatus: null,
 	});
 	return true;
+}
+
+/** Detect a detached `bash` spawn result — shape is
+ *  `{ detached: true, id, pid, log_path, cmd, target }` (ADR 0034).
+ *  Shared by both `tool_result` reducers (parent transcript and
+ *  sub-agent pop-out) to flip the row into its live
+ *  process-running state. */
+function isDetachedBashResult(result: unknown): boolean {
+	if (typeof result !== 'object' || result === null) {
+		return false;
+	}
+	return 'detached' in result && result.detached === true;
 }
 
 /** Monotonic id for synthetic transcript rows (compaction, per-turn
