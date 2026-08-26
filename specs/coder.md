@@ -924,6 +924,20 @@ Append-only JSONL at
 The slug is `<basename>-<8-char FNV-1a hex>` of the folder's absolute
 path — deterministic, collision-free across same-basename folders.
 
+**No folder bound** (empty workspace): sessions are allowed and file
+under the slug of the **scratch root** — the user's home directory,
+canonicalised. The scratch root is never registered in
+`WorkspaceRegistry`; the coder synthesises a home-rooted folder entry
+on demand for exactly that path. `bash` and relative paths run from
+home, absolute host paths work through the out-of-workspace arm
+(ADR 0025), and a scratch session never routes to the workspace shell
+container, never gets format-on-save, and reads no project rules. A
+scratch coordinator can bootstrap the workspace — `init_repo` /
+`clone_repo` land at `~/<name>` — after which the new folder's
+sessions are separate from the scratch ones (scratch sessions stay
+filed under home). See
+[ADR 0074](decisions/0074-coder-sessions-without-a-folder.md).
+
 The first line is a header; every subsequent line is one record in
 **[pi](https://pi.dev)'s session-log wire shape**, so the file
 uploads to a HF dataset and renders in the Hub's pi trace viewer.
@@ -1762,7 +1776,10 @@ hash. Generation is detached and never blocks a turn — a missing
 summary renders as `(summary still generating)`; a
 `folder_summary_ready` event fires when one lands. Worktree folders
 are skipped by the generator and reuse their parent's summary (same
-codebase, no duplicate model spend).
+codebase, no duplicate model spend). With no folders bound the
+section is absent and a scratch session instead gets a "No folders
+bound" section: home as cwd, absolute-path tools, no project rules
+(ADR 0074).
 
 ### Path resolution and cross-folder routing
 
@@ -1801,9 +1818,11 @@ parent is left as addressed.
 This routing applies to `read_file`, `list_dir`, `write_file`, and
 `edit_file`. `grep` and `bash` stay scoped to the session's folder —
 a sub-agent against the target folder is the way to search or run
-commands elsewhere. Sub-agents share the registry, so the same rules
-apply to them; depth=1 is enforced by omitting `task` from their
-tool list.
+commands elsewhere. `grep` validates that its root directory exists
+and errors loudly otherwise (a scratch session's root is real, but a
+bad one must not read as "0 matches"). Sub-agents share the registry,
+so the same rules apply to them; depth=1 is enforced by omitting
+`task` from their tool list.
 
 ### Project-bar git status: surgical refresh
 

@@ -1760,6 +1760,19 @@ impl ToolRegistry {
 		// when `WorkspaceHost` grows a `content_search` trait method
 		// (Phase 6.x or sooner if `RemoteHost` lands first).
 		let root = camino::Utf8PathBuf::from(folder.folder.path.clone());
+		// The root is the session's cwd verbatim: an unmountable or
+		// typo'd path must fail loudly here rather than grep an empty
+		// directory and report a misleading "0 matches".
+		if !tokio::fs::metadata(root.as_std_path())
+			.await
+			.map(|m| m.is_dir())
+			.unwrap_or(false)
+		{
+			return Err(CoderError::tool_failed(
+				"grep",
+				format!("grep root `{root}` is not an existing directory"),
+			));
+		}
 		let options = ContentSearchOptions {
 			query: parsed.pattern.clone(),
 			case_sensitive: parsed.case_sensitive,

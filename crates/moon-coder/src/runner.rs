@@ -960,17 +960,49 @@ impl CoderState {
 		folder
 	}
 
-	/// Resolve to `(coder-root folder's FolderSession, folder path)`
-	/// or error with `NoActiveFolder`. Used by commands that
-	/// operate at the folder level (`list_sessions`, `new_session`,
-	/// the runtime-routing inside `open_session` / `delete_session`).
-	/// Routes through [`Self::coder_root_folder`] so worktree folders
-	/// share their parent project's session list.
+	/// Resolve to `(coder-root folder's FolderSession, folder path)`.
+	/// Used by commands that operate at the folder level
+	/// (`list_sessions`, `new_session`, the runtime-routing inside
+	/// `open_session` / `delete_session`). Routes through
+	/// [`Self::coder_root_folder`] so worktree folders share their
+	/// parent project's session list. When no folder is bound, falls
+	/// back to the scratch root ([`Self::no_folder_root`]) so coder
+	/// sessions work in an empty workspace.
 	async fn active_folder_session(&self) -> Result<(Arc<FolderSession>, Utf8PathBuf), CoderError> {
-		let folder = self.coder_root_folder().await.ok_or(CoderError::NoActiveFolder)?;
-		let folder_path = Utf8PathBuf::from(folder.folder.path.clone());
+		let folder_path = match self.coder_root_folder().await {
+			Some(folder) => Utf8PathBuf::from(folder.folder.path.clone()),
+			None => self.no_folder_root().await?,
+		};
 		let session = self.folder_session_for(&folder_path).await;
 		Ok((session, folder_path))
+	}
+
+	/// Sessions-root path for an empty workspace: the user's home
+	/// directory, canonicalised. Never registered in
+	/// [`WorkspaceRegistry`] — a synthetic [`WorkspaceFolderEntry`]
+	/// is built on demand by [`Self::folder_entry_for`] instead, so
+	/// the scratch root can't leak into the folder bar, the MCP
+	/// roots set, or the registry-keyed fs watcher. Home is the
+	/// working directory (a shell's default cwd) and the
+	/// sessions-dir slug anchor.
+	async fn no_folder_root(&self) -> Result<Utf8PathBuf, CoderError> {
+		no_folder_root().await
+	}
+
+	/// The registry's `folder_for_path`, plus the scratch root: a
+	/// fresh, unregistered entry whose host is a plain
+	/// [`moon_core::LocalHost`] rooted at home. Built on demand
+	/// (never cached) so the shell-resolver / log-sink wiring a
+	/// registry-added folder gets is irrelevant here — a scratch
+	/// session's bash never routes to the workspace shell container
+	/// (its root is never in the container's applied mount set) and
+	/// its writes never hit format-on-save (home has no project
+	/// config).
+	async fn folder_entry_for(&self, path: &str) -> Option<Arc<WorkspaceFolderEntry>> {
+		if let Some(entry) = self.workspaces.folder_for_path(path).await {
+			return Some(entry);
+		}
+		scratch_folder_entry(path).await
 	}
 
 	/// Coder-root path for an explicitly-named bound folder — the
@@ -1022,6 +1054,16 @@ impl CoderState {
 		Ok((rt, id, folder_path))
 	}
 
+	/// `true` when `path` is the scratch root — the sessions anchor
+	/// for an empty workspace, not a bound folder. Drives the
+	/// folder-level commands that must not materialise it.
+	async fn is_no_folder_root(&self, path: &Utf8Path) -> bool {
+		match no_folder_root().await {
+			Ok(root) => root == path,
+			Err(_) => false,
+		}
+	}
+
 	/// Find the mounted runtime — in **any** folder — that's holding
 	/// an `ask_user` prompt parked under `call_id`. The prompt lives
 	/// on whichever session originated it, which may no longer be
@@ -1063,6 +1105,41 @@ impl CoderState {
 		}
 		None
 	}
+}
+
+/// The scratch root itself: the user's home directory,
+/// canonicalised. Free function (not a `CoderState` method) so the
+/// synthetic-entry builder and tests can reach it without a state.
+async fn no_folder_root() -> Result<Utf8PathBuf, CoderError> {
+	let home = std::env::var("HOME")
+		.or_else(|_| std::env::var("USERPROFILE"))
+		.map_err(|_| CoderError::Internal("no folder bound and HOME is not set — can't anchor a scratch session".into()))?;
+	let path = Utf8PathBuf::from(home);
+	tokio::fs::canonicalize(path.as_std_path())
+		.await
+		.map_err(CoderError::from)
+		.and_then(|p| {
+			Utf8PathBuf::from_path_buf(p).map_err(|p| CoderError::Internal(format!("non-utf8 path: {}", p.display())))
+		})
+}
+
+/// A synthetic, unregistered [`WorkspaceFolderEntry`] for the
+/// scratch root — `Some` only when `path` *is* the scratch root.
+async fn scratch_folder_entry(path: &str) -> Option<Arc<WorkspaceFolderEntry>> {
+	let scratch = no_folder_root().await.ok()?;
+	if path != scratch.as_str() {
+		return None;
+	}
+	let folder = moon_protocol::workspace::WorkspaceFolder {
+		path: scratch.to_string(),
+		name: scratch.file_name().unwrap_or("home").to_string(),
+		host: moon_protocol::workspace::HostKind::Local,
+		origin: moon_protocol::workspace::FolderOrigin::UserPicked,
+	};
+	Some(Arc::new(WorkspaceFolderEntry {
+		folder,
+		host: Arc::new(moon_core::LocalHost::new(scratch)),
+	}))
 }
 
 impl CoderHandle {
@@ -1947,8 +2024,9 @@ impl CoderHandle {
 	}
 
 	/// List sessions on disk for the active workspace folder.
-	/// Empty when the folder has none — including when no folder
-	/// is active at all (chat-only sessions aren't supported).
+	/// Empty when the folder has none. With no folder bound, lists
+	/// the workspace's scratch sessions (filed under the home-rooted
+	/// slug).
 	pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, CoderError> {
 		self.list_sessions_in(None).await
 	}
@@ -1963,7 +2041,9 @@ impl CoderHandle {
 			Some(path) => self.state.coder_root_at(path).await?,
 			None => match self.state.coder_root_folder().await {
 				Some(f) => Utf8PathBuf::from(f.folder.path.clone()),
-				None => return Ok(Vec::new()),
+				// Empty workspace: scratch sessions live under the
+				// home-rooted slug (a missing dir lists as empty).
+				None => self.state.no_folder_root().await?,
 			},
 		};
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
@@ -1992,10 +2072,10 @@ impl CoderHandle {
 	/// full summaries here would be wasted work. Same per-project
 	/// scoping as [`Self::list_sessions`].
 	pub async fn search_sessions(&self, query: &str) -> Result<Vec<String>, CoderError> {
-		let Some(folder) = self.state.coder_root_folder().await else {
-			return Ok(Vec::new());
+		let folder_root = match self.state.coder_root_folder().await {
+			Some(folder) => Utf8PathBuf::from(folder.folder.path.clone()),
+			None => self.state.no_folder_root().await?,
 		};
-		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
 		sessions::search_sessions(&dir, query).await
 	}
@@ -2020,10 +2100,10 @@ impl CoderHandle {
 		sessions::validate_session_id(&id)?;
 		// Per-project scoping (ADR 0028): worktree sessions are filed
 		// under the parent project root.
-		let Some(folder) = self.state.coder_root_folder().await else {
-			return Err(CoderError::NoActiveFolder);
+		let folder_root = match self.state.coder_root_folder().await {
+			Some(folder) => Utf8PathBuf::from(folder.folder.path.clone()),
+			None => self.state.no_folder_root().await?,
 		};
-		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
 		let direct = sessions::session_path(&dir, &id);
 		if tokio::fs::try_exists(direct.as_std_path())
@@ -4441,10 +4521,10 @@ impl CoderHandle {
 			return Ok(true);
 		}
 		sessions::validate_session_id(subagent_id)?;
-		let Some(folder) = self.state.coder_root_folder().await else {
-			return Err(CoderError::NoActiveFolder);
+		let folder_root = match self.state.coder_root_folder().await {
+			Some(folder) => Utf8PathBuf::from(folder.folder.path.clone()),
+			None => self.state.no_folder_root().await?,
 		};
-		let folder_root = Utf8PathBuf::from(folder.folder.path.clone());
 		let slug_dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
 		let Some(jsonl_path) = sessions::find_subagent_session(&slug_dir, subagent_id).await else {
 			return Ok(false);
@@ -4466,13 +4546,13 @@ impl CoderHandle {
 		};
 		// The sub-agent's tools must land in the same folder they
 		// originally operated against; if that folder is no longer
-		// bound, refuse rather than silently retargeting.
+		// bound, refuse rather than silently retargeting. The
+		// scratch root resolves without being bound.
 		let target = header
 			.subagent_target_folder
 			.clone()
 			.unwrap_or_else(|| header.cwd.clone());
-		let bound = self.state.workspaces.folders().await;
-		let Some(target_entry) = bound.iter().find(|f| f.folder.path == target).cloned() else {
+		let Some(target_entry) = self.state.folder_entry_for(&target).await else {
 			return Err(CoderError::Internal(format!(
 				"sub-agent folder `{target}` is not bound — bind it to follow up with this sub-agent"
 			)));
@@ -5944,9 +6024,11 @@ async fn run_turn(
 		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root.into(),
 		_ => folder_path.to_path_buf(),
 	};
+	// The routing path is normally a bound folder; the exception is
+	// the scratch root of an empty workspace, which is never
+	// registered — `folder_entry_for` synthesises an entry for it.
 	let folder_entry = state
-		.workspaces
-		.folder_for_path(routing_path.as_str())
+		.folder_entry_for(routing_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
 	// Snapshot the top-level session mode once at turn-start (same
@@ -6025,8 +6107,12 @@ async fn run_turn(
 	// sub-agent prompts.
 	// Use the routing path (worktree when bound, else parent) as the
 	// prompt's "active folder" so the agent is oriented at the
-	// checkout its tools actually operate on.
-	refresh_system_prompt(state, rt, &routing_path, force_host_bash, mode).await;
+	// checkout its tools actually operate on. A scratch session
+	// (empty workspace) passes `None` — no project rules to read,
+	// and its "no folders bound" section is written from the
+	// scratch root instead.
+	let scratch = state.is_no_folder_root(&routing_path).await;
+	refresh_system_prompt(state, rt, &routing_path, scratch, force_host_bash, mode).await;
 	// Schedule background regeneration for any bound folder whose
 	// summary cache is missing or stale. Detached tokio tasks; we
 	// don't block the turn waiting for them to land. The next
@@ -8366,7 +8452,7 @@ async fn handle_workspace_scm_status(
 		}
 		None => sink.folder().to_string(),
 	};
-	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
+	let Some(folder) = state.folder_entry_for(&routing_path).await else {
 		return Err(CoderError::invalid_args(
 			"workspace_scm_status",
 			format!("no bound folder for path `{routing_path}`"),
@@ -8460,7 +8546,7 @@ async fn handle_check_worker_base(state: &Arc<CoderState>, args: &Value) -> Resu
 		};
 		(path, touched)
 	};
-	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
+	let Some(folder) = state.folder_entry_for(&routing_path).await else {
 		return Err(CoderError::invalid_args(
 			"check_worker_base",
 			format!("no bound folder for path `{routing_path}`"),
@@ -9134,7 +9220,10 @@ async fn handle_clone_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args
 		}
 	};
 	// Run the clone on the host via the coordinator folder's host.
-	let Some(folder) = state.workspaces.folder_for_path(folder_path.as_str()).await else {
+	// The scratch root (empty workspace) resolves to a synthetic
+	// home-rooted host, so a scratch coordinator can bootstrap the
+	// workspace's first project.
+	let Some(folder) = state.folder_entry_for(folder_path.as_str()).await else {
 		return Err(CoderError::invalid_args(
 			"clone_repo",
 			"could not resolve the session's folder host for git clone",
@@ -9267,7 +9356,7 @@ async fn handle_init_repo(state: &Arc<CoderState>, sink: &FolderEventSink, args:
 			format!("`{dest}` already exists — pick a different name"),
 		));
 	}
-	let Some(folder) = state.workspaces.folder_for_path(sink.folder()).await else {
+	let Some(folder) = state.folder_entry_for(sink.folder()).await else {
 		return Err(CoderError::invalid_args(
 			"init_repo",
 			"could not resolve the session's folder host for git init",
@@ -9515,18 +9604,31 @@ pub(crate) fn split_tool_images(value: Value) -> (Vec<crate::inference::ImageAtt
 /// active in its own prompt regardless of which folder the user
 /// is currently browsing — that's what keeps the model's
 /// "your folder" reference stable across folder switches.
+/// Rewrite the session's system prompt for the upcoming turn.
+/// `routing_path` is the folder the session's tools operate
+/// against (the worktree when bound, else the session's coder
+/// root). `scratch` is `true` when that path is the
+/// empty-workspace scratch root: the session then gets no
+/// project rules, no "active folder" marker, and a prompt
+/// section explaining the empty-workspace posture instead.
 async fn refresh_system_prompt(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
-	folder_path: &Utf8Path,
+	routing_path: &Utf8Path,
+	scratch: bool,
 	force_host_bash: bool,
 	mode: CoderMode,
 ) {
 	let folders = state.workspaces.folders().await;
-	let container_mode = workspace_in_container_mode(&state.tools, force_host_bash, folder_path, &folders).await;
+	let container_mode = if scratch {
+		false
+	} else {
+		workspace_in_container_mode(&state.tools, force_host_bash, routing_path, &folders).await
+	};
 	let prompt = compose_system_prompt(
 		&folders,
-		Some(folder_path.as_str()),
+		if scratch { None } else { Some(routing_path.as_str()) },
+		if scratch { Some(routing_path) } else { None },
 		&state.folder_summaries,
 		container_mode,
 		mode,
@@ -9625,6 +9727,7 @@ async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSi
 async fn compose_system_prompt(
 	folders: &[Arc<WorkspaceFolderEntry>],
 	active_path: Option<&str>,
+	scratch_root: Option<&Utf8Path>,
 	summaries: &Arc<FolderSummaryService>,
 	container_mode: bool,
 	mode: CoderMode,
@@ -9672,6 +9775,13 @@ async fn compose_system_prompt(
 		}
 	}
 
+	if let Some(scratch) = scratch_root {
+		out.push('\n');
+		out.push_str("## No folders bound\n\n");
+		out.push_str(&format!(
+			"This workspace has no folders bound, so this session is a scratch session: relative paths and `bash` run from your home directory (`{scratch}`). Address files anywhere on the host with absolute paths — `read_file` / `list_dir` / `write_file` / `edit_file` accept them; `grep` takes an absolute root. Ask before running destructive commands outside a project directory. The user can bind a project folder at any time; new sessions there are separate from this one.\n"
+		));
+	}
 	if folders.is_empty() {
 		return out;
 	}
@@ -12037,6 +12147,57 @@ mod tests {
 		// Empty AGENTS.md falls through to CLAUDE.md.
 		let rules = read_agent_rules(&root).await.unwrap();
 		assert!(rules.contains("fallback"));
+	}
+
+	#[tokio::test]
+	async fn compose_system_prompt_scratch_session_explains_empty_workspace() {
+		let cache = tempfile::TempDir::new().unwrap();
+		let summaries = Arc::new(FolderSummaryService::new(
+			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
+		));
+		let scratch = Utf8PathBuf::from("/home/dev");
+		let prompt = compose_system_prompt(&[], None, Some(scratch.as_path()), &summaries, false, CoderMode::Agent).await;
+		assert!(prompt.contains("## No folders bound"));
+		assert!(prompt.contains("/home/dev"));
+		assert!(!prompt.contains("## Bound folders"));
+		assert!(!prompt.contains("## Project rules"));
+	}
+
+	#[tokio::test]
+	async fn compose_system_prompt_bound_session_has_no_scratch_section() {
+		let cache = tempfile::TempDir::new().unwrap();
+		let summaries = Arc::new(FolderSummaryService::new(
+			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
+		));
+		let prompt = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, CoderMode::Agent).await;
+		assert!(!prompt.contains("## No folders bound"));
+	}
+
+	#[tokio::test]
+	async fn no_folder_root_resolves_an_existing_home() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let canonical = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+		// Env mutation is process-global; serialise against every
+		// other test that touches HOME via a mutex. Tokio's mutex so
+		// the guard can be held across the awaits below without
+		// tripping `clippy::await_holding_lock`.
+		static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+		let _guard = HOME_LOCK.lock().await;
+		let prev = std::env::var("HOME").ok();
+		// SAFETY: single-threaded under the mutex; no other thread
+		// reads HOME concurrently in this test binary.
+		unsafe { std::env::set_var("HOME", dir.path()) };
+		let root = no_folder_root().await.unwrap();
+		// A synthetic entry resolves for exactly the scratch path,
+		// and nothing else.
+		let entry = scratch_folder_entry(canonical.as_str()).await.expect("scratch entry");
+		assert_eq!(entry.folder.path, canonical.as_str());
+		assert!(scratch_folder_entry("/definitely/not/the/scratch-root").await.is_none());
+		match prev {
+			Some(v) => unsafe { std::env::set_var("HOME", v) },
+			None => unsafe { std::env::remove_var("HOME") },
+		}
+		assert_eq!(root, canonical);
 	}
 
 	#[test]

@@ -2377,9 +2377,11 @@ export class CoderPanelState {
 			return;
 		}
 		this.#workspaceReady = true;
-		if (this.activeFolderPath !== null) {
-			void this.#hydrateFolder(this.activeFolderPath);
-		}
+		// Hydrate the active folder — or the no-folder bucket (keyed
+		// `''`): the backend anchors an empty workspace's sessions
+		// under the home-rooted scratch slug, so the panel lists and
+		// restores them exactly like a bound folder's.
+		void this.#hydrateFolder(this.activeFolderPath ?? NO_FOLDER_KEY);
 	}
 
 	/** Register a callback the panel fires when the user opens a
@@ -2639,6 +2641,13 @@ export class CoderPanelState {
 					// fall through to the list view.
 				}
 			}
+		}
+		// With no folder bound there is no sessions list to pick
+		// from (the list IPC errors); land on a blank session view
+		// so the composer is immediately usable.
+		if (this.activeFolderPath === null) {
+			folder.view = 'session';
+			return;
 		}
 		folder.view = (sessions?.length ?? 0) > 0 ? 'list' : 'session';
 	}
