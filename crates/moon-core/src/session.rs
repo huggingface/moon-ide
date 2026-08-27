@@ -40,9 +40,13 @@ pub async fn load(workspaces_dir: &Utf8Path, workspace_id: &str) -> MoonResult<W
 	if !path.exists() {
 		return Ok(WorkspaceSession::default());
 	}
-	let text = tokio::fs::read_to_string(path.as_std_path())
-		.await
-		.map_err(MoonError::from)?;
+	let bytes = tokio::fs::read(path.as_std_path()).await.map_err(MoonError::from)?;
+	// A torn write (crash mid-save) can leave arbitrary bytes on
+	// disk, not just malformed JSON. Lossy-decode so that case
+	// lands in the same warn-and-default branch below instead of
+	// erroring — an error here would also abort every
+	// load-then-save caller, so the corrupt file could never heal.
+	let text = String::from_utf8_lossy(&bytes);
 	match serde_json::from_str::<WorkspaceSession>(&text) {
 		Ok(session) => Ok(session),
 		Err(e) => {
@@ -64,7 +68,22 @@ pub async fn save(workspaces_dir: &Utf8Path, workspace_id: &str, session: &Works
 	}
 	let text = serde_json::to_string_pretty(session)
 		.map_err(|e| MoonError::Internal(format!("workspace session serialize error: {e}")))?;
-	tokio::fs::write(path.as_std_path(), text)
+	// Write-fsync-rename so a crash mid-save can never leave a
+	// torn `session.json`: readers see either the old document or
+	// the new one, never garbage. The fsync before the rename
+	// matters — without it the rename can land while the data
+	// blocks never hit disk, which is exactly the all-garbage
+	// file this replaced `fs::write` used to produce.
+	let tmp = path.with_extension("json.tmp");
+	{
+		use tokio::io::AsyncWriteExt;
+		let mut file = tokio::fs::File::create(tmp.as_std_path())
+			.await
+			.map_err(MoonError::from)?;
+		file.write_all(text.as_bytes()).await.map_err(MoonError::from)?;
+		file.sync_all().await.map_err(MoonError::from)?;
+	}
+	tokio::fs::rename(tmp.as_std_path(), path.as_std_path())
 		.await
 		.map_err(MoonError::from)?;
 	Ok(())
@@ -136,6 +155,31 @@ mod tests {
 		let s = load(&workspaces_dir, "default").await.unwrap();
 		assert!(s.folders.is_empty());
 		assert!(s.active_folder_path.is_none());
+	}
+
+	#[tokio::test]
+	async fn non_utf8_session_falls_back_to_default() {
+		// A torn write after a crash leaves arbitrary bytes, not
+		// just malformed JSON. This must default like the corrupt
+		// case, not error — an error would block every
+		// load-then-save caller from ever healing the file.
+		let dir = TempDir::new().unwrap();
+		let workspaces_dir = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let path = session_path(&workspaces_dir, "default");
+		tokio::fs::create_dir_all(path.parent().unwrap().as_std_path())
+			.await
+			.unwrap();
+		tokio::fs::write(path.as_std_path(), [0x90, 0x1b, 0xa9, 0xff, 0xfe])
+			.await
+			.unwrap();
+
+		let s = load(&workspaces_dir, "default").await.unwrap();
+		assert!(s.folders.is_empty());
+
+		// And the next save heals the file in place.
+		save(&workspaces_dir, "default", &sample_session()).await.unwrap();
+		let healed = load(&workspaces_dir, "default").await.unwrap();
+		assert_eq!(healed.folders.len(), 1);
 	}
 
 	#[tokio::test]

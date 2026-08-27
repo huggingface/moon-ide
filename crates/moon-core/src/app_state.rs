@@ -63,9 +63,11 @@ pub async fn load(config_dir: &Utf8Path) -> MoonResult<AppState> {
 	if !path.exists() {
 		return Ok(AppState::default());
 	}
-	let text = tokio::fs::read_to_string(path.as_std_path())
-		.await
-		.map_err(MoonError::from)?;
+	let bytes = tokio::fs::read(path.as_std_path()).await.map_err(MoonError::from)?;
+	// Lossy-decode so a file holding non-UTF-8 garbage (torn
+	// write after a crash) lands in the warn-and-default branch
+	// below like any other corrupt document, instead of erroring.
+	let text = String::from_utf8_lossy(&bytes);
 	match serde_json::from_str::<AppState>(&text) {
 		Ok(state) => Ok(state),
 		Err(e) => {
@@ -119,7 +121,12 @@ where
 
 	let state_path = state_path(config_dir);
 	let mut state = if state_path.exists() {
-		let text = std::fs::read_to_string(state_path.as_std_path()).map_err(MoonError::from)?;
+		let bytes = std::fs::read(state_path.as_std_path()).map_err(MoonError::from)?;
+		// Same lossy-decode as `load`: a non-UTF-8 file must fall
+		// back to defaults, not error — an error here would abort
+		// the mutate before the write, so the corrupt file could
+		// never heal.
+		let text = String::from_utf8_lossy(&bytes);
 		match serde_json::from_str::<AppState>(&text) {
 			Ok(s) => s,
 			Err(e) => {
@@ -136,7 +143,15 @@ where
 	let text =
 		serde_json::to_string_pretty(&state).map_err(|e| MoonError::Internal(format!("app state serialize error: {e}")))?;
 	let tmp = tmp_path(config_dir);
-	std::fs::write(tmp.as_std_path(), text).map_err(MoonError::from)?;
+	// fsync before the rename: without it the rename can hit disk
+	// while the data blocks don't, and a crash leaves `state.json`
+	// full of garbage instead of the previous document.
+	{
+		use std::io::Write;
+		let mut file = std::fs::File::create(tmp.as_std_path()).map_err(MoonError::from)?;
+		file.write_all(text.as_bytes()).map_err(MoonError::from)?;
+		file.sync_all().map_err(MoonError::from)?;
+	}
 	std::fs::rename(tmp.as_std_path(), state_path.as_std_path()).map_err(MoonError::from)?;
 
 	Ok(r)
@@ -182,6 +197,28 @@ mod tests {
 
 		let s = load(&cfg).await.unwrap();
 		assert_eq!(s.theme, ThemeMode::System);
+	}
+
+	#[tokio::test]
+	async fn non_utf8_state_falls_back_to_default_and_heals() {
+		let dir = TempDir::new().unwrap();
+		let cfg = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		tokio::fs::write(state_path(&cfg).as_std_path(), [0x90, 0x1b, 0xa9, 0xff, 0xfe])
+			.await
+			.unwrap();
+
+		let s = load(&cfg).await.unwrap();
+		assert_eq!(s.theme, ThemeMode::System);
+
+		// `mutate` must start from defaults and overwrite the
+		// corrupt file rather than erroring before the write.
+		mutate(&cfg, |s| {
+			s.theme = ThemeMode::Light;
+		})
+		.await
+		.unwrap();
+		let healed = load(&cfg).await.unwrap();
+		assert_eq!(healed.theme, ThemeMode::Light);
 	}
 
 	#[tokio::test]
