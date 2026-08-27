@@ -306,9 +306,11 @@ Changes` that surfaces when the repo's default branch
   back to that branch (`git switch <name>` via the same
   `branch_switch` path). The previous branch name rides on the
   existing `git_branch` IPC as `GitBranchInfo.previousBranch`
-  (resolved `git rev-parse --abbrev-ref @{-1}`), so no extra
-  round-trip is needed and the label stays current as the user
-  switches around. Hidden when there's no recorded previous
+  (resolved `git rev-parse --abbrev-ref @{-1}`; a remote-tracking
+  result like `origin/main` is shortened to the local name, but a
+  slash in a _local_ branch name like `moon/feature` is kept
+  intact), so no extra round-trip is needed and the label stays
+  current as the user switches around. Hidden when there's no recorded previous
   branch (fresh repo, or prior state was detached HEAD — git's
   branch stack only records branch names) or when it would
   target the branch the tree is already on.

@@ -2673,7 +2673,9 @@ fn run_git_branch(root: &Utf8Path) -> GitBranchInfo {
 /// `None`; the SCM panel hides its "switch back" affordance in those
 /// cases. Resolved on every `git_branch` call so the label stays
 /// current as the user switches around — no client-side history to
-/// drift out of sync.
+/// drift out of sync. A remote-tracking result (`origin/main`) is
+/// shortened to the local name; a slash in a *local* branch name
+/// (`moon/feature`) is kept intact.
 fn resolve_previous_branch(root: &Utf8Path) -> Option<String> {
 	use std::process::Command;
 
@@ -2693,7 +2695,23 @@ fn resolve_previous_branch(root: &Utf8Path) -> Option<String> {
 	// `git switch <name>` we issue on click both use the local short
 	// name. `git switch origin/main` would create a new local branch
 	// named `origin/main`, which is not what the chip means.
-	let stripped = name.split_once('/').map(|(_, short)| short.to_owned()).unwrap_or(name);
+	// But a *local* branch can carry a slash too (`moon/feature`),
+	// so only strip when a remote-tracking ref by that exact name
+	// resolves — anything else is a local branch whose full name we
+	// must keep.
+	let stripped = match name.split_once('/') {
+		Some((_, short))
+			if Command::new("git")
+				.arg("-C")
+				.arg(root.as_std_path())
+				.args(["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{name}")])
+				.output()
+				.is_ok_and(|o| o.status.success()) =>
+		{
+			short.to_owned()
+		}
+		_ => name,
+	};
 	// `HEAD` means `@{-1}` resolved to the current branch — git
 	// returns it when the previous-entry pointer happens to alias
 	// the current ref. Not useful as a "switch back" target.
@@ -9232,6 +9250,39 @@ mod tests {
 			branch.previous_branch.as_deref(),
 			Some("feature"),
 			"expected @{{-1}} to flip to feature after switching back, got {branch:?}",
+		);
+	}
+
+	/// A local branch whose name carries a slash (`moon/feature`) must
+	/// survive `previous_branch` resolution intact — the remote-prefix
+	/// strip only applies when a remote-tracking ref by that exact name
+	/// exists, otherwise the "switch back" chip would pass a truncated
+	/// name to `git switch` and fail with `invalid reference`.
+	#[tokio::test]
+	async fn git_branch_previous_branch_keeps_slash_in_local_name() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping slash-name previous-branch test");
+			return;
+		};
+
+		let root = TempDir::new().unwrap();
+		let repo = root.path();
+		run_git(&git, repo, &["init", "-q", "-b", "main"]);
+		run_git(&git, repo, &["config", "user.email", "t@example.com"]);
+		run_git(&git, repo, &["config", "user.name", "T"]);
+		std::fs::write(repo.join("README.md"), "v1\n").unwrap();
+		run_git(&git, repo, &["add", "."]);
+		run_git(&git, repo, &["commit", "-q", "-m", "one"]);
+		run_git(&git, repo, &["switch", "-q", "-c", "moon/lfs-db-cutover-gate"]);
+		run_git(&git, repo, &["switch", "-q", "main"]);
+
+		let utf8 = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		let branch = LocalHost::new(utf8).git_branch().await.unwrap();
+		assert_eq!(branch.name.as_deref(), Some("main"));
+		assert_eq!(
+			branch.previous_branch.as_deref(),
+			Some("moon/lfs-db-cutover-gate"),
+			"slash in a local branch name must not be treated as a remote prefix, got {branch:?}",
 		);
 	}
 

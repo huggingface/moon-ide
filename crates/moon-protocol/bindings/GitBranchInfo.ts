@@ -117,14 +117,17 @@ defaultBranchRemoteRef: string | null,
  */
 defaultBranchBehind: number, 
 /**
- * Local short name of the branch `git switch -` would return
- * to — the previous checked-out branch, resolved via
- * `git rev-parse --abbrev-ref @{-1}`. `None` when there's no
- * previous switch recorded (fresh repo, `@{-1}` doesn't
- * resolve), or when the previous state was detached HEAD (git
- * only records branch names, so `@{-1}` abbreviates to empty).
- * Lets the SCM panel render a "switch back to <branch>" button
- * while sitting on the default branch, without keeping its own
- * history.
+ * Name of the branch `git switch -` would return to — the
+ * previous checked-out branch, resolved via
+ * `git rev-parse --abbrev-ref @{-1}`. Remote-tracking results
+ * (`origin/main`) are shortened to the local name; a slash in
+ * a local branch name (`moon/feature`) is kept intact, so the
+ * value is always a valid `git switch <name>` argument. `None`
+ * when there's no previous switch recorded (fresh repo,
+ * `@{-1}` doesn't resolve), or when the previous state was
+ * detached HEAD (git only records branch names, so `@{-1}`
+ * abbreviates to empty). Lets the SCM panel render a
+ * "switch back to <branch>" button while sitting on the
+ * default branch, without keeping its own history.
  */
 previousBranch: string | null, };

@@ -389,9 +389,11 @@ max_events)`, which replays the slice ending just before that
   branch (`@{-1}`), a "⇄ Switch to <branch>" chip swaps the working
   tree back to it. The previous branch name is forwarded in the
   `workspace_scm_status` response's `branch.previous_branch` field
-  (resolved server-side from `git rev-parse --abbrev-ref @{-1}`), so
-  the chip hides itself when there's no recorded previous branch
-  (fresh repo, or the prior state was detached HEAD).
+  (resolved server-side from `git rev-parse --abbrev-ref @{-1}`;
+  remote-tracking results are shortened to the local name, slashes
+  in local branch names kept intact), so the chip hides itself when
+  there's no recorded previous branch (fresh repo, or the prior
+  state was detached HEAD).
 - **SCM (git) status + commit.** The workspace view shows the
   active folder's current branch, ahead/behind upstream, changed
   file counts (added / modified / deleted) and a collapsible file
