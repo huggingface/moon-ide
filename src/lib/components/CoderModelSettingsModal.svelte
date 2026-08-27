@@ -431,7 +431,7 @@
 					'OK — endpoint reachable, but it does not expose `/v1/models`. You can still type a model id directly.';
 			}
 		} catch (err) {
-			probeError = err instanceof Error ? err.message : String(err);
+			probeError = formatError(err);
 		} finally {
 			probing = false;
 		}
@@ -483,7 +483,7 @@
 			}
 			closeProviderDraft();
 		} catch (err) {
-			probeError = err instanceof Error ? err.message : String(err);
+			probeError = formatError(err);
 		}
 	}
 
@@ -499,7 +499,7 @@
 			providerDraft = { ...providerDraft, api_key: '' };
 			probeMessage = 'API key cleared.';
 		} catch (err) {
-			probeError = err instanceof Error ? err.message : String(err);
+			probeError = formatError(err);
 		}
 	}
 
@@ -518,7 +518,7 @@
 			}
 			closeProviderDraft();
 		} catch (err) {
-			probeError = err instanceof Error ? err.message : String(err);
+			probeError = formatError(err);
 		}
 	}
 
@@ -591,7 +591,7 @@
 			await coder.saveWebSearchKey(trimmed);
 			webKeyDraft = '';
 		} catch (err) {
-			webKeyError = err instanceof Error ? err.message : String(err);
+			webKeyError = formatError(err);
 		} finally {
 			webKeySaving = false;
 		}
@@ -604,7 +604,7 @@
 			await coder.clearWebSearchKey();
 			webKeyDraft = '';
 		} catch (err) {
-			webKeyError = err instanceof Error ? err.message : String(err);
+			webKeyError = formatError(err);
 		} finally {
 			webKeySaving = false;
 		}
@@ -972,7 +972,7 @@
 			await coder.saveModelSettings(next);
 			onClose();
 		} catch (err) {
-			saveError = err instanceof Error ? err.message : String(err);
+			saveError = formatError(err);
 		} finally {
 			saving = false;
 		}

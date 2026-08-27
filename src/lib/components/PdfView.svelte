@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { OpenFile } from '../state.svelte';
 	import type { PDFDocumentLoadingTask } from 'pdfjs-dist';
+	import { formatError } from '../protocol';
 	// Vite resolves the `?url` suffix to the bundled worker asset; the
 	// import plugin's resolver doesn't grok the query string, so it can't
 	// see the default export — it's there.
@@ -67,7 +68,7 @@
 			}
 			status = 'ready';
 		} catch (err) {
-			errorMessage = err instanceof Error ? err.message : String(err);
+			errorMessage = formatError(err);
 			status = 'error';
 		} finally {
 			void task?.destroy();

@@ -454,7 +454,7 @@
 		try {
 			await coder.uploadSessionToHub(sessionId);
 		} catch (err) {
-			workspace.flash(`Hub upload failed: ${err instanceof Error ? err.message : String(err)}`);
+			workspace.flash(`Hub upload failed: ${formatError(err)}`);
 		}
 	}
 

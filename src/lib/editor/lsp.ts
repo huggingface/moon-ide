@@ -205,8 +205,7 @@ async function runQuickFix(ca: LspCodeAction): Promise<void> {
 			workspace.flash(`Quick fix: nothing to apply for "${ca.title}"`);
 		}
 	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		workspace.flash(`Quick fix failed: ${msg}`);
+		workspace.flash(`Quick fix failed: ${formatError(err)}`);
 	}
 }
 
