@@ -1347,7 +1347,11 @@ un-elided (a 413 loop the budget could never break). User providers
 opt in via `payload_cap_mb` on their config (settable from both the
 desktop provider form and the phone add-provider form): the wire
 budget ceilings at ~85 % of the cap, floor at half — HF keeps its
-built-in budget.
+built-in budget. Sub-agents run the same budget over their own
+history with their own sticky set, and both the parent's and the
+sub-agent's iteration-cap wrap-up call replay the elision set — the
+one request that must not fail can't be the one that ships every
+screenshot.
 
 ### Compaction
 

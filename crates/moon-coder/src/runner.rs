@@ -6675,7 +6675,16 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	);
 	push_sentinel_user_message(rt, sink, sentinel_text).await;
 
-	let messages = rt.session.lock().await.messages.clone();
+	// Same wire shape as the turn's round-trips: replay the
+	// session's image-elision set on the outgoing copy (ADR 0049).
+	// Shipping the wrap-up un-elided re-inflated the request past
+	// the provider's body cap — the one request that must not fail
+	// 413'd exactly when the turn was image-heavy enough to elide.
+	let (mut messages, elided_images) = {
+		let session = rt.session.lock().await;
+		(session.messages.clone(), session.elided_images.clone())
+	};
+	crate::images::apply_elision(&mut messages, &elided_images);
 	let assistant_id = new_message_id();
 	let id_for_cb = assistant_id.clone();
 	let sink_for_cb = sink.clone();
@@ -11289,7 +11298,7 @@ fn is_local_base_url(base_url: &str) -> bool {
 	matches!(host, "localhost" | "127.0.0.1" | "::1") || host.ends_with(".local")
 }
 
-fn estimate_completion_tokens(response: &AssistantResponse) -> u32 {
+pub(crate) fn estimate_completion_tokens(response: &AssistantResponse) -> u32 {
 	let mut bytes: usize = 0;
 	bytes += response.content.as_deref().map(str::len).unwrap_or(0);
 	bytes += response.thinking.as_deref().map(str::len).unwrap_or(0);

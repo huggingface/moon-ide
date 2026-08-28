@@ -893,6 +893,12 @@ async fn run_subagent_loop(
 	// truncated audit from a complete one.
 	let mut report_fragments: Vec<String> = Vec::new();
 	let mut output_cap_continuations: usize = 0;
+	// Sticky image-elision set, mirroring the parent loop (ADR
+	// 0049). `messages` is the sub-agent's canonical in-memory
+	// history, so elisions are applied to a per-round-trip wire
+	// clone — the transcript, the JSONL, and a later resume keep
+	// every attachment.
+	let mut elided_images: std::collections::HashSet<u64> = std::collections::HashSet::new();
 	for iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
@@ -942,6 +948,25 @@ async fn run_subagent_loop(
 		let standard_model = models.standard().to_owned();
 		let pi_model = models.resolve_route().pi_provider_model(&standard_model);
 
+		// Image budget planning runs *before* compaction (ADR 0049),
+		// same as the parent loop: compaction's in-session summary
+		// call replays the elision set, so fresh screenshots must be
+		// marked first or the summary request ships them un-elided.
+		// Sub-agents need this backstop just as much — a playwright
+		// UI review racks up screenshots fast and 413'd against the
+		// HF body cap before this ran here.
+		if let Some(budget) = inference.image_wire_budget().await {
+			let newly = crate::images::plan_elision(&messages, budget, &mut elided_images);
+			if newly > 0 {
+				tracing::info!(
+					subagent_id = %id,
+					newly,
+					total = elided_images.len(),
+					"sub-agent image payload over budget; dropping the oldest attachments from the prompt"
+				);
+			}
+		}
+
 		// Compaction-before-send: if the last round's prompt size
 		// is bumping into the model's context window, fold the
 		// older messages into a synthetic system summary before
@@ -950,9 +975,6 @@ async fn run_subagent_loop(
 		// JSONL alongside the parent path, so a future "reopen
 		// sub-agent transcript" feature replays into the same
 		// compacted shape instead of re-inflating the prefix.
-		// Sub-agents don't run the image-elision budget, so an empty
-		// set reproduces their previous round-trips' wire shape.
-		let no_elisions = std::collections::HashSet::new();
 		let compaction_outcome = compaction::compact_if_needed(
 			inference,
 			sink,
@@ -961,23 +983,16 @@ async fn run_subagent_loop(
 			&tool_defs,
 			last_usage.as_ref(),
 			&mut messages,
-			&no_elisions,
+			&elided_images,
 			&cancel,
 		)
 		.await;
 		if let Some(applied) = compaction_outcome {
-			// Re-anchor on the compacted prompt's estimate (not
-			// `None`), so the next iteration's compaction check
-			// stays armed and re-fires if a single pass didn't get
-			// us under the threshold. Mirrors the parent loop.
-			let estimate = crate::runner::estimate_prompt_tokens(&messages);
-			last_usage = Some(TokenUsage {
-				prompt_tokens: estimate,
-				completion_tokens: 0,
-				total_tokens: estimate,
-				cache_read_input_tokens: 0,
-				cache_creation_input_tokens: 0,
-			});
+			// No re-anchor of `last_usage` here (unlike the parent
+			// loop): every iteration unconditionally refreshes it
+			// after the round-trip below — provider-exact or
+			// estimated — and this loop has no path that skips the
+			// round-trip, so the guard stays armed either way.
 			persist_subagent(
 				session_dir,
 				header,
@@ -990,19 +1005,24 @@ async fn run_subagent_loop(
 			.await;
 		}
 
+		// Wire copy with the elisions applied; `messages` itself
+		// keeps every attachment (ADR 0049).
+		let mut wire_messages = messages.clone();
+		crate::images::apply_elision(&mut wire_messages, &elided_images);
+
 		let assistant_id = format!("{id}::msg-{iter}");
 		let id_for_cb = assistant_id.clone();
 		let id_for_subagent = id.clone();
 		let sink_for_cb = sink.clone();
 		let started = std::sync::atomic::AtomicBool::new(false);
 		let output_budget = crate::defaults::turn_output_budget(
-			crate::runner::estimate_prompt_tokens(&messages),
+			crate::runner::estimate_prompt_tokens(&wire_messages),
 			models.context_window(&standard_model),
 		);
 		let mut response = inference
 			.chat_completion_stream(
 				&standard_model,
-				&messages,
+				&wire_messages,
 				&tool_defs,
 				output_budget,
 				&cancel,
@@ -1061,9 +1081,22 @@ async fn run_subagent_loop(
 			));
 		}
 
-		if let Some(u) = response.usage {
-			last_usage = Some(u);
-		}
+		// Provider-supplied usage is exact; synthesise a bytes/4
+		// estimate when missing so the compaction trigger still has
+		// a number to compare against — same fallback as the parent
+		// loop. Without it a provider that never emits usage left
+		// `last_usage` as `None` and the sub-agent never compacted.
+		last_usage = Some(response.usage.unwrap_or_else(|| {
+			let prompt = crate::runner::estimate_prompt_tokens(&messages);
+			let completion = crate::runner::estimate_completion_tokens(&response);
+			TokenUsage {
+				prompt_tokens: prompt,
+				completion_tokens: completion,
+				total_tokens: prompt + completion,
+				cache_read_input_tokens: 0,
+				cache_creation_input_tokens: 0,
+			}
+		}));
 		// Wrap the parent runner's helper so the sub-agent's ring
 		// updates land on the same wire as parent updates. The
 		// envelope is `SubagentEvent { inner: TokenUsage … }`.
@@ -1268,6 +1301,7 @@ async fn run_subagent_loop(
 		&standard_model,
 		&pi_model,
 		&mut messages,
+		&elided_images,
 		&cancel,
 	)
 	.await;
@@ -1315,6 +1349,7 @@ async fn subagent_wrap_up(
 	standard_model: &str,
 	pi_model: &str,
 	messages: &mut Vec<ChatMessage>,
+	elided_images: &std::collections::HashSet<u64>,
 	cancel: &CancellationToken,
 ) -> Result<String, CoderError> {
 	let id = spec.id.as_str();
@@ -1353,13 +1388,19 @@ Do not call any more tools. Write a final response now using only what you've al
 		},
 	));
 
+	// The wrap-up ships the same wire shape as the round-trips
+	// before it: elisions applied to a copy, history untouched
+	// (ADR 0049).
+	let mut wire_messages = messages.clone();
+	crate::images::apply_elision(&mut wire_messages, elided_images);
+
 	let assistant_id = format!("{id}::wrap-up");
 	let id_for_cb = assistant_id.clone();
 	let id_for_subagent = id.to_string();
 	let sink_for_cb = sink.clone();
 	let started = std::sync::atomic::AtomicBool::new(false);
 	let response = inference
-		.chat_completion_stream(standard_model, messages, &[], None, cancel, |event| match event {
+		.chat_completion_stream(standard_model, &wire_messages, &[], None, cancel, |event| match event {
 			StreamEvent::ContentDelta { delta } => {
 				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
 					sink_for_cb.send(wrap_inner(
