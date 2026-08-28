@@ -1024,6 +1024,14 @@ export type CoderProviderConfig = {
 	base_url: string;
 	standard_model: string;
 	cheap_model: string;
+	/**
+	 * Request-payload cap for this provider, in MB
+	 * (1000-multiples). Drives the image wire budget (ADR 0049):
+	 * past ~85 % of this, the oldest screenshots are elided from
+	 * the wire copy of the history. `null` / absent = uncapped.
+	 * The HF route has a built-in cap and ignores this field.
+	 */
+	payload_cap_mb?: number | null;
 	has_api_key: boolean;
 };
 

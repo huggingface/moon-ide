@@ -1344,9 +1344,10 @@ Budget planning runs **before** compaction in the turn loop: the
 in-session compaction summary replays the elision set, and marking
 fresh screenshots only afterwards let a summary request ship them
 un-elided (a 413 loop the budget could never break). User providers
-opt in via `payload_cap_mb` on their config (phone add-provider form
-included): the wire budget ceilings at ~85 % of the cap, floor at
-half — HF keeps its built-in budget.
+opt in via `payload_cap_mb` on their config (settable from both the
+desktop provider form and the phone add-provider form): the wire
+budget ceilings at ~85 % of the cap, floor at half — HF keeps its
+built-in budget.
 
 ### Compaction
 

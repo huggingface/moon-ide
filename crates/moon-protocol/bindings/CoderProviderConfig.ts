@@ -50,11 +50,6 @@ standard_model: string,
  */
 cheap_model: string, 
 /**
- * `true` iff the keyring currently holds an entry for this
- * provider. Server-set, read-only on the picker's side —
- * editing the key goes through `coder_set_provider_api_key`.
- * Deserialised as `false` when the field is missing so
- * inbound shapes from the frontend don't have to set it.
  * Request-payload cap for this provider, in MB (1000-multiples).
  * Drives the image wire budget: when the outgoing request's
  * image attachments would push past ~85 % of this, the oldest
@@ -63,4 +58,12 @@ cheap_model: string,
  * (locally-hosted endpoints don't care). The HF route has a
  * built-in cap and ignores this field.
  */
-payload_cap_mb?: number | null, has_api_key: boolean, };
+payload_cap_mb?: number | null, 
+/**
+ * `true` iff the keyring currently holds an entry for this
+ * provider. Server-set, read-only on the picker's side —
+ * editing the key goes through `coder_set_provider_api_key`.
+ * Deserialised as `false` when the field is missing so
+ * inbound shapes from the frontend don't have to set it.
+ */
+has_api_key: boolean, };

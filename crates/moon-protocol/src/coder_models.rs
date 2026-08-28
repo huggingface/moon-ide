@@ -313,11 +313,6 @@ pub struct CoderProviderConfig {
 	/// HF-only slug onto every non-HF route.
 	#[serde(default)]
 	pub cheap_model: String,
-	/// `true` iff the keyring currently holds an entry for this
-	/// provider. Server-set, read-only on the picker's side —
-	/// editing the key goes through `coder_set_provider_api_key`.
-	/// Deserialised as `false` when the field is missing so
-	/// inbound shapes from the frontend don't have to set it.
 	/// Request-payload cap for this provider, in MB (1000-multiples).
 	/// Drives the image wire budget: when the outgoing request's
 	/// image attachments would push past ~85 % of this, the oldest
@@ -328,6 +323,11 @@ pub struct CoderProviderConfig {
 	#[serde(default)]
 	#[ts(optional, type = "number | null")]
 	pub payload_cap_mb: Option<u32>,
+	/// `true` iff the keyring currently holds an entry for this
+	/// provider. Server-set, read-only on the picker's side —
+	/// editing the key goes through `coder_set_provider_api_key`.
+	/// Deserialised as `false` when the field is missing so
+	/// inbound shapes from the frontend don't have to set it.
 	#[serde(default)]
 	pub has_api_key: bool,
 }

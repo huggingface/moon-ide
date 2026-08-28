@@ -148,6 +148,7 @@
 		kind: ProviderKind;
 		base_url: string;
 		api_key: string; // local-only; never read back from the keyring
+		payload_cap: string; // MB, free-text; empty = uncapped
 		is_new: boolean;
 	};
 	let providerDraft = $state<ProviderDraft | null>(null);
@@ -378,6 +379,7 @@
 				kind,
 				base_url: preset?.base_url ?? '',
 				api_key: '',
+				payload_cap: '',
 				is_new: true,
 			};
 			probeMessage = null;
@@ -396,6 +398,7 @@
 			kind: entry.kind,
 			base_url: entry.base_url,
 			api_key: '',
+			payload_cap: typeof entry.payload_cap_mb === 'number' ? String(entry.payload_cap_mb) : '',
 			is_new: false,
 		};
 		probeMessage = null;
@@ -449,6 +452,7 @@
 			return;
 		}
 		const cleanedKey = draft.api_key.trim();
+		const capMb = parseInt(draft.payload_cap, 10);
 		try {
 			// Persist the key first so the runner's `has_api_key`
 			// flips to true at the moment the config lands.
@@ -463,6 +467,7 @@
 				base_url: baseUrl,
 				standard_model: existing?.standard_model ?? '',
 				cheap_model: existing?.cheap_model ?? '',
+				payload_cap_mb: Number.isFinite(capMb) && capMb > 0 ? capMb : null,
 				has_api_key: cleanedKey.length > 0 || (existing?.has_api_key ?? false),
 			};
 			await coder.saveProvider(next);
@@ -1181,6 +1186,21 @@
 							Stored in your OS keyring, never read back into this dialog. Leave blank for keyless local servers (<code
 								>localhost</code
 							>, <code>*.local</code>).
+						</span>
+					</label>
+					<label class="field">
+						<span class="label-row"><span class="label-name">Payload cap (MB)</span></span>
+						<input
+							type="text"
+							inputmode="numeric"
+							bind:value={providerDraft.payload_cap}
+							placeholder="uncapped"
+							spellcheck="false"
+							autocomplete="off"
+						/>
+						<span class="hint">
+							Max request-body size the endpoint accepts. Past ~85 % of it, the oldest screenshots are elided from
+							outgoing requests (never from the session). Leave empty for uncapped.
 						</span>
 					</label>
 				</div>
