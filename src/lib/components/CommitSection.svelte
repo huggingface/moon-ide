@@ -310,7 +310,15 @@
 		border: 1px solid var(--m-border);
 		border-radius: 6px;
 		background: var(--m-bg);
-		overflow: hidden;
+		/* `visible` (not `hidden`) so the sticky `.hdr` anchors to the
+		 * outer `.commit-view` scroller. `hidden` makes this box a
+		 * scroll container, which turns the header's `top: 35px` into
+		 * an offset *inside the section* — permanently parking it over
+		 * the first diff row (the top `… N unchanged lines`
+		 * placeholder, which became invisible and unclickable) and
+		 * never actually sticking. Same trap ReviewSection documents;
+		 * `.body` below reapplies the clipping. */
+		overflow: visible;
 		scroll-margin-top: var(--m-review-banner-h, 12px);
 	}
 	.hdr {
@@ -323,6 +331,9 @@
 		position: sticky;
 		top: var(--m-review-banner-h, 0);
 		z-index: 2;
+		/* Round the top corners ourselves now that the section no
+		 * longer clips its children. */
+		border-radius: 5px 5px 0 0;
 	}
 	.status {
 		display: inline-flex;
@@ -374,6 +385,12 @@
 	}
 	.body {
 		min-height: 0;
+		/* Clips the MergeView's horizontal overflow and keeps the
+		 * diff inside the card's rounded bottom corners — the
+		 * containment the section box provided before it relaxed
+		 * to `overflow: visible` for the sticky header. */
+		overflow: hidden;
+		border-radius: 0 0 5px 5px;
 	}
 	.placeholder {
 		padding: 12px 10px;
