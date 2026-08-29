@@ -55,6 +55,36 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// the reconnect loop takes over. Three missed ping exchanges.
 const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(95);
 
+/// Deadline for any single write to the bridge, covering both the
+/// sink-mutex acquisition and the TCP write. A stalled peer (bridge
+/// blocked on a phone that stopped draining, half-open socket) used
+/// to wedge the event-forwarder task inside `send` *while holding
+/// the sink lock* — every other writer then queued on the mutex,
+/// the serve loop stopped reading, and forwarded calls timed out
+/// bridge-side forever with no reconnect. Generous: even a slow
+/// uplink drains a multi-MB frame well inside a minute.
+const WRITE_WEDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `sink.lock().send(msg)` with [`WRITE_WEDGE_TIMEOUT`]. `Err` means
+/// the connection is wedged or gone; callers must treat it as lost
+/// (the reconnect ladder builds a fresh socket).
+async fn send_with_deadline<S>(sink: &Mutex<S>, msg: Message) -> Result<(), ()>
+where
+	S: futures_util::Sink<Message> + Unpin,
+{
+	match tokio::time::timeout(WRITE_WEDGE_TIMEOUT, async {
+		sink.lock().await.send(msg).await.map_err(|_| ())
+	})
+	.await
+	{
+		Ok(res) => res,
+		Err(_) => {
+			tracing::warn!("bridge write wedged past deadline; treating connection as lost");
+			Err(())
+		}
+	}
+}
+
 /// Keyring coordinates for the IDE's stored remote-bridge credential.
 /// One entry per enrolled bridge; the IDE stores `{ bridge_url,
 /// ide_id, token }` so a reconnect doesn't re-enroll.
@@ -513,7 +543,7 @@ async fn connect_and_serve(
 					}
 					return Err(anyhow::anyhow!("bridge connection idle past deadline; reconnecting"));
 				}
-				if sink.lock().await.send(Message::Ping(Vec::new().into())).await.is_err() {
+				if send_with_deadline(&sink, Message::Ping(Vec::new().into())).await.is_err() {
 					break;
 				}
 				continue;
@@ -523,7 +553,7 @@ async fn connect_and_serve(
 					Some(HandleCommand::PairCode(reply_tx)) => {
 						let req = IdeToBridge::PairCode { token: cred.token.clone() };
 						let json = serde_json::to_string(&req)?;
-						if sink.lock().await.send(Message::Text(json.into())).await.is_err() {
+						if send_with_deadline(&sink, Message::Text(json.into())).await.is_err() {
 							let _ = reply_tx.send(Err("bridge connection lost".into()));
 							break;
 						}
@@ -559,7 +589,7 @@ async fn connect_and_serve(
 					};
 					let json = serde_json::to_string(&reply)
 						.unwrap_or_else(|_| r#"{"type":"forwarderror","id":0,"message":"encode failed"}"#.into());
-					let _ = sink.lock().await.send(Message::Text(json.into())).await;
+					let _ = send_with_deadline(&sink, Message::Text(json.into())).await;
 				});
 			}
 			BridgeToIde::ForwardSubscribe {
@@ -575,7 +605,7 @@ async fn connect_and_serve(
 						Err(message) => {
 							let reply = IdeToBridge::ForwardError { id, message };
 							let json = serde_json::to_string(&reply).unwrap_or_default();
-							let _ = sink.lock().await.send(Message::Text(json.into())).await;
+							let _ = send_with_deadline(&sink, Message::Text(json.into())).await;
 							return;
 						}
 					};
@@ -591,7 +621,7 @@ async fn connect_and_serve(
 						event: serde_json::json!({ "event": { "kind": "stream_opened" } }),
 					};
 					if let Ok(json) = serde_json::to_string(&ack) {
-						let _ = sink.lock().await.send(Message::Text(json.into())).await;
+						let _ = send_with_deadline(&sink, Message::Text(json.into())).await;
 					}
 					while let Some(event) = rx.recv().await {
 						let frame = IdeToBridge::ForwardEvent { id, event };
@@ -599,14 +629,14 @@ async fn connect_and_serve(
 							Ok(j) => j,
 							Err(_) => continue,
 						};
-						if sink.lock().await.send(Message::Text(json.into())).await.is_err() {
+						if send_with_deadline(&sink, Message::Text(json.into())).await.is_err() {
 							break; // bridge gone
 						}
 					}
 					// Stream ended — tell the bridge.
 					let end = IdeToBridge::ForwardEnd { id };
 					let json = serde_json::to_string(&end).unwrap_or_default();
-					let _ = sink.lock().await.send(Message::Text(json.into())).await;
+					let _ = send_with_deadline(&sink, Message::Text(json.into())).await;
 				});
 			}
 			BridgeToIde::Result { value } => {

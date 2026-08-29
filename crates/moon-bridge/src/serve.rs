@@ -707,13 +707,27 @@ async fn handle_conn(
 					let Some(msg) = msg else { break };
 					let json =
 						serde_json::to_string(&msg).unwrap_or_else(|_| r#"{"type":"error","message":"encode failed"}"#.into());
-					if sink.send(Message::Text(json.into())).await.is_err() {
-						break;
+					// Write deadline: a peer that stops draining (phone
+					// suspended mid-stream, half-open TCP) must kill
+					// this connection, not wedge the writer forever. A
+					// wedged phone writer fills its bounded queue, the
+					// IDE read loops forwarding events into that queue
+					// block in turn — the bridge then stops reading
+					// the IDE socket and every call to that workspace
+					// times out until something restarts.
+					match tokio::time::timeout(WRITE_WEDGE_TIMEOUT, sink.send(Message::Text(json.into()))).await {
+						Ok(Ok(())) => {}
+						Ok(Err(_)) => break,
+						Err(_) => {
+							tracing::info!("connection write wedged past deadline; dropping peer");
+							break;
+						}
 					}
 				}
 				_ = ping.tick() => {
-					if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
-						break;
+					match tokio::time::timeout(WRITE_WEDGE_TIMEOUT, sink.send(Message::Ping(Vec::new().into()))).await {
+						Ok(Ok(())) => {}
+						_ => break,
 					}
 				}
 			}
@@ -1621,6 +1635,10 @@ async fn handle_local_launch(workspaces_dir: &Utf8Path, slug: &str) -> Result<()
 /// auto-pong, giving the read loop steady traffic to prove liveness
 /// and keeping idle connections alive through proxy idle timeouts.
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Deadline for a single write to any peer socket — see the writer
+/// task; pairs with the IDE relay's own write deadline.
+const WRITE_WEDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Read-silence deadline. Three missed ping/pong exchanges means the
 /// peer is gone (half-open TCP after a suspend / NAT drop); the

@@ -790,3 +790,12 @@ Prose, not commitments — revisit when someone asks:
   remembers which project it was on per workspace (localStorage)
   and re-opens it on refresh/workspace open, taking precedence over
   the IDE's active folder; an explicit `f` route param still wins.
+- **Relay/bridge write deadlines** (60s, both directions): a peer
+  that stops draining its socket (phone suspended mid-stream,
+  half-open TCP) is dropped instead of wedging the writer. Without
+  this, one stalled phone cascaded: bridge writer wedged, its
+  bounded queue filled, the IDE read loop blocked forwarding into
+  it, the bridge stopped reading that IDE socket, and every call to
+  that workspace answered `forwarded call timed out` until a
+  process restart. The IDE relay treats a wedged write as a lost
+  connection and re-enters its reconnect ladder.
