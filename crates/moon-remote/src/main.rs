@@ -86,6 +86,27 @@ enum Command {
 		#[arg(long)]
 		workspace: String,
 	},
+	/// Manage the workspace shell container. When it's running,
+	/// agents' `bash` / format / lint route into it exactly like
+	/// the desktop (the routing is shared moon-coder code); when
+	/// it isn't, everything runs host-side. Works against docker
+	/// or a podman socket via `DOCKER_HOST`.
+	Container {
+		/// Workspace slug.
+		#[arg(long)]
+		workspace: String,
+		/// Regenerate `compose.yaml` from the bound folders and
+		/// `docker compose up -d --wait` (first run pulls/builds
+		/// the dev image).
+		#[arg(long)]
+		up: bool,
+		/// Stop and remove the compose project.
+		#[arg(long)]
+		stop: bool,
+		/// Dev image for `--up`. Defaults to the desktop's default.
+		#[arg(long)]
+		image: Option<String>,
+	},
 	/// Unbind a project folder from a workspace (`session.json`).
 	/// The inverse of `workspace-add`'s bind; sessions and the
 	/// folder's files are untouched. **Stop the workspace's `serve`
@@ -163,6 +184,12 @@ fn main() -> anyhow::Result<()> {
 			Command::WorkspaceAdd { name, folder, slug } => workspace_add(name, folder, slug).await,
 			Command::WorkspaceRemoveFolder { workspace, folder } => workspace_remove_folder(workspace, folder).await,
 			Command::Serve { workspace } => serve(workspace).await,
+			Command::Container {
+				workspace,
+				up,
+				stop,
+				image,
+			} => container(workspace, up, stop, image).await,
 			Command::Mcp {
 				workspace,
 				enable,
@@ -439,6 +466,50 @@ impl WorkspaceLauncher for HeadlessLauncher {
 /// SIGINT/SIGTERM. Mirrors the desktop's setup subset: state load,
 /// registry + folder restore, models seed, `CoderHandle`, relay
 /// connect with the full catalog registered.
+/// Shell-container lifecycle for a headless workspace: the same
+/// moon-container `setup`/`stop`/`status` path the desktop's
+/// container panel drives. `--up` is idempotent (regenerate compose
+/// from the current bound folders, `up -d --wait`), so it can run
+/// from an `ExecStartPre=` or after folder changes. A running
+/// `serve` picks the container up on the next tool call — routing
+/// probes live status per call, no restart needed.
+async fn container(slug: String, up: bool, stop: bool, image: Option<String>) -> anyhow::Result<()> {
+	anyhow::ensure!(!(up && stop), "--up and --stop are mutually exclusive");
+	moon_protocol::workspace::validate_workspace_id(&slug)?;
+	let (_, workspaces_dir) = data_dirs()?;
+	let session = core_session::load(&workspaces_dir, &slug).await.unwrap_or_default();
+	anyhow::ensure!(
+		!session.folders.is_empty(),
+		"workspace `{slug}` has no bound folders — run `moon-remote workspace-add` first"
+	);
+	// Worktree-backed folders are host-only (ADR 0028), same
+	// filter as the desktop's `workspace_handle`.
+	let bound_folders: Vec<Utf8PathBuf> = session
+		.folders
+		.iter()
+		.filter(|f| !matches!(f.origin, moon_protocol::workspace::FolderOrigin::Worktree { .. }))
+		.map(|f| Utf8PathBuf::from(&f.folder_path))
+		.collect();
+	let ws = moon_container::Workspace::new(moon_container::WorkspaceConfig {
+		workspace_id: slug.clone(),
+		state_dir: workspaces_dir.join(&slug),
+		bound_folders,
+	})?;
+	if up {
+		let image = image.as_deref().unwrap_or(moon_container::DEFAULT_DEV_IMAGE);
+		println!("bringing up shell container for `{slug}` (image {image})…");
+		ws.setup(image).await?;
+	} else if stop {
+		ws.stop().await?;
+	}
+	let status = ws.status().await?;
+	println!("state: {:?}", status.state);
+	for svc in &status.services {
+		println!("  {} — {}", svc.name, svc.raw_state);
+	}
+	Ok(())
+}
+
 async fn serve(slug: String) -> anyhow::Result<()> {
 	moon_protocol::workspace::validate_workspace_id(&slug)?;
 	let cred = relay::load_credential()?

@@ -15,6 +15,7 @@ name = "moon-remote"
 path = "src/main.rs"
 
 [dependencies]
+moon-container = { workspace = true }
 moon-core = { workspace = true }
 moon-coder = { workspace = true }
 moon-protocol = { workspace = true }

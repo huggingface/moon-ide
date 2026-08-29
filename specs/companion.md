@@ -799,3 +799,10 @@ Prose, not commitments — revisit when someone asks:
   that workspace answered `forwarded call timed out` until a
   process restart. The IDE relay treats a wedged write as a lost
   connection and re-enters its reconnect ladder.
+- **Headless shell container**: `moon-remote container --workspace
+<slug> --up|--stop` drives the same moon-container lifecycle the
+  desktop panel does; agents route `bash`/format/lint into the
+  running container automatically (shared moon-coder routing).
+  Podman hosts work via its docker-compatible socket: docker CLI +
+  compose plugin with `DOCKER_HOST=unix://…/podman/podman.sock`,
+  `userns = "keep-id"` for bind-mount ownership.

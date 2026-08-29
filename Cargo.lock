@@ -3347,6 +3347,7 @@ dependencies = [
  "hostname",
  "keyring",
  "moon-coder",
+ "moon-container",
  "moon-core",
  "moon-protocol",
  "moon-terminal",
