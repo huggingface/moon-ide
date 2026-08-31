@@ -113,6 +113,16 @@ pub enum CoderError {
 	/// silent turn end so the user knows the model never answered.
 	#[error("the model returned an empty response after {attempts} attempts — try again, or switch model/provider")]
 	EmptyResponse { attempts: u32 },
+
+	/// Every tool call in each of `rounds` consecutive round-trips
+	/// had arguments that didn't parse as JSON. The model is stuck
+	/// emitting the same malformed shape (a truncation loop or a
+	/// model-side JSON bug) and the per-call refusal — which quotes
+	/// the model's own bytes — didn't unstick it. Failing the turn
+	/// surfaces the loop to the user instead of burning prompt
+	/// tokens on round-trip N+1.
+	#[error("the model emitted malformed tool-call arguments in all of {rounds} consecutive round-trips — the model appears stuck; try again, or switch model/provider")]
+	BrokenToolCallLoop { rounds: u32 },
 }
 
 impl CoderError {

@@ -6152,6 +6152,13 @@ async fn run_turn(
 	// `OUTPUT_CAP_CONTINUATIONS`; never reset, so a pathological
 	// turn can't loop on it.
 	let mut output_cap_continuations: usize = 0;
+	// Consecutive round-trips in which EVERY tool call was refused
+	// for unparseable JSON. A model emitting the same malformed
+	// shape every round (GLM-5.3's `"args": ,`) can't self-repair
+	// from the refusal, and each round re-pays the whole prompt —
+	// cap it like the empty-shell retry caps a bailed provider.
+	// Reset the moment any call in a batch dispatches.
+	let mut broken_tool_rounds: usize = 0;
 	for _iter in 0..MAX_TURN_ITERATIONS {
 		if cancel.is_cancelled() {
 			return Err(CoderError::Aborted);
@@ -6583,6 +6590,27 @@ async fn run_turn(
 			continue;
 		}
 
+		// Loop-breaker accounting for fully-refused rounds. A
+		// mixed batch (any dispatchable call) resets the counter —
+		// one malformed call beside healthy ones is a fumble, not
+		// a stuck model. Only a round where nothing dispatched
+		// counts toward [`BROKEN_TOOL_CALL_ROUNDS`].
+		let all_broken = !response.tool_calls.is_empty()
+			&& response
+				.tool_calls
+				.iter()
+				.all(|c| tool_args_or_refusal(&c.function, response.hit_output_cap()).is_err());
+		if all_broken {
+			broken_tool_rounds += 1;
+			if broken_tool_rounds > crate::defaults::BROKEN_TOOL_CALL_ROUNDS {
+				return Err(CoderError::BrokenToolCallLoop {
+					rounds: broken_tool_rounds as u32,
+				});
+			}
+		} else {
+			broken_tool_rounds = 0;
+		}
+
 		dispatch_tool_calls(
 			state,
 			rt,
@@ -6612,6 +6640,19 @@ async fn run_turn(
 /// stopped calling tools, or why one answer arrived in two bubbles.
 /// Persistence is best-effort; a write failure logs and the turn
 /// carries on with the in-memory history.
+/// First `n` chars of `s`, char-boundary safe (an ellipsis marks a
+/// clip). Used to quote a malformed tool-call's arguments back to
+/// the model — the parser error sits near the start, so a head
+/// clip is the useful one.
+fn head_chars(s: &str, n: usize) -> String {
+	if s.chars().count() <= n {
+		return s.to_string();
+	}
+	let mut clipped: String = s.chars().take(n.saturating_sub(1)).collect();
+	clipped.push('…');
+	clipped
+}
+
 /// Last `n` chars of `s`, char-boundary safe. Used to quote the
 /// tail of a truncated reasoning trace into the continuation
 /// sentinel without blowing up the prompt.
@@ -11374,9 +11415,22 @@ rewriting the whole file.",
 				bytes = call.arguments.len(),
 				"could not parse tool-call arguments as JSON; refusing the call"
 			);
+			// Quote the model's own bytes back at it. A bare parser
+			// message ("expected value at line 1 column 10") names a
+			// position, not the mistake — a model emitting the same
+			// malformed shape every round (GLM-5.3 writing
+			// `"args": ,` when it meant to omit the key) cannot
+			// self-repair from it, and the wire repair (ADR 0076)
+			// replays the broken call as `{}`, so this tool result
+			// is the only place the raw bytes ever surface.
+			let quoted = head_chars(&call.arguments, 512);
 			Err(CoderError::invalid_args(
 				call.name.clone(),
-				format!("arguments were not valid JSON ({err}); the call was not executed"),
+				format!(
+					"arguments were not valid JSON ({err}); the call was not executed. \
+Your arguments, verbatim: `{quoted}` — the JSON itself is malformed (for example a value is missing after a key). \
+Re-emit the call with strictly valid JSON; to omit an optional argument, leave the key out entirely instead of writing it with no value."
+				),
 			))
 		}
 	}
@@ -11940,6 +11994,38 @@ mod tests {
 		};
 		let err = tool_args_or_refusal(&call, false).expect_err("garbage args must be refused");
 		assert!(err.to_string().contains("not valid JSON"), "{err}");
+		// The refusal quotes the model's own bytes — the only place
+		// they surface, since the wire repair replays the call as
+		// `{}`. A bare parser message ("expected value at line 1
+		// column 5") didn't give GLM-5.3 enough to self-repair its
+		// recurring `"args": ,` shape (observed: 11 identical
+		// refused rounds, ~170k prompt tokens each).
+		assert!(err.to_string().contains("not json at all"), "{err}");
+		assert!(err.to_string().contains("leave the key out"), "{err}");
+	}
+
+	#[test]
+	fn malformed_arguments_refusal_clips_huge_payloads() {
+		// Malformed (missing value after `content`:) so the
+		// refusal fires; huge so the quote must clip.
+		let call = FunctionCall {
+			name: "write_file".into(),
+			arguments: format!(r#"{{"path":"a","content": {}}}"#, "x".repeat(4_000)),
+		};
+		let err = tool_args_or_refusal(&call, false).expect_err("must be refused");
+		assert!(
+			err.to_string().contains('…'),
+			"a 4 kB payload must be clipped, not quoted whole: {err}"
+		);
+		assert!(err.to_string().contains(r#""path":"a""#), "{err}");
+	}
+
+	#[test]
+	fn head_chars_is_boundary_safe_and_marks_clips() {
+		assert_eq!(super::head_chars("hello", 10), "hello");
+		assert_eq!(super::head_chars("hello", 2), "h…");
+		// Multi-byte: never splits a char.
+		assert_eq!(super::head_chars("héllo", 2), "h…");
 	}
 
 	#[test]

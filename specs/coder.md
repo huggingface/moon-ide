@@ -340,11 +340,24 @@ land in prose or inside a tool call:
   tool, which surfaced as "missing field `path`" and sent the model
   straight back into the same oversized call. Calls that parse still
   run, including in a response that was truncated after them. The
-  broken assistant turn still lands in history (the refusal result
-  answers it), and strict routers validate replayed
-  `tool_calls[].function.arguments` as JSON — the OpenAI-compat wire
-  builder repairs an unparseable blob to `{}` at request time so the
-  session's next round-trip isn't 400'd wholesale (ADR 0076).
+  refusal **quotes the model's own raw arguments back** (clipped to
+  ~512 chars) plus the recovery hint: a bare parser message ("expected
+  value at line 1 column 10") names a position, not the mistake, and
+  a model emitting the same malformed shape every round can't
+  self-repair from it — observed with GLM-5.3 writing `"args": ,`
+  (key with no value) eleven consecutive `mcp_call` rounds. A
+  round in which **every** tool call was refused counts toward
+  `BROKEN_TOOL_CALL_ROUNDS` (3); when consecutive fully-refused
+  rounds exceed it the turn fails with a `BrokenToolCallLoop` error
+  instead of burning prompt tokens on round N+1 (same posture as the
+  empty-shell retry cap). Any round with at least one dispatchable
+  call resets the counter. The broken assistant turn still lands in
+  history (the refusal result answers it), and strict routers validate
+  replayed `tool_calls[].function.arguments` as JSON — the
+  OpenAI-compat wire builder repairs an unparseable blob to `{}` at
+  request time so the session's next round-trip isn't 400'd wholesale
+  (ADR 0076; the loop breaker and self-descriptive refusal are
+  ADR 0078).
 
 #### Prompt caching (Anthropic, native or via OpenRouter)
 

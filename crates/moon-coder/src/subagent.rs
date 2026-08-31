@@ -886,6 +886,9 @@ async fn run_subagent_loop(
 	// empty `result` as a *success*, which the parent model (and
 	// the user) reads as "the sub-agent found nothing".
 	let mut empty_shell_attempts: usize = 0;
+	// Consecutive fully-refused rounds — same breaker as the
+	// parent loop's `broken_tool_rounds` (see `run_turn`).
+	let mut broken_tool_rounds: usize = 0;
 	// Fragments of a report the provider cut off at the
 	// output-token ceiling, in order. The parent gets them joined
 	// back together — a sub-agent report that stops mid-sentence is
@@ -1197,6 +1200,25 @@ async fn run_subagent_loop(
 		// report it'll write at the end. Drop the fragments — they
 		// stay in `messages` as history either way.
 		report_fragments.clear();
+
+		// Loop-breaker accounting, mirroring the parent loop: only
+		// a round whose EVERY call was refused counts; one healthy
+		// call resets it.
+		let all_broken = !response.tool_calls.is_empty()
+			&& response
+				.tool_calls
+				.iter()
+				.all(|c| crate::runner::tool_args_or_refusal(&c.function, response.hit_output_cap()).is_err());
+		if all_broken {
+			broken_tool_rounds += 1;
+			if broken_tool_rounds > crate::defaults::BROKEN_TOOL_CALL_ROUNDS {
+				return Err(CoderError::BrokenToolCallLoop {
+					rounds: broken_tool_rounds as u32,
+				});
+			}
+		} else {
+			broken_tool_rounds = 0;
+		}
 
 		// Sub-agents dispatch their tools sequentially today —
 		// recursive parallelism (a sub-agent's own tools running

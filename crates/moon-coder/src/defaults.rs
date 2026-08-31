@@ -74,6 +74,18 @@ pub const MAX_TURN_ITERATIONS: usize = 200;
 /// [`crate::error::CoderError::EmptyResponse`] instead.
 pub const EMPTY_RESPONSE_RETRIES: usize = 2;
 
+/// How many consecutive round-trips whose **every** tool call was
+/// refused for unparseable JSON the loop tolerates before failing
+/// the turn. A model stuck emitting the same malformed shape
+/// (observed: GLM-5.3 writing `"args": ,` eleven rounds straight,
+/// each burning ~170k prompt tokens) never self-repairs from a
+/// positional parser error, so capping saves the burn; a model
+/// that merely fumbles once (or has a broken call alongside
+/// healthy ones) resets the counter and is unaffected. Two
+/// refusals already include one "you showed me my bytes, retry"
+/// chance.
+pub const BROKEN_TOOL_CALL_ROUNDS: usize = 3;
+
 /// How many extra round-trips a single assistant answer may take
 /// after the provider cut it off at the output-token ceiling
 /// (`stop_reason: "length"`). Each continuation re-sends the history
