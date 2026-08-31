@@ -2828,16 +2828,29 @@ impl CoderHandle {
 		Ok(())
 	}
 
-	/// Resume the turn from a mid-turn agent response: truncate the
-	/// session to keep everything up to **and including** the
-	/// `assistant_ordinal`-th `Assistant` record (with tool calls),
-	/// drop its `Tool` records and everything after, then re-dispatch
-	/// the kept `Assistant`'s `tool_calls` against the current
-	/// workspace and continue the turn loop. The user-visible gesture
-	/// is "re-run the tool calls from this checkpoint" — the model
-	/// isn't re-prompted for that round-trip; its existing tool calls
-	/// execute fresh against current workspace state and the loop
-	/// continues with the new results in context.
+	/// Resume the turn from the assistant response that issued
+	/// `tool_call_id` (the desktop panel's visible-session path —
+	/// the phone uses the by-id [`Self::resume_from_tool_call_in`]):
+	/// truncate the session to keep everything up to **and
+	/// including** that `Assistant` record, drop its `Tool` records
+	/// and everything after, then re-dispatch the kept `Assistant`'s
+	/// `tool_calls` against the current workspace and continue the
+	/// turn loop. The user-visible gesture is "re-run the tool calls
+	/// from this checkpoint" — the model isn't re-prompted for that
+	/// round-trip; its existing tool calls execute fresh against
+	/// current workspace state and the loop continues with the new
+	/// results in context.
+	///
+	/// **Anchored on the persisted tool-call id, not an ordinal**:
+	/// the desktop's old ordinal path counted *visible assistant
+	/// rows* while the backend counted *assistant records with tool
+	/// calls*, and the two sets diverge by every tool-only assistant
+	/// record (a bare call with no prose renders tool rows but no
+	/// assistant row) — on a coordinator session that drift reached
+	/// 70+ records and a "replay from a few messages up" cut the
+	/// transcript ~40 messages too high, swallowing the thread the
+	/// user was replying to. Ids are persisted and globally unique,
+	/// so nothing drifts (same fix the companion already got).
 	///
 	/// Auth-gates **before** the destructive truncation (same posture
 	/// as [`replay_from_message`]). Refuses mid-turn. Unlike
@@ -2847,14 +2860,16 @@ impl CoderHandle {
 	/// the frontend clears and rebuilds to the checkpoint state. The
 	/// turn loop then runs on the same `rt`, so `abort` / `send`
 	/// target the right runtime.
-	pub async fn resume_from_assistant(&self, assistant_ordinal: usize) -> Result<(), CoderError> {
+	pub async fn resume_from_tool_call(&self, tool_call_id: &str) -> Result<(), CoderError> {
 		let (_, session_id, _) = self.state.active_visible_runtime().await?;
-		self.resume_from_assistant_in(&session_id, assistant_ordinal).await
+		self.resume_from_tool_call_in(&session_id, tool_call_id).await
 	}
 
-	/// [`Self::resume_from_assistant`] against an explicit session —
+	/// [`Self::resume_from_tool_call`] against an explicit session —
 	/// the bridge path, where the phone drives a session the desktop
-	/// isn't showing.
+	/// isn't showing. Still ordinal-based; the bridge prefers
+	/// [`Self::resume_from_tool_call_in`] (id anchor) and this is its
+	/// fallback.
 	pub async fn resume_from_assistant_in(&self, session_id: &str, assistant_ordinal: usize) -> Result<(), CoderError> {
 		self.ensure_can_send().await?;
 		let (rt, folder_path) = self
@@ -3054,7 +3069,7 @@ impl CoderHandle {
 		};
 		let session_id = session_id.to_string();
 		{
-			// Refuse mid-turn — same guard as `resume_from_assistant`.
+			// Refuse mid-turn — same guard as `resume_from_tool_call`.
 			let turn = rt.turn.lock().await;
 			if turn.cancel.is_some() {
 				return Err(CoderError::Internal(
@@ -3174,7 +3189,7 @@ impl CoderHandle {
 	/// the running turn by an iteration.
 	/// Rebuild `Vec<ChatMessage>` from persisted records — the
 	/// message-history reconstruction `open_session` and
-	/// `resume_from_assistant` both need. Walks records linearly,
+	/// `resume_from_tool_call_in` both need. Walks records linearly,
 	/// folding compaction summaries at the same cutoff the live pass
 	/// used, and tracking `last_usage` / `last_todos` (last-wins).
 	/// **Does not** inject orphan-recovery `Tool` messages — the
@@ -3935,7 +3950,7 @@ impl CoderHandle {
 		// the frontend closes the replay window in the same reduce
 		// pass.
 		// Filter out `ToolCall` events for the `ask_user` calls we're
-		// about to re-dispatch — same reason as `resume_from_assistant`:
+		// about to re-dispatch — same reason as `resume_from_tool_call_in`:
 		// the re-dispatch emits fresh `ToolCall` events and the panel
 		// always pushes a new row (never dedups by id), so leaving the
 		// replayed ones in would render duplicate cards.
@@ -4011,7 +4026,7 @@ impl CoderHandle {
 		// interactive "waiting" state, and `coder_respond_to_prompt`
 		// resolves the oneshot the moment the user picks an option. The
 		// turn then continues exactly as if the prompt had never been
-		// interrupted — same code path as `resume_from_assistant`.
+		// interrupted — same code path as `resume_from_tool_call_in`.
 		if !resume_ask_user_calls.is_empty() {
 			if let Some(rt) = fs.runtime(&id).await {
 				let cancel = CancellationToken::new();
@@ -5482,7 +5497,7 @@ pub struct RevertedMessage {
 /// Rebuilt chat history from persisted records, returned by
 /// [`Coder::rebuild_messages_from_records`]. Carries the
 /// last-wins `usage` and `todos` alongside `messages` so both
-/// `open_session` and `resume_from_assistant` can seed the
+/// `open_session` and `resume_from_tool_call_in` can seed the
 /// runtime's state without duplicating the record-walk logic.
 struct RebuiltMessages {
 	messages: Vec<ChatMessage>,

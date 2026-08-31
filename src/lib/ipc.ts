@@ -402,8 +402,7 @@ export const ipc = {
 			invoke<boolean>('coder_respond_to_prompt', { callId, response }),
 		revertToMessage: (userOrdinal: number) => invoke<RevertedMessage>('coder_revert_to_message', { userOrdinal }),
 		replayFromMessage: (userOrdinal: number) => invoke<void>('coder_replay_from_message', { userOrdinal }),
-		resumeFromAssistant: (assistantOrdinal: number) =>
-			invoke<void>('coder_resume_from_assistant', { assistantOrdinal }),
+		resumeFromToolCall: (toolCallId: string) => invoke<void>('coder_resume_from_tool_call', { toolCallId }),
 		retryLastTurn: () => invoke<void>('coder_retry_last_turn'),
 		rerunToolCall: (toolCallId: string) => invoke<RerunToolOutcome>('coder_rerun_tool_call', { toolCallId }),
 		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),

@@ -351,28 +351,28 @@ pub async fn coder_replay_from_message(state: State<'_, AppState>, user_ordinal:
 		.map_err(MoonError::from)
 }
 
-/// Resume the active folder's visible session from its
-/// `assistant_ordinal`-th assistant message with tool calls (0-based,
-/// among assistant records that have non-empty `tool_calls`):
-/// truncate the session to keep everything up to and including that
-/// assistant message, drop its tool results and everything after,
-/// then re-dispatch the kept assistant's tool calls against the
-/// current workspace and continue the turn loop. The "resume the
-/// tool-loop from this checkpoint" gesture — the model isn't
-/// re-prompted for that round-trip; its existing tool calls execute
-/// fresh and the loop continues with the new results in context.
+/// Resume the active folder's visible session from the assistant
+/// message that issued `tool_call_id`: truncate the session to keep
+/// everything up to and including that assistant message, drop its
+/// tool results and everything after, then re-dispatch the kept
+/// assistant's tool calls against the current workspace and continue
+/// the turn loop. The "resume the tool-loop from this checkpoint"
+/// gesture — the model isn't re-prompted for that round-trip; its
+/// existing tool calls execute fresh and the loop continues with the
+/// new results in context. Anchored on the persisted tool-call id
+/// rather than a counted ordinal — the panel's visible-row count and
+/// the backend's record count drift on tool-only assistant records
+/// (a bare call with no prose renders tool rows but no assistant
+/// row), which once swallowed ~40 messages of a coordinator session.
 /// Auth-gates before the truncation. Refused while a turn is in
 /// flight. The trimmed transcript replays on `coder:event` (via the
 /// reload), then the re-dispatched tool calls stream as normal
 /// `tool_call` / `tool_result` events.
 #[tauri::command]
-pub async fn coder_resume_from_assistant(
-	state: State<'_, AppState>,
-	assistant_ordinal: usize,
-) -> Result<(), MoonError> {
+pub async fn coder_resume_from_tool_call(state: State<'_, AppState>, tool_call_id: String) -> Result<(), MoonError> {
 	state
 		.coder
-		.resume_from_assistant(assistant_ordinal)
+		.resume_from_tool_call(&tool_call_id)
 		.await
 		.map_err(MoonError::from)
 }

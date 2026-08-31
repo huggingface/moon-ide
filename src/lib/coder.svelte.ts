@@ -2834,51 +2834,29 @@ export class CoderPanelState {
 		return null;
 	}
 
-	/** The 0-based ordinal of an assistant row among all assistant
-	 *  rows that are followed by at least one tool row (i.e.
-	 *  mid-turn agent responses with tool calls). The backend's
-	 *  `truncate_before_assistant_record` counts the same way —
-	 *  only `Assistant` records with non-empty `tool_calls` are
-	 *  valid anchors. Returns `null` when the id isn't a mid-turn
-	 *  assistant row or the row is followed by no tools (the final
-	 *  answer). */
-	#assistantOrdinalForRow(rowId: string): number | null {
-		// Walk the rows once, tracking whether each assistant row
-		// is "mid-turn" (followed by at least one tool row before
-		// the next user row). Count mid-turn assistant rows up to
-		// the target, matching the backend's ordinal count — only
-		// `Assistant` records with non-empty `tool_calls` are valid
-		// anchors.
-		let ordinal = 0;
-		let found = false;
-		for (let i = 0; i < this.rows.length; i++) {
-			const row = this.rows[i]!;
-			if (row.kind !== 'assistant') {
-				continue;
-			}
-			// Check if this assistant row is mid-turn (has tool
-			// rows after it before the next user row).
-			let isMidTurn = false;
-			for (let j = i + 1; j < this.rows.length; j++) {
-				const inner = this.rows[j]!;
-				if (inner.kind === 'user') {
-					break;
-				}
-				if (inner.kind === 'tool') {
-					isMidTurn = true;
-					break;
-				}
-			}
-			if (!isMidTurn) {
-				continue;
-			}
-			if (row.id === rowId) {
-				found = true;
-				break;
-			}
-			ordinal += 1;
+	/** Id of the first tool call an assistant row issued, or null
+	 *  when it issued none (a plain answer, which a resume can't
+	 *  target). This id — persisted and unique — is the resume
+	 *  anchor: no index, so nothing can drift between what the
+	 *  panel counts as visible rows and what the backend counts
+	 *  as records. Scans the rows that follow the bubble up to the
+	 *  next assistant/user row. Mirrors the companion's
+	 *  `resumeAnchorFor`. */
+	#resumeAnchorForRow(rowId: string): string | null {
+		const start = this.rows.findIndex((r) => r.kind === 'assistant' && r.id === rowId);
+		if (start === -1) {
+			return null;
 		}
-		return found ? ordinal : null;
+		for (let i = start + 1; i < this.rows.length; i++) {
+			const row = this.rows[i];
+			if (!row || row.kind === 'assistant' || row.kind === 'user') {
+				return null;
+			}
+			if (row.kind === 'tool') {
+				return row.id;
+			}
+		}
+		return null;
 	}
 
 	/** Revert the visible session to just before the user message
@@ -2973,19 +2951,26 @@ export class CoderPanelState {
 	 *  tool calls against the current workspace and continue the
 	 *  turn loop. The model isn't re-prompted for that round-trip
 	 *  — its existing tool calls execute fresh and the loop
-	 *  continues with the new results in context. The backend
+	 *  continues with the new results in context. Anchored on the
+	 *  first tool-call id the assistant row issued — persisted and
+	 *  unique, so nothing drifts between what the panel counts as
+	 *  visible rows and what the backend counts as records. The
+	 *  old ordinal path drifted on tool-only assistant records (a
+	 *  bare call with no prose renders tool rows but no assistant
+	 *  row) and swallowed ~40 messages of a coordinator session
+	 *  on one "replay from a few messages up". The backend
 	 *  auth-gates before the destructive truncation and refuses
 	 *  mid-turn, so we hide the affordance while busy. The trimmed
 	 *  transcript repaints from the `open_session` replay, then
 	 *  the re-dispatched tool calls stream as normal `tool_call` /
 	 *  `tool_result` events — no `rows` mutation here. */
 	async resumeFromAssistant(rowId: string): Promise<void> {
-		const ordinal = this.#assistantOrdinalForRow(rowId);
-		if (ordinal === null) {
+		const anchor = this.#resumeAnchorForRow(rowId);
+		if (anchor === null) {
 			return;
 		}
 		try {
-			await ipc.coder.resumeFromAssistant(ordinal);
+			await ipc.coder.resumeFromToolCall(anchor);
 			await this.refreshSessions();
 		} catch (err) {
 			this.rows = [

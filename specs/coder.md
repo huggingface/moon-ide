@@ -480,7 +480,8 @@ show a "needs input" cue that takes precedence over "running".
 A cold restart (IDE quit + relaunch) also resumes a parked prompt
 instead of erroring it: the `ask_user` call's args survive in the
 Assistant record, so `open_session` re-dispatches the call via the
-same `resume_tool_calls` path `resume_from_assistant` uses, which
+same `resume_tool_calls` path the resume-from-assistant gesture
+uses, which
 re-parks a fresh oneshot and the card re-renders interactive.
 Answering it resolves the oneshot and the turn continues. Only
 `ask_user` orphans resume this way — a mixed orphan tail (an
@@ -1141,9 +1142,21 @@ operation from the user-message replay above — it resumes the
 tool-loop from that checkpoint rather than re-sending a prompt.
 
 Routes through
-`coder_resume_from_assistant(assistant_ordinal)`, where the anchor is
-the 0-based ordinal among assistant records that have non-empty
-`tool_calls`. The backend truncates the JSONL to keep everything up
+`coder_resume_from_tool_call(tool_call_id)`, anchored on the
+**persisted tool-call id** of the first call the assistant row
+issued — ids are unique and nothing needs to count, so nothing can
+drift between what the panel renders and what the backend indexes.
+(The desktop previously sent an ordinal counted over _visible
+assistant rows_ while the backend counted _assistant records with
+tool calls_; the two sets diverge by every tool-only assistant
+record — a bare call with no prose renders tool rows but no
+assistant row — and on a long coordinator session the drift passed
+70 records, so a "replay from a few messages up" cut ~40 messages
+too high and swallowed the thread the user was answering. The
+companion hit the same class of bug first and switched to the id
+anchor; the desktop now matches. The bridge's ordinal variant
+remains only as its fallback.) The backend truncates the JSONL to
+keep everything up
 to **and including** the target `Assistant` record, drops its `Tool`
 records (and everything after), then mutates the existing runtime's
 `messages` in place (rebuilt from the surviving records without
@@ -2054,29 +2067,29 @@ card + "+ New session" when signed in with no session.
 
 Tauri commands in `src-tauri/src/commands/coder.rs`:
 
-| Command                                                 | Purpose                                                                                                       |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `coder_start_device_flow()`                             | Returns `{ user_code, verification_uri, expires_in, interval }`; background poll runs in `moon-coder`         |
-| `coder_status()`                                        | `{ signed_in, identity?, has_session, sync_enabled }`                                                         |
-| `coder_sign_out()`                                      | Drops keyring + identity                                                                                      |
-| `coder_list_sessions()`                                 | Per-session summaries for the list view                                                                       |
-| `coder_search_sessions(query)`                          | Ids of sessions whose title or transcript contains the query (case-insensitive); powers the list's search box |
-| `coder_open_session(id?)`                               | Load `id`, or create a new session; returns the active id                                                     |
-| `coder_delete_session(id)`                              | Removes JSONL (+ sub-agent subdir)                                                                            |
-| `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                          |
-| `coder_send(text, images, session_id?)`                 | Send / steer, targeted at the composer's session id (ADR 0066); `null` falls back to the visible session      |
-| `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                                  |
-| `coder_continue_subagent(subagent_id, text)`            | Steers a running sub-agent, or resumes a finished one with a follow-up; `false` when nothing to continue      |
-| `coder_abort_subagent(subagent_id)`                     | Cancels one sub-agent's own token; parent turn and siblings unaffected                                        |
-| `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                                    |
-| `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn               |
-| `coder_replay_from_message(user_ordinal)`               | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn            |
-| `coder_resume_from_assistant(assistant_ordinal)`        | Truncates to the assistant message (kept), re-dispatches its tool calls, continues the turn. Refused mid-turn |
-| `coder_rerun_tool_call(tool_call_id)`                   | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched                      |
-| `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                                   |
-| `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                             |
-| `coder_set_sync_enabled(enabled)`                       | Per-workspace bucket-sync toggle                                                                              |
-| `coder_mcp_*` commands                                  | MCP server rows, per-workspace enable toggle, custom-server add/remove (see [§ MCP servers](#mcp-servers))    |
+| Command                                                 | Purpose                                                                                                               |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `coder_start_device_flow()`                             | Returns `{ user_code, verification_uri, expires_in, interval }`; background poll runs in `moon-coder`                 |
+| `coder_status()`                                        | `{ signed_in, identity?, has_session, sync_enabled }`                                                                 |
+| `coder_sign_out()`                                      | Drops keyring + identity                                                                                              |
+| `coder_list_sessions()`                                 | Per-session summaries for the list view                                                                               |
+| `coder_search_sessions(query)`                          | Ids of sessions whose title or transcript contains the query (case-insensitive); powers the list's search box         |
+| `coder_open_session(id?)`                               | Load `id`, or create a new session; returns the active id                                                             |
+| `coder_delete_session(id)`                              | Removes JSONL (+ sub-agent subdir)                                                                                    |
+| `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                                  |
+| `coder_send(text, images, session_id?)`                 | Send / steer, targeted at the composer's session id (ADR 0066); `null` falls back to the visible session              |
+| `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                                          |
+| `coder_continue_subagent(subagent_id, text)`            | Steers a running sub-agent, or resumes a finished one with a follow-up; `false` when nothing to continue              |
+| `coder_abort_subagent(subagent_id)`                     | Cancels one sub-agent's own token; parent turn and siblings unaffected                                                |
+| `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                                            |
+| `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn                       |
+| `coder_replay_from_message(user_ordinal)`               | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn                    |
+| `coder_resume_from_tool_call(tool_call_id)`             | Truncates to the issuing assistant message (kept), re-dispatches its tool calls, continues the turn. Refused mid-turn |
+| `coder_rerun_tool_call(tool_call_id)`                   | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched                              |
+| `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                                           |
+| `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                                     |
+| `coder_set_sync_enabled(enabled)`                       | Per-workspace bucket-sync toggle                                                                                      |
+| `coder_mcp_*` commands                                  | MCP server rows, per-workspace enable toggle, custom-server add/remove (see [§ MCP servers](#mcp-servers))            |
 
 Push events: `coder:event` (every loop event, envelope-wrapped),
 `coder:signed_out`, `coder:sync_state`.
