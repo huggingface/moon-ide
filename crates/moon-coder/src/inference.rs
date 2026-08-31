@@ -22,6 +22,7 @@
 //! one stays around for places that don't want a callback shape
 //! (sub-agents, future test fixtures).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -305,6 +306,19 @@ pub struct ToolCall {
 	pub function: FunctionCall,
 }
 
+impl ToolCall {
+	/// Whether `function.arguments` is a JSON object we could hand
+	/// to the dispatcher. The wire convention (and every
+	/// chat-completions provider) requires this of replayed history
+	/// too — the HF router 400s the whole request otherwise.
+	pub fn args_parse(&self) -> bool {
+		if self.function.arguments.trim().is_empty() {
+			return true;
+		}
+		serde_json::from_str::<serde_json::Value>(&self.function.arguments).is_ok()
+	}
+}
+
 fn default_tool_type() -> String {
 	"function".into()
 }
@@ -334,8 +348,8 @@ enum WireMessage<'a> {
 	Assistant {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		content: Option<&'a str>,
-		#[serde(skip_serializing_if = "<[ToolCall]>::is_empty")]
-		tool_calls: &'a [ToolCall],
+		#[serde(skip_serializing_if = "cow_tool_calls_is_empty")]
+		tool_calls: Cow<'a, [ToolCall]>,
 	},
 	Tool {
 		tool_call_id: &'a str,
@@ -449,7 +463,7 @@ fn build_wire_messages<'a>(
 			},
 			ChatMessage::Assistant {
 				content, tool_calls, ..
-			} => WireMessage::Assistant {
+			} => {
 				// `thinking_blocks` is Anthropic-native-only and never
 				// rides on the OpenAI-compat wire, so it's dropped here.
 				// `cache_breakpoint_indexes` never targets an
@@ -457,9 +471,34 @@ fn build_wire_messages<'a>(
 				// previous tool / user message), so `cache_here`
 				// is `false` for every assistant message and we
 				// keep the simple string-content shape.
-				content: content.as_deref(),
-				tool_calls,
-			},
+				//
+				// Replayed tool calls must carry parseable JSON
+				// arguments — strict routers (the HF router, for
+				// one) validate the whole request body and 400 it
+				// on the first invalid blob, killing the session
+				// at every subsequent round-trip. A broken blob is
+				// the model's own truncated call, already refused
+				// at dispatch time and answered with a tool result
+				// naming the cause; here it only needs to be
+				// well-formed, so it degrades to `{}` rather than
+				// blocking the request.
+				WireMessage::Assistant {
+					content: content.as_deref(),
+					// Replayed tool calls must carry parseable JSON in
+					// `function.arguments` — strict routers (the HF
+					// router, for one) validate the request body and
+					// 400 it on the first invalid blob, killing the
+					// session at every subsequent round-trip. A broken
+					// blob is the model's own truncated call, already
+					// refused at dispatch and answered with a tool
+					// result naming the cause; here it only needs to
+					// be well-formed, so it degrades to `{}`. The
+					// healthy path borrows verbatim — no allocation,
+					// byte-identical wire body (routers prefix-cache
+					// on the literal request bytes).
+					tool_calls: repair_wire_tool_calls(tool_calls),
+				}
+			}
 			ChatMessage::Tool {
 				tool_call_id,
 				content,
@@ -476,6 +515,42 @@ fn build_wire_messages<'a>(
 	}
 	flush_tool_images(&mut out, &mut pending_tool_images, images_ok);
 	out
+}
+
+/// `skip_serializing_if` predicate for the `Cow<[ToolCall]>` wire
+/// field — Serde can't see through the `Cow` to use
+/// `<[ToolCall]>::is_empty` directly.
+fn cow_tool_calls_is_empty(calls: &[ToolCall]) -> bool {
+	calls.is_empty()
+}
+
+/// Borrow an assistant turn's tool calls verbatim when every
+/// `function.arguments` blob parses as JSON (the overwhelmingly
+/// common case — no allocation, byte-identical wire body), or
+/// produce an owned copy where each broken blob degrades to `{}`.
+/// Kept next to [`build_wire_messages`], the only caller.
+fn repair_wire_tool_calls<'a>(calls: &'a [ToolCall]) -> Cow<'a, [ToolCall]> {
+	if calls.iter().all(ToolCall::args_parse) {
+		return Cow::Borrowed(calls);
+	}
+	let repaired = calls
+		.iter()
+		.map(|c| {
+			if c.args_parse() {
+				c.clone()
+			} else {
+				let mut fixed = c.clone();
+				fixed.function.arguments = "{}".to_string();
+				fixed
+			}
+		})
+		.collect::<Vec<_>>();
+	let repaired_count = repaired.iter().filter(|c| c.function.arguments == "{}").count();
+	tracing::warn!(
+		count = repaired_count,
+		"repaired unparseable tool-call arguments to an empty object for the wire body"
+	);
+	Cow::Owned(repaired)
 }
 
 /// Emit the synthetic user message carrying the images collected
@@ -3003,6 +3078,75 @@ mod tests {
 		let wire = build_wire_messages(&messages, &[], true);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert_eq!(json, r#"[{"role":"user","content":"hi"}]"#);
+	}
+
+	#[test]
+	fn wire_repairs_broken_tool_call_arguments_to_valid_json() {
+		// The HF router validates `tool_calls[].function.arguments` as
+		// JSON on replayed history and 400s the whole request on the
+		// first invalid blob ("Invalid JSON in tool call arguments") —
+		// a truncated `write_file` would otherwise kill every
+		// subsequent round-trip of the session. The broken blob is
+		// already answered by a refusal tool result; on the wire it
+		// only needs to be well-formed, so it degrades to `{}`.
+		// Valid sibling calls in the same assistant turn replay
+		// untouched, and the ids survive so the tool results stay
+		// paired.
+		let messages = vec![ChatMessage::Assistant {
+			content: None,
+			thinking_blocks: Vec::new(),
+			tool_calls: vec![
+				ToolCall {
+					id: "call_broken".into(),
+					kind: "function".into(),
+					function: FunctionCall {
+						name: "write_file".into(),
+						arguments: r#"{"path":"/a","content":"trunc"#.into(),
+					},
+				},
+				ToolCall {
+					id: "call_ok".into(),
+					kind: "function".into(),
+					function: FunctionCall {
+						name: "read_file".into(),
+						arguments: r#"{"path":"/b"}"#.into(),
+					},
+				},
+			],
+		}];
+		let wire = build_wire_messages(&messages, &[], true);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert!(!json.contains("trunc"));
+		assert!(json.contains(r#""id":"call_broken""#));
+		assert!(json.contains(r#""arguments":"{}""#));
+		assert!(json.contains(r#""id":"call_ok""#));
+		assert!(json.contains(r#""arguments":"{\"path\":\"/b\"}""#));
+	}
+
+	#[test]
+	fn wire_valid_tool_call_arguments_replay_byte_identical() {
+		// Regression guard: the repair path must never touch a
+		// healthy session — routers prefix-cache on the literal
+		// request bytes, and a spurious re-encode (even a
+		// semantically equal one) would miss every cache.
+		let messages = vec![ChatMessage::Assistant {
+			content: Some("running it".into()),
+			thinking_blocks: Vec::new(),
+			tool_calls: vec![ToolCall {
+				id: "call_1".into(),
+				kind: "function".into(),
+				function: FunctionCall {
+					name: "read_file".into(),
+					arguments: r#"{"path":"/a"}"#.into(),
+				},
+			}],
+		}];
+		let wire = build_wire_messages(&messages, &[], true);
+		let json = serde_json::to_string(&wire).unwrap();
+		assert_eq!(
+			json,
+			r#"[{"role":"assistant","content":"running it","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/a\"}"}}]}]"#
+		);
 	}
 
 	#[test]

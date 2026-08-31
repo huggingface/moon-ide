@@ -662,8 +662,16 @@ async fn summarise_once(
 	// enough for the chunks; the cheap model's may not be.
 	let mut bytes = 0usize;
 	let mut last_reported = 0u32;
+	// Chunked-path budget mirrors the in-session path's
+	// (`in_session_summary_max_tokens`): one chunk plus the
+	// instruction is a small prompt, so the window clamp rarely
+	// bites, but the explicit ceiling always applies — the whole
+	// point of both paths is to beat the provider default, which
+	// on some HF deployments is a 2,048-token cap.
+	let output_budget =
+		crate::defaults::turn_output_budget(estimate_prompt_tokens(&call), models.context_window(models.standard()));
 	let result = inference
-		.chat_completion_stream(models.standard(), &call, &[], None, cancel, |ev| {
+		.chat_completion_stream(models.standard(), &call, &[], output_budget, cancel, |ev| {
 			if let StreamEvent::ContentDelta { delta } = ev {
 				bytes += delta.len();
 				let tokens = (bytes / 4) as u32;

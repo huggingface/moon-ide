@@ -1298,6 +1298,7 @@ async fn run_subagent_loop(
 		spec,
 		session_dir,
 		header,
+		&wrap_up_models,
 		&standard_model,
 		&pi_model,
 		&mut messages,
@@ -1346,6 +1347,7 @@ async fn subagent_wrap_up(
 	spec: &Subagent,
 	session_dir: &Utf8Path,
 	header: &SessionHeader,
+	models: &crate::models::CoderModels,
 	standard_model: &str,
 	pi_model: &str,
 	messages: &mut Vec<ChatMessage>,
@@ -1399,41 +1401,56 @@ Do not call any more tools. Write a final response now using only what you've al
 	let id_for_subagent = id.to_string();
 	let sink_for_cb = sink.clone();
 	let started = std::sync::atomic::AtomicBool::new(false);
+	// Same explicit output budget as the sub-agent loop's round
+	// trips: never ride the provider default — some HF deployments
+	// default to 2,048, which a reasoning model burns entirely on
+	// thinking (see `TURN_MAX_OUTPUT_TOKENS`).
+	let output_budget = crate::defaults::turn_output_budget(
+		crate::runner::estimate_prompt_tokens(&wire_messages),
+		models.context_window(standard_model),
+	);
 	let response = inference
-		.chat_completion_stream(standard_model, &wire_messages, &[], None, cancel, |event| match event {
-			StreamEvent::ContentDelta { delta } => {
-				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+		.chat_completion_stream(
+			standard_model,
+			&wire_messages,
+			&[],
+			output_budget,
+			cancel,
+			|event| match event {
+				StreamEvent::ContentDelta { delta } => {
+					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						sink_for_cb.send(wrap_inner(
+							&id_for_subagent,
+							CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+						));
+					}
 					sink_for_cb.send(wrap_inner(
 						&id_for_subagent,
-						CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+						CoderEvent::AssistantMessageDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						},
 					));
 				}
-				sink_for_cb.send(wrap_inner(
-					&id_for_subagent,
-					CoderEvent::AssistantMessageDelta {
-						id: id_for_cb.clone(),
-						delta: delta.to_string(),
-					},
-				));
-			}
-			StreamEvent::ThinkingDelta { delta } => {
-				if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+				StreamEvent::ThinkingDelta { delta } => {
+					if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+						sink_for_cb.send(wrap_inner(
+							&id_for_subagent,
+							CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+						));
+					}
 					sink_for_cb.send(wrap_inner(
 						&id_for_subagent,
-						CoderEvent::AssistantMessageStart { id: id_for_cb.clone() },
+						CoderEvent::AssistantThinkingDelta {
+							id: id_for_cb.clone(),
+							delta: delta.to_string(),
+						},
 					));
 				}
-				sink_for_cb.send(wrap_inner(
-					&id_for_subagent,
-					CoderEvent::AssistantThinkingDelta {
-						id: id_for_cb.clone(),
-						delta: delta.to_string(),
-					},
-				));
-			}
-			// Tools were disabled in the request; drop any stragglers.
-			StreamEvent::ToolCallDelta { .. } => {}
-		})
+				// Tools were disabled in the request; drop any stragglers.
+				StreamEvent::ToolCallDelta { .. } => {}
+			},
+		)
 		.await?;
 
 	// Same empty-shell guard as the main sub-agent loop.

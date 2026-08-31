@@ -339,7 +339,12 @@ land in prose or inside a tool call:
   large-`write_file` case; the previous behaviour passed `{}` to the
   tool, which surfaced as "missing field `path`" and sent the model
   straight back into the same oversized call. Calls that parse still
-  run, including in a response that was truncated after them.
+  run, including in a response that was truncated after them. The
+  broken assistant turn still lands in history (the refusal result
+  answers it), and strict routers validate replayed
+  `tool_calls[].function.arguments` as JSON — the OpenAI-compat wire
+  builder repairs an unparseable blob to `{}` at request time so the
+  session's next round-trip isn't 400'd wholesale (ADR 0076).
 
 #### Prompt caching (Anthropic, native or via OpenRouter)
 
@@ -642,13 +647,17 @@ the workspace has no enabled servers, and neither is mode-gated
   "is caching working for this session?" doesn't depend on the last
   request alone. Sub-agent inner usage events carry `0/0` (no
   scoreboard).
-- **Output budget + cap continuations.** The turn and sub-agent
-  loops send an explicit `max_tokens` — min(32k, window − prompt −
-  slop), mirroring the in-session compaction summary's budget —
-  instead of riding the
-  provider default — some HF deployments default to 2,048, which
+- **Output budget + cap continuations.** Every agent-shaped
+  streaming call — the turn and sub-agent loops, the iteration-cap
+  wrap-ups (parent and sub-agent), and both compaction summary
+  paths (in-session and chunked) — sends an explicit `max_tokens`:
+  min(32k, window − prompt − slop) via `turn_output_budget`, never
+  the provider default. Some HF deployments default to 2,048, which
   reasoning models burn entirely on thinking and then loop through
-  continuations without ever answering. On a `length` stop the
+  continuations without ever answering. (The short utility calls —
+  auto-rename, commit/branch suggestions, terminal command — ride
+  the default on purpose: tiny prompts, tiny answers, and a 2k cap
+  is not a constraint on a commit message.) On a `length` stop the
   runner injects a continuation sentinel (max 3); when the cut
   response was thinking-only, the sentinel quotes the tail of the
   lost reasoning (reasoning is not replayed to the model outside
