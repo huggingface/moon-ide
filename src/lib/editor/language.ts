@@ -316,7 +316,12 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 		case 'tsx': {
 			const { javascript } = await import('@codemirror/lang-javascript');
 			const { jsdocExtension } = await import('./jsdoc');
-			return [javascript({ typescript: true, jsx: ext === 'tsx' }), jsdocExtension()];
+			const { doctagExtension } = await import('./doctags');
+			return [
+				javascript({ typescript: true, jsx: ext === 'tsx' }),
+				jsdocExtension(),
+				doctagExtension({ flavor: 'jsdoc' }),
+			];
 		}
 		case 'js':
 		case 'mjs':
@@ -324,7 +329,8 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 		case 'jsx': {
 			const { javascript } = await import('@codemirror/lang-javascript');
 			const { jsdocExtension } = await import('./jsdoc');
-			return [javascript({ jsx: ext === 'jsx' }), jsdocExtension()];
+			const { doctagExtension } = await import('./doctags');
+			return [javascript({ jsx: ext === 'jsx' }), jsdocExtension(), doctagExtension({ flavor: 'jsdoc' })];
 		}
 		case 'json':
 		case 'jsonc': {
@@ -362,7 +368,11 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			// `@codemirror/lang-vue` does for Vue. Landed together
 			// with the svelte-language-server LSP wiring.
 			const { svelte } = await import('@replit/codemirror-lang-svelte');
-			return [svelte()];
+			const { doctagExtension } = await import('./doctags');
+			// `<script>` bodies are JS/TS, so the JSDoc flavor applies
+			// to the nested BlockComment nodes the composite grammar
+			// produces.
+			return [svelte(), doctagExtension({ flavor: 'jsdoc' })];
 		}
 		case 'vue': {
 			// `@codemirror/lang-vue` is the official upstream Vue SFC
@@ -383,7 +393,8 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 		}
 		case 'rs': {
 			const { rust } = await import('@codemirror/lang-rust');
-			return [rust()];
+			const { doctagExtension } = await import('./doctags');
+			return [rust(), doctagExtension({ flavor: 'rustdoc' })];
 		}
 		case 'go': {
 			// `@codemirror/lang-go` is the official upstream — it
@@ -395,12 +406,14 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			// auto-close-brackets the same way the Rust / Python
 			// extensions do.
 			const { go } = await import('@codemirror/lang-go');
-			return [go()];
+			const { doctagExtension } = await import('./doctags');
+			return [go(), doctagExtension({ flavor: 'godoc' })];
 		}
 		case 'py':
 		case 'pyi': {
 			const { python } = await import('@codemirror/lang-python');
-			return [python()];
+			const { doctagExtension } = await import('./doctags');
+			return [python(), doctagExtension({ flavor: 'pydoc' })];
 		}
 		case 'dart': {
 			// No `@lezer/dart` grammar exists upstream. The CM5 legacy

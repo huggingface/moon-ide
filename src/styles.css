@@ -103,6 +103,7 @@
 	   palette stays readable. The Lezer tag → var mapping lives in
 	   `editor/theme.ts`. */
 	--m-syntax-comment: #6a7490;
+	--m-syntax-doctag: #a48ac9;
 	--m-syntax-keyword: #c792ea;
 	--m-syntax-string: #a3e9a4;
 	--m-syntax-number: #f0b86e;
@@ -195,6 +196,7 @@
 	--m-code-border: rgba(199, 37, 78, 0.18);
 
 	--m-syntax-comment: #8a93ab;
+	--m-syntax-doctag: #8b44e6;
 	--m-syntax-keyword: #7c3aed;
 	--m-syntax-string: #1f7a3a;
 	--m-syntax-number: #a8470c;
@@ -696,6 +698,29 @@ button:focus-visible {
 .cm-line.cm-conflict-marker-line {
 	background: color-mix(in srgb, var(--m-warning) 18%, transparent);
 	box-shadow: inset 2px 0 0 var(--m-warning);
+	font-weight: 600;
+}
+
+/* Doc-comment tag emphasis (editor/doctags.ts): JSDoc `@param` /
+   `{@link Target}` and rustdoc `# Section` / `[Foo]` links inside
+   comment nodes. Color-only decoration that layers on top of the
+   grammar's `tags.comment` italic grey, so the base comment style
+   stays intact. Doctag sigils get a keyword-family tint that is a
+   shade calmer than real code keywords; link targets reuse the
+   markdown link color, which already reads as "clickable
+   reference" elsewhere in the UI. */
+.cm-doctag {
+	color: var(--m-syntax-doctag);
+	font-style: normal;
+}
+.cm-doctag-link {
+	color: var(--m-syntax-link);
+	text-decoration: underline;
+	text-decoration-thickness: 1px;
+	text-underline-offset: 2px;
+}
+.cm-doctag-heading {
+	color: var(--m-syntax-heading);
 	font-weight: 600;
 }
 

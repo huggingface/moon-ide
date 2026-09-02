@@ -37,8 +37,9 @@
 	// effect runs after Svelte flushes the DOM, so `scrollHeight`
 	// already reflects the newly-appended chunk.
 	$effect(() => {
-		const _trigger = text;
-		void _trigger;
+		// `void text` reads the reactive chunk list so the effect
+		// re-runs on append; the actual work below doesn't.
+		void text;
 		if (!streaming) {
 			return;
 		}

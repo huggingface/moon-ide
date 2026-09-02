@@ -521,8 +521,7 @@
 	// next user action. Reading `workspace.activeFolder?.host` here
 	// makes the effect re-run on either path or host change.
 	$effect(() => {
-		const _kind = workspace.activeFolder?.host ?? null;
-		void _kind;
+		void workspace.activeFolder?.host;
 		void coder.refreshStatus();
 	});
 
