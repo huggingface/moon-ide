@@ -84,8 +84,8 @@ RUN apt-get update \
 # precedence over any system git), and install the runtime libs it
 # needs. Arm64 is served by the same PPA distro path. Pin the version;
 # bumps are intentional, same as the Go / uv / helm pins.
-ARG GIT_VERSION=2.54.0
-ARG GIT_PPA_BUILD=0ppa1~ubuntu22.04.1
+ARG GIT_VERSION=2.55.0
+ARG GIT_PPA_BUILD=0ppa1~ubuntu22.04.2
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         dpkg-dev \
@@ -298,12 +298,29 @@ RUN corepack enable \
 # `cd ~/code/moon-landing` after the team bumps `.nvmrc` Just
 # Works rather than printing a "version not installed" error.
 #
-# Sourced for interactive shells only; `docker exec` non-interactive
-# calls get the default Node from $PATH.
+# The hook only fires on an explicit `cd`, so also call it once at
+# the end of .bashrc: IDE terminal shells start *already inside* the
+# workspace dir, so without this the first shell would sit on fnm's
+# default Node instead of the project's .nvmrc version.
+#
+# Non-interactive shells (moon-ide's coder `bash` tool, format-on-save,
+# LSP sidecars: `docker exec … bash -c …`) skip `.bashrc` entirely, so
+# the hook never runs there either. They *do* source the file named by
+# `$BASH_ENV` though, so the same two-line setup runs for every bash
+# invocation, interactive or not. The `fnm use` env plumbing must be
+# `--shell bash` even inside `$BASH_ENV`: the eval creates the
+# per-shell `fnm_multishells` dir + PATH entry that makes the
+# switched-to Node resolvable for the rest of the command. A missing
+# version file is a silent no-op (fnm falls back to the default
+# alias), and `--install-if-missing` keeps a bumped `.nvmrc` from
+# erroring the first time.
+COPY --chown=${UID}:${GID} fnm-bash-env.sh /home/${USERNAME}/.config/fnm-bash-env.sh
+ENV BASH_ENV=/home/${USERNAME}/.config/fnm-bash-env.sh
 RUN { \
         echo 'eval "$(fnm env --use-on-cd --version-file-strategy=recursive --shell bash)"'; \
         echo '__fnm_use_if_file_found() { fnm use --install-if-missing --silent-if-unchanged; }'; \
-    } >> /home/${USERNAME}/.bashrc
+        echo '__fnm_use_if_file_found'; \
+    } >> /home/dev/.bashrc
 
 # uv (Astral's Python toolchain manager). Standalone installer
 # detects the right arch automatically and lands at

@@ -233,6 +233,15 @@ What it ships:
   comfort tooling (`git`, `ripgrep`, `fzf`, `bat`, `jq`). Projects
   pin their own versions via `.nvmrc` / `rust-toolchain.toml` /
   `pyproject.toml` / `go.mod`.
+- **`.nvmrc` auto-switch everywhere**: fnm switches (and
+  auto-installs) the pinned Node version for _any_ bash —
+  interactive terminals (via the `cd` hook + a startup call in
+  `~/.bashrc`) and non-interactive `docker exec … bash -c` (via
+  `$BASH_ENV` → `~/.config/fnm-bash-env.sh`, image `ENV`). The
+  coder's `bash` tool relies on this: its `-w <container_cwd>`
+  framing means the per-command shell starts inside the project
+  and lands on the project's Node. No `.nvmrc` up-tree → silently
+  stays on the `default` alias.
 - **Cluster tooling**: `helm` (user-mode, pinned) for the
   Helm-chart-heavy infra / workloads repos. No Kubernetes daemon
   or `kubectl` baked in — add those in a `FROM moon-base`

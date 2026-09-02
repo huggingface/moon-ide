@@ -2180,11 +2180,15 @@ impl ToolRegistry {
 	///   **`bash -c` here (not `-lc`).** moon-base sets toolchain
 	///   PATH segments via Dockerfile `ENV`. A login shell reads
 	///   Debian `/etc/profile`, which resets `PATH` before project
-	///   hooks run; non-interactive shells skip `~/.bashrc`, so fnm's
-	///   eval never restores Node — yet `docker exec … bash` (PTY
-	///   terminals) is interactive and does load `~/.bashrc`. Using a
-	///   non-login shell inherits the container env verbatim and
-	///   matches what `node`, `cargo`, etc. expect from the image.
+	///   hooks run; yet `docker exec … bash` (PTY terminals) is
+	///   interactive and does load `~/.bashrc`. Using a non-login
+	///   shell inherits the container env verbatim and matches what
+	///   `node`, `cargo`, etc. expect from the image. `.nvmrc`
+	///   auto-switch still works here: moon-base's `BASH_ENV` image
+	///   env points non-interactive bash at
+	///   `~/.config/fnm-bash-env.sh`, which runs the fnm switch
+	///   against the `-w` cwd before the command (see
+	///   specs/containers.md, "The moon-base image").
 	/// - **Host** (otherwise): `bash -lc <cmd>` rooted at the folder.
 	///
 	/// **Why host uses `bash -lc` and not `sh -lc`.** On most modern
