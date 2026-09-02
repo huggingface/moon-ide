@@ -183,3 +183,4 @@ docker build -t moon-base:dev images/moon-base/
   - Pick a sensible default model automatically after connecting to HF.
   - Let the editor be used without connecting to HF at all, as long as a model provider is supplied another way.
   - Rework the flow around "set the LLM provider" — connecting to HF becomes one option that's triggered (e.g. via the cloud icon) only when an HF provider is chosen.
+- Better LSP restart on changed revs/..., need to restart manually at the moment to remove TS errors
