@@ -111,6 +111,8 @@ Implementation: a `ViewPlugin` that iterates **syntax-tree nodes** in the visibl
 
 **Dart** (`.dart`) has no upstream Lezer grammar (`@lezer/dart` doesn't exist), so it uses the legacy CM5 mode exported from `@codemirror/legacy-modes/mode/clike` rather than a `lang-*` package. That mode is the right call regardless: it handles Dart's `$x` / `${…}` string interpolation, `r'…'` raw strings, triple-quoted strings, and `@annotations`, which a keyword-and-string clike would mis-highlight. Like the other stream modes it has no fold info.
 
+**Zig** (`.zig`) uses `codemirror-lang-zig` — the de-facto CM6 grammar (Jared Hughes, Zed team), generated from the zig-spec repository's `grammar.y`. No official `@codemirror/lang-zig` exists upstream. It's a proper Lezer parser with `styleTags` wired to the standard tag set, so the `--m-syntax-*` theme paints it with zero extra theme work; its `languageData` also registers keyword autocomplete and `//` comment tokens (which the comment-toggle keymap picks up for free). `build.zig.zon` (Zig's package manifest) stays plain text — no grammar for the ZON format exists and `languageFor` keys on the final extension. Highlighting-only: no ZLS / LSP wiring; add `zig` to `lspLanguageFor` + a broker spec when the team asks for more than colors.
+
 ### Diff and conflict surfaces
 
 Different jobs, different tools:

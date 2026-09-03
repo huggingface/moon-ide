@@ -6,6 +6,43 @@ import { __test, languageFor } from './language';
 
 const { WORKFLOW_PATH_RE, githubActionsYaml } = __test;
 
+// Parse the shared Zig sample and return its syntax tree plus the
+// sample text, so tests can resolve nodes at given offsets.
+async function parseZig() {
+	const { zigLanguage } = await import('codemirror-lang-zig');
+	const state = EditorState.create({ doc: ZIG_SAMPLE, extensions: [zigLanguage] });
+	return { tree: syntaxTree(state), source: ZIG_SAMPLE };
+}
+
+// Resolve the `classHighlighter` classes for the innermost node at
+// `needle`'s start — i.e. what the editor actually paints. Falls
+// back to the node name when the node carries no style tags, so
+// assertions read uniformly.
+async function zigHighlightAt(needle: string): Promise<string> {
+	const { classHighlighter, getStyleTags } = await import('@lezer/highlight');
+	const { tree, source } = await parseZig();
+	const pos = source.indexOf(needle);
+	if (pos < 0) {
+		throw new Error(`needle "${needle}" not found in source`);
+	}
+	const node = tree.resolveInner(pos, 1);
+	const styled = getStyleTags(node);
+	if (styled === null) {
+		return node.name;
+	}
+	return classHighlighter.style(styled.tags) ?? node.name;
+}
+
+const ZIG_SAMPLE = [
+	'const std = @import("std");',
+	'',
+	'/// Doc comment for the entry point.',
+	'pub fn main() !void {',
+	'    const count: u32 = 42;',
+	'    std.debug.print("Hello, {s}!\\n", .{"world"});',
+	'}',
+].join('\n');
+
 // Build a fresh editor state with the GitHub Actions YAML language
 // extension loaded, then parse a sample. Returns the syntax tree so a
 // test can resolve nodes at given offsets and inspect the grammar that
@@ -154,5 +191,41 @@ describe('githubActionsYaml — shell overlay', () => {
 		// `$KEY` inside the run block resolves via the shell grammar as
 		// a `variableName.definition` token, not a YAML `Literal`.
 		expect(nodeAt(tree, doc, '$KEY')).toBe('variableName.definition');
+	});
+});
+
+describe('languageFor — zig', () => {
+	it('returns a non-empty extension set for .zig files', async () => {
+		const exts = await languageFor('src/main.zig');
+		expect(exts.length).toBeGreaterThan(0);
+	});
+
+	it('does not claim zig-adjacent extensions', async () => {
+		// `.zig`'s neighbour extensions stay unmatched — only the
+		// exact extension maps.
+		const exts = await languageFor('build.zig.zon');
+		// `build.zig.zon` ends in `.zon` (Zig's package-lock
+		// format), which has no grammar — plain text is fine.
+		expect(exts).toEqual([]);
+	});
+});
+
+describe('zig grammar highlighting', () => {
+	it('paints keywords, strings, and comments through the standard tag set', async () => {
+		// `pub` / `fn` map to `keyword`, string literals to
+		// `string`, `///` doc comments to `comment` — the exact
+		// classes our `--m-syntax-*` CSS targets.
+		expect(await zigHighlightAt('pub fn')).toBe('tok-keyword');
+		expect(await zigHighlightAt('"Hello')).toContain('tok-string');
+		expect(await zigHighlightAt('/// Doc')).toContain('tok-comment');
+	});
+
+	it('paints builtin identifiers and number literals distinctly', async () => {
+		// `@import` is a builtin (variableName per the grammar's
+		// styleTags); `42` a number — `tags.integer` subclasses
+		// `tags.number` and `classHighlighter` only names the
+		// base, hence `tok-number`.
+		expect(await zigHighlightAt('@import(')).toContain('tok-variableName');
+		expect(await zigHighlightAt('42')).toContain('tok-number');
 	});
 });

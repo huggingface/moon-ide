@@ -76,6 +76,7 @@ const LOADERS: Record<string, () => Promise<Parser>> = {
 		return StreamLanguage.define(dockerFile).parser;
 	},
 	hcl: async () => (await import('codemirror-lang-hcl')).hclLanguage.parser,
+	zig: async () => (await import('codemirror-lang-zig')).zigLanguage.parser,
 };
 
 /**

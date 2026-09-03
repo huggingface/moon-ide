@@ -396,6 +396,20 @@ export async function languageFor(filename: string, firstLine?: string): Promise
 			const { doctagExtension } = await import('./doctags');
 			return [rust(), doctagExtension({ flavor: 'rustdoc' })];
 		}
+		case 'zig': {
+			// No official `@codemirror/lang-zig` exists; this is
+			// the de-facto CM6 grammar (Jared Hughes, Zed team),
+			// generated from the zig-spec repository's grammar.y.
+			// Ships a proper Lezer parser with styleTags wired to
+			// the standard tag set, so our `--m-syntax-*` theme
+			// covers it with zero theme work. It also registers
+			// keyword autocomplete + `//` comment tokens via
+			// `languageData`, which the comment-toggle keymap
+			// picks up for free. Team-asked addition — LSP
+			// (ZLS) is deliberately not wired up here.
+			const { zig } = await import('codemirror-lang-zig');
+			return [zig()];
+		}
 		case 'go': {
 			// `@codemirror/lang-go` is the official upstream — it
 			// ships a Lezer grammar tracked against the latest Go
