@@ -490,6 +490,15 @@ async fn container(slug: String, up: bool, stop: bool, image: Option<String>) ->
 		.filter(|f| !matches!(f.origin, moon_protocol::workspace::FolderOrigin::Worktree { .. }))
 		.map(|f| Utf8PathBuf::from(&f.folder_path))
 		.collect();
+	// The ssh-agent proxy must be registered in-process before any
+	// compose render so `detect_ssh_agent_forward` prefers it —
+	// same rationale as `serve`.
+	{
+		let (_, ws_dir) = data_dirs()?;
+		moon_container::agent_proxy::spawn(ws_dir.parent().expect("workspaces dir has a parent"))
+			.await
+			.map_err(|err| anyhow::anyhow!("could not start ssh-agent proxy: {err}"))?;
+	}
 	let ws = moon_container::Workspace::new(moon_container::WorkspaceConfig {
 		workspace_id: slug.clone(),
 		state_dir: workspaces_dir.join(&slug),
@@ -512,6 +521,19 @@ async fn container(slug: String, up: bool, stop: bool, image: Option<String>) ->
 
 async fn serve(slug: String) -> anyhow::Result<()> {
 	moon_protocol::workspace::validate_workspace_id(&slug)?;
+	// Host-side ssh-agent proxy (ADR 0060), same as the desktop's
+	// setup callback: a stable socket directory the compose layer
+	// prefers over a raw `$SSH_AUTH_SOCK` mount, so host agent
+	// restarts never leave the container with a stale bind-mount.
+	// Without this, a headless host renders compose with **no**
+	// ssh-agent block at all (the service env carries no
+	// SSH_AUTH_SOCK) and every container grew up unable to ssh.
+	{
+		let (_, workspaces_dir) = data_dirs()?;
+		moon_container::agent_proxy::spawn(workspaces_dir.parent().expect("workspaces dir has a parent"))
+			.await
+			.map_err(|err| anyhow::anyhow!("could not start ssh-agent proxy: {err}"))?;
+	}
 	let cred = relay::load_credential()?
 		.ok_or_else(|| anyhow::anyhow!("not enrolled — run `moon-remote enroll --bridge wss://… --code …` first"))?;
 	let config_dir = config_dir()?;

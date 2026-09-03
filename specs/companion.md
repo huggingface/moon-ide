@@ -806,3 +806,9 @@ Prose, not commitments — revisit when someone asks:
   Podman hosts work via its docker-compatible socket: docker CLI +
   compose plugin with `DOCKER_HOST=unix://…/podman/podman.sock`,
   `userns = "keep-id"` for bind-mount ownership.
+- **Headless ssh-agent forwarding**: `moon-remote serve` and
+  `container --up` now start the host-side agent proxy (ADR 0060)
+  before rendering compose, like the desktop does. Previously a
+  headless host emitted compose with no ssh-agent block at all
+  (the unit env carries no `SSH_AUTH_SOCK`), so containers grew
+  up unable to ssh anywhere.
