@@ -83,7 +83,9 @@ export async function applyWorkspaceEdit(edit: LspWorkspaceEdit): Promise<Worksp
 	}
 	if (closedPaths.length > 0) {
 		try {
-			await ipc.lsp.notifyFilesChanged(closedPaths);
+			// In-place rewrites, so `changed` is the honest kind for
+			// every path.
+			await ipc.lsp.notifyFilesChanged(closedPaths.map((path) => ({ path, kind: 'changed' as const })));
 		} catch {
 			// Best-effort: a server that disconnected between
 			// the apply and the notify isn't a user-facing

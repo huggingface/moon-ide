@@ -719,6 +719,26 @@ export type LspWorkspaceEdit = {
 };
 
 /**
+ * What happened to a file reported to a language server via
+ * `workspace/didChangeWatchedFiles`. Mirrors
+ * `moon_protocol::lsp::LspFileChangeKind`. The `deleted` kind
+ * matters: a branch switch that removes a file must be reported
+ * as deleted so the server drops its stale snapshot instead of
+ * trying to re-read the file and failing silently.
+ */
+export type LspFileChangeKind = 'created' | 'changed' | 'deleted';
+
+/**
+ * One path plus its change kind, forwarded to
+ * `lsp_notify_files_changed`. Mirrors
+ * `moon_protocol::lsp::LspFileChange`.
+ */
+export type LspFileChange = {
+	path: string;
+	kind: LspFileChangeKind;
+};
+
+/**
  * Result of `textDocument/prepareRename` — `null` from the IPC
  * means "cursor not on a renameable symbol". Mirrors
  * `moon_protocol::lsp::LspPrepareRename`.

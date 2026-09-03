@@ -61,7 +61,7 @@
 //! inotify, macOS FSEvents, Windows ReadDirectoryChangesW) doesn't
 //! leak past this file.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -71,6 +71,8 @@ use notify::event::{CreateKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
+
+use moon_protocol as mp;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant, Sleep};
 
@@ -89,6 +91,17 @@ pub const FS_CHANGED_EVENT: &str = "fs:changed";
 /// race or a symlinked path that escapes the root) — the frontend
 /// falls back to a conservative full-tab refresh in that case.
 ///
+/// `kinds` carries the per-path classification (created / changed /
+/// deleted) parallel to `paths`, so the LSP
+/// `workspace/didChangeWatchedFiles` forward can tell a language
+/// server a branch-switch-deleted file is `Deleted` rather than
+/// `Changed` — servers react to a `Changed` event for a vanished
+/// file by re-reading it from disk and, on failure, keeping the
+/// stale in-memory snapshot (the "old type errors survive a
+/// branch switch" symptom). `None` per entry means "this backend
+/// couldn't classify" and maps to `Changed` at the consumer —
+/// same behaviour as before the kinds existed.
+///
 /// `topology_changed` is `true` when at least one event in the
 /// batch was a Create / Remove / Rename — those change which
 /// entries the tree should render and the frontend must re-walk
@@ -101,6 +114,9 @@ pub const FS_CHANGED_EVENT: &str = "fs:changed";
 #[serde(rename_all = "camelCase")]
 struct FsChangedPayload {
 	paths: Vec<String>,
+	/// Same length + order as `paths`. Per-path change kind or
+	/// `None` when this backend can't classify the event.
+	kinds: Vec<Option<mp::lsp::LspFileChangeKind>>,
 	topology_changed: bool,
 }
 
@@ -189,6 +205,13 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 	// resets `current_root`, any stale paths are dropped — they no
 	// longer mean anything outside the workspace they came from.
 	let mut pending_paths: HashSet<PathBuf> = HashSet::new();
+	// Per-path change kind, keyed on the same paths as
+	// `pending_paths`. A create event for a path we haven't seen
+	// this window records `Created`; a remove event erases the
+	// entry and records `Deleted`. A path that both appears and
+	// vanishes inside one window reports `None` (unclassifiable) —
+	// the consumer maps that to `Changed`, the pre-kinds behaviour.
+	let mut pending_kinds: HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>> = HashMap::new();
 	// Sticky-true flag: any topology event in the batch flips the
 	// payload's `topologyChanged` so the frontend re-walks the
 	// tree. Modify-only batches (the common Ctrl+S case) keep it
@@ -223,6 +246,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 						// Stale paths from the previous root mean
 						// nothing to the new one's frontend.
 						pending_paths.clear();
+						pending_kinds.clear();
 						pending_topology = false;
 						trailing = None;
 						last_emit = None;
@@ -252,7 +276,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 					}
 				}
 				let prev_count = pending_paths.len();
-				collect_event_paths(&res, current.as_ref(), &mut pending_paths, &mut pending_topology);
+				collect_event_paths(&res, current.as_ref(), &mut pending_paths, &mut pending_kinds, &mut pending_topology);
 				if pending_paths.len() == prev_count {
 					// Event was filtered (unobserved `.git/`
 					// churn, access bump, `node_modules/`,
@@ -267,7 +291,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 					// trailing window so any follow-up events in
 					// this same save burst collapse into one
 					// flush at the end.
-					emit_pending(&app, &mut pending_paths, &mut pending_topology);
+					emit_pending(&app, &mut pending_paths, &mut pending_kinds, &mut pending_topology);
 					last_emit = Some(now);
 					trailing = None;
 				} else if trailing.is_none() {
@@ -285,7 +309,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 				if pending_paths.is_empty() {
 					continue;
 				}
-				emit_pending(&app, &mut pending_paths, &mut pending_topology);
+				emit_pending(&app, &mut pending_paths, &mut pending_kinds, &mut pending_topology);
 				last_emit = Some(Instant::now());
 			}
 		}
@@ -297,12 +321,21 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 /// trailing call sites match exactly. Logs at debug on emit
 /// failure (webview not attached / torn down) — the next event
 /// will re-arm the watcher and we'll retry.
-fn emit_pending(app: &AppHandle, paths: &mut HashSet<PathBuf>, topology: &mut bool) {
+fn emit_pending(
+	app: &AppHandle,
+	paths: &mut HashSet<PathBuf>,
+	kinds: &mut HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>>,
+	topology: &mut bool,
+) {
 	if paths.is_empty() {
 		return;
 	}
+	let drained: Vec<PathBuf> = paths.drain().collect();
+	let path_kinds: Vec<Option<mp::lsp::LspFileChangeKind>> = drained.iter().map(|p| kinds.remove(p).flatten()).collect();
+	kinds.clear();
 	let payload = FsChangedPayload {
-		paths: paths.drain().map(path_to_forward_slash).collect(),
+		paths: drained.into_iter().map(path_to_forward_slash).collect(),
+		kinds: path_kinds,
 		topology_changed: *topology,
 	};
 	*topology = false;
@@ -673,6 +706,7 @@ fn collect_event_paths(
 	res: &notify::Result<Event>,
 	watched: Option<&WatchedRoot>,
 	pending: &mut HashSet<PathBuf>,
+	kinds: &mut HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>>,
 	topology: &mut bool,
 ) {
 	let event = match res {
@@ -688,6 +722,7 @@ fn collect_event_paths(
 	let Some(watched) = watched else {
 		return;
 	};
+	let kind = event_kind_to_change_kind(&event.kind);
 	let mut took_a_tree_path = false;
 	for raw in &event.paths {
 		let Some(rel) = watched.relativize(raw) else {
@@ -695,7 +730,8 @@ fn collect_event_paths(
 		};
 		if is_in_dotgit(&rel) {
 			if is_dotgit_observed(&rel) {
-				pending.insert(rel);
+				pending.insert(rel.clone());
+				record_kind(kinds, rel, kind);
 			}
 			continue;
 		}
@@ -709,11 +745,66 @@ fn collect_event_paths(
 		if path_has_excluded_component(&rel) {
 			continue;
 		}
-		pending.insert(rel);
+		pending.insert(rel.clone());
+		record_kind(kinds, rel, kind);
 		took_a_tree_path = true;
 	}
 	if took_a_tree_path && is_topology_event(&event.kind) {
 		*topology = true;
+	}
+}
+
+/// Fold one classification into the per-path kind map. One
+/// event per path isn't guaranteed — notify fires create, modify,
+/// and rename-pair events for the same path inside one debounce
+/// window — so the fold is a precedence merge, not an overwrite:
+/// `Deleted` beats everything (a vanished file must be reported
+/// as vanished even when a spurious `Changed` follows),
+/// `Created` beats `Changed` (modify-after-create is still a new
+/// file), and `None` (unclassifiable) loses to any concrete kind.
+fn record_kind(
+	kinds: &mut HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>>,
+	path: PathBuf,
+	kind: Option<mp::lsp::LspFileChangeKind>,
+) {
+	let entry = kinds.entry(path).or_insert(kind);
+	if kind_rank(kind) > kind_rank(*entry) {
+		*entry = kind;
+	}
+}
+
+/// Precedence for [`record_kind`]: higher wins.
+fn kind_rank(kind: Option<mp::lsp::LspFileChangeKind>) -> u8 {
+	match kind {
+		Some(mp::lsp::LspFileChangeKind::Deleted) => 3,
+		Some(mp::lsp::LspFileChangeKind::Created) => 2,
+		Some(mp::lsp::LspFileChangeKind::Changed) => 1,
+		None => 0,
+	}
+}
+
+/// Map a notify event kind onto the three-way classification the
+/// LSP watched-files forward needs. `None` for the catch-alls we
+/// can't classify (`Any` / `Other` and their sub-kinds) — the
+/// consumer maps `None` to `Changed`, matching the pre-kinds
+/// behaviour for every backend that doesn't classify.
+fn event_kind_to_change_kind(kind: &EventKind) -> Option<mp::lsp::LspFileChangeKind> {
+	use mp::lsp::LspFileChangeKind as K;
+	match kind {
+		EventKind::Create(_) => Some(K::Created),
+		EventKind::Remove(_) => Some(K::Deleted),
+		// inotify reports a rename as `Name(From)` for the old
+		// path, `Name(To)` for the new one, and — when both halves
+		// arrive — a `Name(Both)` carrying both paths. From the
+		// LSP's point of view the old path is deleted and the new
+		// one created; `From`/`To` events land separately so each
+		// path gets its own classification, and `Both` re-confirms
+		// both (record_kind folds without downgrading).
+		EventKind::Modify(ModifyKind::Name(_)) => None,
+		// Plain in-place content / metadata edits.
+		EventKind::Modify(_) => Some(K::Changed),
+		// Catch-alls: `Any` / `Other` and unknown sub-kinds.
+		_ => None,
 	}
 }
 
@@ -828,13 +919,23 @@ mod tests {
 		event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), paths)
 	}
 
-	fn collect(e: Event, watched: &WatchedRoot) -> (Vec<String>, bool) {
+	fn collect(e: Event, watched: &WatchedRoot) -> (Vec<String>, Vec<Option<mp::lsp::LspFileChangeKind>>, bool) {
 		let mut pending = HashSet::new();
+		let mut kinds: HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>> = HashMap::new();
 		let mut topology = false;
-		collect_event_paths(&Ok(e), Some(watched), &mut pending, &mut topology);
-		let mut paths: Vec<String> = pending.into_iter().map(path_to_forward_slash).collect();
-		paths.sort();
-		(paths, topology)
+		collect_event_paths(&Ok(e), Some(watched), &mut pending, &mut kinds, &mut topology);
+		// Sort the path+kind pairs together so the two vectors stay
+		// parallel — assertions below index both.
+		let mut drained: Vec<(String, Option<mp::lsp::LspFileChangeKind>)> = pending
+			.into_iter()
+			.map(|p| {
+				let kind = kinds.get(&p).copied().flatten();
+				(path_to_forward_slash(p), kind)
+			})
+			.collect();
+		drained.sort_by(|a, b| a.0.cmp(&b.0));
+		let (paths, path_kinds): (Vec<String>, Vec<Option<mp::lsp::LspFileChangeKind>>) = drained.into_iter().unzip();
+		(paths, path_kinds, topology)
 	}
 
 	#[test]
@@ -850,7 +951,7 @@ mod tests {
 			"packed-refs",
 		] {
 			let raw = format!("/ws/.git/{name}");
-			let (paths, topology) = collect(modify(&[&raw]), &root);
+			let (paths, _kinds, topology) = collect(modify(&[&raw]), &root);
 			assert_eq!(paths, vec![format!(".git/{name}")], "{name} should survive");
 			assert!(!topology);
 		}
@@ -858,7 +959,7 @@ mod tests {
 
 	#[test]
 	fn ref_moves_survive_but_lock_files_do_not() {
-		let (paths, _) = collect(
+		let (paths, _, _) = collect(
 			modify(&[
 				"/ws/.git/refs/heads/feature/x",
 				"/ws/.git/refs/heads/feature/x.lock",
@@ -877,7 +978,7 @@ mod tests {
 
 	#[test]
 	fn dotgit_churn_is_dropped() {
-		let (paths, topology) = collect(
+		let (paths, _, topology) = collect(
 			modify(&[
 				"/ws/.git/objects/ab/cdef0123",
 				"/ws/.git/logs/HEAD",
@@ -896,27 +997,140 @@ mod tests {
 	fn dotgit_events_never_flip_topology() {
 		// A commit creates / removes loose ref files; that must
 		// not force the frontend's recursive tree re-walk.
-		let (paths, topology) = collect(
+		let (paths, kinds, topology) = collect(
 			event(EventKind::Create(CreateKind::File), &["/ws/.git/refs/heads/main"]),
 			&plain_root(),
 		);
 		assert_eq!(paths, vec![".git/refs/heads/main".to_string()]);
+		assert_eq!(kinds, vec![Some(mp::lsp::LspFileChangeKind::Created)]);
 		assert!(!topology);
 	}
 
 	#[test]
 	fn tree_create_flips_topology() {
-		let (paths, topology) = collect(
+		let (paths, kinds, topology) = collect(
 			event(EventKind::Create(CreateKind::File), &["/ws/src/new.rs"]),
 			&plain_root(),
 		);
 		assert_eq!(paths, vec!["src/new.rs".to_string()]);
+		assert_eq!(kinds, vec![Some(mp::lsp::LspFileChangeKind::Created)]);
 		assert!(topology);
 	}
 
 	#[test]
+	fn classify_modify_as_changed_and_catchalls_as_none() {
+		let root = plain_root();
+		let (paths, kinds, _) = collect(modify(&["/ws/a.ts"]), &root);
+		assert_eq!(paths, vec!["a.ts".to_string()]);
+		assert_eq!(kinds, vec![Some(mp::lsp::LspFileChangeKind::Changed)]);
+
+		let (paths, kinds, _) = collect(event(EventKind::Any, &["/ws/a.ts"]), &root);
+		assert_eq!(paths, vec!["a.ts".to_string()]);
+		assert_eq!(kinds, vec![None]);
+
+		let (paths, kinds, _) = collect(
+			event(EventKind::Remove(notify::event::RemoveKind::File), &["/ws/a.ts"]),
+			&root,
+		);
+		assert_eq!(paths, vec!["a.ts".to_string()]);
+		assert_eq!(kinds, vec![Some(mp::lsp::LspFileChangeKind::Deleted)]);
+	}
+
+	/// A rename event's `Both` variant carries the old path first
+	/// and the new path second; each half of the pair also arrives
+	/// as its own `From` / `To` event. Folding `From` (unclassified)
+	/// then `Both` must leave the old path `None` — the rename-away
+	/// half has no clean three-way answer on its own — while a
+	/// `Delete` followed by a spurious `Modify` (the vanish-then-
+	/// touch race) must stay `Deleted`: reporting a vanished file
+	/// as `Changed` makes language servers keep stale snapshots.
+	#[test]
+	fn deleted_wins_over_a_later_changed_in_the_same_window() {
+		let mut kinds: HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>> = HashMap::new();
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Changed),
+		);
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Deleted),
+		);
+		assert_eq!(
+			kinds.get(&PathBuf::from("/ws/a.ts")),
+			Some(&Some(mp::lsp::LspFileChangeKind::Deleted))
+		);
+		// Order-independence: delete first, change after.
+		let mut kinds: HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>> = HashMap::new();
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Deleted),
+		);
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Changed),
+		);
+		assert_eq!(
+			kinds.get(&PathBuf::from("/ws/a.ts")),
+			Some(&Some(mp::lsp::LspFileChangeKind::Deleted))
+		);
+		// Created is sticky over Changed, but not over Deleted.
+		let mut kinds: HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>> = HashMap::new();
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Created),
+		);
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Changed),
+		);
+		assert_eq!(
+			kinds.get(&PathBuf::from("/ws/a.ts")),
+			Some(&Some(mp::lsp::LspFileChangeKind::Created))
+		);
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Deleted),
+		);
+		assert_eq!(
+			kinds.get(&PathBuf::from("/ws/a.ts")),
+			Some(&Some(mp::lsp::LspFileChangeKind::Deleted))
+		);
+		// `None` never clobbers a concrete classification, and a
+		// concrete kind fills in a `None` in either order.
+		let mut kinds: HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>> = HashMap::new();
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Created),
+		);
+		record_kind(&mut kinds, PathBuf::from("/ws/a.ts"), None);
+		assert_eq!(
+			kinds.get(&PathBuf::from("/ws/a.ts")),
+			Some(&Some(mp::lsp::LspFileChangeKind::Created))
+		);
+		let mut kinds: HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>> = HashMap::new();
+		record_kind(&mut kinds, PathBuf::from("/ws/a.ts"), None);
+		record_kind(
+			&mut kinds,
+			PathBuf::from("/ws/a.ts"),
+			Some(mp::lsp::LspFileChangeKind::Changed),
+		);
+		assert_eq!(
+			kinds.get(&PathBuf::from("/ws/a.ts")),
+			Some(&Some(mp::lsp::LspFileChangeKind::Changed))
+		);
+	}
+
+	#[test]
 	fn node_modules_and_out_of_root_paths_are_dropped() {
-		let (paths, topology) = collect(
+		let (paths, _, topology) = collect(
 			event(
 				EventKind::Create(CreateKind::File),
 				&["/ws/node_modules/foo/index.js", "/elsewhere/file.txt", "/ws"],
@@ -936,7 +1150,7 @@ mod tests {
 			// commondir, mirroring `attach`'s push order.
 			dotgit_aliases: vec![PathBuf::from("/main/.git/worktrees/wt"), PathBuf::from("/main/.git")],
 		};
-		let (paths, topology) = collect(
+		let (paths, _, topology) = collect(
 			modify(&[
 				"/main/.git/worktrees/wt/HEAD",
 				"/main/.git/worktrees/wt/index",
@@ -961,7 +1175,7 @@ mod tests {
 
 	#[test]
 	fn nested_dotgit_outside_root_level_is_dropped() {
-		let (paths, _) = collect(modify(&["/ws/vendor/dep/.git/HEAD"]), &plain_root());
+		let (paths, _, _) = collect(modify(&["/ws/vendor/dep/.git/HEAD"]), &plain_root());
 		assert!(paths.is_empty(), "got {paths:?}");
 	}
 

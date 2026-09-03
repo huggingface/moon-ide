@@ -839,11 +839,11 @@ impl LspBroker {
 	/// Errors are logged at warn level rather than propagated:
 	/// notify is fire-and-forget by design, and a single server
 	/// failing to receive the batch shouldn't block the others.
-	pub async fn notify_files_changed(&self, paths: &[String]) {
+	pub async fn notify_files_changed(&self, changes: &[(String, Option<mp::LspFileChangeKind>)]) {
 		let mut servers: Vec<Arc<LspServer>> = collect_alive(&self.servers).await;
 		servers.extend(collect_alive(&self.lint_servers).await);
 		for server in servers {
-			if let Err(err) = server.notify_files_changed(paths).await {
+			if let Err(err) = server.notify_files_changed(changes).await {
 				tracing::warn!(error = %err, "lsp: notify_files_changed failed");
 			}
 		}

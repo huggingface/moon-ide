@@ -21,8 +21,8 @@ use moon_core::lsp::server::PathTranslator;
 use moon_core::lsp::{LspBroker, LspServerEvent, LspSpawner};
 use moon_protocol::container::ContainerState;
 use moon_protocol::lsp::{
-	LspCodeAction, LspCompletionItem, LspCompletionList, LspDiagnostic, LspHover, LspLocation, LspPosition,
-	LspPrepareRename, LspRange, LspWorkspaceEdit,
+	LspCodeAction, LspCompletionItem, LspCompletionList, LspDiagnostic, LspFileChange, LspFileChangeKind, LspHover,
+	LspLocation, LspPosition, LspPrepareRename, LspRange, LspWorkspaceEdit,
 };
 use moon_protocol::MoonError;
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
@@ -134,13 +134,21 @@ pub async fn lsp_completion(
 }
 
 /// Forward an fs-watcher batch to every running language
-/// server. Each server filters the paths through the globs it
+/// server. Each server filters the entries through the globs it
 /// registered via `client/registerCapability` and sends one
 /// `workspace/didChangeWatchedFiles` notification with the
 /// matching subset; servers that didn't register watchers
 /// silently no-op. The window-focus path uses
 /// [`lsp_refresh_open_diagnostics`] instead, since focus events
 /// don't carry a path list.
+///
+/// `changes` carries a per-entry kind (created / changed /
+/// deleted, from the fs-watcher's event classification) so a
+/// branch-switch delete is reported as `Deleted` — servers then
+/// drop their in-memory snapshot of the file instead of trying
+/// to re-read it and silently keeping the stale bytes. The
+/// rename / quick-fix appliers pass `changed` for every path they
+/// rewrote in place.
 ///
 /// Well-behaved servers respond to a watched-files batch by
 /// invalidating per-file caches and (because we advertise
@@ -155,7 +163,10 @@ pub async fn lsp_completion(
 /// LSP language file in this session): forwarding fs events to
 /// zero servers is a fine idempotent.
 #[tauri::command]
-pub async fn lsp_notify_files_changed(state: State<'_, AppState>, paths: Vec<String>) -> Result<(), MoonError> {
+pub async fn lsp_notify_files_changed(
+	state: State<'_, AppState>,
+	changes: Vec<LspFileChange>,
+) -> Result<(), MoonError> {
 	let broker = {
 		let guard = state.lsp.lock().await;
 		match guard.as_ref() {
@@ -163,7 +174,8 @@ pub async fn lsp_notify_files_changed(state: State<'_, AppState>, paths: Vec<Str
 			None => return Ok(()),
 		}
 	};
-	broker.notify_files_changed(&paths).await;
+	let changes: Vec<(String, Option<LspFileChangeKind>)> = changes.into_iter().map(|c| (c.path, Some(c.kind))).collect();
+	broker.notify_files_changed(&changes).await;
 	Ok(())
 }
 

@@ -54,6 +54,7 @@ import type {
 	LspCompletionItem,
 	LspCompletionList,
 	LspDiagnostic,
+	LspFileChange,
 	LspHover,
 	LspLocation,
 	LspPosition,
@@ -358,10 +359,14 @@ export const ipc = {
 		// canonical LSP plumbing for off-disk file changes —
 		// well-behaved servers invalidate caches and fire a
 		// `workspace/diagnostic/refresh` request back, which the
-		// backend turns into a per-server diagnostic re-pull. No-op
-		// when no broker has spun up yet, or when no server has
-		// registered a watcher matching any of the paths.
-		notifyFilesChanged: (paths: readonly string[]) => invoke<void>('lsp_notify_files_changed', { paths }),
+		// backend turns into a per-server diagnostic re-pull. Each
+		// entry carries its change kind so a branch-switch delete
+		// is reported as `Deleted` (servers drop the snapshot
+		// instead of re-reading a vanished file and keeping stale
+		// bytes). No-op when no broker has spun up yet, or when no
+		// server has registered a watcher matching any of the
+		// paths.
+		notifyFilesChanged: (changes: readonly LspFileChange[]) => invoke<void>('lsp_notify_files_changed', { changes }),
 	},
 	slack: {
 		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),

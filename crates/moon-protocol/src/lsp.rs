@@ -292,6 +292,42 @@ pub struct LspWorkspaceEdit {
 	pub document_edits: Vec<LspDocumentEdit>,
 }
 
+/// What happened to a file we're about to report to a language
+/// server via `workspace/didChangeWatchedFiles`. Maps 1:1 onto
+/// LSP's `FileChangeType` (Created=1, Changed=2, Deleted=3), but
+/// lives here so the watcher → frontend → broker pipeline speaks
+/// the moon protocol end to end instead of leaking raw LSP
+/// numbers across the Tauri boundary.
+///
+/// The distinction matters for correctness: a `git switch` deletes
+/// files the new branch doesn't have and creates files it does.
+/// Telling the server a deleted file merely "changed" makes it try
+/// to re-read the file from disk, fail, and keep serving the
+/// stale in-memory snapshot — exactly the "type updated in
+/// another file but the LSP still shows the old errors" symptom.
+/// With a real `deleted` kind the server drops the snapshot
+/// instead.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum LspFileChangeKind {
+	Created,
+	Changed,
+	Deleted,
+}
+
+/// One path + its change kind, forwarded to
+/// `lsp_notify_files_changed` so the broker can translate to
+/// `FileChangeType` per event.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct LspFileChange {
+	/// Workspace-relative, forward-slash separated.
+	pub path: String,
+	pub kind: LspFileChangeKind,
+}
+
 /// Result of `textDocument/prepareRename`. `Some(...)` means the
 /// server has confirmed the cursor sits on a renameable symbol
 /// and hands back the existing identifier's range (so the

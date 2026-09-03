@@ -599,6 +599,32 @@ struct DocState {
 	version: i32,
 }
 
+/// Translate a moon change kind onto LSP's `FileChangeType`.
+/// `None` (backend couldn't classify) maps to `Changed`, matching
+/// the behaviour before kinds existed.
+fn change_kind_to_file_change_type(kind: Option<mp::LspFileChangeKind>) -> lt::FileChangeType {
+	match kind {
+		Some(mp::LspFileChangeKind::Created) => lt::FileChangeType::CREATED,
+		Some(mp::LspFileChangeKind::Deleted) => lt::FileChangeType::DELETED,
+		Some(mp::LspFileChangeKind::Changed) | None => lt::FileChangeType::CHANGED,
+	}
+}
+
+/// The `WatchKind` bit a server must have registered for an event
+/// of this type to be forwarded: a `Created` / `Deleted` event is
+/// only meaningful to a server that asked to hear about creates /
+/// deletes. Servers omitting `kind` in their registration got the
+/// spec default (all three bits), so this only narrows servers
+/// that explicitly opted out of an event class.
+fn watch_kind_for(typ: lt::FileChangeType) -> lt::WatchKind {
+	match typ {
+		lt::FileChangeType::CREATED => lt::WatchKind::Create,
+		lt::FileChangeType::CHANGED => lt::WatchKind::Change,
+		lt::FileChangeType::DELETED => lt::WatchKind::Delete,
+		_ => unreachable!("FileChangeType is a newtype with exactly three constants"),
+	}
+}
+
 impl LspServer {
 	/// Locate and spawn the server binary. Returns `Ok(None)` when
 	/// no copy can be found on disk — caller surfaces a
@@ -1251,29 +1277,33 @@ impl LspServer {
 	/// changed paths match — the round-trip cost is one map walk
 	/// against the registered globs.
 	///
-	/// `kind` is hardcoded to `Changed` for now: the host
-	/// fs-watcher emits a flat `paths` list without per-path
-	/// create/modify/delete classification, and `Changed` is what
-	/// every wired server actually keys off (rust-analyzer
-	/// invalidates caches, tsgo / tsserver re-index). If a
-	/// fidelity issue surfaces, the watcher payload extension is
-	/// the right fix; defaulting here avoids over-engineering
-	/// before there's a real bug.
-	pub async fn notify_files_changed(&self, paths: &[String]) -> Result<(), LspClientError> {
-		if paths.is_empty() {
+	/// `changes` carries a per-path kind so the server can tell a
+	/// branch-switch delete from a plain edit: a `Deleted` event
+	/// makes the server drop its in-memory snapshot of the file,
+	/// while a `Changed` event for a vanished file makes it try
+	/// to re-read from disk and, on failure, keep the stale
+	/// snapshot serving. `kind: None` (a backend that couldn't
+	/// classify, or a path that both appeared and vanished in one
+	/// debounce window) maps to `Changed` — the pre-kinds
+	/// behaviour.
+	pub async fn notify_files_changed(
+		&self,
+		changes: &[(String, Option<mp::LspFileChangeKind>)],
+	) -> Result<(), LspClientError> {
+		if changes.is_empty() {
 			return Ok(());
 		}
 		let patterns = self.watched_patterns.lock().await;
 		if patterns.is_empty() {
 			return Ok(());
 		}
-		let kind = lt::FileChangeType::CHANGED;
 		let mut events: Vec<lt::FileEvent> = Vec::new();
-		for path in paths {
+		for (path, kind) in changes {
+			let typ = change_kind_to_file_change_type(*kind);
 			let mut matched = false;
 			for group in patterns.values() {
 				for pattern in group {
-					if !pattern.kind.contains(lt::WatchKind::Change) {
+					if !pattern.kind.contains(watch_kind_for(typ)) {
 						continue;
 					}
 					if pattern.matcher.is_match(path) {
@@ -1290,7 +1320,7 @@ impl LspServer {
 			}
 			events.push(lt::FileEvent {
 				uri: self.relative_to_uri(path),
-				typ: kind,
+				typ,
 			});
 		}
 		drop(patterns);
@@ -3071,6 +3101,32 @@ mod tests {
 		assert_eq!(patterns[1].kind.bits(), 2);
 		assert!(patterns[1].matcher.is_match("tsconfig.json"));
 		assert!(patterns[1].matcher.is_match("packages/api/tsconfig.build.json"));
+	}
+
+	/// Moon change kinds map onto LSP's `FileChangeType` 1:1, and
+	/// an unclassifiable event (`None`) falls back to `Changed` —
+	/// the behaviour before kinds existed. This is the exactness
+	/// a branch-switch delete depends on: `Deleted` on the wire.
+	#[test]
+	fn change_kinds_map_to_lsp_file_change_types() {
+		use mp::LspFileChangeKind as K;
+		assert_eq!(
+			change_kind_to_file_change_type(Some(K::Created)),
+			lt::FileChangeType::CREATED
+		);
+		assert_eq!(
+			change_kind_to_file_change_type(Some(K::Changed)),
+			lt::FileChangeType::CHANGED
+		);
+		assert_eq!(
+			change_kind_to_file_change_type(Some(K::Deleted)),
+			lt::FileChangeType::DELETED
+		);
+		assert_eq!(change_kind_to_file_change_type(None), lt::FileChangeType::CHANGED);
+		// Watch-kind gating follows the event type.
+		assert!(watch_kind_for(lt::FileChangeType::DELETED).contains(lt::WatchKind::Delete));
+		assert!(watch_kind_for(lt::FileChangeType::CREATED).contains(lt::WatchKind::Create));
+		assert!(watch_kind_for(lt::FileChangeType::CHANGED).contains(lt::WatchKind::Change));
 	}
 
 	/// Empty `watchers` list → `None` so the caller treats it

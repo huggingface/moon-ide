@@ -201,10 +201,17 @@ leave the server on a stale view. Two closures:
   panel but no server wants) and the broker fans out per-server,
   filtered through that server's globs.
   Servers respond with `workspace/diagnostic/refresh`, which makes
-  the broker re-pull every open buffer on that server. The watcher
-  carries no per-path change kind, so we send `Changed` for
-  everything — every server we wire invalidates caches on `Changed`
-  regardless; extend the payload if fidelity ever bites.
+  the broker re-pull every open buffer on that server. Each entry
+  carries the watcher's per-path classification
+  (`LspFileChangeKind`: created / changed / deleted) mapped onto
+  LSP's `FileChangeType`, so a branch-switch delete is reported as
+  `Deleted` — a server told merely `Changed` for a vanished file
+  tries to re-read it from disk, fails, and keeps serving the
+  stale in-memory snapshot (the "old type errors survive a branch
+  switch" symptom). Unclassifiable events fall back to `Changed`.
+  The `WatchKind` bits a server registered (create / change /
+  delete) gate the per-event forward, so a server that opted out
+  of delete notifications isn't spammed with them.
 - **Focus-driven (cold-start safety net).** A `git checkout` while
   the IDE was closed leaves no watcher trace, so every window
   focus-gain re-pulls all open buffers on all servers (debounced

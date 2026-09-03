@@ -27,6 +27,8 @@ import {
 	type GitStatusEntry,
 	type LspDiagnostic,
 	type LspDiagnosticsEvent,
+	type LspFileChange,
+	type LspFileChangeKind,
 	type LspStatusEvent,
 	type NextEditProbeResult,
 	type NextEditServerSnapshot,
@@ -3809,64 +3811,81 @@ class WorkspaceState {
 		}
 		this.#folderRefreshWired = true;
 		try {
-			await listen<{ paths: string[]; topologyChanged: boolean }>('fs:changed', ({ payload }) => {
-				const subset = payload.paths.length > 0 ? new Set(payload.paths) : null;
-				// Sample up to 5 paths so a `git checkout` burst
-				// doesn't dump dozens of lines per emit; the user
-				// can compare these against `file.path` in the
-				// per-buffer log lines below to diagnose path
-				// mismatches (workspace-relative vs absolute,
-				// cross-folder, etc.).
-				const sample = payload.paths.slice(0, 5).join(', ');
-				const more = payload.paths.length > 5 ? ` … (+${payload.paths.length - 5} more)` : '';
-				frontendLog(
-					'fs-watcher',
-					'info',
-					`fs:changed paths=${payload.paths.length} topology=${payload.topologyChanged}${payload.paths.length === 0 ? '' : ` [${sample}${more}]`}`,
-				);
-				void this.refreshActiveFolder(subset, payload.topologyChanged);
-				// `.git/MERGE_HEAD` / `.git/MERGE_MSG` appear when
-				// the user starts a merge from a terminal (or
-				// our own merge IPC) and disappear when it
-				// commits / aborts. Either case flips the SCM
-				// panel into / out of merge-in-progress mode,
-				// so a dedicated re-probe keeps the panel live
-				// without waiting for the next branch refresh
-				// cadence. `refreshActiveFolder` above does
-				// `refreshGitBranch → refreshGitMergeState` on
-				// its own pass too; this is the surgical fast
-				// path for the `.git/`-only burst.
-				if (payload.paths.some((p) => p === '.git/MERGE_HEAD' || p === '.git/MERGE_MSG')) {
-					void this.refreshGitMergeState();
-				}
-				// Forward the fs-watcher batch to every running
-				// LSP server as `workspace/didChangeWatchedFiles`.
-				// Each server filters the paths through the globs
-				// it registered at startup, so a `.toml`-only
-				// burst lands on no server at all and a TS file
-				// change only reaches the TypeScript server.
-				// Well-behaved servers respond by invalidating
-				// caches and asking us (via the
-				// `workspace/diagnostic/refresh` request handled
-				// by the broker's notification pump) to re-pull
-				// diagnostics for every open buffer — that's how
-				// the panel catches up to a `git checkout`
-				// without the user having to retype. Servers
-				// that don't register watchers (rust-analyzer
-				// post-init, push-only servers) silently no-op
-				// inside the per-server filter, so the broad
-				// fan-out is cheap. Git metadata paths stay out:
-				// the watcher forwards `.git/HEAD` / `.git/refs/`
-				// writes for the SCM panel, but no language
-				// server wants per-commit `.git` churn — a
-				// `**/*`-glob server would re-index for nothing.
-				const lspPaths = payload.paths.filter((p) => p !== '.git' && !p.startsWith('.git/'));
-				if (lspPaths.length > 0) {
-					void ipc.lsp.notifyFilesChanged(lspPaths).catch((err) => {
-						frontendLog('lsp.refresh', 'warn', `notifyFilesChanged failed: ${formatError(err)}`);
+			await listen<{ paths: string[]; kinds: (LspFileChangeKind | null)[]; topologyChanged: boolean }>(
+				'fs:changed',
+				({ payload }) => {
+					const subset = payload.paths.length > 0 ? new Set(payload.paths) : null;
+					// Sample up to 5 paths so a `git checkout` burst
+					// doesn't dump dozens of lines per emit; the user
+					// can compare these against `file.path` in the
+					// per-buffer log lines below to diagnose path
+					// mismatches (workspace-relative vs absolute,
+					// cross-folder, etc.).
+					const sample = payload.paths.slice(0, 5).join(', ');
+					const more = payload.paths.length > 5 ? ` … (+${payload.paths.length - 5} more)` : '';
+					frontendLog(
+						'fs-watcher',
+						'info',
+						`fs:changed paths=${payload.paths.length} topology=${payload.topologyChanged}${payload.paths.length === 0 ? '' : ` [${sample}${more}]`}`,
+					);
+					void this.refreshActiveFolder(subset, payload.topologyChanged);
+					// `.git/MERGE_HEAD` / `.git/MERGE_MSG` appear when
+					// the user starts a merge from a terminal (or
+					// our own merge IPC) and disappear when it
+					// commits / aborts. Either case flips the SCM
+					// panel into / out of merge-in-progress mode,
+					// so a dedicated re-probe keeps the panel live
+					// without waiting for the next branch refresh
+					// cadence. `refreshActiveFolder` above does
+					// `refreshGitBranch → refreshGitMergeState` on
+					// its own pass too; this is the surgical fast
+					// path for the `.git/`-only burst.
+					if (payload.paths.some((p) => p === '.git/MERGE_HEAD' || p === '.git/MERGE_MSG')) {
+						void this.refreshGitMergeState();
+					}
+					// Forward the fs-watcher batch to every running
+					// LSP server as `workspace/didChangeWatchedFiles`.
+					// Each server filters the entries through the globs
+					// it registered at startup, so a `.toml`-only
+					// burst lands on no server at all and a TS file
+					// change only reaches the TypeScript server. Every
+					// entry carries the watcher's per-path
+					// classification, so a branch-switch delete is
+					// reported as `Deleted` — a server told merely
+					// `Changed` tries to re-read the vanished file from
+					// disk, fails, and keeps serving the stale
+					// in-memory snapshot (the "old type errors survive
+					// a branch switch" symptom). An unclassifiable
+					// entry (`null`) falls back to `changed`.
+					// Well-behaved servers respond by invalidating
+					// caches and asking us (via the
+					// `workspace/diagnostic/refresh` request handled
+					// by the broker's notification pump) to re-pull
+					// diagnostics for every open buffer — that's how
+					// the panel catches up to a `git checkout`
+					// without the user having to retype. Servers
+					// that don't register watchers (rust-analyzer
+					// post-init, push-only servers) silently no-op
+					// inside the per-server filter, so the broad
+					// fan-out is cheap. Git metadata paths stay out:
+					// the watcher forwards `.git/HEAD` / `.git/refs/`
+					// writes for the SCM panel, but no language
+					// server wants per-commit `.git` churn — a
+					// `**/*`-glob server would re-index for nothing.
+					const lspChanges: LspFileChange[] = [];
+					payload.paths.forEach((p, i) => {
+						if (p === '.git' || p.startsWith('.git/')) {
+							return;
+						}
+						lspChanges.push({ path: p, kind: payload.kinds[i] ?? 'changed' });
 					});
-				}
-			});
+					if (lspChanges.length > 0) {
+						void ipc.lsp.notifyFilesChanged(lspChanges).catch((err) => {
+							frontendLog('lsp.refresh', 'warn', `notifyFilesChanged failed: ${formatError(err)}`);
+						});
+					}
+				},
+			);
 		} catch {
 			// Event bus unavailable (tests / non-Tauri). Focus
 			// listener still has a shot below.
