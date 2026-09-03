@@ -575,6 +575,11 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 			tracing::warn!(error = %e, path = %active, "failed to restore active folder");
 		}
 	}
+	// Disk is the source of truth for worktrees (ADR 0079): adopt
+	// IDE-managed checkouts under a bound folder's `.worktrees/`
+	// that session.json didn't list. Same sweep as the desktop's
+	// `restore_session`.
+	registry.adopt_disk_worktrees().await;
 
 	// Models seed: per-workspace provider lock beats the global
 	// active provider (same resolution as the desktop's setup).

@@ -22,6 +22,10 @@ use crate::state::AppState;
 pub async fn workspace_open_local(state: State<'_, AppState>, path: String) -> Result<WorkspaceRecord, MoonError> {
 	let path = Utf8PathBuf::from(path);
 	state.workspaces.add_folder(path).await?;
+	// Disk is the source of truth for worktrees (ADR 0079): a
+	// folder re-added after a session.json loss brings its
+	// IDE-managed `.worktrees/` checkouts back as rows.
+	state.workspaces.adopt_disk_worktrees().await;
 	let snap = state.workspaces.snapshot().await;
 	repoint_fs_watcher(&state, &snap);
 	detach_lsp_teardown_if_root_changed(&state, &snap).await;

@@ -17,7 +17,7 @@
 //! active folder's host, never the workspace's, because hosts
 //! are per-folder by construction.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use moon_protocol::workspace::{FolderOrigin, HostKind, Workspace as WorkspaceRecord, WorkspaceFolder, WorkspaceId};
 use moon_protocol::{MoonError, MoonResult};
 use std::sync::{Arc, OnceLock};
@@ -178,6 +178,78 @@ impl WorkspaceRegistry {
 			inner.active_folder_path = Some(canonical_str);
 		}
 		Ok(entry)
+	}
+
+	/// Re-bind git worktrees that exist on disk under a bound
+	/// folder's `.worktrees/` but aren't bound yet (ADR 0079).
+	///
+	/// `session.json` records which folders were bound, but disk is
+	/// the **source of truth** for worktrees: a persisted `Worktree`
+	/// origin can be lost (a corrupt session.json falls back to
+	/// defaults) or never written (the checkout outlived the owning
+	/// session), and without a row the IDE can't reach the checkout
+	/// it created — the branch stays pinned behind git's "used by
+	/// worktree" refusal until the user resolves it by hand. This
+	/// sweep makes those rows reappear on every startup and
+	/// folder-add instead.
+	///
+	/// Only the IDE-managed location is adopted: `<parent>/.worktrees/`
+	/// (ADR 0029). A worktree the user made themselves elsewhere is
+	/// never taken over — the row's `×` means **delete**, so adopting
+	/// a user-made checkout would put a destructive affordance on
+	/// something the user owns.
+	///
+	/// Best-effort and per-parent: a git failure on one folder (not
+	/// a repo, git unavailable) is logged and skipped; the sweep
+	/// never fails and never steals the active folder.
+	pub async fn adopt_disk_worktrees(&self) {
+		let parents: Vec<Arc<WorkspaceFolderEntry>> = self
+			.folders()
+			.await
+			.into_iter()
+			// A worktree folder as an adoption parent would bind a
+			// nested worktree-of-worktree (ADR 0037 cross-project
+			// workers) — that checkout belongs to its owning session,
+			// not a fresh parent project. Only project folders adopt.
+			.filter(|e| !matches!(e.folder.origin, FolderOrigin::Worktree { .. }))
+			.collect();
+		for parent in parents {
+			let Ok(worktrees) = parent.host.git_worktree_list().await else {
+				// Not a repo, or git unavailable — nothing to adopt.
+				continue;
+			};
+			for wt in worktrees {
+				let Some(branch) = wt.branch else {
+					// Detached-HEAD worktree: nothing to label the
+					// row with (and nothing to deliver as a branch).
+					continue;
+				};
+				let wt_path = Utf8Path::new(&wt.path);
+				let Ok(tail) = wt_path.strip_prefix(&parent.folder.path) else {
+					// Lives outside `<parent>/.worktrees/` — a
+					// user-made worktree; never adopt (see above).
+					continue;
+				};
+				if tail.components().next().map(|c| c.as_str()) != Some(crate::WORKTREES_DIR_NAME) {
+					continue;
+				}
+				// git still lists a checkout whose directory is mid-
+				// removal; only bind what's live (`<path>/.git`).
+				if !wt_path.join(".git").exists() {
+					continue;
+				}
+				if self.folder_for_path(&wt.path).await.is_some() {
+					continue; // already bound (session.json restore or earlier pass)
+				}
+				match self
+					.add_worktree_folder(Utf8PathBuf::from(&wt.path), parent.folder.path.clone(), branch.clone())
+					.await
+				{
+					Ok(_) => tracing::info!(worktree = %wt.path, branch = %branch, "adopted IDE-managed worktree from disk"),
+					Err(e) => tracing::warn!(error = %e, worktree = %wt.path, "could not adopt worktree from disk"),
+				}
+			}
+		}
 	}
 
 	/// Sync a worktree folder's stored branch label to its actual
@@ -443,6 +515,132 @@ mod tests {
 		let registry = test_registry();
 		let err = registry.set_active_folder("/nope").await.unwrap_err();
 		assert!(matches!(err, MoonError::NotFound(_)));
+	}
+
+	// --- adopt_disk_worktrees (ADR 0079) -------------------------
+	// Real git, mirroring how the IDE itself creates worktrees:
+	// `git worktree add --relative-paths` under `<parent>/.worktrees/`
+	// plus the creation-time lock. The sweep must recognise exactly
+	// the states those produce.
+
+	use crate::test_util::{init_committed_repo, relative_worktrees_supported, run_git, which_git};
+
+	#[tokio::test]
+	async fn adopt_disk_worktrees_binds_unlisted_checkout() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping adoption test");
+			return;
+		};
+		if !relative_worktrees_supported() {
+			eprintln!("git < 2.48 (no relative worktrees) — skipping adoption test");
+			return;
+		}
+		let dir = tempfile::TempDir::new().unwrap();
+		init_committed_repo(&git, dir.path());
+		let wt_path = dir.path().join(".worktrees").join("moon-agent-1");
+		run_git(
+			&git,
+			dir.path(),
+			&[
+				"worktree",
+				"add",
+				"--relative-paths",
+				"-b",
+				"moon/agent-1",
+				wt_path.to_str().unwrap(),
+			],
+		);
+
+		let parent_path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let registry = test_registry();
+		registry.add_folder(parent_path.clone()).await.unwrap();
+
+		registry.adopt_disk_worktrees().await;
+
+		let snap = registry.snapshot().await;
+		let wt = snap
+			.folders
+			.iter()
+			.find(|f| matches!(&f.origin, FolderOrigin::Worktree { branch, .. } if branch == "moon/agent-1"))
+			.expect("worktree should be adopted");
+		assert_eq!(wt.path, wt_path.to_str().unwrap());
+		// The parent stays active — adoption never steals the focus.
+		assert_eq!(snap.active_folder.as_deref(), Some(parent_path.as_str()));
+	}
+
+	#[tokio::test]
+	async fn adopt_disk_worktrees_skips_already_bound_and_user_made() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping adoption test");
+			return;
+		};
+		if !relative_worktrees_supported() {
+			eprintln!("git < 2.48 (no relative worktrees) — skipping adoption test");
+			return;
+		}
+		let dir = tempfile::TempDir::new().unwrap();
+		init_committed_repo(&git, dir.path());
+		let wt_path = dir.path().join(".worktrees").join("moon-agent-1");
+		run_git(
+			&git,
+			dir.path(),
+			&[
+				"worktree",
+				"add",
+				"--relative-paths",
+				"-b",
+				"moon/agent-1",
+				wt_path.to_str().unwrap(),
+			],
+		);
+		// A user-made worktree outside `.worktrees/` — never adopt
+		// (its row would carry the destructive `×` = delete).
+		let user_wt = dir.path().join("elsewhere").join("mine");
+		run_git(
+			&git,
+			dir.path(),
+			&["worktree", "add", "-b", "mine", user_wt.to_str().unwrap()],
+		);
+
+		let parent_path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let registry = test_registry();
+		registry.add_folder(parent_path.clone()).await.unwrap();
+		// The `.worktrees/` one is already bound (the session.json
+		// restore path) — adoption must not double-bind it.
+		registry
+			.add_worktree_folder(
+				Utf8PathBuf::from_path_buf(wt_path.clone()).unwrap(),
+				parent_path.to_string(),
+				"moon/agent-1".into(),
+			)
+			.await
+			.unwrap();
+
+		registry.adopt_disk_worktrees().await;
+
+		let snap = registry.snapshot().await;
+		let wt_count = snap
+			.folders
+			.iter()
+			.filter(|f| matches!(&f.origin, FolderOrigin::Worktree { .. }))
+			.count();
+		assert_eq!(
+			wt_count, 1,
+			"exactly the one bound worktree — no double-bind, no user-made adoption"
+		);
+	}
+
+	#[tokio::test]
+	async fn adopt_disk_worktrees_ignores_non_repo_folders() {
+		let dir = tempfile::TempDir::new().unwrap();
+		let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+
+		let registry = test_registry();
+		registry.add_folder(path).await.unwrap();
+		// Must not error on a folder with no .git — the sweep is
+		// best-effort per folder.
+		registry.adopt_disk_worktrees().await;
+		assert_eq!(registry.snapshot().await.folders.len(), 1);
 	}
 
 	#[tokio::test]

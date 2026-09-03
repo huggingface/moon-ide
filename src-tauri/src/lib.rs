@@ -1404,6 +1404,14 @@ async fn restore_session(
 				tracing::warn!(error = %e, path = %active, "failed to restore active folder");
 			}
 		}
+		// Disk is the source of truth for worktrees (ADR 0079): adopt
+		// IDE-managed checkouts under a bound folder's `.worktrees/`
+		// that session.json didn't list — a corrupt/healed session.json
+		// or a checkout outliving its owning session. Rows reappear
+		// instead of pinning their branches behind git's "used by
+		// worktree" refusal.
+		state.workspaces.adopt_disk_worktrees().await;
+
 		let snap = state.workspaces.snapshot().await;
 		tracing::info!(
 			workspace = %workspace_id,

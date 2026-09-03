@@ -1954,7 +1954,8 @@ agent" action (local branches and open-PR head refs); the coder
 panel's worktree button covers the fresh-branch default.
 
 Created on opt-in (`git worktree add`), re-bound at startup (the
-folder's `origin` rides `session.json`), and **pruned** by the
+folder's `origin` rides `session.json`, with disk adoption as the
+backstop — see ADR 0079 below), and **pruned** by the
 worktree row's `×` — run against the parent repo and guarded by a
 re-confirm when the worktree is dirty. Deleting the owning session
 keeps the worktree (the branch is the deliverable you may still PR).
@@ -1997,6 +1998,19 @@ gone from disk is forgotten, unbound, and announced via
 restore skips (and forgets) a persisted worktree folder whose
 checkout vanished while the IDE was closed, instead of re-binding a
 dead row.
+
+**Disk is the source of truth for worktree rows**
+([ADR 0079](decisions/0079-worktree-adoption-from-disk.md)): at
+startup and on every folder-add, each bound project folder sweeps
+`git worktree list` for checkouts under its `.worktrees/` and binds
+any that aren't bound yet (branch label from git). A corrupted
+`session.json` — or a checkout whose owning session was deleted —
+no longer strands the row: it reappears in the folder bar, where
+`×` deletes it and the merge button lands it. Worktrees the user
+created outside `.worktrees/` are never adopted (`×` deletes; it
+must never aim at a user-made checkout), detached-HEAD worktrees are
+skipped, and a persisted-but-dead binding is still dropped as above.
+The sweep never changes the active folder and never fails startup.
 
 #### The worktree button is context-aware
 

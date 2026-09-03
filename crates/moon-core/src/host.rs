@@ -3504,12 +3504,12 @@ fn run_git_worktree_add_moving(
 /// relative links resolve both on the host *and* inside the dev
 /// container, where the same worktree is reachable via the parent
 /// repo's bind mount at a different absolute path (ADR 0029).
-const MIN_GIT_FOR_RELATIVE_WORKTREES: (u32, u32) = (2, 48);
+pub(crate) const MIN_GIT_FOR_RELATIVE_WORKTREES: (u32, u32) = (2, 48);
 
 /// Parse `(major, minor)` from `git version`, e.g. `git version
 /// 2.48.1` → `(2, 48)`. `None` if git can't run or the output is
 /// unparseable.
-fn git_major_minor(target: &ShellTarget, root: &Utf8Path) -> Option<(u32, u32)> {
+pub(crate) fn git_major_minor(target: &ShellTarget, root: &Utf8Path) -> Option<(u32, u32)> {
 	let out = git_command(target, root).arg("version").output().ok()?;
 	if !out.status.success() {
 		return None;
@@ -8984,44 +8984,17 @@ mod tests {
 	}
 
 	fn which_git() -> Option<std::path::PathBuf> {
-		std::process::Command::new("git")
-			.arg("--version")
-			.output()
-			.ok()
-			.filter(|o| o.status.success())
-			.map(|_| std::path::PathBuf::from("git"))
+		crate::test_util::which_git()
 	}
 
 	/// Worktree-add version-gates on git >= 2.48 (relative links), so
 	/// the real-`git worktree add` tests skip on older git.
 	fn relative_worktrees_supported() -> bool {
-		git_major_minor(&ShellTarget::Host, Utf8Path::new(".")).is_some_and(|v| v >= MIN_GIT_FOR_RELATIVE_WORKTREES)
+		crate::test_util::relative_worktrees_supported()
 	}
 
 	fn run_git(git: &std::path::Path, cwd: &std::path::Path, args: &[&str]) {
-		// Scrub the ambient identity. Devs (and CI containers) often
-		// have `GIT_AUTHOR_NAME` / `GIT_COMMITTER_NAME` exported in
-		// their shell — those override `git config user.name` and
-		// make the blame / log tests assert against the wrong name.
-		// Removing them here pins every test commit to the repo-local
-		// `user.name` / `user.email` the test sets up.
-		let out = std::process::Command::new(git)
-			.arg("-C")
-			.arg(cwd)
-			.args(args)
-			.env_remove("GIT_AUTHOR_NAME")
-			.env_remove("GIT_AUTHOR_EMAIL")
-			.env_remove("GIT_AUTHOR_DATE")
-			.env_remove("GIT_COMMITTER_NAME")
-			.env_remove("GIT_COMMITTER_EMAIL")
-			.env_remove("GIT_COMMITTER_DATE")
-			.output()
-			.expect("spawn git");
-		assert!(
-			out.status.success(),
-			"git {args:?} failed: {}",
-			String::from_utf8_lossy(&out.stderr)
-		);
+		crate::test_util::run_git(git, cwd, args)
 	}
 
 	/// SHA a ref points at in a (bare) repo, or `None` when the ref
