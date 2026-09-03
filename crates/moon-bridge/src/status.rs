@@ -40,6 +40,13 @@ pub enum ControlRequest {
 	/// on-demand everywhere: the local panel asks over this socket,
 	/// a remote IDE over its enrolled WS. There is no startup window.
 	PairCode,
+	/// Open a fresh IDE-enrollment window on demand (mirror of
+	/// `PairCode` for the IDE↔bridge relationship). Enrollment was
+	/// startup-only because it bootstraps trust; but the control
+	/// socket is already a trusted local channel, so minting here
+	/// costs nothing and removes the restart-the-bridge dance every
+	/// time a new machine needs to enroll.
+	EnrollCode,
 	/// Ask the bridge to exit (e.g. before a rebuild).
 	Shutdown,
 }
@@ -60,6 +67,12 @@ pub enum ControlResponse {
 		url: String,
 		code: String,
 		fingerprint: String,
+	},
+	/// Reply to [`ControlRequest::EnrollCode`]: the fresh enrollment
+	/// code (valid for `ENROLLMENT_CODE_TTL`).
+	EnrollCode {
+		code: String,
+		ttl_secs: u64,
 	},
 	Ok,
 	Error {

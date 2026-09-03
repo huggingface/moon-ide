@@ -265,10 +265,44 @@ fn run_revoke(id: &str) -> anyhow::Result<()> {
 /// and runs `verify_and_consume` when an IDE presents the code over
 /// WSS. This subcommand just demonstrates issuance.
 fn run_enroll_code() -> anyhow::Result<()> {
+	// If a bridge is live locally, open its enrollment window over
+	// the control socket — the running listener holds the session,
+	// so a code minted *here* would never verify. Fall back to
+	// printing a local session when no socket answers (the
+	// pre-serve demonstration path).
+	if let Ok(resp) = control_request(crate::status::ControlRequest::EnrollCode) {
+		match resp {
+			crate::status::ControlResponse::EnrollCode { code, ttl_secs } => {
+				println!("Enrollment code: {code}");
+				println!("Valid for {ttl_secs} seconds.");
+				return Ok(());
+			}
+			other => {
+				anyhow::bail!("unexpected reply from live bridge: {other:?}");
+			}
+		}
+	}
 	let session = enrollment::EnrollmentSession::issue();
 	println!("Enrollment code: {}", session.code());
+	println!("(no live bridge answered on the control socket — code minted locally)");
 	println!("Valid for {} seconds.", enrollment::ENROLLMENT_CODE_TTL.as_secs());
 	Ok(())
+}
+
+/// Ask a live local bridge over its control socket. One framed
+/// request line in, one framed reply line out.
+fn control_request(req: crate::status::ControlRequest) -> anyhow::Result<crate::status::ControlResponse> {
+	use std::io::{BufRead, Write};
+	let path = crate::status::control_sock_path(&crate::tls::resolve_bridge_dir()?);
+	let mut stream = std::os::unix::net::UnixStream::connect(&path)?;
+	let body = serde_json::to_vec(&req)?;
+	stream.write_all(&body)?;
+	stream.write_all(b"\n")?;
+	stream.flush()?;
+	let mut line = String::new();
+	std::io::BufReader::new(stream).read_line(&mut line)?;
+	let resp = serde_json::from_str(&line)?;
+	Ok(resp)
 }
 
 /// List enrolled IDEs (Phase 14.0). Mirror of `run_devices`.

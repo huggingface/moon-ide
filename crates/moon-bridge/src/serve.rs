@@ -540,6 +540,19 @@ fn spawn_control_listener(bridge_dir: Utf8PathBuf, ctx: Arc<ServeCtx>, mdns_url:
 					crate::status::ControlRequest::Status => {
 						crate::status::ControlResponse::Status(current_status(&ctx, mdns_url.as_deref()))
 					}
+					crate::status::ControlRequest::EnrollCode => {
+						// On-demand IDE-enrollment window (mirror of
+						// PairCode): replace any live session so a
+						// second ask can't be blocked by a stale one.
+						let session = EnrollmentSession::issue();
+						let code = session.code().to_owned();
+						*ctx.enrollment.lock().await = Some(session);
+						tracing::info!("enrollment window opened from the local panel");
+						crate::status::ControlResponse::EnrollCode {
+							code,
+							ttl_secs: crate::enrollment::ENROLLMENT_CODE_TTL.as_secs(),
+						}
+					}
 					crate::status::ControlRequest::PairCode => {
 						// Local-panel mint (Phase 14.5): same semantics
 						// as the enrolled-IDE path — one live session,
