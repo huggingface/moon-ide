@@ -214,6 +214,21 @@ impl Workspace {
 		})
 	}
 
+	/// Stable id of the workspace this handle belongs to (the
+	/// compose project name's suffix). Callers that need to
+	/// derive sibling handles (per-folder compose projects) use
+	/// this plus [`Self::state_dir`].
+	pub fn workspace_id(&self) -> &str {
+		&self.workspace_id
+	}
+
+	/// Workspace state directory (`<workspaces_dir>/<id>/`), where
+	/// `compose.yaml` and the per-folder restart-override files
+	/// live.
+	pub fn state_dir(&self) -> &Utf8Path {
+		&self.state_dir
+	}
+
 	pub fn project(&self) -> &ProjectName {
 		&self.project
 	}

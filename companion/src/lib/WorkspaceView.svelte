@@ -47,6 +47,7 @@
 
 	/** Provider picker disclosure (collapsed by default). */
 	let providerOpen = $state(false);
+	let servicesOpen = $state(false);
 
 	/** Standard-model editor (HF route only): tap the model row to
 	 * edit the slug inline; Enter/Save persists via the same
@@ -509,6 +510,152 @@
 		</div>
 	{/if}
 
+	{#if app.containerSnapshot || Object.keys(app.projectCompose).length > 0}
+		{@const snap = app.containerSnapshot}
+		{@const shellState = snap?.status.state ?? null}
+		{@const action = snap?.action ?? null}
+		{@const composeFolders = Object.values(app.projectCompose).filter((pc) => pc.compose_file)}
+		{@const actionLabel = (a: { action: string; folder?: string; service?: string }): string => {
+			const short = a.action.replace('project_compose_', '').replace('project_compose', '').replace(/_/g, ' ');
+			const target = a.service ?? a.folder?.split('/').at(-1) ?? '';
+			return `${short}${target ? ` — ${target}` : ''}…`;
+		}}
+		<div class="card services-card">
+			<button class="provider-row" onclick={() => (servicesOpen = !servicesOpen)}>
+				<span class="muted">Services</span>
+				<strong class="provider-name">
+					{#if shellState === 'running'}dev running{:else if shellState === 'paused'}dev paused{:else if shellState === 'absent'}dev
+						off{:else}{shellState ?? 'unknown'}{/if}
+					{#if composeFolders.length > 0}
+						· {composeFolders.length} project{composeFolders.length === 1 ? '' : 's'}
+					{/if}
+				</strong>
+				<span class="chevron">{servicesOpen ? '▴' : '▾'}</span>
+			</button>
+			{#if servicesOpen}
+				<div class="services-body">
+					{#if action}
+						<p class="services-action {action.error ? 'error' : ''}">
+							{#if !action.finished}
+								{actionLabel(action)}
+							{:else if action.error}
+								{action.error}
+							{:else}
+								{actionLabel(action).replace('…', '')} done
+							{/if}
+						</p>
+					{/if}
+					{#if shellState}
+						<div class="services-row">
+							<span class="muted">Dev container</span>
+							<span class="services-btns">
+								{#if shellState === 'absent'}
+									<button
+										class="ghost"
+										disabled={app.containerBusy}
+										onclick={() => app.containerAction('container_setup')}>Start</button
+									>
+								{:else if shellState === 'running'}
+									<button
+										class="ghost"
+										disabled={app.containerBusy}
+										onclick={() => app.containerAction('container_pause')}>Pause</button
+									>
+									<button
+										class="ghost"
+										disabled={app.containerBusy}
+										onclick={() => app.containerAction('container_stop')}>Stop</button
+									>
+								{:else if shellState === 'paused'}
+									<button
+										class="ghost"
+										disabled={app.containerBusy}
+										onclick={() => app.containerAction('container_resume')}>Resume</button
+									>
+								{:else}
+									<button
+										class="ghost"
+										disabled={app.containerBusy}
+										onclick={() => app.containerAction('container_setup')}>Recreate</button
+									>
+								{/if}
+								{#if shellState !== 'absent'}
+									<button
+										class="ghost"
+										disabled={app.containerBusy}
+										title="Stop and remove the compose project (compose.yaml stays)"
+										onclick={() => app.containerAction('container_teardown')}>Teardown</button
+									>
+								{/if}
+							</span>
+						</div>
+					{/if}
+					{#each composeFolders as pc (pc.folder_path)}
+						<div class="services-folder">
+							<div class="services-row">
+								<strong class="services-folder-name">{pc.folder_path.split('/').at(-1)}</strong>
+								<span class="services-btns">
+									{#if pc.status.state === 'running'}
+										<button
+											class="ghost"
+											disabled={app.containerBusy}
+											onclick={() => app.projectComposeAction('project_compose_pause', pc.folder_path)}>Pause</button
+										>
+										<button
+											class="ghost"
+											disabled={app.containerBusy}
+											onclick={() => app.projectComposeAction('project_compose_stop', pc.folder_path)}>Stop</button
+										>
+									{:else}
+										<button
+											class="ghost"
+											disabled={app.containerBusy}
+											onclick={() => app.projectComposeAction('project_compose_up', pc.folder_path)}
+											>{pc.status.state === 'absent' ? 'Start' : 'Resume'}</button
+										>
+										{#if pc.status.state !== 'absent'}
+											<button
+												class="ghost"
+												disabled={app.containerBusy}
+												onclick={() => app.projectComposeAction('project_compose_down', pc.folder_path)}>Down</button
+											>
+										{/if}
+									{/if}
+								</span>
+							</div>
+							{#each pc.status.services as svc (svc.name)}
+								<div class="services-svc {svc.raw_state}">
+									<span class="svc-name">{svc.name}</span>
+									<span class="svc-state"
+										>{svc.raw_state}{svc.health ? ` · ${svc.health}` : ''}{svc.raw_state === 'exited' &&
+										svc.exit_code !== 0
+											? ` (${svc.exit_code})`
+											: ''}</span
+									>
+									{#if svc.raw_state === 'running'}
+										<button
+											class="ghost svc-btn"
+											disabled={app.containerBusy}
+											onclick={() =>
+												app.projectComposeAction('project_compose_service_restart', pc.folder_path, svc.name)}>↻</button
+										>
+									{:else if svc.raw_state === 'exited' || svc.raw_state === 'created'}
+										<button
+											class="ghost svc-btn"
+											disabled={app.containerBusy}
+											onclick={() =>
+												app.projectComposeAction('project_compose_service_start', pc.folder_path, svc.name)}>▶</button
+										>
+									{/if}
+								</div>
+							{/each}
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	{/if}
+
 	{#if app.scmStatus}
 		{@const scm = app.scmStatus}
 		{@const branch = scm.branch}
@@ -739,6 +886,70 @@
 		flex-direction: column;
 		gap: 0.5rem;
 		padding: 0.6rem 0.8rem;
+	}
+	.services-card {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		padding: 0.6rem 0.8rem;
+	}
+	.services-body {
+		display: flex;
+		flex-direction: column;
+		gap: 0.45rem;
+	}
+	.services-action {
+		margin: 0;
+		font-size: 0.78rem;
+		color: var(--fg-muted);
+	}
+	.services-action.error {
+		color: var(--danger, #e5484d);
+		overflow-wrap: anywhere;
+	}
+	.services-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem;
+	}
+	.services-btns {
+		display: flex;
+		gap: 0.3rem;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+	}
+	.services-folder {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		border-top: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+		padding-top: 0.4rem;
+	}
+	.services-folder-name {
+		font-size: 0.85rem;
+	}
+	.services-svc {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.75rem;
+		padding-left: 0.4rem;
+	}
+	.services-svc .svc-name {
+		min-width: 5.5rem;
+		font-weight: 600;
+	}
+	.services-svc .svc-state {
+		color: var(--fg-muted);
+		flex: 1;
+	}
+	.services-svc.exited .svc-state {
+		color: var(--danger, #e5484d);
+	}
+	.svc-btn {
+		padding: 0.05rem 0.4rem;
+		font-size: 0.75rem;
 	}
 	.provider-row {
 		display: flex;

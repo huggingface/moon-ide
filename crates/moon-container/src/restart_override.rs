@@ -10,7 +10,8 @@
 //! didn't ask for.
 //!
 //! We don't want to edit the user's compose file. Instead, we
-//! generate a tiny sibling override file (`<state-dir>/project-
+//! generate a tiny sibling override file (which also pins
+//! `userns_mode: host` — see `render_override`) (`<state-dir>/project-
 //! overrides/<slug>.yaml`) that sets `restart: "no"` for every
 //! service declared by the user's compose, and pass it as a
 //! second `-f` to every `docker compose` invocation for that
@@ -166,6 +167,15 @@ fn render_override(services: &[String]) -> String {
 	for name in services {
 		let _ = writeln!(body, "  {name}:");
 		let _ = writeln!(body, "    restart: \"no\"");
+		// Rootless podman hosts run `userns = "keep-id"` (required so
+		// the dev container's UID matches the bind-mounted repos).
+		// keep-id breaks stock images whose entrypoints expect
+		// container-root to chown their volumes (mongo, minio, …):
+		// the chown lands on an unmapped UID and the service dies on
+		// "Permission denied". `userns_mode: host` pins the service
+		// back to the daemon's own namespace — a no-op on Docker
+		// (host is the default there), the documented fix on podman.
+		let _ = writeln!(body, "    userns_mode: host");
 	}
 	body
 }

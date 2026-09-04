@@ -38,7 +38,9 @@
 use std::sync::Arc;
 
 use moon_coder::CoderHandle;
+use moon_container::{ProjectCompose, Workspace as ContainerWorkspace, WorkspaceConfig as ContainerWorkspaceConfig};
 use moon_core::WorkspaceRegistry;
+use moon_protocol::container::{ContainerState, ContainerStatus, ProjectComposeStatus};
 use serde_json::Value;
 
 use crate::settings::SettingsContext;
@@ -89,6 +91,12 @@ pub struct BridgeRpc {
 	workspaces: Arc<WorkspaceRegistry>,
 	settings: SettingsContext,
 	launcher: Option<Arc<dyn WorkspaceLauncher>>,
+	/// Last container/compose lifecycle action, for the phone's
+	/// services panel: mutations run in the background (compose
+	/// `up --wait` can outlive the phone's 30 s call deadline by
+	/// minutes) and the phone polls `container_status` — which
+	/// embeds this — to see progress / the terminal error.
+	container_action: std::sync::Arc<std::sync::Mutex<Option<ContainerActionState>>>,
 	/// Per-folder `git fetch` throttle for the phone's SCM surface:
 	/// a status request (fired on every project switch / manual
 	/// refresh) triggers a *background* fetch at most once per
@@ -114,6 +122,7 @@ impl BridgeRpc {
 			workspaces,
 			settings,
 			launcher,
+			container_action: std::sync::Arc::new(std::sync::Mutex::new(None)),
 			last_fetch: tokio::sync::Mutex::new(std::collections::HashMap::new()),
 		}
 	}
@@ -157,6 +166,204 @@ impl BridgeRpc {
 				.ok_or_else(|| format!("no bound folder at `{path}`")),
 			None => self.workspaces.require_active_folder().await.map_err(|e| e.to_string()),
 		}
+	}
+}
+
+impl BridgeRpc {
+	/// Build the workspace's shell-container handle from the live
+	/// folder snapshot — the headless twin of the desktop's
+	/// `workspace_handle`. Worktree-backed folders are host-only
+	/// (ADR 0028) and get no bind mount.
+	async fn container_workspace_handle(&self) -> Result<ContainerWorkspace, String> {
+		let snapshot = self.workspaces.snapshot().await;
+		let Some(id) = self.settings.workspace_id.clone() else {
+			return Err("this process owns no workspace (preboot mode)".into());
+		};
+		let bound_folders: Vec<camino::Utf8PathBuf> = snapshot
+			.folders
+			.iter()
+			.filter(|f| !matches!(f.origin, moon_protocol::workspace::FolderOrigin::Worktree { .. }))
+			.map(|f| camino::Utf8PathBuf::from(&f.path))
+			.collect();
+		ContainerWorkspace::new(ContainerWorkspaceConfig {
+			state_dir: self.settings.workspaces_dir.join(&id),
+			workspace_id: id,
+			bound_folders,
+		})
+		.map_err(|e| e.to_string())
+	}
+
+	/// Per-folder compose handle, `None` when the folder has no
+	/// compose file at its root (the common case for code-only
+	/// folders — the UI renders those as "no services").
+	async fn project_handle(&self, folder: &str) -> Result<Option<ProjectCompose>, String> {
+		let snapshot = self.workspaces.snapshot().await;
+		let Some(id) = self.settings.workspace_id.clone() else {
+			return Err("this process owns no workspace (preboot mode)".into());
+		};
+		if !snapshot.folders.iter().any(|f| f.path == folder) {
+			return Err(format!("folder `{folder}` is not bound to this workspace"));
+		}
+		ProjectCompose::for_folder(
+			&id,
+			&self.settings.workspaces_dir.join(&id),
+			camino::Utf8Path::new(folder),
+		)
+		.map_err(|e| e.to_string())
+	}
+
+	/// Register a lifecycle action as running and hand it to a
+	/// background task. The call returns immediately (the phone's
+	/// 30 s call deadline cannot host a `compose up --wait` that
+	/// pulls images); the phone follows progress by polling
+	/// `container_status` / `project_compose_status`, which embed
+	/// the action state. Only one action runs at a time — a second
+	/// request while one is in flight is rejected, matching how
+	/// the desktop's panel disables its buttons mid-mutation.
+	async fn spawn_container_action(
+		&self,
+		method: &str,
+		folder: Option<String>,
+		service: Option<String>,
+	) -> Result<Value, String> {
+		{
+			let mut guard = self.container_action.lock().expect("container_action");
+			if let Some(prev) = guard.as_ref() {
+				if !prev.finished {
+					return Err(format!(
+						"another container action is already running (`{}`), wait for it to finish",
+						prev.action
+					));
+				}
+			}
+			*guard = Some(ContainerActionState {
+				action: method.to_owned(),
+				folder: folder.clone(),
+				service: service.clone(),
+				started_at_ms: std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map(|d| d.as_millis())
+					.unwrap_or(0),
+				finished: false,
+				error: None,
+			});
+		}
+		let ws = self.container_workspace_handle().await?;
+		let workspaces = Arc::clone(&self.workspaces);
+		let settings = self.settings.clone();
+		let action_cell = std::sync::Arc::clone(&self.container_action);
+		let method = method.to_owned();
+		tokio::spawn(async move {
+			let result = run_container_action(&ws, &workspaces, &settings, &method, &folder, &service).await;
+			let mut guard = action_cell.lock().expect("container_action");
+			if let Some(state) = guard.as_mut() {
+				state.finished = true;
+				state.error = result.err();
+			}
+		});
+		Ok(serde_json::json!({ "started": true }))
+	}
+}
+
+/// Execute one lifecycle action. Runs on the background task; the
+/// returned `Err` is surfaced to the phone via the action state
+/// (and the status poll), not the original call.
+#[allow(clippy::too_many_arguments)]
+async fn run_container_action(
+	ws: &ContainerWorkspace,
+	_workspaces: &Arc<WorkspaceRegistry>,
+	_settings: &SettingsContext,
+	method: &str,
+	folder: &Option<String>,
+	service: &Option<String>,
+) -> Result<(), String> {
+	// Shell-container actions
+	match method {
+		"container_setup" => {
+			return ws
+				.setup(moon_container::DEFAULT_DEV_IMAGE)
+				.await
+				.map_err(|e| e.to_string())
+		}
+		"container_pause" => return ws.pause().await.map_err(|e| e.to_string()),
+		"container_resume" => return ws.resume().await.map_err(|e| e.to_string()),
+		"container_stop" => return ws.stop().await.map_err(|e| e.to_string()),
+		"container_teardown" => return ws.teardown().await.map_err(|e| e.to_string()),
+		_ => {}
+	}
+	// Per-folder compose actions
+	let folder = folder.as_deref().ok_or_else(|| format!("{method} requires a folder"))?;
+	// Re-derive the handle inside the task: it needs the compose
+	// file's *current* location and the folder may have been
+	// rebound since the call — deriving here is the honest read.
+	let pc = ProjectCompose::for_folder(ws.workspace_id(), ws.state_dir(), camino::Utf8Path::new(folder))
+		.map_err(|e| e.to_string())?
+		.ok_or_else(|| format!("no compose file in {folder}"))?;
+	let result = match method {
+		"project_compose_up" => pc.up().await,
+		"project_compose_pause" => pc.pause().await,
+		"project_compose_resume" => pc.resume().await,
+		"project_compose_rebuild" => pc.rebuild().await,
+		"project_compose_stop" => pc.stop().await,
+		"project_compose_down" => pc.down().await,
+		"project_compose_service_start" => pc.start_service(service.as_deref().ok_or("missing service")?).await,
+		"project_compose_service_stop" => pc.stop_service(service.as_deref().ok_or("missing service")?).await,
+		"project_compose_service_restart" => pc.restart_service(service.as_deref().ok_or("missing service")?).await,
+		other => return Err(format!("unknown container action `{other}`")),
+	};
+	result.map_err(|e| e.to_string())
+}
+
+/// One lifecycle action in flight or recently finished, surfaced
+/// through `container_status` so the phone can follow a
+/// background mutation without a long-lived call.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ContainerActionState {
+	action: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	folder: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	service: Option<String>,
+	started_at_ms: u128,
+	finished: bool,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectComposeParams {
+	folder: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectComposeServiceParams {
+	folder: String,
+	service: String,
+}
+
+/// The phone-facing per-folder snapshot, same shape as the
+/// desktop's `ProjectComposeStatus`.
+fn make_project_status(
+	folder_path: &str,
+	pc: Option<&ProjectCompose>,
+	status: ContainerStatus,
+) -> ProjectComposeStatus {
+	match pc {
+		Some(pc) => ProjectComposeStatus {
+			folder_path: folder_path.to_owned(),
+			compose_file: Some(pc.compose_file().to_string()),
+			project_name: Some(pc.project().as_str().to_owned()),
+			status,
+		},
+		None => ProjectComposeStatus {
+			folder_path: folder_path.to_owned(),
+			compose_file: None,
+			project_name: None,
+			status: ContainerStatus {
+				state: ContainerState::Absent,
+				services: Vec::new(),
+			},
+		},
 	}
 }
 
@@ -703,6 +910,44 @@ impl BridgeRpcHandler for BridgeRpc {
 				let final_branch = folder.host.git_branch().await.unwrap_or_default();
 				to_value(&final_branch)
 			}
+			// --- shell container (global workspace state) ---
+			"container_status" => {
+				let ws = self.container_workspace_handle().await?;
+				let status = ws.status().await.map_err(|e| e.to_string())?;
+				let action = self.container_action.lock().expect("container_action").clone();
+				to_value(&serde_json::json!({ "status": status, "action": action }))
+			}
+			"container_setup" | "container_pause" | "container_resume" | "container_stop" | "container_teardown" => {
+				self.spawn_container_action(method, None, None).await
+			}
+			// --- per-folder compose projects (mongo, redis, …) ---
+			"project_compose_status" => {
+				let p: ProjectComposeParams = parse_params(params)?;
+				let pc = self.project_handle(&p.folder).await?;
+				let status = match &pc {
+					Some(pc) => pc.status().await.map_err(|e| e.to_string())?,
+					None => ContainerStatus {
+						state: ContainerState::Absent,
+						services: Vec::new(),
+					},
+				};
+				to_value(&make_project_status(&p.folder, pc.as_ref(), status))
+			}
+			"project_compose_up"
+			| "project_compose_pause"
+			| "project_compose_resume"
+			| "project_compose_rebuild"
+			| "project_compose_stop"
+			| "project_compose_down" => {
+				let p: ProjectComposeParams = parse_params(params)?;
+				self.spawn_container_action(method, Some(p.folder), None).await
+			}
+			"project_compose_service_start" | "project_compose_service_stop" | "project_compose_service_restart" => {
+				let p: ProjectComposeServiceParams = parse_params(params)?;
+				self
+					.spawn_container_action(method, Some(p.folder), Some(p.service))
+					.await
+			}
 			"bridge_methods" => Ok(serde_json::json!({
 				"methods": SUPPORTED_METHODS,
 				"streams": SUPPORTED_STREAMS,
@@ -972,6 +1217,22 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"workspace_scm_suggest_message",
 	"workspace_scm_sync",
 	"workspace_scm_switch_branch",
+	"container_status",
+	"container_setup",
+	"container_pause",
+	"container_resume",
+	"container_stop",
+	"container_teardown",
+	"project_compose_status",
+	"project_compose_up",
+	"project_compose_pause",
+	"project_compose_resume",
+	"project_compose_rebuild",
+	"project_compose_stop",
+	"project_compose_down",
+	"project_compose_service_start",
+	"project_compose_service_stop",
+	"project_compose_service_restart",
 	"bridge_methods",
 ];
 

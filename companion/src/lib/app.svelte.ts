@@ -40,6 +40,48 @@ export type CoderStatus = {
 	signed_in: boolean;
 };
 
+/** One service of a compose project (`docker compose ps`). */
+export type ServiceStatus = {
+	name: string;
+	raw_state: string;
+	exit_code: number;
+	health: string;
+	networkless: boolean;
+};
+
+export type ContainerStatus = {
+	state: 'absent' | 'creating' | 'running' | 'paused' | 'stopped' | 'failed';
+	services: ServiceStatus[];
+};
+
+/** A background lifecycle action in flight (or the last one's
+ * outcome), from `container_status`. Mutations return immediately —
+ * the phone polls this to follow progress. */
+export type ContainerAction = {
+	action: string;
+	folder?: string;
+	service?: string;
+	started_at_ms: number;
+	finished: boolean;
+	error?: string;
+};
+
+/** `container_status` reply: the shell container's snapshot plus
+ * the action registry. */
+export type ContainerSnapshot = {
+	status: ContainerStatus;
+	action?: ContainerAction;
+};
+
+/** Per-folder compose project snapshot (`project_compose_status`). */
+export type ProjectComposeStatus = {
+	folder_path: string;
+	/** null = the folder has no compose file at its root. */
+	compose_file: string | null;
+	project_name: string | null;
+	status: ContainerStatus;
+};
+
 /** One user-added provider (mirror of `CoderProviderConfig`; only
  * the fields the phone renders, the rest round-trips untouched). */
 export type ProviderEntry = {
@@ -485,6 +527,7 @@ class CompanionState {
 
 	connection = $state<Connection | null>(null);
 	#socket: BridgeSocket | null = null;
+	#containerPollTimer: ReturnType<typeof setInterval> | null = null;
 
 	/** Host workspaces (the switcher). */
 	workspaces = $state<WorkspaceListing[]>([]);
@@ -513,6 +556,16 @@ class CompanionState {
 	savingProvider = $state(false);
 	/** SCM status for the active folder, or null while loading. */
 	scmStatus = $state<ScmStatus | null>(null);
+	/** Shell-container snapshot for the open workspace (the
+	 * desktop's container panel equivalent), or null while
+	 * loading / on an IDE that predates the methods. */
+	containerSnapshot = $state<ContainerSnapshot | null>(null);
+	/** Per-folder compose snapshots, keyed by folder path. Only
+	 * folders with a compose file at their root get an entry. */
+	projectCompose = $state<Record<string, ProjectComposeStatus>>({});
+	/** True while a container/compose mutation is in flight —
+	 * disables the buttons (the backend enforces one at a time). */
+	containerBusy = $state(false);
 	/** Repo web base for the active folder (from `scmStatus`), kept
 	 * separately so transcript autolinks survive SCM reloads. Seeded
 	 * from the persisted cache the moment a folder is targeted;
@@ -1014,6 +1067,10 @@ class CompanionState {
 			void this.loadScmStatus();
 			void this.#loadRunningSessions();
 			this.sessions = await this.#loadSessions();
+			void this.loadContainerStatus();
+			for (const f of this.folders) {
+				void this.loadProjectCompose(f.path);
+			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -1047,6 +1104,10 @@ class CompanionState {
 			this.sessions = await this.#loadSessions();
 			void this.loadScmStatus();
 			void this.#loadRunningSessions();
+			void this.loadContainerStatus();
+			for (const f of this.folders) {
+				void this.loadProjectCompose(f.path);
+			}
 		} catch (e) {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -1223,6 +1284,105 @@ class CompanionState {
 	 * files). Best-effort: an IDE build that predates the method
 	 * leaves the card hidden. */
 	#scmGeneration = 0;
+
+	/** Shell-container status + action registry. Safe to call on
+	 * IDEs without the methods (older binaries) — the error is
+	 * swallowed and the panel stays hidden. */
+	async loadContainerStatus(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			this.containerSnapshot = await this.#call<ContainerSnapshot>(
+				this.activeWorkspace,
+				'container_status',
+				{},
+				this.activeIde,
+			);
+			const action = this.containerSnapshot?.action;
+			this.containerBusy = action ? !action.finished : false;
+			if (action && !action.finished) {
+				this.#scheduleContainerPoll();
+			}
+		} catch {
+			this.containerSnapshot = null;
+			this.containerBusy = false;
+		}
+	}
+
+	/** While a background mutation runs, poll the status so the
+	 * panel tracks progress without a long-lived call. */
+	#scheduleContainerPoll(): void {
+		if (this.#containerPollTimer !== null) {
+			return;
+		}
+		this.#containerPollTimer = setInterval(() => {
+			const action = this.containerSnapshot?.action;
+			if (!action || action.finished) {
+				if (this.#containerPollTimer !== null) {
+					clearInterval(this.#containerPollTimer);
+					this.#containerPollTimer = null;
+				}
+				this.containerBusy = false;
+				return;
+			}
+			void this.loadContainerStatus();
+		}, 2000);
+	}
+
+	/** Fire a shell-container lifecycle mutation (setup / pause /
+	 * resume / stop / teardown). Runs in the background on the
+	 * IDE — the call returns once started. */
+	async containerAction(method: string): Promise<void> {
+		if (!this.activeWorkspace || this.containerBusy) {
+			return;
+		}
+		try {
+			await this.#call(this.activeWorkspace, method, {}, this.activeIde);
+			this.containerBusy = true;
+			void this.loadContainerStatus();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	/** Per-folder compose snapshot. Folders without a compose file
+	 * get an entry too (compose_file: null) so the panel can say
+	 * "no services" instead of nothing. */
+	async loadProjectCompose(folder: string): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			const status = await this.#call<ProjectComposeStatus>(
+				this.activeWorkspace,
+				'project_compose_status',
+				{ folder },
+				this.activeIde,
+			);
+			this.projectCompose = { ...this.projectCompose, [folder]: status };
+		} catch {
+			// Older IDE: leave the folder out of the panel.
+		}
+	}
+
+	/** Per-folder compose lifecycle mutation (up / pause / resume /
+	 * rebuild / stop / down, or service start/stop/restart). */
+	async projectComposeAction(method: string, folder: string, service?: string): Promise<void> {
+		if (!this.activeWorkspace || this.containerBusy) {
+			return;
+		}
+		try {
+			await this.#call(this.activeWorkspace, method, service ? { folder, service } : { folder }, this.activeIde);
+			this.containerBusy = true;
+			// The action registry rides on container_status; poll it,
+			// and refresh the folder's snapshot when it lands.
+			void this.loadContainerStatus();
+			void this.loadProjectCompose(folder);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
 
 	async loadScmStatus(): Promise<void> {
 		if (!this.activeWorkspace || !this.activeFolder) {
