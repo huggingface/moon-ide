@@ -932,6 +932,14 @@ with the live `turn_complete` / `aborted` / `error` events so a stale
 fetch can't blank a genuinely running pip. (The companion seeds from
 the same method.)
 
+The `coder_status` probe the panel fires on every folder switch is a
+second reconcile of the same shape: it overwrites the visible
+session's `busy` from the backend, so it resolves the visible session
+through the active folder's **coder root** (ADR 0028) — the same
+routing `send` / `open_session` use. Anything keyed by the raw
+active-folder path would read an empty per-worktree bucket and blank
+the running pip the replay's `in_flight` flag just re-asserted.
+
 The same running / finished signal also surfaces at the OS level —
 a status dot on the window icon and on the always-visible
 per-workspace tray icon, and a taskbar flash when a turn settles
@@ -2097,7 +2105,7 @@ Tauri commands in `src-tauri/src/commands/coder.rs`:
 | Command                                                 | Purpose                                                                                                               |
 | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `coder_start_device_flow()`                             | Returns `{ user_code, verification_uri, expires_in, interval }`; background poll runs in `moon-coder`                 |
-| `coder_status()`                                        | `{ signed_in, identity?, has_session, sync_enabled }`                                                                 |
+| `coder_status()`                                        | `{ signed_in, identity?, busy, bash_target?, force_host_override }` — coder-root visible session (ADR 0028)           |
 | `coder_sign_out()`                                      | Drops keyring + identity                                                                                              |
 | `coder_list_sessions()`                                 | Per-session summaries for the list view                                                                               |
 | `coder_search_sessions(query)`                          | Ids of sessions whose title or transcript contains the query (case-insensitive); powers the list's search box         |

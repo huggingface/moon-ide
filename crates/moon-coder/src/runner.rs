@@ -1742,31 +1742,32 @@ impl CoderHandle {
 				}
 			}
 		};
-		// `busy` reflects the **active folder's visible session**
-		// turn only — the panel mirrors per-folder, per-session UI
-		// state, so background sessions in the same folder (or
-		// other folders entirely) don't make this session's
-		// composer disable. The frontend's sessions-list view
-		// surfaces a `running…` pip on every running session row
-		// across the folder via the per-bucket event stream.
-		//
-		// Two-step look-up rather than `visible_runtime()` so we
-		// don't lazy-create a blank runtime just to read its
-		// `busy` flag — that would litter the folder's runtimes
-		// map with empty entries every time the panel polls
-		// status on mount.
-		let busy = match self.state.workspaces.active_folder().await {
-			Some(folder) => {
-				let path = Utf8PathBuf::from(folder.folder.path.clone());
-				let fs = self.state.folder_session_for(&path).await;
-				match fs.visible_session_id().await {
-					Some(id) => match fs.runtime(&id).await {
-						Some(rt) => rt.turn.lock().await.cancel.is_some(),
-						None => false,
-					},
+		// The visible session the panel mirrors is filed under the
+		// active folder's **coder root** (ADR 0028) — the parent
+		// project root when a worktree is active, the scratch root
+		// when no folder is bound (ADR 0074) — so resolve through
+		// the same routing `send` / `open_session` use. Keying by
+		// the raw active-folder path would read an empty per-
+		// worktree bucket instead. Resolved once here and shared by
+		// both reads below; the two-step visible-pointer look-up
+		// (rather than `visible_runtime()`) avoids lazy-creating a
+		// blank runtime on every panel status poll.
+		let coder_root_fs = self.state.active_folder_session().await.ok().map(|(fs, _)| fs);
+		// `busy` reflects the **visible session's** turn only — the
+		// panel mirrors per-folder, per-session UI state, so
+		// background sessions in the same folder (or other folders
+		// entirely) don't make this session's composer disable. The
+		// frontend's sessions-list view surfaces a `running…` pip
+		// on every running session row across the folder via the
+		// per-bucket event stream.
+		let busy = match &coder_root_fs {
+			Some(fs) => match fs.visible_session_id().await {
+				Some(id) => match fs.runtime(&id).await {
+					Some(rt) => rt.turn.lock().await.cancel.is_some(),
 					None => false,
-				}
-			}
+				},
+				None => false,
+			},
 			None => false,
 		};
 		// `bash_target` mirrors what `tools::bash` would pick if it
@@ -1776,19 +1777,22 @@ impl CoderHandle {
 		// `None` when no folder is active — chat still works, only
 		// tool calls would fail. `force_host_override` is surfaced
 		// separately so the panel can render the "off-default" badge
-		// without re-deriving the auto target.
-		let (bash_target, force_host_override) = match self.state.workspaces.active_folder().await {
-			Some(folder) => {
-				let path = Utf8PathBuf::from(folder.folder.path.clone());
-				let fs = self.state.folder_session_for(&path).await;
-				let force_host = self.visible_session_force_host(&fs).await;
+		// without re-deriving the auto target. The folder entry
+		// handed to `resolve_bash_target` is the actual active
+		// folder: mount-root resolution is worktree-aware
+		// (`effective_mount_root` maps a worktree to its parent's
+		// mount), matching what the `bash` tool itself does for the
+		// session's routing path.
+		let (bash_target, force_host_override) = match (&coder_root_fs, self.state.workspaces.active_folder().await) {
+			(Some(fs), Some(folder)) => {
+				let force_host = self.visible_session_force_host(fs).await;
 				let target =
 					crate::tools::resolve_bash_target(&self.state.workspaces, &self.state.workspaces_dir, force_host, &folder)
 						.await
 						.to_string();
 				(Some(target), force_host)
 			}
-			None => (None, false),
+			_ => (None, false),
 		};
 		Ok(CoderStatus {
 			signed_in,
@@ -13054,5 +13058,65 @@ mod tests {
 			sibling_dest(Utf8Path::new("/home/me/code/moon-landing"), "dashboard"),
 			Utf8Path::new("/home/me/code/dashboard")
 		);
+	}
+
+	#[tokio::test]
+	async fn status_resolves_the_visible_session_through_the_coder_root_for_a_worktree_folder() {
+		// `CoderHandle::new` warms the OS keyring; the in-memory mock
+		// keeps that (and `Authenticator::new`'s load) working where
+		// no secret service is reachable (CI containers).
+		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+
+		let parent_dir = tempfile::TempDir::new().unwrap();
+		let parent_path = Utf8PathBuf::from_path_buf(parent_dir.path().canonicalize().unwrap()).unwrap();
+		let worktree_path = parent_path.join(".worktrees").join("agent-abc");
+		std::fs::create_dir_all(worktree_path.as_std_path()).unwrap();
+
+		let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		registry.add_folder(parent_path.clone()).await.unwrap();
+		registry
+			.add_worktree_folder(worktree_path.clone(), parent_path.to_string(), "agent/abc".into())
+			.await
+			.unwrap();
+		registry.set_active_folder(worktree_path.as_str()).await.unwrap();
+
+		let data_dir = tempfile::TempDir::new().unwrap();
+		let coder = CoderHandle::new(
+			registry,
+			Utf8PathBuf::from_path_buf(data_dir.path().join("workspaces")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("coder-sessions")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("folder-summaries")).unwrap(),
+			CoderModels::default(),
+			Arc::new(moon_terminal::TerminalRegistry::default()),
+		)
+		.unwrap();
+
+		// A worktree session (ADR 0028): filed under the parent coder
+		// root, made visible, with a live turn + force-host override.
+		let fs = coder.state.folder_session_for(&parent_path).await;
+		let mut blank = Session::new_blank();
+		blank.header.worktree_root = Some(worktree_path.to_string());
+		blank.header.bash_target_override = Some(BashTargetOverride::ForceHost);
+		let id = blank.header.id.clone();
+		let rt = Arc::new(SessionRuntime::new(blank));
+		fs.insert_runtime(id.clone(), rt.clone()).await;
+		fs.set_visible(id).await;
+		{
+			let mut turn = rt.turn.lock().await;
+			turn.cancel = Some(CancellationToken::new());
+		}
+
+		let status = coder.status().await.unwrap();
+		// Both reads must resolve through the coder root: keying by
+		// the raw active-folder path minted an empty per-worktree
+		// bucket whose visible pointer was `None`, answering
+		// `busy: false` / `force_host_override: false` and clobbering
+		// the running pip on every worktree folder switch.
+		assert!(status.busy, "busy must reflect the worktree session's in-flight turn");
+		assert!(
+			status.force_host_override,
+			"force_host_override must read the visible session's header"
+		);
+		assert_eq!(status.bash_target.as_deref(), Some("host"));
 	}
 }
