@@ -674,6 +674,24 @@ impl BridgeRpcHandler for BridgeRpc {
 			// Probe a provider endpoint/key before committing — the
 			// phone's add-provider form surfaces the upstream failure
 			// verbatim ("401 Unauthorized", DNS, …).
+			// Web-search (Tavily) key management — mirror of the
+			// desktop's model-settings popover. The key lives in the
+			// OS keyring on the IDE's host; `web_fetch` (Jina) needs
+			// no key and is always available.
+			"coder_web_search_configured" => to_value(&self.coder.web_search_configured()),
+			"coder_set_web_search_key" => {
+				let p: WebSearchKeyParams = parse_params(params)?;
+				let key = p.key.trim().to_owned();
+				if key.is_empty() {
+					return Err("empty key".to_owned());
+				}
+				self.coder.set_web_search_key(&key).map_err(|e| e.to_string())?;
+				to_value(&true)
+			}
+			"coder_clear_web_search_key" => {
+				self.coder.clear_web_search_key().map_err(|e| e.to_string())?;
+				to_value(&true)
+			}
 			"coder_probe_provider" => {
 				let p: ProbeProviderParams = parse_params(params)?;
 				let key = if p.api_key.is_empty() {
@@ -996,6 +1014,11 @@ struct FolderParams {
 }
 
 #[derive(serde::Deserialize)]
+struct WebSearchKeyParams {
+	key: String,
+}
+
+#[derive(serde::Deserialize)]
 struct ProbeProviderParams {
 	base_url: String,
 	#[serde(default)]
@@ -1207,6 +1230,9 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_revert_to_message",
 	"coder_get_model_settings",
 	"coder_set_model_settings",
+	"coder_web_search_configured",
+	"coder_set_web_search_key",
+	"coder_clear_web_search_key",
 	"coder_probe_provider",
 	"coder_add_provider",
 	"workspace_launch",

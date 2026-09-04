@@ -556,6 +556,12 @@ class CompanionState {
 	/** Model/provider settings for the open workspace, or null while
 	 * loading / when the workspace's IDE predates the methods. */
 	modelSettings = $state<ModelSettings | null>(null);
+	/** Tavily web-search key state on the workspace's IDE: true =
+	 * key configured, false = none, null = unknown / unsupported
+	 * (older IDE — the card hides). `web_fetch` (Jina) needs no
+	 * key and is always available. */
+	webSearchConfigured = $state<boolean | null>(null);
+	#webKeyBusy = false;
 	/** True while a provider switch / lock toggle is in flight. */
 	savingProvider = $state(false);
 	/** SCM status for the active folder, or null while loading. */
@@ -1068,6 +1074,7 @@ class CompanionState {
 			// stays empty until the user opens a session.
 			this.#ensureSubscribed(workspace, ide);
 			void this.#loadModelSettings();
+			void this.loadWebSearchConfigured();
 			void this.loadScmStatus();
 			void this.#loadRunningSessions();
 			this.sessions = await this.#loadSessions();
@@ -1173,6 +1180,61 @@ class CompanionState {
 	/** Best-effort read of the workspace's model/provider settings.
 	 * An IDE build that predates the methods just leaves the
 	 * provider card hidden. */
+	/** Read the Tavily key state from the IDE's keyring. Swallows
+	 * errors so an older IDE just leaves the card hidden. */
+	async loadWebSearchConfigured(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			this.webSearchConfigured = await this.#call<boolean>(
+				this.activeWorkspace,
+				'coder_web_search_configured',
+				{},
+				this.activeIde,
+			);
+		} catch {
+			this.webSearchConfigured = null;
+		}
+	}
+
+	/** Store a Tavily key on the IDE's keyring (trims; empty is a
+	 * no-op). The next agent turn will see `web_search`. */
+	async setWebSearchKey(key: string): Promise<void> {
+		if (!this.activeWorkspace || this.#webKeyBusy) {
+			return;
+		}
+		const trimmed = key.trim();
+		if (!trimmed) {
+			return;
+		}
+		this.#webKeyBusy = true;
+		try {
+			await this.#call(this.activeWorkspace, 'coder_set_web_search_key', { key: trimmed }, this.activeIde);
+			this.webSearchConfigured = true;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.#webKeyBusy = false;
+		}
+	}
+
+	/** Drop the Tavily key. Idempotent server-side. */
+	async clearWebSearchKey(): Promise<void> {
+		if (!this.activeWorkspace || this.#webKeyBusy) {
+			return;
+		}
+		this.#webKeyBusy = true;
+		try {
+			await this.#call(this.activeWorkspace, 'coder_clear_web_search_key', {}, this.activeIde);
+			this.webSearchConfigured = false;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.#webKeyBusy = false;
+		}
+	}
+
 	async #loadModelSettings(): Promise<void> {
 		if (!this.activeWorkspace) {
 			return;

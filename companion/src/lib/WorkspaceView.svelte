@@ -47,6 +47,8 @@
 
 	/** Provider picker disclosure (collapsed by default). */
 	let providerOpen = $state(false);
+	let webKeyDraft = $state('');
+	let webKeyEditing = $state(false);
 	let servicesOpen = $state(false);
 
 	/** Standard-model editor (HF route only): tap the model row to
@@ -676,6 +678,47 @@
 		</div>
 	{/if}
 
+	{#if app.webSearchConfigured !== null}
+		<div class="card web-key-card">
+			<div class="web-key-row">
+				<span class="muted">Web search</span>
+				{#if app.webSearchConfigured}
+					<span class="key-status configured" title="Tavily key stored in the IDE's keyring">key configured</span>
+				{:else}
+					<span class="key-status missing">no key</span>
+				{/if}
+				<span class="flex-spacer"></span>
+				{#if app.webSearchConfigured}
+					<button class="ghost" onclick={() => (webKeyEditing = true)}>Replace</button>
+					<button class="ghost" onclick={() => void app.clearWebSearchKey()}>Clear</button>
+				{:else}
+					<button class="ghost" onclick={() => (webKeyEditing = true)}>Add key…</button>
+				{/if}
+			</div>
+			{#if webKeyEditing}
+				<div class="web-key-form">
+					<input type="password" bind:value={webKeyDraft} placeholder="tvly-…" spellcheck="false" autocomplete="off" />
+					<div class="web-key-actions">
+						<button
+							class="primary"
+							disabled={!webKeyDraft.trim()}
+							onclick={() => {
+								void app.setWebSearchKey(webKeyDraft);
+								webKeyDraft = '';
+								webKeyEditing = false;
+							}}>Save</button
+						>
+						<button class="ghost" onclick={() => (webKeyEditing = false)}>Cancel</button>
+					</div>
+					<p class="muted web-key-hint">
+						Tavily API key — stored in the IDE's OS keyring. With a key, agents get the `web_search` tool; `web_fetch`
+						(Jina Reader) works without one.
+					</p>
+				</div>
+			{/if}
+		</div>
+	{/if}
+
 	{#if app.scmStatus}
 		{@const scm = app.scmStatus}
 		{@const branch = scm.branch}
@@ -912,6 +955,54 @@
 		flex-direction: column;
 		gap: 0.5rem;
 		padding: 0.6rem 0.8rem;
+	}
+	.web-key-card {
+		display: flex;
+		flex-direction: column;
+		gap: 0.45rem;
+		padding: 0.6rem 0.8rem;
+	}
+	.web-key-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+	.web-key-row .flex-spacer {
+		flex: 1;
+	}
+	.key-status {
+		font-size: 0.72rem;
+		padding: 0.05rem 0.4rem;
+		border-radius: 999px;
+	}
+	.key-status.configured {
+		color: var(--ok, #9ece6a);
+		border: 1px solid var(--ok, #9ece6a);
+	}
+	.key-status.missing {
+		color: var(--fg-muted);
+		border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+	}
+	.web-key-form {
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+	.web-key-form input {
+		padding: 0.4rem 0.5rem;
+		border-radius: 6px;
+		border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+		background: var(--bg-inset, rgba(127, 127, 127, 0.12));
+		color: inherit;
+		font-size: 0.9rem;
+	}
+	.web-key-actions {
+		display: flex;
+		gap: 0.4rem;
+	}
+	.web-key-hint {
+		margin: 0;
+		font-size: 0.72rem;
 	}
 	.services-body {
 		display: flex;
