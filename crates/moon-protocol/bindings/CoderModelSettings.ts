@@ -47,6 +47,15 @@ context_window_overrides: { [key in string]: number },
  */
 rotation: Array<string>, 
 /**
+ * User-selected reasoning depth, passed verbatim as the
+ * OpenAI-compatible `reasoning_effort` request field when set.
+ * `None` (the default) sends **nothing** — providers apply
+ * their own default. Free-text by design: the ecosystem's
+ * accepted values move fast (`medium`/`high`/`xhigh`/`max`
+ * today); the UIs offer those as one-tap choices.
+ */
+reasoning_effort?: string | null, 
+/**
  * Per-workspace lock on the active provider. `None` means
  * "no lock; this workspace follows the global
  * `active_provider`". `Some(_)` means "this workspace is

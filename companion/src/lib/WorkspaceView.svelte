@@ -493,6 +493,26 @@
 					</button>
 				{/if}
 			{/if}
+			<div class="effort-row">
+				<span class="muted">Reasoning</span>
+				<span class="effort-chips">
+					<button
+						class="effort-chip"
+						class:selected={(settings.reasoning_effort ?? null) === null}
+						disabled={app.savingProvider}
+						title="Provider default — no reasoning_effort field is sent"
+						onclick={() => void app.setReasoningEffort(null)}>default</button
+					>
+					{#each ['medium', 'high', 'xhigh', 'max'] as lvl (lvl)}
+						<button
+							class="effort-chip"
+							class:selected={settings.reasoning_effort === lvl}
+							disabled={app.savingProvider}
+							onclick={() => void app.setReasoningEffort(lvl)}>{lvl}</button
+						>
+					{/each}
+				</span>
+			</div>
 			<label class="lock-row">
 				<input
 					type="checkbox"
@@ -997,6 +1017,32 @@
 		gap: 0.5rem;
 		font-size: 0.85rem;
 		min-height: 28px;
+	}
+	.effort-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+	.effort-chips {
+		display: flex;
+		gap: 0.25rem;
+		flex-wrap: wrap;
+	}
+	.effort-chip {
+		padding: 0.15rem 0.55rem;
+		border-radius: 999px;
+		border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+		background: none;
+		color: var(--fg-muted);
+		font-size: 0.75rem;
+	}
+	.effort-chip.selected {
+		background: var(--accent, #7aa2f7);
+		border-color: var(--accent, #7aa2f7);
+		color: var(--bg, #1a1b26);
+		font-weight: 600;
 	}
 	.model-row {
 		display: flex;

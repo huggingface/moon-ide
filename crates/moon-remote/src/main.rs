@@ -157,6 +157,10 @@ enum Command {
 		/// string clears the chain.
 		#[arg(long)]
 		rotation: Option<String>,
+		/// Reasoning depth passed as `reasoning_effort` (e.g. medium,
+		/// high, xhigh, max). Pass an empty string to clear it.
+		#[arg(long)]
+		reasoning: Option<String>,
 	},
 }
 
@@ -199,7 +203,8 @@ fn main() -> anyhow::Result<()> {
 				standard,
 				cheap,
 				rotation,
-			} => model(standard, cheap, rotation).await,
+				reasoning,
+			} => model(standard, cheap, rotation, reasoning).await,
 		}
 	})
 }
@@ -622,6 +627,7 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		active_provider: effective_active_provider,
 		context_window_overrides: Arc::new(loaded_state.coder.context_window_overrides.clone()),
 		rotation: Arc::new(loaded_state.coder.rotation.clone()),
+		reasoning_effort: loaded_state.coder.reasoning_effort.clone(),
 		..moon_coder::CoderModels::default()
 	};
 
@@ -748,7 +754,12 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 /// Show or persist the model picks. Writes the same `state.json`
 /// fields the desktop picker saves, so the two stay interchangeable;
 /// prints the effective values (empty = built-in default) either way.
-async fn model(standard: Option<String>, cheap: Option<String>, rotation: Option<String>) -> anyhow::Result<()> {
+async fn model(
+	standard: Option<String>,
+	cheap: Option<String>,
+	rotation: Option<String>,
+	reasoning: Option<String>,
+) -> anyhow::Result<()> {
 	let config_dir = config_dir()?;
 	let state = app_state_store::mutate(&config_dir, move |s| {
 		if let Some(standard) = standard {
@@ -756,6 +767,10 @@ async fn model(standard: Option<String>, cheap: Option<String>, rotation: Option
 		}
 		if let Some(cheap) = cheap {
 			s.coder.cheap_model = cheap.trim().to_string();
+		}
+		if let Some(reasoning) = reasoning {
+			let cleaned = reasoning.trim().to_string();
+			s.coder.reasoning_effort = if cleaned.is_empty() { None } else { Some(cleaned) };
 		}
 		if let Some(rotation) = rotation {
 			s.coder.rotation = rotation
@@ -790,6 +805,10 @@ async fn model(standard: Option<String>, cheap: Option<String>, rotation: Option
 		println!("rotation  (none)");
 	} else {
 		println!("rotation  {}", state.coder.rotation.join(" -> "));
+	}
+	match &state.coder.reasoning_effort {
+		Some(effort) => println!("reasoning {effort}"),
+		None => println!("reasoning (provider default — field not sent)"),
 	}
 	println!("(a running `moon-remote serve` picks these up on restart)");
 	Ok(())

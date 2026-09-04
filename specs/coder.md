@@ -2178,3 +2178,11 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
 - [`containers.md`](containers.md) — the agent is a moon-core
   component in the Tauri shell; its bash / fs tools cross into the
   container the way the terminal does.
+- **Reasoning depth pick** (modal + companion): medium / high /
+  xhigh / max, or cleared. Cleared is the default and sends
+  `reasoning_effort` **not at all** — provider default; a set
+  value rides the OpenAI-compatible request verbatim. Persisted in
+  `state.json` alongside the picks; CLI:
+  `moon-remote model --reasoning xhigh` (empty string clears).
+  Anthropic native route ignores it (its thinking config is
+  budget-based, separate).

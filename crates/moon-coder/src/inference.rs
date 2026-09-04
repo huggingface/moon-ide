@@ -735,6 +735,12 @@ struct ChatCompletionRequest<'a> {
 	/// in that case.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	stream_options: Option<StreamOptions>,
+	/// User-selected reasoning depth, passed **verbatim** when set
+	/// (`medium`/`high`/`xhigh`/`max` today). `None` omits the
+	/// field entirely — providers apply their own default, which
+	/// is the explicit "cleared" contract of the picker.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1631,6 +1637,7 @@ impl InferenceClient {
 			max_tokens: None,
 			stream: false,
 			stream_options: None,
+			reasoning_effort: self.models.read().await.reasoning_effort.clone(),
 		};
 
 		let mut response = self.send_once(&endpoint, &route, &body, cancel).await?;
@@ -1730,6 +1737,7 @@ impl InferenceClient {
 			// `AssistantResponse.usage` to drive the context-usage
 			// indicator and the auto-compaction trigger.
 			stream_options: Some(StreamOptions { include_usage: true }),
+			reasoning_effort: self.models.read().await.reasoning_effort.clone(),
 		};
 
 		let mut response = self.send_once_stream(&endpoint, &route, &body, cancel).await?;
@@ -2594,6 +2602,28 @@ mod tests {
 		let both = r#"{"prompt_tokens":10,"cache_read_input_tokens":7,"prompt_tokens_details":{"cached_tokens":3}}"#;
 		let usage: super::TokenUsage = serde_json::from_str(both).unwrap();
 		assert_eq!(usage.cache_read_input_tokens, 7);
+	}
+
+	#[test]
+	fn reasoning_effort_serializes_only_when_set() {
+		// The picker's contract: cleared (None) sends NOTHING —
+		// the provider default applies; a set value rides the wire
+		// verbatim.
+		#[derive(serde::Serialize)]
+		struct Wrap {
+			#[serde(skip_serializing_if = "Option::is_none")]
+			reasoning_effort: Option<String>,
+		}
+		let cleared = serde_json::to_value(Wrap { reasoning_effort: None }).unwrap();
+		assert!(
+			cleared.get("reasoning_effort").is_none(),
+			"cleared must omit the field: {cleared}"
+		);
+		let set = serde_json::to_value(Wrap {
+			reasoning_effort: Some("xhigh".into()),
+		})
+		.unwrap();
+		assert_eq!(set["reasoning_effort"], "xhigh");
 	}
 
 	use super::*;

@@ -116,6 +116,11 @@ pub struct CoderModels {
 	/// given task (context window, caching, quality all differ).
 	/// Empty = no rotation.
 	pub rotation: Arc<Vec<String>>,
+	/// User-selected reasoning depth, sent verbatim as the
+	/// OpenAI-compatible `reasoning_effort` field when set. `None`
+	/// sends nothing (provider default). Hot-swapped through the
+	/// same settings path as the picks above.
+	pub reasoning_effort: Option<String>,
 }
 
 impl Default for CoderModels {
@@ -130,6 +135,7 @@ impl Default for CoderModels {
 			vision: Arc::new(HashMap::new()),
 			context_window_overrides: Arc::new(HashMap::new()),
 			rotation: Arc::new(Vec::new()),
+			reasoning_effort: None,
 		}
 	}
 }

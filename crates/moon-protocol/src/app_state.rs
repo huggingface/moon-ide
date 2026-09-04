@@ -206,6 +206,9 @@ pub struct CoderAppState {
 	/// [`crate::coder_models::CoderModelSettings::rotation`].
 	#[serde(default)]
 	pub rotation: Vec<String>,
+	/// See [`crate::coder_models::CoderModelSettings::reasoning_effort`].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reasoning_effort: Option<String>,
 }
 
 /// Bottom-panel slice of [`AppState`].

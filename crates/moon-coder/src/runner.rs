@@ -1340,6 +1340,15 @@ impl CoderHandle {
 	/// [`CoderModels::rotation`]). Empty and whitespace-only slugs
 	/// are dropped at this boundary so a sloppy comma list can't
 	/// produce a fallback to model "".
+	/// Replace the user's reasoning-depth pick. `None` clears it
+	/// (the request then omits `reasoning_effort` entirely —
+	/// provider default), any other value passes through verbatim.
+	pub async fn set_reasoning_effort(&self, effort: Option<String>) {
+		let cleaned = effort.map(|e| e.trim().to_owned()).filter(|e| !e.is_empty());
+		let mut m = self.state.models.write().await;
+		m.reasoning_effort = cleaned;
+	}
+
 	pub async fn set_rotation(&self, rotation: Vec<String>) {
 		let cleaned: Vec<String> = rotation
 			.into_iter()

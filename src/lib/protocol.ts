@@ -2036,6 +2036,11 @@ export type CoderModelSettings = {
 	 *  omitted it would silently clear the persisted chain via
 	 *  serde's default. */
 	rotation: string[];
+	/** Reasoning depth passed verbatim as the OpenAI-compatible
+	 *  `reasoning_effort` field when set (medium / high / xhigh /
+	 *  max). Optional on purpose: absent / null sends NOTHING —
+	 *  provider default — which is the picker's "cleared" state. */
+	reasoning_effort?: string | null;
 	/** Per-workspace lock on the active provider. `null` (or
 	 *  missing) means "no lock — follow the global default and
 	 *  let modal saves write the global". Non-null pins the

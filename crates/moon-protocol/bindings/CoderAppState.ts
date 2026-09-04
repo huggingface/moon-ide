@@ -101,4 +101,8 @@ context_window_overrides: { [key in string]: number },
  * Rate-limit fallback chain — see
  * [`crate::coder_models::CoderModelSettings::rotation`].
  */
-rotation: Array<string>, };
+rotation: Array<string>, 
+/**
+ * See [`crate::coder_models::CoderModelSettings::reasoning_effort`].
+ */
+reasoning_effort?: string | null, };

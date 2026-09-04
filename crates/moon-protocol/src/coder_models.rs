@@ -198,6 +198,15 @@ pub struct CoderModelSettings {
 	/// only — the picked model is untouched. Empty = no rotation.
 	#[serde(default)]
 	pub rotation: Vec<String>,
+	/// User-selected reasoning depth, passed verbatim as the
+	/// OpenAI-compatible `reasoning_effort` request field when set.
+	/// `None` (the default) sends **nothing** — providers apply
+	/// their own default. Free-text by design: the ecosystem's
+	/// accepted values move fast (`medium`/`high`/`xhigh`/`max`
+	/// today); the UIs offer those as one-tap choices.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[ts(optional, type = "string | null")]
+	pub reasoning_effort: Option<String>,
 	/// Per-workspace lock on the active provider. `None` means
 	/// "no lock; this workspace follows the global
 	/// `active_provider`". `Some(_)` means "this workspace is

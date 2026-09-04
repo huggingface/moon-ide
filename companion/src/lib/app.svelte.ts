@@ -155,6 +155,10 @@ export type ModelSettings = {
 	/** Rate-limit fallback chain: wire slugs tried in order when a
 	 * request's 429 backoff is exhausted. Empty = no rotation. */
 	rotation?: string[];
+	/** Reasoning depth passed verbatim as `reasoning_effort`
+	 * (medium / high / xhigh / max). Absent/null = send nothing —
+	 * provider default — the picker's "cleared" state. */
+	reasoning_effort?: string | null;
 	[key: string]: unknown;
 };
 
@@ -1745,6 +1749,26 @@ class CompanionState {
 	 * built-in default. HF route only — user providers carry their
 	 * model in their own config, which stays desktop-edited. */
 	/** Commit the rate-limit fallback chain (comma list in the UI). */
+	/** Set (or clear — null) the reasoning-depth pick. Persists
+	 * through the same model-settings round-trip as the rest. */
+	async setReasoningEffort(effort: string | null): Promise<void> {
+		const settings = this.modelSettings;
+		if (!this.activeWorkspace || !settings) {
+			return;
+		}
+		this.savingProvider = true;
+		try {
+			const next: ModelSettings = { ...settings, reasoning_effort: effort };
+			await this.#call(this.activeWorkspace, 'coder_set_model_settings', { settings: next }, this.activeIde);
+			this.modelSettings = next;
+			await this.#loadModelSettings();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		} finally {
+			this.savingProvider = false;
+		}
+	}
+
 	async setRotation(slugs: string[]): Promise<void> {
 		const settings = this.modelSettings;
 		if (!this.activeWorkspace || !settings) {

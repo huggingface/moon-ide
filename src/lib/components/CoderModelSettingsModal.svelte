@@ -103,6 +103,9 @@
 	// Rate-limit fallback chain (HF-route rotation). Edited as an
 	// ordered list; saved verbatim.
 	let rotation = $state<string[]>([]);
+	// Reasoning depth (OpenAI-compatible `reasoning_effort`). null =
+	// send nothing — provider default — the explicit "cleared" state.
+	let reasoningEffort = $state<string | null>(null);
 	let rotationAddDraft = $state('');
 	let activeProviderId = $state<string | null>(null);
 	let providers = $state<CoderProviderConfig[]>([]);
@@ -305,6 +308,7 @@
 		// `slugCapInput`.
 		slugCaps = { ...settings.context_window_overrides };
 		rotation = [...(settings.rotation ?? [])];
+		reasoningEffort = settings.reasoning_effort ?? null;
 		providerLocked = settings.provider_lock !== null && settings.provider_lock !== undefined;
 	}
 
@@ -968,6 +972,7 @@
 				Object.entries(slugCaps).filter(([, v]) => Number.isFinite(v) && v > 0),
 			),
 			rotation: rotation.map((m) => m.trim()).filter((m) => m.length > 0),
+			reasoning_effort: reasoningEffort,
 			provider_lock: providerLock,
 			// Read-only field; the runner ignores it on write and
 			// recomputes it on the post-save re-read.
@@ -1434,6 +1439,33 @@
 						</span>
 					</div>
 				{/if}
+
+				<div class="field">
+					<span class="label-row">
+						<span class="label-name">Reasoning depth</span>
+					</span>
+					<span class="effort-chips">
+						<button
+							type="button"
+							class="effort-chip"
+							class:selected={reasoningEffort === null}
+							title="Provider default — no reasoning_effort field is sent"
+							onclick={() => (reasoningEffort = null)}>default</button
+						>
+						{#each ['medium', 'high', 'xhigh', 'max'] as lvl (lvl)}
+							<button
+								type="button"
+								class="effort-chip"
+								class:selected={reasoningEffort === lvl}
+								onclick={() => (reasoningEffort = lvl)}>{lvl}</button
+							>
+						{/each}
+					</span>
+					<span class="hint">
+						Sent verbatim as <code>reasoning_effort</code> on OpenAI-compatible routes (HF router, custom providers). Default
+						sends nothing — the provider's own default applies. Applied on save.
+					</span>
+				</div>
 			</section>
 
 			<section class="catalog">
@@ -1914,6 +1946,26 @@
 		border-color: var(--m-accent);
 	}
 	.field input,
+	.effort-chips {
+		display: flex;
+		gap: 0.3rem;
+		flex-wrap: wrap;
+	}
+	.effort-chip {
+		padding: 0.15rem 0.6rem;
+		border-radius: 999px;
+		border: 1px solid rgba(127, 127, 127, 0.35);
+		background: none;
+		color: var(--fg-muted, #888);
+		font-size: 0.78rem;
+		cursor: pointer;
+	}
+	.effort-chip.selected {
+		background: var(--accent, #7aa2f7);
+		border-color: var(--accent, #7aa2f7);
+		color: var(--bg, #1a1b26);
+		font-weight: 600;
+	}
 	.rotation-row {
 		display: flex;
 		align-items: center;
