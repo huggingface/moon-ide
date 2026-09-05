@@ -410,6 +410,9 @@ function parseAskUserArgs(args: unknown): AskUserQuestion[] {
 				id?: string;
 				question?: string;
 				options?: Array<{ id?: string; label?: string }>;
+				/** Wire field (the runner's ask_user schema); `multi`
+				 * tolerated as a fallback for older payloads. */
+				allow_multiple?: boolean;
 				multi?: boolean;
 			};
 			return {
@@ -419,7 +422,7 @@ function parseAskUserArgs(args: unknown): AskUserQuestion[] {
 					id: o.id ?? '',
 					label: o.label ?? '',
 				})),
-				multi: qo.multi === true,
+				multi: qo.allow_multiple === true || qo.multi === true,
 			};
 		})
 		.filter((q): q is AskUserQuestion => q !== null);
@@ -2050,14 +2053,16 @@ class CompanionState {
 		}
 		if (observed.in_flight) {
 			this.busy = true;
-			// Re-derive a live-parked ask_user prompt: its replayed
-			// tool_call set the prompt state, but the terminator
-			// cleared it again.
-			const pending = this.rows.find((r) => r.kind === 'ask_user' && !r.answered);
-			if (pending && pending.kind === 'ask_user') {
-				this.awaitingInput = true;
-				this.pendingPrompt = { callId: pending.callId, questions: pending.questions };
-			}
+		}
+		// Re-derive the parked ask_user prompt from the reduced rows:
+		// the trailing turn_complete cleared `pendingPrompt` again
+		// (the ask's own answer never made it to disk while parked),
+		// and a session can sit idle-with-prompt without a running
+		// turn (in_flight false after a restart).
+		const pending = this.rows.find((r) => r.kind === 'ask_user' && !r.answered);
+		if (pending && pending.kind === 'ask_user' && pending.questions.length > 0) {
+			this.awaitingInput = true;
+			this.pendingPrompt = { callId: pending.callId, questions: pending.questions };
 		}
 	}
 
@@ -2841,8 +2846,19 @@ class CompanionState {
 					break;
 				}
 				this.busy = false;
-				this.awaitingInput = false;
-				this.pendingPrompt = null;
+				// Only clear the parked prompt when it was actually
+				// answered — a turn that ended with the user sending
+				// a normal message (the skip path) or the process
+				// restarting leaves the row unanswered but the turn
+				// over; keeping the prompt lets the user still
+				// answer or, if truly orphaned, reopen.
+				if (
+					this.pendingPrompt &&
+					!this.rows.some((r) => r.kind === 'ask_user' && r.callId === this.pendingPrompt?.callId && !r.answered)
+				) {
+					this.awaitingInput = false;
+					this.pendingPrompt = null;
+				}
 				// A *replayed* turn_complete is always the synthetic
 				// batch terminator (real completions are never
 				// persisted as records) — it must not clear a

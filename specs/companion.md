@@ -812,3 +812,9 @@ Prose, not commitments — revisit when someone asks:
   headless host emitted compose with no ssh-agent block at all
   (the unit env carries no `SSH_AUTH_SOCK`), so containers grew
   up unable to ssh anywhere.
+- **Web-search key card**: the companion manages the Tavily
+  `web_search` key on the workspace's IDE (read / set / clear via
+  `coder_web_search_configured|set_web_search_key|
+clear_web_search_key` RPCs — key stays in the IDE's OS keyring).
+  `web_fetch` (Jina Reader) is keyless and always available. Card
+  hides on IDEs without the methods.

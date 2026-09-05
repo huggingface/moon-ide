@@ -1170,7 +1170,7 @@
 								/>
 							</div>
 						{/each}
-						{#if app.pendingPrompt.questions.some((q) => q.multi)}
+						{#if app.pendingPrompt.questions.some((q) => q.multi) || app.pendingPrompt.questions.length > 1}
 							<button type="button" class="primary" onclick={submitPrompt}>Submit</button>
 						{/if}
 					{:else}
