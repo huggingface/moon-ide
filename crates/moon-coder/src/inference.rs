@@ -269,6 +269,15 @@ pub enum ChatMessage {
 	},
 	Tool {
 		tool_call_id: String,
+		/// Tool name, echoed onto the wire as `name` when present.
+		/// Strict routers (Kimi K3 via the HF router) accept a tool
+		/// message that "carries `tool`/`name`" as an alternative to
+		/// order-matching the preceding assistant tool_call — which
+		/// is the only resolution we used to rely on, and it breaks
+		/// on their strict path. Carrying the name makes every tool
+		/// result self-resolving. Unknown for synthesized orphans.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		tool_name: Option<String>,
 		content: String,
 		/// Images the tool returned (a `read_file` on a PNG, a
 		/// playwright screenshot block). On the OpenAI-compat wire
@@ -353,6 +362,8 @@ enum WireMessage<'a> {
 	},
 	Tool {
 		tool_call_id: &'a str,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		name: Option<&'a str>,
 		content: WireContent<'a>,
 	},
 }
@@ -501,12 +512,14 @@ fn build_wire_messages<'a>(
 			}
 			ChatMessage::Tool {
 				tool_call_id,
+				tool_name,
 				content,
 				images,
 			} => {
 				pending_tool_images.extend(images.iter());
 				WireMessage::Tool {
 					tool_call_id,
+					name: tool_name.as_deref(),
 					content: wire_text_content(content, cache_here),
 				}
 			}
@@ -2605,6 +2618,38 @@ mod tests {
 	}
 
 	#[test]
+	fn tool_message_carries_name_when_known() {
+		// Kimi K3's router accepts a tool message that carries
+		// `name` as an alternative to order-matching the preceding
+		// assistant tool_call. Our wire must emit it.
+		let msgs = vec![
+			ChatMessage::Assistant {
+				content: None,
+				thinking_blocks: vec![],
+				tool_calls: vec![ToolCall {
+					id: "call_1".into(),
+					kind: "function".into(),
+					function: FunctionCall {
+						name: "bash".into(),
+						arguments: "{}".into(),
+					},
+				}],
+			},
+			ChatMessage::Tool {
+				tool_call_id: "call_1".into(),
+				tool_name: Some("bash".into()),
+				content: "ok".into(),
+				images: vec![],
+			},
+		];
+		let wire = build_wire_messages(&msgs, &[], false);
+		let v = serde_json::to_value(&wire).unwrap();
+		assert_eq!(v[1]["role"], "tool");
+		assert_eq!(v[1]["tool_call_id"], "call_1");
+		assert_eq!(v[1]["name"], "bash", "tool name must ride the wire for Kimi K3");
+	}
+
+	#[test]
 	fn reasoning_effort_serializes_only_when_set() {
 		// The picker's contract: cleared (None) sends NOTHING —
 		// the provider default applies; a set value rides the wire
@@ -2915,6 +2960,7 @@ mod tests {
 			},
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
+				tool_name: None,
 				content: "/etc /var".into(),
 				images: Vec::new(),
 			},
@@ -2933,6 +2979,7 @@ mod tests {
 			ChatMessage::user("hi"),
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
+				tool_name: None,
 				content: "ok".into(),
 				images: Vec::new(),
 			},
@@ -2955,6 +3002,7 @@ mod tests {
 			ChatMessage::user("hi"),
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
+				tool_name: None,
 				content: "ok".into(),
 				images: Vec::new(),
 			},
@@ -2982,6 +3030,7 @@ mod tests {
 		// synthetic user message right after the tool run.
 		let messages = vec![ChatMessage::Tool {
 			tool_call_id: "call_1".into(),
+			tool_name: None,
 			content: "[image file — image/png, attached]".into(),
 			images: vec![ImageAttachment {
 				data_url: "data:image/png;base64,QUJD".into(),
@@ -3004,6 +3053,7 @@ mod tests {
 		// messages to directly follow the tool-calling assistant.
 		let tool = |id: &str, url: &str| ChatMessage::Tool {
 			tool_call_id: id.into(),
+			tool_name: None,
 			content: "ok".into(),
 			images: vec![ImageAttachment {
 				data_url: url.into(),
@@ -3077,6 +3127,7 @@ mod tests {
 			},
 			ChatMessage::Tool {
 				tool_call_id: "c1".into(),
+				tool_name: None,
 				content: "screenshot taken".into(),
 				images: vec![ImageAttachment {
 					data_url: "data:image/webp;base64,BBBB".into(),

@@ -420,6 +420,7 @@ mod tests {
 		for (idx, kb) in sizes_kb.iter().enumerate() {
 			messages.push(ChatMessage::Tool {
 				tool_call_id: format!("call_{idx}"),
+				tool_name: None,
 				content: "{\"content\":\"[image attached]\"}".into(),
 				images: vec![{
 					// Exact `kb`, prefix included, so the budget
@@ -505,11 +506,13 @@ mod tests {
 		let messages = vec![
 			ChatMessage::Tool {
 				tool_call_id: "call_0".into(),
+				tool_name: None,
 				content: "{}".into(),
 				images: vec![duplicate.clone()],
 			},
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
+				tool_name: None,
 				content: "{}".into(),
 				images: vec![duplicate],
 			},
@@ -554,6 +557,7 @@ mod tests {
 		let mut messages = history_with_images(&[1, 1]);
 		messages.push(ChatMessage::Tool {
 			tool_call_id: "call_dup".into(),
+			tool_name: None,
 			content: "{}".into(),
 			images: vec![ImageAttachment {
 				data_url: format!("data:image/webp;base64,{}", "A".repeat(1000)),
@@ -568,6 +572,7 @@ mod tests {
 		};
 		messages.push(ChatMessage::Tool {
 			tool_call_id: "call_dup2".into(),
+			tool_name: None,
 			content: "{}".into(),
 			images: vec![dup],
 		});

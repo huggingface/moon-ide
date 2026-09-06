@@ -403,6 +403,7 @@ fn translate<'a>(messages: &'a [ChatMessage], mark_system_cache: bool, mark_last
 				tool_call_id,
 				content,
 				images,
+				..
 			} => {
 				let result_content = if images.is_empty() {
 					ToolResultContent::Text(content)
@@ -1285,11 +1286,13 @@ mod tests {
 		let messages = vec![
 			ChatMessage::Tool {
 				tool_call_id: "toolu_a".into(),
+				tool_name: None,
 				content: "result a".into(),
 				images: Vec::new(),
 			},
 			ChatMessage::Tool {
 				tool_call_id: "toolu_b".into(),
+				tool_name: None,
 				content: "result b".into(),
 				images: Vec::new(),
 			},
@@ -1322,6 +1325,7 @@ mod tests {
 	fn translate_tool_with_images_nests_blocks_in_tool_result() {
 		let messages = vec![ChatMessage::Tool {
 			tool_call_id: "toolu_a".into(),
+			tool_name: None,
 			content: "[image attached]".into(),
 			images: vec![ImageAttachment {
 				data_url: "data:image/png;base64,QUJD".into(),
@@ -1347,6 +1351,7 @@ mod tests {
 	fn translate_tool_without_images_keeps_string_content() {
 		let messages = vec![ChatMessage::Tool {
 			tool_call_id: "toolu_a".into(),
+			tool_name: None,
 			content: "plain".into(),
 			images: Vec::new(),
 		}];
@@ -1421,6 +1426,7 @@ mod tests {
 			user_msg("hi"),
 			ChatMessage::Tool {
 				tool_call_id: "toolu_a".into(),
+				tool_name: None,
 				content: "ok".into(),
 				images: Vec::new(),
 			},

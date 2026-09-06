@@ -2192,3 +2192,12 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
   wire never carries a tool result without its assistant tool_call.
   Strict routers (Kimi K3 via the HF router) 400 the request
   otherwise; this is the resume-after-restart failure mode.
+- **Tool messages carry `name` on the wire**: every `role:tool`
+  message echoes the tool name (from the record`s `toolName`, or
+resolved off the owning assistant`s tool_calls for synthesized
+  orphans). Kimi K3 via the HF router requires a resolvable tool
+  name — either the message carries `name`/`tool`, or it
+  order-matches the preceding assistant tool_call. We relied on
+  order-matching alone; any drift (compaction cut, replay, orphan
+  synthesis) 400`d the resume. Carrying `name` makes every tool
+  result self-resolving.

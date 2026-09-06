@@ -3241,13 +3241,18 @@ impl CoderHandle {
 				}
 				SessionRecord::Tool {
 					tool_call_id,
-					tool_name: _,
+					tool_name,
 					content,
 					duration_ms: _,
 					images,
 				} => {
 					messages.push(ChatMessage::Tool {
 						tool_call_id: tool_call_id.clone(),
+						tool_name: if tool_name.is_empty() {
+							None
+						} else {
+							Some(tool_name.clone())
+						},
 						content: content.clone(),
 						images: images.clone(),
 					});
@@ -3667,11 +3672,46 @@ impl CoderHandle {
 			if resume_ask_user_ids.contains(orphan_id) {
 				continue;
 			}
-			messages.push(ChatMessage::Tool {
-				tool_call_id: orphan_id.clone(),
-				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
-				images: Vec::new(),
+			// Insert right after the owning Assistant's surviving
+			// Tool run (not a blind tail push): a trailing user
+			// steer or an assistant reply after the killed call
+			// would otherwise separate the synthetic result from
+			// its call, and strict routers (Kimi K3) order-match
+			// tool results — a displaced result 400s the whole
+			// resume.
+			let anchor = messages.iter().rposition(
+				|m| matches!(m, ChatMessage::Assistant { tool_calls, .. } if tool_calls.iter().any(|c| c.id == *orphan_id)),
+			);
+			let insert_at = match anchor {
+				Some(ai) => {
+					// past the assistant and its contiguous Tool run
+					let mut j = ai + 1;
+					while j < messages.len() && matches!(messages[j], ChatMessage::Tool { .. }) {
+						j += 1;
+					}
+					j
+				}
+				None => messages.len(),
+			};
+			// Resolve the name off the owning assistant's tool_calls
+			// so the synthetic result self-identifies on strict routers
+			// (Kimi K3) instead of relying on order-matching alone.
+			let orphan_name = anchor.and_then(|ai| match &messages[ai] {
+				ChatMessage::Assistant { tool_calls, .. } => tool_calls
+					.iter()
+					.find(|c| c.id == *orphan_id)
+					.map(|c| c.function.name.clone()),
+				_ => None,
 			});
+			messages.insert(
+				insert_at,
+				ChatMessage::Tool {
+					tool_call_id: orphan_id.clone(),
+					tool_name: orphan_name,
+					content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
+					images: Vec::new(),
+				},
+			);
 		}
 		// `in_flight` is `true` when this session has a turn still
 		// running in the background (already mounted), OR when we're
@@ -7114,6 +7154,7 @@ async fn dispatch_subagent_batch(
 				});
 				messages.push(ChatMessage::Tool {
 					tool_call_id: call.id.clone(),
+					tool_name: Some(call.function.name.clone()),
 					content: json!({ "error": "sub-agent task failed" }).to_string(),
 					images: Vec::new(),
 				});
@@ -9563,8 +9604,17 @@ async fn recover_in_memory_orphans(rt: &Arc<SessionRuntime>, sink: &FolderEventS
 	{
 		let mut session = rt.session.lock().await;
 		for (id, _) in &orphans {
+			// Name resolved off the owning assistant call (see the
+			// mount-path orphan synthesis for why the name matters).
+			let name = session.messages.iter().rev().find_map(|m| match m {
+				ChatMessage::Assistant { tool_calls, .. } => {
+					tool_calls.iter().find(|c| c.id == *id).map(|c| c.function.name.clone())
+				}
+				_ => None,
+			});
 			session.messages.push(ChatMessage::Tool {
 				tool_call_id: id.clone(),
+				tool_name: name,
 				content: sessions::INTERRUPTED_TOOL_RESULT_JSON.to_string(),
 				images: Vec::new(),
 			});
@@ -9622,6 +9672,7 @@ async fn emit_tool_result(
 			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms, &images).await;
 			Ok(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
+				tool_name: Some(tool_name.to_string()),
 				content,
 				images,
 			})
@@ -9639,6 +9690,7 @@ async fn emit_tool_result(
 			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms, &[]).await;
 			Ok(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
+				tool_name: Some(tool_name.to_string()),
 				content,
 				images: Vec::new(),
 			})
@@ -11338,6 +11390,7 @@ fn message_bytes(messages: &[ChatMessage]) -> usize {
 				tool_call_id,
 				content,
 				images: _,
+				..
 			} => {
 				bytes += tool_call_id.len();
 				bytes += content.len();
@@ -11938,6 +11991,7 @@ mod tests {
 			assistant_with_call("call_1", "edit_file", r#"{"path":"a.rs","find":"x","replace":"y"}"#),
 			ChatMessage::Tool {
 				tool_call_id: "call_1".into(),
+				tool_name: None,
 				content: "ok".into(),
 				images: Vec::new(),
 			},
@@ -12343,6 +12397,7 @@ mod tests {
 			ChatMessage::user("do thing"),
 			ChatMessage::Tool {
 				tool_call_id: "x".into(),
+				tool_name: None,
 				content: "tool body".into(),
 				images: Vec::new(),
 			},
@@ -12449,6 +12504,7 @@ mod tests {
 			},
 			ChatMessage::Tool {
 				tool_call_id: "tc-1".into(),
+				tool_name: None,
 				content: "{}".into(),
 				images: Vec::new(),
 			},
@@ -12801,6 +12857,7 @@ mod tests {
 			},
 			ChatMessage::Tool {
 				tool_call_id: String::new(),
+				tool_name: None,
 				content: "t".repeat(40),
 				images: Vec::new(),
 			},
@@ -12981,6 +13038,7 @@ mod tests {
 			},
 			ChatMessage::Tool {
 				tool_call_id: "call-1".into(),
+				tool_name: None,
 				content: "{\"ok\":true}".into(),
 				images: Vec::new(),
 			},

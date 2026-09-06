@@ -841,6 +841,7 @@ fn render_message_for_summary(msg: &ChatMessage) -> String {
 			tool_call_id,
 			content,
 			images,
+			..
 		} => {
 			out.push_str(&format!("### tool ({tool_call_id})\n"));
 			out.push_str(content);
@@ -903,6 +904,7 @@ mod tests {
 	fn tool(t: &str) -> ChatMessage {
 		ChatMessage::Tool {
 			tool_call_id: "call_1".into(),
+			tool_name: None,
 			content: t.into(),
 			images: Vec::new(),
 		}

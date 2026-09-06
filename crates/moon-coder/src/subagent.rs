@@ -1287,6 +1287,7 @@ async fn run_subagent_loop(
 			));
 			messages.push(ChatMessage::Tool {
 				tool_call_id: call.id.clone(),
+				tool_name: Some(call.function.name.clone()),
 				content: content.clone(),
 				images: images.clone(),
 			});
