@@ -353,6 +353,13 @@ pub(crate) async fn compact_if_needed(
 /// sees after a compaction" would diverge between a live run and
 /// the same session reopened from disk.
 pub(crate) fn apply_summary_to_messages(messages: &mut Vec<ChatMessage>, cutoff: usize, summary: &str) {
+	// Snap the cut to a tool-call boundary: dropping an Assistant
+	// `tool_calls` while keeping its Tool result orphans the result
+	// on the wire, and strict routers (Kimi K3, the HF router's
+	// Kimi flavor) 400 the whole request on it. Walk the cut forward
+	// past any contiguous Tool run whose owning Assistant survived,
+	// or backward so the whole call+result block falls together.
+	let cutoff = snap_cutoff_to_tool_boundary(messages, cutoff);
 	messages.drain(1..cutoff);
 	messages.insert(
 		1,
@@ -360,6 +367,61 @@ pub(crate) fn apply_summary_to_messages(messages: &mut Vec<ChatMessage>, cutoff:
 			content: format!("{COMPACTION_HEADER}{summary}"),
 		},
 	);
+}
+
+/// Adjust `cutoff` so the drain never splits an Assistant
+/// `tool_calls` from its Tool results. Two cases:
+///
+/// - The Assistant carrying the calls is **kept** (index ≥ cutoff)
+///   but some of its Tool results are cut — extend the cut forward
+///   so the whole block stays or goes together.
+/// - The first kept message is a Tool whose owning Assistant was
+///   **cut** — extend the cut forward past the orphan run so no
+///   dangling Tool result survives. (A Tool result with no visible
+///   assistant tool_call is what Kimi K3 rejects.)
+fn snap_cutoff_to_tool_boundary(messages: &[ChatMessage], cutoff: usize) -> usize {
+	let mut cut = cutoff.clamp(1, messages.len());
+	loop {
+		// Case 1: a kept Assistant with tool_calls that have a Tool
+		// result being cut away.
+		let mut extended = false;
+		let mut i = cut;
+		while i < messages.len() {
+			let ChatMessage::Assistant { tool_calls, .. } = &messages[i] else {
+				i += 1;
+				continue;
+			};
+			if tool_calls.is_empty() {
+				i += 1;
+				continue;
+			}
+			// Find the contiguous Tool run immediately after it.
+			let mut j = i + 1;
+			while j < messages.len() && matches!(messages[j], ChatMessage::Tool { .. }) {
+				j += 1;
+			}
+			// If any of those results fall below the cut, extend past them.
+			if j > i + 1 && i + 1 < cut && j > cut {
+				cut = j;
+				extended = true;
+			}
+			i += 1;
+		}
+		// Case 2: the first kept message is a Tool result whose
+		// owning Assistant was cut — the orphan run must go too.
+		if cut < messages.len() && matches!(messages[cut], ChatMessage::Tool { .. }) {
+			let mut j = cut;
+			while j < messages.len() && matches!(messages[j], ChatMessage::Tool { .. }) {
+				j += 1;
+			}
+			cut = j;
+			extended = true;
+		}
+		if !extended {
+			break;
+		}
+	}
+	cut
 }
 
 /// Rough token estimate for a rendered string: bytes / 4, the
@@ -847,6 +909,47 @@ mod tests {
 	}
 	fn system(t: &str) -> ChatMessage {
 		ChatMessage::System { content: t.into() }
+	}
+
+	fn apply(cutoff: usize) -> Vec<ChatMessage> {
+		let mut m = vec![
+			system("sys"),
+			user("u1"),
+			assistant_with_tool("", "bash"),
+			tool("result 1"),
+			user("u2"),
+			assistant("done"),
+		];
+		apply_summary_to_messages(&mut m, cutoff, "summary");
+		m
+	}
+
+	#[test]
+	fn compaction_never_orphans_a_tool_result() {
+		// Cut lands between the assistant tool_call and its result:
+		// the boundary snap must push past the Tool row so the kept
+		// history has no dangling tool result (Kimi K3 400s those).
+		let kept = apply(3); // would split call/result without snapping
+		assert!(
+			!matches!(kept[1], ChatMessage::Tool { .. }),
+			"first kept message must not be a Tool result: {kept:?}"
+		);
+	}
+
+	#[test]
+	fn compaction_keeps_call_and_result_together() {
+		// Cut before the block: both survive, untouched.
+		let kept = apply(2);
+		assert!(kept
+			.iter()
+			.any(|m| matches!(m, ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())));
+		assert!(kept.iter().any(|m| matches!(m, ChatMessage::Tool { .. })));
+	}
+
+	#[test]
+	fn compaction_past_the_block_is_unchanged() {
+		let kept = apply(5);
+		assert!(matches!(kept.last(), Some(ChatMessage::Assistant { .. })));
 	}
 
 	#[test]

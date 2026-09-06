@@ -828,3 +828,10 @@ clear_web_search_key` RPCs — key stays in the IDE's OS keyring).
   moon-remote spawns `agent_proxy` (ADR 0060) with
   `SSH_AUTH_SOCK=/run/user/1000/openssh_agent` in its unit env;
   the container mounts the proxy socket read-only.
+- **`ssh bgs` alias**: the workspace host has `Host bgs` in
+  `~/.ssh/config` (HostName host.containers.internal, User ops,
+  IdentityFile the mounted pubkey, IdentitiesOnly no). Agents in the
+  container and on the host (force_host) reach it alike. Note:
+  editing `~/.ssh/config` in-place does not propagate into the
+  running container (bind-mounted inode) — recreate the container
+  (`container --up`) after changing it.

@@ -2186,3 +2186,9 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
   `moon-remote model --reasoning xhigh` (empty string clears).
   Anthropic native route ignores it (its thinking config is
   budget-based, separate).
+- **Compaction cut is tool-boundary-safe** (ADR-worthy): the
+  summary cut snaps forward past any Tool run whose owning
+  Assistant survived (and drops a leading orphan Tool run), so the
+  wire never carries a tool result without its assistant tool_call.
+  Strict routers (Kimi K3 via the HF router) 400 the request
+  otherwise; this is the resume-after-restart failure mode.
