@@ -674,6 +674,22 @@ impl BridgeRpcHandler for BridgeRpc {
 			// Probe a provider endpoint/key before committing — the
 			// phone's add-provider form surfaces the upstream failure
 			// verbatim ("401 Unauthorized", DNS, …).
+			// MCP servers (presets + custom) — the playwright toggle
+			// lives here. Workspace-scoped: enabled state persists in
+			// session.json; disabling drops the live connection.
+			"coder_mcp_servers" => {
+				let rows = crate::settings::mcp_servers(&self.settings)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&rows)
+			}
+			"coder_mcp_set_enabled" => {
+				let p: McpSetParams = parse_params(params)?;
+				crate::settings::mcp_set_enabled(&self.coder, &self.settings, &p.id, p.enabled)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&true)
+			}
 			// Web-search (Tavily) key management — mirror of the
 			// desktop's model-settings popover. The key lives in the
 			// OS keyring on the IDE's host; `web_fetch` (Jina) needs
@@ -1014,6 +1030,12 @@ struct FolderParams {
 }
 
 #[derive(serde::Deserialize)]
+struct McpSetParams {
+	id: String,
+	enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
 struct WebSearchKeyParams {
 	key: String,
 }
@@ -1230,6 +1252,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_revert_to_message",
 	"coder_get_model_settings",
 	"coder_set_model_settings",
+	"coder_mcp_servers",
+	"coder_mcp_set_enabled",
 	"coder_web_search_configured",
 	"coder_set_web_search_key",
 	"coder_clear_web_search_key",

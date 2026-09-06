@@ -818,3 +818,13 @@ Prose, not commitments — revisit when someone asks:
 clear_web_search_key` RPCs — key stays in the IDE's OS keyring).
   `web_fetch` (Jina Reader) is keyless and always available. Card
   hides on IDEs without the methods.
+- **MCP toggle card**: the companion lists the workspace's MCP
+  servers (presets like playwright + custom) and toggles each
+  enabled flag (`coder_mcp_servers` / `coder_mcp_set_enabled` —
+  persisted in session.json, disabling drops the live connection).
+- **SSH from agents to the IDE's host**: an agent can
+  `ssh ops@host.containers.internal` (container route) or
+  `ssh ops@localhost` (host route, force_host). Works because
+  moon-remote spawns `agent_proxy` (ADR 0060) with
+  `SSH_AUTH_SOCK=/run/user/1000/openssh_agent` in its unit env;
+  the container mounts the proxy socket read-only.

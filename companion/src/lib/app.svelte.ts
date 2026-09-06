@@ -40,6 +40,17 @@ export type CoderStatus = {
 	signed_in: boolean;
 };
 
+/** One MCP server row (preset like playwright, or a custom entry),
+ * mirror of `McpServerStatus`. Only the fields the phone renders. */
+export type McpServerRow = {
+	id: string;
+	label: string;
+	command: string;
+	args: string[];
+	preset: boolean;
+	enabled: boolean;
+};
+
 /** One service of a compose project (`docker compose ps`). */
 export type ServiceStatus = {
 	name: string;
@@ -565,6 +576,10 @@ class CompanionState {
 	 * key and is always available. */
 	webSearchConfigured = $state<boolean | null>(null);
 	#webKeyBusy = false;
+	/** MCP servers for this workspace (presets like playwright plus
+	 * custom entries), or null while loading / on an older IDE. */
+	mcpServers = $state<McpServerRow[] | null>(null);
+	#mcpBusy = false;
 	/** True while a provider switch / lock toggle is in flight. */
 	savingProvider = $state(false);
 	/** SCM status for the active folder, or null while loading. */
@@ -1078,6 +1093,7 @@ class CompanionState {
 			this.#ensureSubscribed(workspace, ide);
 			void this.#loadModelSettings();
 			void this.loadWebSearchConfigured();
+			void this.loadMcpServers();
 			void this.loadScmStatus();
 			void this.#loadRunningSessions();
 			this.sessions = await this.#loadSessions();
@@ -1235,6 +1251,39 @@ class CompanionState {
 			this.error = e instanceof Error ? e.message : String(e);
 		} finally {
 			this.#webKeyBusy = false;
+		}
+	}
+
+	/** Load the workspace's MCP server list. Errors (older IDE)
+	 * leave the card hidden. */
+	async loadMcpServers(): Promise<void> {
+		if (!this.activeWorkspace) {
+			return;
+		}
+		try {
+			this.mcpServers = await this.#call<McpServerRow[]>(this.activeWorkspace, 'coder_mcp_servers', {}, this.activeIde);
+		} catch {
+			this.mcpServers = null;
+		}
+	}
+
+	/** Toggle one MCP server for this workspace. Optimistic —
+	 * the backend rejects an unknown id, which we surface as the
+	 * workspace error and reload the true list. */
+	async setMcpEnabled(id: string, enabled: boolean): Promise<void> {
+		if (!this.activeWorkspace || this.#mcpBusy || this.mcpServers === null) {
+			return;
+		}
+		this.#mcpBusy = true;
+		try {
+			this.mcpServers = this.mcpServers.map((r) => (r.id === id ? { ...r, enabled } : r));
+			await this.#call(this.activeWorkspace, 'coder_mcp_set_enabled', { id, enabled }, this.activeIde);
+			void this.loadMcpServers();
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			void this.loadMcpServers();
+		} finally {
+			this.#mcpBusy = false;
 		}
 	}
 

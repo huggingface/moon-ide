@@ -39,6 +39,49 @@ pub async fn workspace_provider_lock(ctx: &SettingsContext) -> Option<CoderProvi
 	}
 }
 
+/// The workspace's MCP server list (presets + custom), each with
+/// its per-workspace enabled flag. Read of `session.json`; no
+/// workspace bound degrades to the preset list with everything
+/// disabled so the companion card can still render.
+pub async fn mcp_servers(ctx: &SettingsContext) -> Result<Vec<moon_protocol::coder_mcp::McpServerStatus>, MoonError> {
+	let Some(id) = ctx.workspace_id.as_deref() else {
+		return Ok(moon_coder::mcp::server_rows(&Default::default()));
+	};
+	let session = core_session::load(&ctx.workspaces_dir, id).await?;
+	Ok(moon_coder::mcp::server_rows(&session.coder_mcp))
+}
+
+/// Flip one server's enabled flag for this workspace. The next
+/// agent turn advertises (or stops advertising) the MCP meta-tools
+/// accordingly. Disabling also kills the server's live connection
+/// so the child process doesn't linger.
+pub async fn mcp_set_enabled(
+	coder: &CoderHandle,
+	ctx: &SettingsContext,
+	server_id: &str,
+	enabled: bool,
+) -> Result<(), MoonError> {
+	let Some(workspace_id) = ctx.workspace_id.clone() else {
+		return Err(MoonError::invalid("no workspace bound to this process"));
+	};
+	let mut session = core_session::load(&ctx.workspaces_dir, &workspace_id).await?;
+	let known = moon_coder::mcp::server_rows(&session.coder_mcp);
+	if !known.iter().any(|row| row.config.id == server_id) {
+		return Err(MoonError::invalid(format!("unknown MCP server `{server_id}`")));
+	}
+	let currently = session.coder_mcp.enabled.iter().any(|e| e == server_id);
+	if currently == enabled {
+		return Ok(());
+	}
+	if enabled {
+		session.coder_mcp.enabled.push(server_id.to_owned());
+	} else {
+		session.coder_mcp.enabled.retain(|e| e != server_id);
+		coder.mcp_drop_connection(server_id).await;
+	}
+	core_session::save(&ctx.workspaces_dir, &workspace_id, &session).await
+}
+
 /// Apply `lock` to this workspace's `session.json`. `Some(_)`
 /// replaces the existing lock; `None` clears it. No-ops without a
 /// bound workspace. Load-then-save round-trip preserves every other

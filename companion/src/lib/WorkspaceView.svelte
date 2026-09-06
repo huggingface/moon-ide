@@ -47,6 +47,7 @@
 
 	/** Provider picker disclosure (collapsed by default). */
 	let providerOpen = $state(false);
+	let mcpOpen = $state(false);
 	let webKeyDraft = $state('');
 	let webKeyEditing = $state(false);
 	let servicesOpen = $state(false);
@@ -678,6 +679,36 @@
 		</div>
 	{/if}
 
+	{#if app.mcpServers !== null && app.mcpServers.length > 0}
+		{@const enabledCount = app.mcpServers.filter((r) => r.enabled).length}
+		<div class="card services-card">
+			<button class="provider-row" onclick={() => (mcpOpen = !mcpOpen)}>
+				<span class="muted">MCP</span>
+				<strong class="provider-name">
+					{enabledCount > 0 ? `${enabledCount} on` : 'off'}
+				</strong>
+				<span class="chevron">{mcpOpen ? '▴' : '▾'}</span>
+			</button>
+			{#if mcpOpen}
+				<div class="services-body">
+					{#each app.mcpServers as srv (srv.id)}
+						<div class="services-row">
+							<span class="mcp-label" title="{srv.command} {srv.args.join(' ')}">
+								{srv.label}
+								{#if srv.preset}<span class="muted mcp-badge">preset</span>{/if}
+							</span>
+							<button
+								class="ghost"
+								class:selected={srv.enabled}
+								onclick={() => void app.setMcpEnabled(srv.id, !srv.enabled)}>{srv.enabled ? 'On' : 'Off'}</button
+							>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	{/if}
+
 	{#if app.webSearchConfigured !== null}
 		<div class="card web-key-card">
 			<div class="web-key-row">
@@ -1003,6 +1034,18 @@
 	.web-key-hint {
 		margin: 0;
 		font-size: 0.72rem;
+	}
+	.mcp-label {
+		font-size: 0.85rem;
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.mcp-badge {
+		font-size: 0.68rem;
+	}
+	.ghost.selected {
+		color: var(--ok, #9ece6a);
 	}
 	.services-body {
 		display: flex;
