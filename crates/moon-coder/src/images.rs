@@ -34,10 +34,15 @@ use crate::inference::{ChatMessage, ImageAttachment};
 /// frame). Capture happens while the user waits, so 4 it is.
 const WEBP_METHOD: i32 = 4;
 
-/// Transport format for re-encoded attachments. Vision endpoints
-/// accept WebP across Anthropic, OpenAI, Gemini and the vLLM
-/// servers most HF-router providers run. If one ever rejects it,
-/// setting this to `None` restores verbatim PNG passthrough.
+/// Transport format for re-encoded attachments. Lossless WebP: it
+/// shaves ~43% off a screenshot's base64 and Anthropic / OpenAI /
+/// Gemini / most vLLM servers decode it fine. The one holdout is
+/// strict vision loaders (Kimi K3 via the HF router), which reject a
+/// lossless WebP with "cannot identify image file" and 400 the whole
+/// request. We keep the saving anyway and recover at send time: a
+/// 400 that names an image decode problem downconverts the latest
+/// WebP back to PNG and retries once (see [`downconvert_latest_webp`]
+/// and the runner's turn loop).
 const REENCODE_TO: Option<&str> = Some("image/webp");
 
 const PNG_MIME: &str = "image/png";
@@ -299,6 +304,111 @@ fn png_to_lossless_webp(bytes: &[u8]) -> Option<Vec<u8>> {
 	Some(encoder.encode_advanced(&config).ok()?.to_vec())
 }
 
+/// Decode a lossless WebP back to PNG. Used on session reload: a
+/// history captured while `REENCODE_TO` was `Some("image/webp")`
+/// holds WebP payloads that strict vision loaders (Kimi K3) reject
+/// with "cannot identify image file", so the rebuilt wire converts
+/// them back to the universally-accepted PNG. `None` when the bytes
+/// don't decode — the caller keeps the original attachment then.
+pub(crate) fn webp_to_png(webp_bytes: &[u8]) -> Option<Vec<u8>> {
+	// WebPImage derefs to the decoded pixel bytes; layout() says
+	// whether they are RGB or RGBA.
+	let decoded = webp::Decoder::new(webp_bytes).decode()?;
+	let (w, h) = (decoded.width(), decoded.height());
+	let (color, pixels): (png::ColorType, &[u8]) = match decoded.layout() {
+		webp::PixelLayout::Rgba => (png::ColorType::Rgba, &decoded),
+		webp::PixelLayout::Rgb => (png::ColorType::Rgb, &decoded),
+	};
+	let mut out = Vec::new();
+	{
+		let mut encoder = png::Encoder::new(std::io::Cursor::new(&mut out), w, h);
+		encoder.set_color(color);
+		encoder.set_depth(png::BitDepth::Eight);
+		encoder.write_header().ok()?.write_image_data(pixels).ok()?;
+	}
+	Some(out)
+}
+
+/// Convert an attachment whose mime is `image/webp` back to PNG,
+/// for replaying histories captured while the webp re-encode was on.
+/// Anything else passes through unchanged.
+pub(crate) fn webp_attachment_to_png(attachment: ImageAttachment) -> ImageAttachment {
+	if attachment.mime != "image/webp" {
+		return attachment;
+	}
+	let Some((_, payload)) = attachment.data_url.split_once(";base64,") else {
+		return attachment;
+	};
+	let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) else {
+		return attachment;
+	};
+	match webp_to_png(&bytes) {
+		Some(png_bytes) => ImageAttachment {
+			data_url: format!(
+				"data:{PNG_MIME};base64,{}",
+				base64::engine::general_purpose::STANDARD.encode(png_bytes)
+			),
+			mime: PNG_MIME.to_string(),
+		},
+		None => attachment,
+	}
+}
+
+/// Whether this error is a provider 400 blaming an image it could not
+/// decode — the trigger for the WebP→PNG downconvert-and-retry in the
+/// turn loop. Matches the message Kimi K3's loader emits; broad enough
+/// to catch the same rejection phrased slightly differently by another
+/// strict backend, narrow enough not to fire on unrelated 400s (the
+/// too-many-images / oversized-body 400s have their own wording).
+pub(crate) fn is_image_decode_400(err: &crate::CoderError) -> bool {
+	let crate::CoderError::Http { status, body, .. } = err else {
+		return false;
+	};
+	if *status != 400 {
+		return false;
+	}
+	let body = body.to_lowercase();
+	body.contains("cannot identify image")
+		|| body.contains("failed to open image")
+		|| body.contains("could not decode image")
+}
+
+/// Replace the most recent WebP image attachment in `messages` with
+/// its PNG form, returning whether anything changed. Walks from the
+/// tail and converts exactly one image — the newest, i.e. the one
+/// being sent for the first time this call. Older WebPs already
+/// survived a round-trip on this provider, so they are not the image
+/// the 400 blames and are left alone (converting them would also
+/// rewrite a prompt prefix the router may have cached). The runner
+/// calls this on an image-decode 400 and retries once.
+pub(crate) fn downconvert_latest_webp(messages: &mut [crate::inference::ChatMessage]) -> bool {
+	for message in messages.iter_mut().rev() {
+		let images = match message {
+			crate::inference::ChatMessage::User { images, .. } | crate::inference::ChatMessage::Tool { images, .. } => images,
+			_ => continue,
+		};
+		for attachment in images.iter_mut().rev() {
+			if attachment.mime != "image/webp" {
+				continue;
+			}
+			let original = std::mem::replace(
+				attachment,
+				ImageAttachment {
+					data_url: String::new(),
+					mime: String::new(),
+				},
+			);
+			let converted = webp_attachment_to_png(original);
+			if converted.mime == PNG_MIME {
+				*attachment = converted;
+				return true;
+			}
+			*attachment = converted;
+		}
+	}
+	false
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -331,12 +441,6 @@ mod tests {
 		let (png, pixels) = sample_png(320, 240);
 		let attachment = attachment_from_bytes(&png, PNG_MIME);
 		assert_eq!(attachment.mime, "image/webp");
-		assert!(
-			attachment.data_url.starts_with("data:image/webp;base64,"),
-			"data URL should advertise the re-encoded mime: {}",
-			&attachment.data_url[..40]
-		);
-
 		let payload = attachment.data_url.split_once(";base64,").unwrap().1;
 		let webp = base64::engine::general_purpose::STANDARD.decode(payload).unwrap();
 		assert!(
@@ -345,7 +449,6 @@ mod tests {
 			webp.len(),
 			png.len()
 		);
-
 		// The whole point is that the model sees the same pixels.
 		let decoded = webp::Decoder::new(&webp).decode().expect("webp decodes");
 		assert_eq!(
@@ -353,6 +456,48 @@ mod tests {
 			pixels.as_slice(),
 			"lossless re-encode must be pixel-identical"
 		);
+	}
+
+	#[test]
+	fn downconvert_latest_webp_swaps_webp_for_png() {
+		let (png, _) = sample_png(64, 64);
+		let webp_att = attachment_from_bytes(&png, PNG_MIME);
+		assert_eq!(webp_att.mime, "image/webp");
+		let mut messages = vec![
+			crate::inference::ChatMessage::user("look"),
+			crate::inference::ChatMessage::Tool {
+				tool_call_id: "c1".into(),
+				tool_name: Some("read_file".into()),
+				content: "img".into(),
+				images: vec![webp_att],
+			},
+		];
+		assert!(downconvert_latest_webp(&mut messages));
+		let crate::inference::ChatMessage::Tool { images, .. } = &messages[1] else {
+			panic!("expected tool message");
+		};
+		assert_eq!(images[0].mime, PNG_MIME, "webp should become png on retry");
+		assert!(images[0].data_url.starts_with("data:image/png;base64,"));
+		// Idempotent once nothing is webp left.
+		assert!(!downconvert_latest_webp(&mut messages));
+	}
+
+	#[test]
+	fn is_image_decode_400_matches_kimi_rejection() {
+		let err = crate::CoderError::Http {
+			endpoint: "x".into(),
+			status: 400,
+			body: "Failed to open image: cannot identify image file".into(),
+			request_id: None,
+		};
+		assert!(is_image_decode_400(&err));
+		let other = crate::CoderError::Http {
+			endpoint: "x".into(),
+			status: 413,
+			body: "request entity too large".into(),
+			request_id: None,
+		};
+		assert!(!is_image_decode_400(&other));
 	}
 
 	#[test]

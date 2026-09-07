@@ -1773,7 +1773,40 @@ impl InferenceClient {
 				_ = cancel.cancelled() => return Err(CoderError::Aborted),
 				out = recv => out.map_err(CoderError::from)?,
 			};
-			return Err(request_error(&endpoint, status, text, request_id, &body, messages));
+			// A strict vision loader (Kimi K3) 400s a lossless-WebP
+			// screenshot with "cannot identify image file". Downconvert
+			// the latest webp on a cloned wire copy back to PNG and
+			// resend once, keeping the session's stored webp untouched.
+			let err = request_error(&endpoint, status, text.clone(), request_id.clone(), &body, messages);
+			if crate::images::is_image_decode_400(&err) {
+				let mut fallback_messages = messages.to_vec();
+				if crate::images::downconvert_latest_webp(&mut fallback_messages) {
+					tracing::warn!("image decode 400; resent the latest webp as png and retrying once");
+					let fallback_body = ChatCompletionRequest {
+						model,
+						messages: build_wire_messages(&fallback_messages, &cache_indexes, images_ok),
+						tools,
+						tool_choice: body.tool_choice,
+						max_tokens,
+						stream: true,
+						stream_options: body.stream_options,
+						reasoning_effort: body.reasoning_effort.clone(),
+					};
+					let mut retry = self.send_once_stream(&endpoint, &route, &fallback_body, cancel).await?;
+					if retry.status() == reqwest::StatusCode::UNAUTHORIZED && route.is_huggingface() {
+						let refreshed = self.refresh_or_abort(cancel).await?;
+						route.auth_token = Some(refreshed);
+						retry = self.send_once_stream(&endpoint, &route, &fallback_body, cancel).await?;
+					}
+					if retry.status().is_success() {
+						return consume_sse_stream(retry, cancel, |chunk| {
+							apply_chunk(chunk, &mut on_event);
+						})
+						.await;
+					}
+				}
+			}
+			return Err(err);
 		}
 
 		consume_sse_stream(response, cancel, |chunk| {

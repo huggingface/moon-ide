@@ -1109,10 +1109,14 @@ fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
 						.and_then(|v| v.as_str())
 						.unwrap_or("image/png")
 						.to_string();
-					images.push(crate::inference::ImageAttachment {
+					// Histories captured while the webp re-encode was on
+					// hold webp payloads that strict vision loaders (Kimi
+					// K3) 400 on; convert back to PNG on the way in.
+					let att = crate::images::webp_attachment_to_png(crate::inference::ImageAttachment {
 						data_url: format!("data:{mime};base64,{data}"),
 						mime,
 					});
+					images.push(att);
 				}
 				_ => {}
 			}

@@ -2201,3 +2201,12 @@ resolved off the owning assistant`s tool_calls for synthesized
   order-matching alone; any drift (compaction cut, replay, orphan
   synthesis) 400`d the resume. Carrying `name` makes every tool
   result self-resolving.
+- **WebP stays, with a PNG fallback on rejection**: captured PNGs
+  are re-encoded to lossless WebP at capture (ADR 0049, −43%
+  base64). Strict vision loaders (Kimi K3 via the HF router) 400 a
+  lossless WebP with "cannot identify image file". On that error the
+  stream path downconverts the _latest_ WebP in a cloned wire copy
+  back to PNG and retries once; the session's stored WebP is
+  untouched, and reload also upconverts stored WebP→PNG so
+  already-stuck sessions recover. The byte budget elision still
+  guards the HF wire independently.
