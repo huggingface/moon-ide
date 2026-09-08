@@ -255,6 +255,7 @@ const CUSTOM_TYPE_USAGE: &str = "moon_usage";
 const CUSTOM_TYPE_ERROR: &str = "moon_error";
 const CUSTOM_TYPE_TURN_DIFF: &str = "moon_turn_diff";
 const CUSTOM_TYPE_WORKER_DETACHED: &str = "moon_worker_detached";
+const CUSTOM_TYPE_SUMMARY: &str = "moon_summary";
 
 impl Serialize for SessionHeader {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -554,6 +555,23 @@ pub(crate) fn record_to_pi_wire(
 			pi_custom_message(
 				CUSTOM_TYPE_TURN_DIFF,
 				serde_json::json!({ "files": files, "diff": diff }),
+			),
+			timestamp_ms,
+		),
+		SessionRecord::SummaryState {
+			title,
+			last_error,
+			interrupted,
+			bytes_len,
+		} => pi_message_envelope(
+			pi_custom_message(
+				CUSTOM_TYPE_SUMMARY,
+				serde_json::json!({
+					"title": title,
+					"last_error": last_error,
+					"interrupted": interrupted,
+					"bytes_len": bytes_len,
+				}),
 			),
 			timestamp_ms,
 		),
@@ -1225,6 +1243,16 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 				.unwrap_or_default()
 				.to_string(),
 		}),
+		CUSTOM_TYPE_SUMMARY => Some(SessionRecord::SummaryState {
+			title: details
+				.get("title")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.to_string(),
+			last_error: details.get("last_error").and_then(|v| v.as_bool()).unwrap_or(false),
+			interrupted: details.get("interrupted").and_then(|v| v.as_bool()).unwrap_or(false),
+			bytes_len: details.get("bytes_len").and_then(|v| v.as_u64()).unwrap_or(0),
+		}),
 		_ => None,
 	}
 }
@@ -1508,6 +1536,27 @@ pub enum SessionRecord {
 	/// Empty `diff` when nothing changed (read-only turn, or the
 	/// agent's writes were identical to the baseline).
 	TurnDiff { files: Vec<String>, diff: String },
+	/// Snapshot of the sessions-list fold (`title` / `last_error` /
+	/// `interrupted`), appended when a turn settles so
+	/// [`list_sessions`] can answer from a tail read instead of
+	/// re-parsing the whole transcript. `bytes_len` is the JSONL's
+	/// byte length at the moment this record was written (i.e. the
+	/// offset just past its own trailing newline): a later append
+	/// grows the file past it, a truncation rewrites the file — both
+	/// make a stale `bytes_len` mismatch the on-disk size, which the
+	/// reader uses to fall back to the full fold. This is an
+	/// append-only-log trailer: the newest `SummaryState` whose
+	/// `bytes_len` matches the file size is authoritative.
+	///
+	/// Like the other metadata records it does **not** shape the
+	/// in-memory `messages` slice on reload, and it never matches
+	/// session search (it's a list-index optimisation, not content).
+	SummaryState {
+		title: String,
+		last_error: bool,
+		interrupted: bool,
+		bytes_len: u64,
+	},
 }
 
 fn u32_is_zero(n: &u32) -> bool {
@@ -1929,23 +1978,40 @@ pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderE
 		return Ok(Vec::new());
 	}
 	let mut read_dir = tokio::fs::read_dir(dir.as_std_path()).await.map_err(CoderError::from)?;
-	let mut summaries: Vec<SessionSummary> = Vec::new();
+	let mut paths: Vec<Utf8PathBuf> = Vec::new();
 	while let Some(entry) = read_dir.next_entry().await.map_err(CoderError::from)? {
 		let path = entry.path();
 		if path.extension().and_then(|s| s.to_str()) != Some(SESSION_EXT) {
 			continue;
 		}
-		let utf8 = match Utf8PathBuf::from_path_buf(path) {
-			Ok(p) => p,
-			Err(_) => continue,
-		};
-		match load_summary(&utf8).await {
-			Ok(summary) => summaries.push(summary),
-			Err(err) => {
-				tracing::warn!(error = %err, path = %utf8, "skipping unreadable session file");
-			}
+		if let Ok(p) = Utf8PathBuf::from_path_buf(path) {
+			paths.push(p);
 		}
 	}
+	// Read summaries concurrently (bounded): each `load_summary` is
+	// mostly filesystem I/O (header + tail window for settled
+	// sessions, full fold for the rest), so serialising them leaves
+	// the round-trip latency on the table for every session in the
+	// folder — which is the whole cost of the sessions list over the
+	// remote bridge.
+	use futures_util::stream::StreamExt;
+	const MAX_PARALLEL: usize = 8;
+	let mut summaries: Vec<SessionSummary> = futures_util::stream::iter(paths.into_iter().map(|p| async move {
+		let res = load_summary(&p).await;
+		(p, res)
+	}))
+	.buffer_unordered(MAX_PARALLEL)
+	.filter_map(|(p, res)| async move {
+		match res {
+			Ok(summary) => Some(summary),
+			Err(err) => {
+				tracing::warn!(error = %err, path = %p, "skipping unreadable session file");
+				None
+			}
+		}
+	})
+	.collect()
+	.await;
 	summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at_ms));
 	Ok(summaries)
 }
@@ -2098,7 +2164,9 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 	let file = tokio::fs::File::open(path.as_std_path())
 		.await
 		.map_err(CoderError::from)?;
-	let mtime_ms = file.metadata().await.ok().as_ref().and_then(file_mtime_ms);
+	let meta = file.metadata().await.ok();
+	let mtime_ms = meta.as_ref().and_then(file_mtime_ms);
+	let file_len = meta.map(|m| m.len());
 	let mut reader = BufReader::new(file);
 	let mut header_line = String::new();
 	reader.read_line(&mut header_line).await.map_err(CoderError::from)?;
@@ -2108,6 +2176,57 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 			format!("could not parse session header: {err}; raw_len={}", header_line.len()),
 		)
 	})?;
+
+	// Fast path: a settled turn appends a `SummaryState` trailer
+	// whose `bytes_len` anchors the file size it was computed at.
+	// When the newest trailer's anchor still matches the on-disk
+	// size, its fold is authoritative and the transcript body never
+	// gets parsed. Any append (a new turn's first record) or
+	// truncation (revert / resume rewrites) breaks the anchor, and
+	// old sessions predate trailers entirely — all fall through to
+	// the full fold below.
+	if let Some(len) = file_len {
+		if let Some(summary) = read_summary_state_trailer(path, len, &header).await {
+			return Ok(SessionSummary {
+				id: header.id,
+				title: summary.0,
+				created_at_ms: header.created_at_ms,
+				updated_at_ms: mtime_ms.unwrap_or(header.updated_at_ms),
+				worktree_root: header.worktree_root,
+				worktree_branch: header.worktree_branch,
+				committed_branch: header.committed_branch,
+				mode: header.mode,
+				last_error: summary.1,
+				interrupted: summary.2,
+			});
+		}
+	}
+
+	let (last_error, interrupted) = fold_summary_state(&mut reader, &mut header).await?;
+	Ok(SessionSummary {
+		id: header.id,
+		title: header.title,
+		created_at_ms: header.created_at_ms,
+		updated_at_ms: mtime_ms.unwrap_or(header.updated_at_ms),
+		worktree_root: header.worktree_root,
+		worktree_branch: header.worktree_branch,
+		committed_branch: header.committed_branch,
+		mode: header.mode,
+		last_error,
+		interrupted,
+	})
+}
+
+/// Fold the transcript body for the sessions-list summary state —
+/// the pre-trailer scan, still the fallback for files without a
+/// valid `SummaryState` anchor. Reads the remaining lines of
+/// `reader` (positioned just past the header) and updates
+/// `header.title` in place on `TitleUpdate`. Returns
+/// `(last_error, interrupted)`.
+async fn fold_summary_state(
+	reader: &mut BufReader<tokio::fs::File>,
+	header: &mut SessionHeader,
+) -> Result<(bool, bool), CoderError> {
 	let mut line = String::new();
 	let mut last_error = false;
 	let mut interrupted = false;
@@ -2158,18 +2277,67 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 			}
 		}
 	}
-	Ok(SessionSummary {
-		id: header.id,
-		title: header.title,
-		created_at_ms: header.created_at_ms,
-		updated_at_ms: mtime_ms.unwrap_or(header.updated_at_ms),
-		worktree_root: header.worktree_root,
-		worktree_branch: header.worktree_branch,
-		committed_branch: header.committed_branch,
-		mode: header.mode,
-		last_error,
-		interrupted,
-	})
+	Ok((last_error, interrupted))
+}
+
+/// Read the newest `SummaryState` trailer whose `bytes_len` anchor
+/// still matches the file's on-disk size. Scans a small tail window
+/// (the trailer is written at settlement, so it sits at the very
+/// end; the window only has to cover the trailer plus whatever a
+/// crash left half-appended after it). Returns
+/// `(title, last_error, interrupted)` on a valid anchor, `None` to
+/// fall back to the full fold.
+async fn read_summary_state_trailer(
+	path: &Utf8Path,
+	file_len: u64,
+	header: &SessionHeader,
+) -> Option<(String, bool, bool)> {
+	// 8 KiB is generous for one summary line (a title is a handful
+	// of words); a crash-torn tail beyond that just falls back.
+	const TAIL_WINDOW: u64 = 8 * 1024;
+	let start = file_len.saturating_sub(TAIL_WINDOW);
+	use tokio::io::{AsyncReadExt, AsyncSeekExt};
+	let mut file = tokio::fs::File::open(path.as_std_path()).await.ok()?;
+	file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+	let mut buf = String::new();
+	file.read_to_string(&mut buf).await.ok()?;
+	// The window may open mid-line; drop the first partial line.
+	let body = if start > 0 {
+		match buf.find('\n') {
+			Some(i) => &buf[i + 1..],
+			None => return None,
+		}
+	} else {
+		&buf[..]
+	};
+	// Newest trailer wins: scan the window's lines back to front.
+	for line in body.lines().rev() {
+		let trimmed = line.trim();
+		if trimmed.is_empty() {
+			continue;
+		}
+		let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+			continue;
+		};
+		for record in pi_wire_to_records(&value) {
+			if let SessionRecord::SummaryState {
+				title,
+				last_error,
+				interrupted,
+				bytes_len,
+			} = record
+			{
+				if bytes_len == file_len {
+					let title = if title.is_empty() { header.title.clone() } else { title };
+					return Some((title, last_error, interrupted));
+				}
+				// A trailer whose anchor no longer matches is stale
+				// (appends landed after it); newer lines may still
+				// hold a valid one, so keep scanning.
+			}
+		}
+	}
+	None
 }
 
 /// File mtime as unix milliseconds. The on-disk authority for a
@@ -2333,6 +2501,117 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 	let wire = record_to_pi_wire(record, header, now_ms());
 	buf.push_str(&serde_json::to_string(&wire).map_err(CoderError::from)?);
 	buf.push('\n');
+	file.write_all(buf.as_bytes()).await.map_err(CoderError::from)?;
+	file.flush().await.map_err(CoderError::from)?;
+	Ok(())
+}
+
+/// Append a [`SessionRecord::SummaryState`] trailer, folding the
+/// session's current title + settled flags into the log so the next
+/// [`list_sessions`] can read it from the tail instead of re-parsing
+/// the transcript. Called at turn settlement (complete / abort /
+/// error) once the session's on-disk shape is final for the pause.
+///
+/// `bytes_len` must encode the file's length *including this record
+/// itself* — a self-reference. The record is the only line being
+/// appended, so the length is `size_before + len(serialised line)`;
+/// the serialised line's own length depends on the digit count of
+/// `bytes_len`, which we converge with a small fixpoint loop (digit
+/// counts are stable for any realistic file size — a session JSONL
+/// crosses a power of 10 at most a handful of times, and each pass
+/// absorbs one digit).
+///
+/// Best-effort: a write failure leaves the next list-load to the
+/// full-fold fallback, never a hard error.
+pub async fn append_summary_state(dir: &Utf8Path, header: &SessionHeader) -> Result<(), CoderError> {
+	// The fold's two flags live in the transcript records (not the
+	// in-memory session), so recompute them from disk — same fold
+	// `load_summary` does.
+	let loaded = load(dir, &header.id).await?;
+	let mut last_error = false;
+	let mut interrupted = false;
+	for record in &loaded.records {
+		match record {
+			SessionRecord::Error { .. } => {
+				last_error = true;
+				interrupted = false;
+			}
+			SessionRecord::User { .. } => {
+				last_error = false;
+				interrupted = true;
+			}
+			SessionRecord::Assistant { tool_calls, .. } => {
+				last_error = false;
+				interrupted = !tool_calls.is_empty();
+			}
+			SessionRecord::Tool { .. } => {
+				last_error = false;
+				interrupted = true;
+			}
+			SessionRecord::Compaction { .. } => {
+				last_error = false;
+			}
+			_ => {}
+		}
+	}
+	let title = loaded.header.title.clone();
+
+	let path = session_path(dir, &loaded.header.id);
+	let lock = append_lock_for(&path);
+	let _append_guard = lock.lock().await;
+	if let Some(parent) = path.parent() {
+		tokio::fs::create_dir_all(parent.as_std_path())
+			.await
+			.map_err(CoderError::from)?;
+	}
+	let exists = tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false);
+	let mut file = OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(path.as_std_path())
+		.await
+		.map_err(CoderError::from)?;
+	let size_before = if exists {
+		file.metadata().await.map(|m| m.len()).unwrap_or(0)
+	} else {
+		0
+	};
+
+	// Header rides in the same buffer when the file is fresh — the
+	// anchor must count those bytes too.
+	let header_bytes = if exists {
+		0
+	} else {
+		serde_json::to_string(&loaded.header).map_err(CoderError::from)?.len() + 1
+	};
+	let prefix_len = size_before + header_bytes as u64;
+
+	// Fixpoint: `bytes_len = prefix_len + len(line(bytes_len))`.
+	let mut bytes_len = prefix_len;
+	let mut line = String::new();
+	for _ in 0..8 {
+		let record = SessionRecord::SummaryState {
+			title: title.clone(),
+			last_error,
+			interrupted,
+			bytes_len,
+		};
+		let wire = record_to_pi_wire(&record, &loaded.header, now_ms());
+		line = serde_json::to_string(&wire).map_err(CoderError::from)?;
+		line.push('\n');
+		let next = prefix_len + line.len() as u64;
+		if next == bytes_len {
+			break;
+		}
+		bytes_len = next;
+	}
+
+	let mut buf = String::new();
+	if !exists {
+		buf.push_str(&serde_json::to_string(&loaded.header).map_err(CoderError::from)?);
+		buf.push('\n');
+	}
+	buf.push_str(&line);
 	file.write_all(buf.as_bytes()).await.map_err(CoderError::from)?;
 	file.flush().await.map_err(CoderError::from)?;
 	Ok(())
@@ -2992,6 +3271,205 @@ mod tests {
 		let summary = load_summary(&summary_path).await.unwrap();
 		assert_eq!(summary.title, "renamed by auto-pass");
 		assert_eq!(summary.id, "sess-test");
+	}
+
+	/// Append a settled transcript (user → assistant answer, no tool
+	/// calls), then the summary trailer, and return the session dir.
+	async fn settled_session_with_trailer(id: &str) -> (tempfile::TempDir, Utf8PathBuf, SessionHeader) {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header(id);
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+				from_coordinator: false,
+			},
+		)
+		.await
+		.unwrap();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Assistant {
+				content: Some("hey".into()),
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: Vec::new(),
+				model: None,
+				stop_reason: None,
+			},
+		)
+		.await
+		.unwrap();
+		append_summary_state(&dir, &header).await.unwrap();
+		(tmp, dir, header)
+	}
+
+	#[tokio::test]
+	async fn summary_trailer_read_on_fast_path() {
+		let (_tmp, dir, header) = settled_session_with_trailer("sess-fast").await;
+		let path = session_path(&dir, "sess-fast");
+
+		let summary = load_summary(&path).await.unwrap();
+		assert_eq!(summary.id, "sess-fast");
+		assert_eq!(summary.title, header.title);
+		assert!(!summary.last_error);
+		// Settled assistant answer (no pending tool calls) → not interrupted.
+		assert!(!summary.interrupted);
+
+		// The trailer's `bytes_len` anchors the file size at write time.
+		let file_len = std::fs::metadata(path.as_std_path()).unwrap().len();
+		let tail = std::fs::read_to_string(path.as_std_path()).unwrap();
+		let last = tail.lines().last().unwrap();
+		let value: serde_json::Value = serde_json::from_str(last).unwrap();
+		let records = pi_wire_to_records(&value);
+		let Some(SessionRecord::SummaryState { bytes_len, .. }) = records.first() else {
+			panic!("expected a SummaryState trailer, got {records:?}");
+		};
+		assert_eq!(*bytes_len, file_len, "trailer must anchor the on-disk size");
+	}
+
+	#[tokio::test]
+	async fn summary_trailer_stale_after_append_falls_back_to_fold() {
+		let (_tmp, dir, header) = settled_session_with_trailer("sess-stale").await;
+		let path = session_path(&dir, "sess-stale");
+
+		// A new turn appends a user record — the trailer's anchor no
+		// longer matches the file size.
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "again".into(),
+				images: Vec::new(),
+				from_coordinator: false,
+			},
+		)
+		.await
+		.unwrap();
+
+		let summary = load_summary(&path).await.unwrap();
+		// Fallback fold: the trailing user message marks the session
+		// interrupted (the turn never settled).
+		assert!(summary.interrupted);
+		assert!(!summary.last_error);
+		assert_eq!(summary.title, header.title);
+	}
+
+	#[tokio::test]
+	async fn summary_trailer_survives_rename_refresh() {
+		let (_tmp, dir, header) = settled_session_with_trailer("sess-rename").await;
+		let path = session_path(&dir, "sess-rename");
+
+		// Rename: append the TitleUpdate, then refresh the trailer
+		// exactly as `rename_session_in` does.
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::TitleUpdate {
+				title: "fresh title".into(),
+			},
+		)
+		.await
+		.unwrap();
+		let mut renamed = header.clone();
+		renamed.title = "fresh title".into();
+		append_summary_state(&dir, &renamed).await.unwrap();
+
+		let summary = load_summary(&path).await.unwrap();
+		assert_eq!(summary.title, "fresh title");
+		// Still anchored on the *latest* size, not the first trailer's.
+		let file_len = std::fs::metadata(path.as_std_path()).unwrap().len();
+		let tail = std::fs::read_to_string(path.as_std_path()).unwrap();
+		let last = tail.lines().last().unwrap();
+		let value: serde_json::Value = serde_json::from_str(last).unwrap();
+		let Some(SessionRecord::SummaryState { bytes_len, .. }) = pi_wire_to_records(&value).first().cloned() else {
+			panic!("expected a SummaryState trailer");
+		};
+		assert_eq!(bytes_len, file_len);
+	}
+
+	#[tokio::test]
+	async fn summary_falls_back_to_fold_without_trailer() {
+		// A session written before trailers existed: plain records,
+		// no `SummaryState` — the fold path must still answer exactly
+		// as it always has.
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let header = make_test_header("sess-old");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+				from_coordinator: false,
+			},
+		)
+		.await
+		.unwrap();
+		append_record(&dir, &header, &SessionRecord::Error { message: "boom".into() })
+			.await
+			.unwrap();
+
+		let path = session_path(&dir, "sess-old");
+		let summary = load_summary(&path).await.unwrap();
+		assert!(summary.last_error);
+		assert!(!summary.interrupted);
+	}
+
+	#[tokio::test]
+	async fn truncation_rewrites_invalidate_the_trailer() {
+		let (_tmp, dir, header) = settled_session_with_trailer("sess-trunc").await;
+		let path = session_path(&dir, "sess-trunc");
+
+		// Revert the only user message: full rewrite drops the trailer
+		// line entirely (the rewrite re-serialises the surviving
+		// records, and SummaryState isn't among them).
+		let _revert = truncate_before_user_record(&dir, &header, 0).await.unwrap();
+		// The file now holds just the header; a fresh user+answer
+		// settles it again, and a new trailer anchors.
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "retry".into(),
+				images: Vec::new(),
+				from_coordinator: false,
+			},
+		)
+		.await
+		.unwrap();
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::Assistant {
+				content: Some("ok".into()),
+				thinking: None,
+				thinking_blocks: vec![],
+				tool_calls: Vec::new(),
+				model: None,
+				stop_reason: None,
+			},
+		)
+		.await
+		.unwrap();
+		append_summary_state(&dir, &header).await.unwrap();
+
+		let summary = load_summary(&path).await.unwrap();
+		assert_eq!(summary.title, header.title);
+		assert!(!summary.interrupted);
+		let file_len = std::fs::metadata(path.as_std_path()).unwrap().len();
+		let tail = std::fs::read_to_string(path.as_std_path()).unwrap();
+		let last = tail.lines().last().unwrap();
+		let value: serde_json::Value = serde_json::from_str(last).unwrap();
+		let Some(SessionRecord::SummaryState { bytes_len, .. }) = pi_wire_to_records(&value).first().cloned() else {
+			panic!("expected a SummaryState trailer after re-settle");
+		};
+		assert_eq!(bytes_len, file_len);
 	}
 
 	#[test]

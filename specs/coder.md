@@ -1030,14 +1030,15 @@ Mapping notes (details live in `sessions.rs`):
 - `Usage` folds onto the prior assistant line's `usage` block on
   write and is re-emitted as a stand-alone record on load.
 - Moon-specific records (`TitleUpdate`, `TodosUpdate`,
-  `SubagentSpawned`, `SubagentFinished`, `Error`) ride in pi `custom`
-  rows with `display:false` and a `moon_*` `customType`; the pi viewer
-  skips them silently. `Error` is appended when a turn fails with a
-  non-recoverable backend error (auth, decode, provider 400); without
-  it the on-disk transcript trails off mid-tool-loop and the failure
-  is invisible to anyone debugging from the JSONL after the fact. It
-  doesn't shape the in-memory `messages` slice on reload — an error
-  ended the turn, so it isn't history the next turn sends.
+  `SubagentSpawned`, `SubagentFinished`, `Error`, `SummaryState`)
+  ride in pi `custom` rows with `display:false` and a `moon_*`
+  `customType`; the pi viewer skips them silently. `Error` is
+  appended when a turn fails with a non-recoverable backend error
+  (auth, decode, provider 400); without it the on-disk transcript
+  trails off mid-tool-loop and the failure is invisible to anyone
+  debugging from the JSONL after the fact. It doesn't shape the
+  in-memory `messages` slice on reload — an error ended the turn, so
+  it isn't history the next turn sends.
 - Image attachments split the data-URL into pi's `data` + `mimeType`
   on write and re-prefix on load.
 
@@ -1047,6 +1048,26 @@ re-adds the current default, so prompt updates apply retroactively.
 `updated_at_ms` is frozen at first persistence; recency for the
 sessions list comes from the file's mtime (free — every append
 touches it — and it keeps appends O(1) and crash-safe).
+
+**The sessions list reads a trailer, not the transcript.** Listing a
+project's sessions only needs the fold (`title` / `last_error` /
+`interrupted`), but the fold's inputs live anywhere in the file — a
+title update or an error record at the very end changes it — so a
+header-only read is wrong and a full read is O(transcript bytes
+parsed) per session per refresh. The structural fix is a
+`SummaryState` record (`moon_summary`) appended **when a turn
+settles** (complete / abort / error, plus the auto-rename's
+`TitleUpdate`), carrying the fold plus a `bytes_len` anchor: the
+file's byte length at the moment the record was written (a
+self-reference the writer converges with a small fixpoint over the
+JSON digit count). `load_summary` reads an 8 KiB tail window and
+takes the newest trailer whose `bytes_len` still matches the on-disk
+size; anything that moves the file past the anchor — a new turn's
+first append, a revert/resume rewrite, a `Usage` fold into the
+trailing assistant line — invalidates it, and old sessions predate
+trailers entirely, so all of those fall back to the original full
+fold. No migration (pre-stability): the fallback is correctness, the
+trailer is the fast path.
 
 Sessions deliberately don't live in the project tree: they're
 personal history, not project artefacts, and putting them under VCS

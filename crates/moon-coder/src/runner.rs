@@ -3290,6 +3290,9 @@ impl CoderHandle {
 				// chat history sent to the model. The diff is a review
 				// artifact, not a message.
 				SessionRecord::TurnDiff { .. } => {}
+				// SummaryState indexes the sessions list — never chat
+				// history.
+				SessionRecord::SummaryState { .. } => {}
 			}
 		}
 		RebuiltMessages {
@@ -3442,6 +3445,12 @@ impl CoderHandle {
 			},
 		)
 		.await?;
+		// The rename changed the fold (title); refresh the trailer so
+		// the next list-load's tail read sees it instead of falling
+		// back to a full re-parse.
+		if let Err(err) = sessions::append_summary_state(&dir, &header).await {
+			tracing::warn!(error = %err, "could not append session summary state after rename");
+		}
 
 		// Notify every subscriber (desktop panel + observing phones).
 		let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), id.clone());
@@ -6022,6 +6031,23 @@ fn spawn_turn_loop(
 				let adopted = state.workspaces.folders().await.len() > bound_before;
 				if !pruned.is_empty() || adopted {
 					sink_for_turn.send(CoderEvent::WorkspaceFoldersChanged);
+				}
+				// Settle the sessions-list index: append the
+				// `SummaryState` trailer so the next list-load reads the
+				// tail instead of re-parsing the transcript. On a
+				// successful turn the fold lands clean; on abort/error
+				// the error record was already persisted above, so the
+				// fold reflects it.
+				{
+					let (dir, header) = {
+						let session = rt_for_turn.session.lock().await;
+						(session.session_dir.clone(), session.header.clone())
+					};
+					if let Some(dir) = dir {
+						if let Err(err) = sessions::append_summary_state(&dir, &header).await {
+							tracing::warn!(error = %err, "could not append session summary state");
+						}
+					}
 				}
 				if auto_rename_after {
 					spawn_auto_rename(state.clone(), rt_for_turn.clone(), sink_for_turn);
@@ -10444,6 +10470,10 @@ fn spawn_auto_rename(state: Arc<CoderState>, rt: Arc<SessionRuntime>, sink: Fold
 			tracing::warn!(error = %err, "auto-rename: failed to persist new title");
 			return;
 		}
+		// Refresh the sessions-list trailer with the new title.
+		if let Err(err) = sessions::append_summary_state(&dir, &header_for_disk).await {
+			tracing::warn!(error = %err, "auto-rename: could not append session summary state");
+		}
 		sink.send(CoderEvent::SessionTitleUpdated {
 			id: header_for_disk.id,
 			title: new_title,
@@ -10939,6 +10969,9 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 			// appeared. A metadata record — doesn't shape `messages`.
 			out.push(CoderEvent::TurnDiff { files, diff });
 		}
+		// Sessions-list index record — the replay doesn't render a
+		// row for it and it doesn't shape `messages`.
+		SessionRecord::SummaryState { .. } => {}
 	}
 }
 
@@ -11110,7 +11143,8 @@ fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<Code
 		| SessionRecord::Compaction { .. }
 		| SessionRecord::SubagentSpawned { .. }
 		| SessionRecord::SubagentFinished { .. }
-		| SessionRecord::TurnDiff { .. } => Vec::new(),
+		| SessionRecord::TurnDiff { .. }
+		| SessionRecord::SummaryState { .. } => Vec::new(),
 	}
 }
 
