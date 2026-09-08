@@ -1743,12 +1743,11 @@
 	/* Pill badge in the header next to the branch name. Always
 	   carries the change count; visible iff the user has changes
 	   *or* the filter is on (so a count of 0 with the filter
-	   active still surfaces the toggle for "go back to all"). The
-	   accent fill makes it the loudest control on the panel —
-	   matches the user's "more obvious color" ask. The active
-	   state inverts to a hollow ring so the toggle reads as
-	   "currently driving the tree" without changing colour
-	   weight. */
+	   active still surfaces the toggle for "go back to all").
+	   Filled means the changes-only filter is driving the tree —
+	   matches the `vs main` pill's "accent fill = active" rule,
+	   so both toggles read the same way. The inactive state is a
+	   hollow accent ring ("all files shown — click to filter"). */
 	.changes-badge {
 		appearance: none;
 		display: inline-flex;
@@ -1759,12 +1758,8 @@
 		padding: 0 6px;
 		border: 1px solid var(--m-accent);
 		border-radius: 999px;
-		background: var(--m-accent);
-		/* `--m-bg` flips between near-black (dark theme) and
-		   near-white (light theme), so it always contrasts well
-		   against the accent fill — saves us inventing a new
-		   token just for this badge. */
-		color: var(--m-bg);
+		background: transparent;
+		color: var(--m-accent);
 		font: inherit;
 		font-size: 11px;
 		font-weight: 600;
@@ -1774,15 +1769,22 @@
 		flex-shrink: 0;
 	}
 	.changes-badge:hover {
-		filter: brightness(1.1);
+		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
 	}
 	.changes-badge:focus-visible {
 		outline: 2px solid var(--m-accent);
 		outline-offset: 2px;
 	}
 	.changes-badge.active {
-		background: transparent;
-		color: var(--m-accent);
+		background: var(--m-accent);
+		/* `--m-bg` flips between near-black (dark theme) and
+		   near-white (light theme), so it always contrasts well
+		   against the accent fill — saves us inventing a new
+		   token just for this badge. */
+		color: var(--m-bg);
+	}
+	.changes-badge.active:hover {
+		filter: brightness(1.1);
 	}
 	/* Compare-against-default-branch pill, sitting next to the
 	   change-count badge in the SCM header. Inactive state is a
