@@ -224,7 +224,21 @@ impl WorkspaceRegistry {
 					// row with (and nothing to deliver as a branch).
 					continue;
 				};
-				let wt_path = Utf8Path::new(&wt.path);
+				// Translate a container-shaped path (`/workspace/<base>/…`)
+				// to its host equivalent before any further test: an agent
+				// running inside the dev container can bypass the host-side
+				// `git worktree add --relative-paths` creation path (the
+				// `bash` tool can't intercept a raw git call) and burn
+				// absolute `/workspace/…` paths into the worktree's git
+				// links. The bind-mount layout is 1:1
+				// (`/workspace/<parent-basename>/…` ↔ `<host-parent>/…`), so
+				// the mapping is exact — and the repair below rewrites both
+				// link files to the relative form, after which host git can
+				// see the worktree again (git had already flagged it
+				// `prunable`).
+				let host_path =
+					crate::worktree::container_path_to_host(Utf8Path::new(&wt.path), Utf8Path::new(&parent.folder.path));
+				let wt_path = Utf8Path::new(&host_path);
 				let Ok(tail) = wt_path.strip_prefix(&parent.folder.path) else {
 					// Lives outside `<parent>/.worktrees/` — a
 					// user-made worktree; never adopt (see above).
@@ -238,15 +252,22 @@ impl WorkspaceRegistry {
 				if !wt_path.join(".git").exists() {
 					continue;
 				}
-				if self.folder_for_path(&wt.path).await.is_some() {
+				// Container-written absolute links don't resolve host-side;
+				// rewrite both ends to the relative form `--relative-paths`
+				// would have written. No-op for healthy links.
+				if let Err(e) = crate::worktree::repair_absolute_worktree_links(wt_path, Utf8Path::new(&parent.folder.path)) {
+					tracing::warn!(error = %e, worktree = %wt_path, "could not repair container-path worktree links");
+					continue;
+				}
+				if self.folder_for_path(host_path.as_str()).await.is_some() {
 					continue; // already bound (session.json restore or earlier pass)
 				}
 				match self
-					.add_worktree_folder(Utf8PathBuf::from(&wt.path), parent.folder.path.clone(), branch.clone())
+					.add_worktree_folder(host_path.clone(), parent.folder.path.clone(), branch.clone())
 					.await
 				{
-					Ok(_) => tracing::info!(worktree = %wt.path, branch = %branch, "adopted IDE-managed worktree from disk"),
-					Err(e) => tracing::warn!(error = %e, worktree = %wt.path, "could not adopt worktree from disk"),
+					Ok(_) => tracing::info!(worktree = %host_path, branch = %branch, "adopted IDE-managed worktree from disk"),
+					Err(e) => tracing::warn!(error = %e, worktree = %host_path, "could not adopt worktree from disk"),
 				}
 			}
 		}
@@ -641,6 +662,78 @@ mod tests {
 		// best-effort per folder.
 		registry.adopt_disk_worktrees().await;
 		assert_eq!(registry.snapshot().await.folders.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn adopt_disk_worktrees_repairs_container_path_links() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping adoption test");
+			return;
+		};
+		let dir = tempfile::TempDir::new().unwrap();
+		// The container mount maps `/workspace/<basename>` 1:1 onto the
+		// parent folder, so name the repo dir to match the links an
+		// in-container `git worktree add` burned in.
+		let repo = dir.path().join("moon-landing");
+		std::fs::create_dir(&repo).unwrap();
+		init_committed_repo(&git, &repo);
+		let wt_path = repo.join(".worktrees").join("feat-x");
+		// No `--relative-paths`: git writes absolute paths into both
+		// link files — on the host, absolute *host* paths.
+		run_git(
+			&git,
+			&repo,
+			&["worktree", "add", "-b", "feat/x", wt_path.to_str().unwrap()],
+		);
+		// Now simulate the container variant: rewrite both links to the
+		// `/workspace/moon-landing/…` absolute form an in-container add
+		// would have written. Host git can no longer resolve the
+		// worktree and reports its registered path with the container
+		// prefix.
+		std::fs::write(
+			wt_path.join(".git"),
+			"gitdir: /workspace/moon-landing/.git/worktrees/feat-x\n",
+		)
+		.unwrap();
+		std::fs::write(
+			repo.join(".git/worktrees/feat-x/gitdir"),
+			"/workspace/moon-landing/.worktrees/feat-x/.git\n",
+		)
+		.unwrap();
+		let listed = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(&repo)
+			.args(["worktree", "list", "--porcelain"])
+			.output()
+			.unwrap();
+		assert!(
+			String::from_utf8_lossy(&listed.stdout).contains("/workspace/moon-landing"),
+			"git should report the container path: {}",
+			String::from_utf8_lossy(&listed.stdout)
+		);
+
+		let parent_path = Utf8PathBuf::from_path_buf(repo.canonicalize().unwrap()).unwrap();
+		let registry = test_registry();
+		registry.add_folder(parent_path.clone()).await.unwrap();
+
+		registry.adopt_disk_worktrees().await;
+
+		let snap = registry.snapshot().await;
+		let wt = snap
+			.folders
+			.iter()
+			.find(|f| matches!(&f.origin, FolderOrigin::Worktree { branch, .. } if branch == "feat/x"))
+			.expect("container-created worktree should be adopted after repair");
+		assert_eq!(wt.path, wt_path.to_str().unwrap());
+		// Both links now resolve host-side.
+		assert_eq!(
+			std::fs::read_to_string(wt_path.join(".git")).unwrap(),
+			"gitdir: ../../.git/worktrees/feat-x\n"
+		);
+		assert_eq!(
+			std::fs::read_to_string(repo.join(".git/worktrees/feat-x/gitdir")).unwrap(),
+			"../../../.worktrees/feat-x/.git\n"
+		);
 	}
 
 	#[tokio::test]

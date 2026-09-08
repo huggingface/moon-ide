@@ -2002,16 +2002,19 @@ Staleness is also **reconciled without a click**
 end of every coder turn, a bound worktree folder whose checkout is
 gone from disk is forgotten, unbound, and announced via
 `WorkspaceFoldersChanged` — so a `git worktree remove` run through
-`bash` drops out of the project bar when the turn ends. Startup
-restore skips (and forgets) a persisted worktree folder whose
-checkout vanished while the IDE was closed, instead of re-binding a
-dead row.
+`bash` drops out of the project bar when the turn ends. The same
+moment also **adopts** checkouts added out-of-band (terminal, or an
+in-container `git worktree add`) via the disk sweep below, announced
+through the same event. Startup restore skips (and forgets) a
+persisted worktree folder whose checkout vanished while the IDE was
+closed, instead of re-binding a dead row.
 
 **Disk is the source of truth for worktree rows**
 ([ADR 0079](decisions/0079-worktree-adoption-from-disk.md)): at
-startup and on every folder-add, each bound project folder sweeps
-`git worktree list` for checkouts under its `.worktrees/` and binds
-any that aren't bound yet (branch label from git). A corrupted
+startup, on every folder-add, and at every coder turn end, each bound
+project folder sweeps `git worktree list` for checkouts under its
+`.worktrees/` and binds any that aren't bound yet (branch label from
+git). A corrupted
 `session.json` — or a checkout whose owning session was deleted —
 no longer strands the row: it reappears in the folder bar, where
 `×` deletes it and the merge button lands it. Worktrees the user
@@ -2019,6 +2022,21 @@ created outside `.worktrees/` are never adopted (`×` deletes; it
 must never aim at a user-made checkout), detached-HEAD worktrees are
 skipped, and a persisted-but-dead binding is still dropped as above.
 The sweep never changes the active folder and never fails startup.
+
+**Container-written absolute links are repaired on adoption.** An
+agent inside the dev container can bypass the host-side
+`git worktree add --relative-paths` creation path (the `bash` tool
+can't intercept a raw git call) and burn absolute `/workspace/…`
+paths into both git link files — the checkout's `.git` pointer and
+the metadata `gitdir`. Host git then can't resolve the worktree at
+all (it flags it `prunable`), and its `worktree list` reports the
+container path. Because the bind-mount layout is 1:1
+(`/workspace/<parent-basename>/…` ↔ `<host-parent>/…`), the sweep
+translates a container-shaped reported path back to its host
+equivalent and rewrites both links to the relative form
+`--relative-paths` would have written, then adopts the row. A link
+naming anything outside the parent's mount is left alone — it may be
+valid, and rewriting a link we can't place would corrupt it.
 
 #### The worktree button is context-aware
 

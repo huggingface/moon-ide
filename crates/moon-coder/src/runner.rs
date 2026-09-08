@@ -6009,8 +6009,18 @@ fn spawn_turn_loop(
 				// A turn's `bash` can remove a worktree checkout behind the
 				// registry's back (ADR 0063) — reconcile on every exit path
 				// so the project bar drops dead rows at turn end instead of
-				// waiting for a manual unbind.
-				if !prune_missing_worktrees(&state).await.is_empty() {
+				// waiting for a manual unbind. Symmetrically, an out-of-band
+				// `git worktree add` into a bound folder's `.worktrees/`
+				// (terminal, or an in-container agent that bypassed the
+				// host-side creation path) lands the row at the same moment:
+				// adoption is disk-based (ADR 0079) and repairs
+				// container-path links (ADR 0080). Both announce through the
+				// same event; the folder bar re-reads the snapshot either way.
+				let pruned = prune_missing_worktrees(&state).await;
+				let bound_before = state.workspaces.folders().await.len();
+				state.workspaces.adopt_disk_worktrees().await;
+				let adopted = state.workspaces.folders().await.len() > bound_before;
+				if !pruned.is_empty() || adopted {
 					sink_for_turn.send(CoderEvent::WorkspaceFoldersChanged);
 				}
 				if auto_rename_after {

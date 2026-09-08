@@ -30,13 +30,14 @@ guarantees the pair stays in sync.
 ## Decision
 
 **Disk is the source of truth for worktree rows.** At workspace
-startup (desktop `restore_session` and `moon-remote serve`), and on
-every `workspace_open_local`, the registry sweeps each bound
-non-worktree folder for worktrees git lists under
-`<parent>/.worktrees/` (the IDE-managed location, ADR 0029) and binds
-any that aren't bound yet, with the branch git reports. Rows
-reappear; the `×` (delete, per the user's rule: removing a worktree
-means deleting it) and the merge button work on them immediately.
+startup (desktop `restore_session` and `moon-remote serve`), on
+every `workspace_open_local`, and at every coder turn end (alongside
+ADR 0063's prune — a turn is when out-of-band adds are most likely),
+the registry sweeps each bound non-worktree folder for worktrees git
+lists under `<parent>/.worktrees/` (the IDE-managed location, ADR 0029) and binds any that aren't bound yet, with the branch git
+reports. Rows reappear; the `×` (delete, per the user's rule:
+removing a worktree means deleting it) and the merge button work on
+them immediately.
 
 `session.json` remains the restore path for ordinary (user-picked)
 folders and for the per-folder UI state (open tabs, terminals,

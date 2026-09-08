@@ -30,15 +30,20 @@ appear or be observed:
   deterministic path), unbind the folder, clear the worktree routing
   on sessions that pointed there, and emit
   `WorkspaceFoldersChanged`. This makes agent-driven `bash` removal
-  harmless: the row disappears when the turn ends.
+  harmless: the row disappears when the turn ends. The same pass runs
+  ADR 0079's adoption sweep, so an out-of-band `git worktree add`
+  lands its row at the same moment through the same event.
 - **Startup restore.** A persisted worktree folder whose checkout is
   gone from disk is skipped (like the orphan-parent case) and its git
   metadata forgotten, instead of re-binding a dead row.
 
 A checkout removed in a terminal while the IDE sits idle still shows
 until the next turn ends, the folder is re-fetched, or the user
-clicks `×` (which ADR 0044 made succeed silently). Cost: one stat per
-bound worktree folder per turn.
+clicks `×` (which ADR 0044 made succeed silently); a checkout _added_
+in a terminal appears at the next turn end via the same pass. Cost:
+one stat per bound worktree folder per turn, plus the adoption
+sweep's `git worktree list` per bound repo (negligible next to the
+turn's own round-trips).
 
 ## Rejected alternatives
 
