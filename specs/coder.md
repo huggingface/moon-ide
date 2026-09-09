@@ -2249,3 +2249,10 @@ resolved off the owning assistant`s tool_calls for synthesized
   untouched, and reload also upconverts stored WebP→PNG so
   already-stuck sessions recover. The byte budget elision still
   guards the HF wire independently.
+- **Sessions-list fold is payload-free**: the summary fold
+  classifies each line from the raw `Value` (role / customType /
+  title / has-toolCalls) instead of running `pi_wire_to_records`,
+  which built an `ImageAttachment` (base64 copy) per tool-result
+  image. That dominated the fold on image-heavy sessions — 57
+  sessions went from ~8 s to ~0.25 s. The summary needs record kind,
+  title, and tool-call presence only.

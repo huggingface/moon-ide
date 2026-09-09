@@ -2243,37 +2243,59 @@ async fn fold_summary_state(
 		let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
 			continue;
 		};
-		for record in pi_wire_to_records(&value) {
-			match record {
-				SessionRecord::TitleUpdate { title } => {
-					header.title = title;
+		// Classify from the raw Value rather than `pi_wire_to_records`:
+		// the typed conversion builds `ImageAttachment`s (base64 copies)
+		// for every tool-result image in the transcript, which dominates
+		// the fold on image-heavy sessions. The summary only needs the
+		// record kind, a title, and whether an assistant has tool_calls —
+		// none of which touch the payload.
+		let msg = value.get("message").unwrap_or(&value);
+		let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+		match role {
+			"user" => {
+				last_error = false;
+				interrupted = true;
+			}
+			"assistant" => {
+				last_error = false;
+				// Tool calls pending → the turn expected to continue; a
+				// plain answer settles it. The pi-mono assistant message
+				// carries tool calls as `content` blocks of type
+				// `toolCall`.
+				let has_tool_calls = msg
+					.get("content")
+					.and_then(|c| c.as_array())
+					.map(|blocks| {
+						blocks
+							.iter()
+							.any(|b| b.get("type").and_then(|v| v.as_str()) == Some("toolCall"))
+					})
+					.unwrap_or(false);
+				interrupted = has_tool_calls;
+			}
+			"toolResult" => {
+				last_error = false;
+				interrupted = true;
+			}
+			"custom" => match msg.get("customType").and_then(|v| v.as_str()) {
+				Some(CUSTOM_TYPE_TITLE_UPDATE) => {
+					if let Some(title) = msg.get("details").and_then(|d| d.get("title")).and_then(|v| v.as_str()) {
+						header.title = title.to_string();
+					}
 				}
-				SessionRecord::Error { .. } => {
+				Some(CUSTOM_TYPE_ERROR) => {
 					last_error = true;
 					// A persisted error is a *settled* end state —
 					// surfaced via `last_error`, not both flags.
 					interrupted = false;
 				}
-				SessionRecord::User { .. } => {
-					last_error = false;
-					interrupted = true;
-				}
-				SessionRecord::Assistant { ref tool_calls, .. } => {
-					last_error = false;
-					// Tool calls pending → the turn expected to
-					// continue; a plain answer settles it.
-					interrupted = !tool_calls.is_empty();
-				}
-				SessionRecord::Tool { .. } => {
-					last_error = false;
-					// Result landed but the follow-up round-trip
-					// never did.
-					interrupted = true;
-				}
-				SessionRecord::Compaction { .. } => {
-					last_error = false;
-				}
 				_ => {}
+			},
+			_ => {
+				// A compaction row (`type` at the envelope top level).
+				if value.get("type").and_then(|v| v.as_str()) == Some(PI_COMPACTION_TYPE) {
+					last_error = false;
+				}
 			}
 		}
 	}
