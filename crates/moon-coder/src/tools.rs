@@ -900,6 +900,14 @@ impl ToolRegistry {
 		&self.mcp
 	}
 
+	/// Currently-bound workspace folders. Exposed for the nested
+	/// sub-agent dispatch inside the sub-agent loop, which has no
+	/// `CoderState` handle but still needs to resolve a `folder`
+	/// argument against the live bound set.
+	pub(crate) async fn bound_folders(&self) -> Vec<Arc<WorkspaceFolderEntry>> {
+		self.workspaces.folders().await
+	}
+
 	/// Shared [`WebClient`]. Exposed so the Tauri command layer can
 	/// expose the keyring-backed Tavily key surface (status / set /
 	/// clear) without needing its own keyring entry.

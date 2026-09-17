@@ -402,6 +402,13 @@ class SessionViewState {
 	attentionPending = $state(false);
 	activeSession = $state<CoderSessionSummary | null>(null);
 	viewSubagentId = $state<string | null>(null);
+	/** Pop-out navigation trail: sub-agent ids underneath the one in
+	 *  `viewSubagentId`. Non-empty only when the user drilled from an
+	 *  outer sub-agent's pop-out into a nested research sub-agent's
+	 *  card (ADR 0081) — "← Back" then unwinds one level at a time
+	 *  instead of jumping straight to the parent session. Plain
+	 *  array (not `$state`): only read inside navigation calls. */
+	subagentViewStack: string[] = [];
 	subagentSummaries = $state<Map<string, SubagentSummary>>(new Map());
 	subagentTranscripts = $state<Map<string, SubagentTranscript>>(new Map());
 	draft = $state('');
@@ -2089,6 +2096,7 @@ export class CoderPanelState {
 		session.subagentSummaries = new Map();
 		session.subagentTranscripts = new Map();
 		session.viewSubagentId = null;
+		session.subagentViewStack = [];
 		session.busy = false;
 		session.awaitingInput = false;
 		session.tokenUsage = null;
@@ -3681,6 +3689,7 @@ export class CoderPanelState {
 				session.subagentSummaries = new Map();
 				session.subagentTranscripts = new Map();
 				session.viewSubagentId = null;
+				session.subagentViewStack = [];
 				session.busy = false;
 				// Reset before replay. A live-parked `ask_user`
 				// re-emits its `tool_call` (with no `tool_result`)
@@ -4014,6 +4023,11 @@ export class CoderPanelState {
 		if (!this.subagentTranscripts.has(subagentId)) {
 			return;
 		}
+		// Drilling into a nested card from an already-open pop-out
+		// pushes the outer id so "← Back" unwinds level by level.
+		if (this.viewSubagentId !== null && this.viewSubagentId !== subagentId) {
+			this.currentSession.subagentViewStack.push(this.viewSubagentId);
+		}
 		this.viewSubagentId = subagentId;
 		this.view = 'subagent';
 	}
@@ -4037,11 +4051,17 @@ export class CoderPanelState {
 		await this.openSession(sessionId);
 	}
 
-	/** Return from a sub-agent pop-out to the parent's session
-	 *  transcript. Keeps the sub-agent's state in
-	 *  `subagentTranscripts` so re-opening the same card lands at
-	 *  the same place. */
+	/** Return from a sub-agent pop-out one navigation level: to the
+	 *  outer sub-agent's pop-out when the user drilled into a nested
+	 *  card, else to the parent's session transcript. Keeps the
+	 *  sub-agent's state in `subagentTranscripts` so re-opening the
+	 *  same card lands at the same place. */
 	closeSubagentView(): void {
+		const outer = this.currentSession.subagentViewStack.pop();
+		if (outer !== undefined && this.subagentTranscripts.has(outer)) {
+			this.viewSubagentId = outer;
+			return;
+		}
 		this.viewSubagentId = null;
 		this.view = 'session';
 	}

@@ -1681,6 +1681,23 @@ work.)
 
 Top-level sessions are always `agent`; mode is a sub-agent concept.
 
+### Nested sub-agents ([ADR 0081](decisions/0081-nested-research-subagents.md))
+
+An `agent`-mode sub-agent gets a **trimmed `task`** of its own:
+research-only (no `mode`), synchronous-only (no `detach`), no
+`system_prompt` override — just `task` + optional `folder`. This gives
+delegated refactors the same context-preservation lever the parent
+has for read-heavy legwork. Depth is capped at 2 by tool-list shape:
+`research` sub-agents never see the tool. A nested call passing
+`mode: "agent"` or `detach: true` errors (actionable, not coerced).
+Nested calls dispatch sequentially (the sub-agent loop has no
+homogeneous-batch path); the nested run's cancel token is a child of
+the outer's, so aborts cascade all the way down. Nested spawns emit
+the same top-level `SubagentSpawned` / `SubagentFinished` events and
+single-wrapped `SubagentEvent`s as depth-1 runs, so the pop-out hosts
+a collapsed card under the outer transcript's `task` row and "← Back"
+unwinds one level at a time.
+
 ### Folder targeting
 
 Sub-agents target one already-bound folder (basename, or absolute
@@ -1720,8 +1737,10 @@ parking the turn behind a blocking call. It's the async counterpart to
 the synchronous default, for slow independent work (a long test suite,
 a background audit) whose report isn't needed before the parent's next
 step. Detached runs share everything else with synchronous ones: same
-modes, same folder targeting, same depth-1 cap (a detached sub-agent
-still can't spawn sub-sub-agents), same JSONL + collapsed card + pop-out.
+modes, same folder targeting, same nested-delegation rules
+(§ Nested sub-agents — a detached `agent` run may spawn nested
+research sub-agents, which are themselves always synchronous), same
+JSONL + collapsed card + pop-out.
 
 The lifecycle surface:
 
@@ -1772,6 +1791,14 @@ so only top-level sessions land in the picker; "open trace" routes
 `sub-...` ids through a scan of parent subdirs. The header carries
 `parent_session_id` + `parent_tool_call_id` + `subagent_mode` (and
 `subagent_target_folder` when it differs from the parent's).
+
+Nested sub-agents ([ADR 0081](decisions/0081-nested-research-subagents.md))
+reuse the top-level `parent_session_id`, so their JSONLs land **flat
+in the same directory** as the outer's — no nested subdirs, and
+deletion with the parent covers them for free. The nested
+`SubagentSpawned` / `SubagentFinished` records go into the **outer
+sub-agent's** JSONL (where the spawning `task` tool call lives);
+replay recurses through them one level.
 
 ### UI
 
@@ -1890,8 +1917,9 @@ a sub-agent against the target folder is the way to search or run
 commands elsewhere. `grep` validates that its root directory exists
 and errors loudly otherwise (a scratch session's root is real, but a
 bad one must not read as "0 matches"). Sub-agents share the registry,
-so the same rules apply to them; depth=1 is enforced by omitting
-`task` from their tool list.
+so the same rules apply to them; depth is capped at 2 by tool-list
+shape — `agent`-mode sub-agents see only the trimmed research-only
+`task`, `research` sub-agents see none ([ADR 0081](decisions/0081-nested-research-subagents.md)).
 
 ### Project-bar git status: surgical refresh
 
@@ -2193,7 +2221,10 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
   prompts wait for a concrete need.
 - **Per-sub-agent abort UI** — parent abort cascades to all live
   sub-agents; individual cancel buttons wait for a real need.
-- **Depth ≥ 2 sub-sub-agents** — hardcoded depth=1 cap.
+- **Depth ≥ 3 sub-agent trees** — `agent`-mode sub-agents may spawn
+  nested `research` sub-agents ([ADR 0081](decisions/0081-nested-research-subagents.md));
+  anything deeper — or nested `agent` mode, detached nesting,
+  parallel nested batches — waits for a real need.
 - **Skill packages / installable skills** — file conventions only.
 - **Bucket browser** ("import session from bucket") — bucket is
   backup-only at first.

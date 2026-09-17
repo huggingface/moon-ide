@@ -3153,11 +3153,12 @@
 <!-- Row renderer extracted as a snippet so the parent's session
 	 transcript and the sub-agent pop-out can share it without
 	 duplicating ~80 lines of conditional markup. `inParentTranscript`
-	 gates the parent-only affordances: the inline collapsed card
-	 under `task` tool rows (sub-agents can't spawn sub-sub-agents —
-	 depth-1 cap) and the user-row revert/replay actions (those
-	 resolve ordinals against the parent session, so they'd be
-	 dead buttons on sub-agent rows). -->
+	 gates the parent-only affordances: the user-row revert/replay
+	 actions (those resolve ordinals against the parent session, so
+	 they'd be dead buttons on sub-agent rows). The inline collapsed
+	 card under `task` tool rows renders in both places — an
+	 agent-mode sub-agent can spawn nested research sub-agents
+	 (ADR 0081), so pop-out tool rows host cards too. -->
 {#snippet compactionMarkup(state: Extract<CoderRow, { kind: 'compaction' }>)}
 	<!-- Compaction disclosure rendered inline at the point the
 		 fold happened, so it scrolls away under later turns
@@ -3420,7 +3421,7 @@
 			<ToolBodyAskUser args={row.args} result={row.result} hasResult={row.hasResult} callId={row.id} />
 		</div>
 	{:else if row.kind === 'tool'}
-		{@const subagent = inParentTranscript ? (coder.subagentSummaries.get(row.id) ?? null) : null}
+		{@const subagent = coder.subagentSummaries.get(row.id) ?? null}
 		{@const elapsedMs = row.hasResult ? (row.durationMs ?? 0) : Math.max(0, nowTick - row.startedAt)}
 		{@const hint = toolHint(row.name, row.args)}
 		<div class="row tool" class:err={row.isError}>

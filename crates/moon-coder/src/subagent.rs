@@ -18,7 +18,7 @@
 //!
 //! Today's contract:
 //!
-//! - Mode is `Research` or `Coder`. `Research` blocks `write_file`
+//! - Mode is `Research` or `Agent`. `Research` blocks `write_file`
 //!   and `edit_file` at the dispatch boundary (see
 //!   [`ToolRegistry::dispatch`]); the "no mutation via `bash`" half
 //!   is behavioural and lives in the system prompt.
@@ -44,9 +44,11 @@
 //!   parent loop ([`crate::compaction::COMPACT_THRESHOLD`]); the
 //!   summary becomes a synthetic `system` message that replaces
 //!   the older prefix.
-//! - Depth cap: hardcoded to 1. The sub-agent's own tool list does
-//!   not include `task`, so a sub-agent literally cannot spawn a
-//!   sub-sub-agent.
+//! - Depth cap: 2, enforced by tool-list shape ([ADR 0081]).
+//!   `Agent`-mode sub-agents see a trimmed research-only `task`
+//!   (synchronous, no detach) so they can fan read-heavy legwork
+//!   out of their own context; `Research` sub-agents never see the
+//!   tool, so the tree bottoms out there.
 //! - User continuation: the pop-out composer steers a running
 //!   sub-agent mid-flight (queued, drained at the next iteration
 //!   top) and resumes a finished one with a follow-up (history
@@ -374,7 +376,7 @@ pub fn task_tool_definition() -> ToolDefinition {
 		"task",
 		"Delegate a self-contained task to a sub-agent and get back a single summarised string. Sub-agents run in their own context — you spend tokens on the task description and the final summary, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
 \
-The sub-agent has no access to your conversation history — describe the task self-containedly. Sub-agents cannot spawn further sub-agents.",
+The sub-agent has no access to your conversation history — describe the task self-containedly. An `agent`-mode sub-agent can itself delegate read-only investigations to nested `research` sub-agents; `research` sub-agents cannot delegate further.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -398,6 +400,35 @@ The sub-agent has no access to your conversation history — describe the task s
 				"detach": {
 					"type": "boolean",
 					"description": "When true, the call returns immediately with a `subagent_id` handle instead of blocking on the report: the sub-agent runs in the background, its finish wakes you with a notice, and you fetch the report with `task_collect(subagent_id)` (steer it mid-run with `task_steer`, or stop it with `task_abort`). Default false (synchronous). Prefer detach for slow, independent work you don't need the answer to before continuing — long test suites, background audits."
+				}
+			},
+			"required": ["task"]
+		}),
+	)
+}
+
+/// Trimmed `task` variant advertised to **`agent`-mode sub-agents**
+/// ([ADR 0081]): research-only (no `mode`), synchronous-only (no
+/// `detach`), no `system_prompt` override. Nested sub-agents give a
+/// delegated refactor the same context-preservation lever the
+/// parent has for its read-heavy legwork; the depth stops at 2
+/// because `research` mode never advertises the tool.
+pub(crate) fn nested_task_tool_definition() -> ToolDefinition {
+	ToolDefinition::function(
+		"task",
+		"Delegate a self-contained read-only investigation to a research sub-agent and get back a single summarised string. The sub-agent reads files, searches, and runs inspection commands, but cannot edit — use it when the answer is much smaller than the inputs (grep-then-read sweeps, \"find every callsite of X\", \"summarise this folder\") so the intermediate reads don't pollute your context. \
+\
+The sub-agent has no access to your conversation history — describe the task self-containedly. It cannot delegate further, and calls run synchronously (no detach).",
+		json!({
+			"type": "object",
+			"properties": {
+				"task": {
+					"type": "string",
+					"description": "Self-contained description of what the research sub-agent should investigate. Include any context it needs — it does not see your transcript."
+				},
+				"folder": {
+					"type": "string",
+					"description": "Basename of a currently-bound workspace folder to scope the sub-agent against. Omit to target your own working folder."
 				}
 			},
 			"required": ["task"]
@@ -493,6 +524,36 @@ pub(crate) async fn run_subagent(
 	spec: Subagent,
 	cancel: CancellationToken,
 ) -> Result<SubagentReport, CoderError> {
+	// JSONL transcript lives under the **parent** folder's slug,
+	// nested inside a per-parent-session subdirectory:
+	// `<sessions_dir>/<parent_session_id>/<sub-id>.jsonl`. Sub-agents
+	// belong to whichever project originated them, and grouping by
+	// parent session means listing the sessions dir flat returns
+	// only top-level sessions (the picker stays clean) while
+	// `<parent_id>/` keeps every sub-agent that ran during that
+	// conversation in one obvious spot. The header carries
+	// `target_folder` as metadata so the UI can still show which
+	// folder the sub-agent was scoped to.
+	let parent_dir = sessions_dir(coder_sessions_dir, spec.parent_folder.as_path());
+	let session_dir = subagent_session_dir(&parent_dir, &spec.parent_session_id);
+	run_subagent_in_dir(tools, inference, sink, models, spec, session_dir, cancel).await
+}
+
+/// [`run_subagent`] body with the session directory already
+/// resolved. Split out so nested spawns ([ADR 0081]) — which run
+/// deep inside an outer sub-agent's loop where `coder_sessions_dir`
+/// isn't threaded — can reuse the outer's directory directly (both
+/// carry the same top-level `parent_session_id`, so their JSONLs
+/// land flat in the same place).
+async fn run_subagent_in_dir(
+	tools: &ToolRegistry,
+	inference: &InferenceClient,
+	sink: &FolderEventSink,
+	models: &SharedCoderModels,
+	spec: Subagent,
+	session_dir: Utf8PathBuf,
+	cancel: CancellationToken,
+) -> Result<SubagentReport, CoderError> {
 	let id = spec.id.clone();
 	let mode = spec.mode;
 	// Open the steer channel before announcing the spawn, so the
@@ -539,18 +600,6 @@ pub(crate) async fn run_subagent(
 		ChatMessage::user(spec.task.clone()),
 	];
 
-	// JSONL transcript lives under the **parent** folder's slug,
-	// nested inside a per-parent-session subdirectory:
-	// `<sessions_dir>/<parent_session_id>/<sub-id>.jsonl`. Sub-agents
-	// belong to whichever project originated them, and grouping by
-	// parent session means listing the sessions dir flat returns
-	// only top-level sessions (the picker stays clean) while
-	// `<parent_id>/` keeps every sub-agent that ran during that
-	// conversation in one obvious spot. The header carries
-	// `target_folder` as metadata so the UI can still show which
-	// folder the sub-agent was scoped to.
-	let parent_dir = sessions_dir(coder_sessions_dir, spec.parent_folder.as_path());
-	let session_dir = subagent_session_dir(&parent_dir, &spec.parent_session_id);
 	let now = current_time_ms();
 	// `subagent_target_folder` is `Some(...)` only when the
 	// sub-agent operated against a folder different from the
@@ -866,11 +915,14 @@ async fn run_subagent_loop(
 		mut todos,
 	} = state;
 
-	// The sub-agent's tool list deliberately omits `task`. That's
-	// how the depth=1 cap is enforced: a sub-agent literally cannot
-	// describe a sub-sub-agent because the model never sees the
-	// tool.
+	// Depth is enforced by tool-list shape: `agent`-mode sub-agents
+	// get the trimmed research-only `task` ([ADR 0081]) so they can
+	// fan read-heavy legwork out of their own context; `research`
+	// sub-agents never see the tool, which caps the tree at depth 2.
 	let mut tool_defs = tools.definitions();
+	if spec.mode == CoderMode::Agent {
+		tool_defs.push(nested_task_tool_definition());
+	}
 	// MCP meta-tools ride along when the workspace has enabled
 	// servers — a sub-agent driving playwright against its target
 	// folder's dev server is a natural delegation.
@@ -947,6 +999,10 @@ async fn run_subagent_loop(
 		// request, so the model slug must come from the same
 		// generation or a provider switch mid-run pairs the old
 		// provider's slug with the new provider's endpoint.
+		// (`shared_models` keeps the live handle reachable for the
+		// nested-`task` dispatch below, which threads it into the
+		// nested run so *its* per-round-trip snapshots stay fresh.)
+		let shared_models = models;
 		let models = models.read().await.clone();
 		let standard_model = models.standard().to_owned();
 		let pi_model = models.resolve_route().pi_provider_model(&standard_model);
@@ -1257,6 +1313,23 @@ async fn run_subagent_loop(
 				// (`todos`), so it can't go through the stateless
 				// registry dispatch.
 				handle_subagent_todo_write(&mut todos, &args, session_dir, header).await
+			} else if call.function.name == "task" && spec.mode == CoderMode::Agent {
+				// Nested research sub-agent ([ADR 0081]). Research
+				// mode falls through to the registry's UnknownTool
+				// error — it never saw the tool advertised.
+				handle_nested_task(
+					tools,
+					inference,
+					sink,
+					shared_models,
+					spec,
+					session_dir,
+					header,
+					&cancel,
+					&call.id,
+					&args,
+				)
+				.await
 			} else {
 				tools
 					.dispatch_with_call_id(&call.function.name, &args, &cx, &cancel, &call.id)
@@ -1342,6 +1415,118 @@ async fn run_subagent_loop(
 		mode: spec.mode,
 		iterations_used: MAX_TURN_ITERATIONS as u32,
 	})
+}
+
+/// Dispatch a nested `task` call from an `agent`-mode sub-agent
+/// ([ADR 0081]). Nested sub-agents are research-only and
+/// synchronous: rejecting `mode: "agent"` / `detach: true` (rather
+/// than silently coercing) surfaces the constraint to a model that
+/// assumed the parent's full `task` surface. The nested run reuses
+/// the outer's session directory and top-level `parent_session_id`,
+/// so its JSONL lands flat next to the outer's and the parent-side
+/// replay finds it with the same lookup; the spawn/finish records go
+/// into the **outer's** JSONL so replay reconstructs the card at the
+/// right spot in the outer transcript.
+#[allow(clippy::too_many_arguments)]
+async fn handle_nested_task(
+	tools: &ToolRegistry,
+	inference: &InferenceClient,
+	sink: &FolderEventSink,
+	models: &SharedCoderModels,
+	outer: &Subagent,
+	session_dir: &Utf8Path,
+	header: &SessionHeader,
+	cancel: &CancellationToken,
+	tool_call_id: &str,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	validate_nested_task_args(args)?;
+	let bound = tools.bound_folders().await;
+	let mut nested = build_subagent_spec(
+		outer.parent_session_id.clone(),
+		tool_call_id.to_string(),
+		outer.parent_folder.clone(),
+		args,
+		&outer.folder,
+		&bound,
+	)?;
+	// The nested schema has no `mode` (validated above), so the
+	// spec builder's `agent` default must be overridden here.
+	nested.mode = CoderMode::Research;
+	let nested_id = nested.id.clone();
+	persist_subagent(
+		session_dir,
+		header,
+		&SessionRecord::SubagentSpawned {
+			tool_call_id: tool_call_id.to_string(),
+			subagent_id: nested_id.clone(),
+			target_folder: nested.folder.folder.path.clone(),
+			mode: nested.mode.as_wire().to_string(),
+			worktree_root: None,
+			worker: false,
+			detached: false,
+		},
+	)
+	.await;
+	// Child token: aborting the outer cascades into the nested run,
+	// same as the parent-turn → sub-agent cascade one level up.
+	// `Box::pin` breaks the async recursion cycle
+	// (`run_subagent_in_dir` → loop → here → `run_subagent_in_dir`).
+	let outcome = Box::pin(run_subagent_in_dir(
+		tools,
+		inference,
+		sink,
+		models,
+		nested,
+		session_dir.to_path_buf(),
+		cancel.child_token(),
+	))
+	.await;
+	let finished_record = match &outcome {
+		Ok(report) => SessionRecord::SubagentFinished {
+			subagent_id: nested_id,
+			tokens_used_estimate: report.tokens_used_estimate,
+			was_error: false,
+			result_preview: crate::runner::result_preview_from(&report.result),
+		},
+		Err(_) => SessionRecord::SubagentFinished {
+			subagent_id: nested_id,
+			tokens_used_estimate: 0,
+			was_error: true,
+			result_preview: None,
+		},
+	};
+	persist_subagent(session_dir, header, &finished_record).await;
+	let report = outcome?;
+	// Same result payload shape as the parent's `handle_task`.
+	Ok(json!({
+		"result": report.result,
+		"sub_session_id": report.sub_session_id,
+		"tokens_used_estimate": report.tokens_used_estimate,
+		"mode": report.mode.as_wire(),
+		"iterations_used": report.iterations_used,
+	}))
+}
+
+/// Reject nested-`task` args that assume the parent's full surface.
+/// Split out of [`handle_nested_task`] for testability.
+fn validate_nested_task_args(args: &Value) -> Result<(), CoderError> {
+	match args.get("mode").and_then(Value::as_str) {
+		None | Some("research") => {}
+		Some(_) => {
+			return Err(CoderError::invalid_args(
+				"task",
+				"nested sub-agents are research-only — a sub-agent cannot spawn an `agent`-mode sub-agent",
+			));
+		}
+	}
+	if args.get("detach").and_then(Value::as_bool).unwrap_or(false) {
+		return Err(CoderError::invalid_args(
+			"task",
+			"nested sub-agents cannot be detached — the call blocks until the research report is ready",
+		));
+	}
+	Ok(())
 }
 
 /// Final tools-disabled round-trip the sub-agent runs after its
@@ -1687,7 +1872,9 @@ Return your findings as a single coherent text result when you finish. The paren
 
 const AGENT_SYSTEM_PROMPT: &str = r#"You are an agent sub-agent inside moon-ide. You have been spawned by a parent agent to perform a focused task in a workspace folder. Your capabilities are the same as the parent's — you can read, search, run commands, and edit files freely.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `read_process`, `stop_process`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `read_process`, `stop_process`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it.
+
+You can delegate self-contained read-only investigations to nested research sub-agents via the `task` tool — useful when the answer is much smaller than the inputs (grep-then-read sweeps, "find every callsite of X"). Nested sub-agents are research-only, run synchronously, and cannot delegate further.
 
 Read before you edit — don't invent file paths. Use `edit_file` for surgical changes inside large files; reach for `write_file` for new files and whole-file rewrites.
 
@@ -1964,6 +2151,26 @@ mod tests {
 		// Sub-agent's persistence still belongs to the **parent's**
 		// folder slug, not the target's.
 		assert_eq!(spec.parent_folder, parent_folder_for(&folders, 0));
+	}
+
+	#[test]
+	fn nested_task_args_reject_agent_mode_and_detach() {
+		assert!(validate_nested_task_args(&make_args(r#"{ "task": "x" }"#)).is_ok());
+		assert!(validate_nested_task_args(&make_args(r#"{ "task": "x", "mode": "research" }"#)).is_ok());
+		let err = validate_nested_task_args(&make_args(r#"{ "task": "x", "mode": "agent" }"#)).unwrap_err();
+		assert!(matches!(err, CoderError::InvalidToolArgs { .. }), "got {err:?}");
+		let err = validate_nested_task_args(&make_args(r#"{ "task": "x", "detach": true }"#)).unwrap_err();
+		assert!(matches!(err, CoderError::InvalidToolArgs { .. }), "got {err:?}");
+	}
+
+	#[test]
+	fn nested_task_tool_definition_omits_parent_only_surface() {
+		let def = nested_task_tool_definition();
+		let params = serde_json::to_value(&def).unwrap();
+		let text = params.to_string();
+		assert!(!text.contains("\"detach\""));
+		assert!(!text.contains("\"system_prompt\""));
+		assert!(!text.contains("\"mode\""));
 	}
 
 	#[test]

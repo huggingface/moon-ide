@@ -7311,7 +7311,7 @@ async fn handle_task(
 /// We keep the full string instead of the panel's two-line cap so a
 /// future "expanded preview" surface doesn't need a re-derivation
 /// pass; `None` for empty results.
-fn result_preview_from(result: &str) -> Option<String> {
+pub(crate) fn result_preview_from(result: &str) -> Option<String> {
 	let trimmed = result.trim();
 	if trimmed.is_empty() {
 		return None;
@@ -7526,6 +7526,11 @@ async fn handle_task_detached(
 		"detached": true,
 		"subagent_id": subagent_id,
 		"status": "running",
+		// Nudge against busy-polling: the finish feeder wakes the
+		// parent (even across turns), so the model can park the
+		// handle and end its turn instead of spinning on
+		// `task_collect`.
+		"hint": "you will be notified when this run finishes — keep working or end your turn; only call task_collect(wait_ms) if you need the result before continuing",
 	}))
 }
 
@@ -10987,10 +10992,18 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 /// `<sub_dir>/<subagent_id>.jsonl` and skip gracefully if it's
 /// missing (manual deletion, partial write, older session that
 /// pre-dated subagent persistence).
+///
+/// Recurses one level for nested sub-agents ([ADR 0081]): an
+/// `agent`-mode sub-agent's JSONL carries `SubagentSpawned` /
+/// `SubagentFinished` records for the research sub-agents it
+/// delegated to, and their transcripts live flat in the same
+/// `sub_dir`. Boxed return type because async recursion needs the
+/// indirection (same shape as [`Coder::open_session_boxed`]); the
+/// depth-2 cap bounds the recursion in practice.
 #[allow(clippy::too_many_arguments)]
-async fn replay_subagent_spawned(
-	out: &mut Vec<CoderEvent>,
-	sub_dir: &Utf8Path,
+fn replay_subagent_spawned<'a>(
+	out: &'a mut Vec<CoderEvent>,
+	sub_dir: &'a Utf8Path,
 	tool_call_id: String,
 	subagent_id: String,
 	target_folder: String,
@@ -10999,72 +11012,130 @@ async fn replay_subagent_spawned(
 	worker: bool,
 	detached: bool,
 	still_running: bool,
-) {
-	out.push(CoderEvent::SubagentSpawned {
-		tool_call_id,
-		subagent_id: subagent_id.clone(),
-		target_folder,
-		mode,
-		worktree_root,
-		worker,
-		detached,
-	});
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+	Box::pin(async move {
+		out.push(CoderEvent::SubagentSpawned {
+			tool_call_id,
+			subagent_id: subagent_id.clone(),
+			target_folder,
+			mode,
+			worktree_root,
+			worker,
+			detached,
+		});
 
-	let loaded = match sessions::load(sub_dir, &subagent_id).await {
-		Ok(loaded) => loaded,
-		Err(err) => {
-			tracing::warn!(?err, %subagent_id, "skipping sub-agent transcript replay (load failed)");
+		let loaded = match sessions::load(sub_dir, &subagent_id).await {
+			Ok(loaded) => loaded,
+			Err(err) => {
+				tracing::warn!(?err, %subagent_id, "skipping sub-agent transcript replay (load failed)");
+				return;
+			}
+		};
+		let orphan_tool_call_ids = sessions::orphan_tool_call_ids(&loaded.records);
+		// Nested runs whose finish record landed are settled regardless
+		// of whether this (outer) sub-agent is still running.
+		let finished_nested_ids: std::collections::HashSet<String> = loaded
+			.records
+			.iter()
+			.filter_map(|r| match r {
+				SessionRecord::SubagentFinished { subagent_id, .. } => Some(subagent_id.clone()),
+				_ => None,
+			})
+			.collect();
+		for (record, record_ts) in loaded.records.into_iter().zip(loaded.record_timestamps) {
+			match record {
+				// Nested sub-agent ([ADR 0081]): replay it exactly like
+				// a depth-1 one — top-level spawn/finish events plus its
+				// own wrapped transcript, loaded from the same flat dir.
+				SessionRecord::SubagentSpawned {
+					tool_call_id,
+					subagent_id: nested_id,
+					target_folder,
+					mode,
+					worktree_root,
+					worker,
+					detached,
+				} => {
+					let nested_still_running = still_running && !finished_nested_ids.contains(&nested_id);
+					replay_subagent_spawned(
+						out,
+						sub_dir,
+						tool_call_id,
+						nested_id,
+						target_folder,
+						mode,
+						worktree_root,
+						worker,
+						detached,
+						nested_still_running,
+					)
+					.await;
+				}
+				SessionRecord::SubagentFinished {
+					subagent_id: nested_id,
+					tokens_used_estimate,
+					was_error,
+					result_preview: _,
+				} => {
+					out.push(CoderEvent::SubagentFinished {
+						subagent_id: nested_id,
+						tokens_used_estimate,
+						was_error,
+					});
+				}
+				record => {
+					// Wrap each replayed event into a `SubagentEvent` so the
+					// frontend routes by `subagent_id` into the per-sub-agent
+					// transcript bucket. Skip records that have no
+					// transcript-shape (Usage, TodosUpdate, Compaction) —
+					// those only matter for live runtime / context
+					// reconstruction, not for the popped-out transcript.
+					let inners = subagent_replay_inners(record, record_ts);
+					for inner in inners {
+						out.push(CoderEvent::SubagentEvent {
+							subagent_id: subagent_id.clone(),
+							inner: Box::new(inner),
+						});
+					}
+				}
+			}
+		}
+		// Same orphan-recovery as the top-level path: a sub-agent
+		// killed mid-tool leaves its last `tool_call` without a
+		// `tool_result`, which the panel renders as a forever-
+		// running row. Synthesise the matching error result so the
+		// popped-out transcript settles into a clean done state.
+		// Not for a still-running sub-agent (`still_running`): its
+		// in-flight tools are orphans on disk but not interrupted —
+		// the live sub-agent's own events flip the rows as they land.
+		if still_running {
 			return;
 		}
-	};
-	let orphan_tool_call_ids = sessions::orphan_tool_call_ids(&loaded.records);
-	for (record, record_ts) in loaded.records.into_iter().zip(loaded.record_timestamps) {
-		// Wrap each replayed event into a `SubagentEvent` so the
-		// frontend routes by `subagent_id` into the per-sub-agent
-		// transcript bucket. Skip records that have no
-		// transcript-shape (Usage, TodosUpdate, Compaction,
-		// nested Subagent*) — those only matter for live
-		// runtime / context reconstruction, not for the popped-
-		// out transcript.
-		let inners = subagent_replay_inners(record, record_ts);
-		for inner in inners {
+		for orphan_id in orphan_tool_call_ids {
 			out.push(CoderEvent::SubagentEvent {
 				subagent_id: subagent_id.clone(),
-				inner: Box::new(inner),
+				inner: Box::new(CoderEvent::ToolResult {
+					id: orphan_id,
+					result: serde_json::json!({ "error": "Interrupted before tool completed." }),
+					is_error: true,
+					duration_ms: None,
+				}),
 			});
 		}
-	}
-	// Same orphan-recovery as the top-level path: a sub-agent
-	// killed mid-tool leaves its last `tool_call` without a
-	// `tool_result`, which the panel renders as a forever-
-	// running row. Synthesise the matching error result so the
-	// popped-out transcript settles into a clean done state.
-	// Not for a still-running sub-agent (`still_running`): its
-	// in-flight tools are orphans on disk but not interrupted —
-	// the live sub-agent's own events flip the rows as they land.
-	if still_running {
-		return;
-	}
-	for orphan_id in orphan_tool_call_ids {
-		out.push(CoderEvent::SubagentEvent {
-			subagent_id: subagent_id.clone(),
-			inner: Box::new(CoderEvent::ToolResult {
-				id: orphan_id,
-				result: serde_json::json!({ "error": "Interrupted before tool completed." }),
-				is_error: true,
-				duration_ms: None,
-			}),
-		});
-	}
+	})
 }
 
 /// Translate one sub-agent persisted record into the
 /// `CoderEvent`s the parent's panel feeds through
 /// `applyInnerEventToRows`. Returns an empty Vec for records that
-/// don't shape the transcript (Usage / TodosUpdate / Compaction /
-/// nested SubagentSpawned/Finished) — they'd be ignored by the
-/// frontend reducer anyway, but skipping them here keeps the IPC
-/// chatter down on a long-running sub-agent.
+/// don't shape the transcript (Usage / TodosUpdate / Compaction) —
+/// they'd be ignored by the frontend reducer anyway, but skipping
+/// them here keeps the IPC chatter down on a long-running
+/// sub-agent. Nested `SubagentSpawned` / `SubagentFinished` records
+/// never reach this function — [`replay_subagent_spawned`] handles
+/// them (recursing into the nested transcript) before falling
+/// through here; the empty-Vec arms below are just the safe default
+/// for any other caller.
 fn subagent_replay_inners(record: SessionRecord, created_at_ms: i64) -> Vec<CoderEvent> {
 	match record {
 		SessionRecord::WorkerDetached { .. } => Vec::new(),
