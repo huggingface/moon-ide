@@ -252,3 +252,19 @@ pub async fn project_compose_service_restart(
 	pc.restart_service(&service).await?;
 	snapshot_and_emit(&app, &folder_path, &pc).await
 }
+
+/// `docker compose up -d --no-deps --force-recreate --pull always
+/// <service>` — pull the latest image and recreate one service's
+/// container, leaving the rest of the project untouched.
+#[tauri::command]
+pub async fn project_compose_service_recreate(
+	app: AppHandle,
+	state: State<'_, AppState>,
+	folder_path: String,
+	service: String,
+) -> Result<ProjectComposeStatus, MoonError> {
+	let folder_path = Utf8PathBuf::from(folder_path);
+	let pc = require_project_handle(&state, &folder_path).await?;
+	pc.recreate_service(&service).await?;
+	snapshot_and_emit(&app, &folder_path, &pc).await
+}

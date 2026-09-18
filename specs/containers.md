@@ -163,6 +163,14 @@ The per-service "▶" runs `up -d --no-deps <service>`, not `start` —
 partially-failed `up`, while `up -d --no-deps` (re)creates and
 (re)joins the one service idempotently.
 
+The per-service "⤓" runs `up -d --no-deps --force-recreate --pull
+always <service>` — pull the latest image and recreate **one**
+container without bouncing the rest of the project. It exists
+because the intuitive alternative doesn't work: `docker compose
+restart` (the "↻") relaunches the _same_ container with the old
+image, so "pull then restart" is a no-op image-wise; only a
+recreate applies a fresh pull.
+
 ### Compose profiles ([ADR 0083](decisions/0083-compose-profiles.md))
 
 Services gated behind a compose `profiles:` list (moon-landing's

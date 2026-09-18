@@ -37,7 +37,7 @@ const PROJECT_COMPOSE_STATE_EVENT = 'project_compose:state';
 export type ProjectComposeProjectAction = 'up' | 'pause' | 'resume' | 'rebuild' | 'stop' | 'down';
 
 /** Per-service compose lifecycle verbs fired from a service row. */
-export type ProjectComposeServiceAction = 'service-start' | 'service-stop' | 'service-restart';
+export type ProjectComposeServiceAction = 'service-start' | 'service-stop' | 'service-restart' | 'service-recreate';
 
 export type ProjectComposeAction = ProjectComposeProjectAction | ProjectComposeServiceAction;
 
@@ -289,6 +289,16 @@ class ProjectComposeStateStore {
 	async restartService(folderPath: string, service: string): Promise<void> {
 		await this.#run(folderPath, { action: 'service-restart', service }, () =>
 			ipc.projectCompose.serviceRestart(folderPath, service),
+		);
+	}
+
+	/** Pull the service's latest image and force-recreate just its
+	 *  container (`up -d --no-deps --force-recreate --pull always
+	 *  <svc>`). A plain restart keeps the old image — this is the
+	 *  per-service counterpart to the project-wide Recreate. */
+	async recreateService(folderPath: string, service: string): Promise<void> {
+		await this.#run(folderPath, { action: 'service-recreate', service }, () =>
+			ipc.projectCompose.serviceRecreate(folderPath, service),
 		);
 	}
 

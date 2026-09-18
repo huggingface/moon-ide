@@ -207,6 +207,7 @@ pub fn run() {
 			commands::project_compose::project_compose_service_start,
 			commands::project_compose::project_compose_service_stop,
 			commands::project_compose::project_compose_service_restart,
+			commands::project_compose::project_compose_service_recreate,
 			commands::ports::ports_list,
 			commands::ports::ports_set,
 			commands::ports::ports_status,

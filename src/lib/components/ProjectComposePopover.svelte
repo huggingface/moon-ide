@@ -94,6 +94,8 @@
 				return inFlightService ? `Stopping ${inFlightService}…` : null;
 			case 'service-restart':
 				return inFlightService ? `Restarting ${inFlightService}…` : null;
+			case 'service-recreate':
+				return inFlightService ? `Pulling a fresh image and recreating ${inFlightService}…` : null;
 			default:
 				return null;
 		}
@@ -118,6 +120,13 @@
 	}
 	function canRestart(svc: ServiceStatus): boolean {
 		return svc.raw_state === 'running' || svc.raw_state === 'exited' || svc.raw_state === 'restarting';
+	}
+	// Per-service pull + force-recreate. Any state with a container
+	// qualifies (recreating an exited service starts it — that's
+	// what you want right after pulling); `absent` rows use ▶,
+	// which pulls anyway when the image is missing locally.
+	function canRecreate(svc: ServiceStatus): boolean {
+		return svc.raw_state !== 'absent';
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -285,6 +294,18 @@
 										onclick={() => projectCompose.restartService(folderPath, svc.name)}
 									>
 										↻
+									</button>
+								{/if}
+								{#if canRecreate(svc)}
+									<button
+										type="button"
+										class="svc-btn"
+										title="Pull the latest image and recreate {svc.name} (docker compose up -d --no-deps --force-recreate --pull always). A plain restart keeps the old image."
+										aria-label="Pull latest image and recreate {svc.name}"
+										disabled={busy}
+										onclick={() => projectCompose.recreateService(folderPath, svc.name)}
+									>
+										⤓
 									</button>
 								{/if}
 								{#if canStop(svc)}

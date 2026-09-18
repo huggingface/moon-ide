@@ -265,6 +265,8 @@ export const ipc = {
 			invoke<ProjectComposeStatus>('project_compose_service_stop', { folderPath, service }),
 		serviceRestart: (folderPath: string, service: string) =>
 			invoke<ProjectComposeStatus>('project_compose_service_restart', { folderPath, service }),
+		serviceRecreate: (folderPath: string, service: string) =>
+			invoke<ProjectComposeStatus>('project_compose_service_recreate', { folderPath, service }),
 	},
 	ports: {
 		list: () => invoke<ForwardedPort[]>('ports_list'),

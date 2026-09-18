@@ -386,11 +386,32 @@ impl ProjectCompose {
 		Ok(())
 	}
 
+	/// `docker compose up -d --no-deps --force-recreate --pull
+	/// always <service>` — pull the service's latest image and
+	/// recreate **just that container**, leaving the rest of the
+	/// project untouched. The scoped counterpart to
+	/// [`Self::rebuild`], for the "the registry has a newer
+	/// `:latest` of this one sidecar" workflow — a project-wide
+	/// Recreate would needlessly bounce every healthy service.
+	/// Same post-op sequence as [`Self::start_service`]: heal,
+	/// re-attach the workspace dev container, and surface the
+	/// original error if the `up` failed.
+	pub async fn recreate_service(&self, service: &str) -> Result<(), LifecycleError> {
+		let result = self
+			.docker_compose(["up", "-d", "--no-deps", "--force-recreate", "--pull", "always", service])
+			.await;
+		self.invalidate_status_cache().await;
+		let healed = self.heal_networkless_services().await;
+		self.attach_workspace_dev().await;
+		result.map(|_| ()).and(healed)
+	}
+
 	/// `docker compose restart <service>` — stop + start one
 	/// service's container, preserving its image and volumes.
 	/// This is the cheap "did the config flake out, try again"
-	/// affordance. Use [`Self::rebuild`] for the heavier
-	/// "recreate from a fresh image" workflow.
+	/// affordance. Use [`Self::recreate_service`] for "pull the
+	/// fresh image and recreate this one container", or
+	/// [`Self::rebuild`] for the whole project.
 	pub async fn restart_service(&self, service: &str) -> Result<(), LifecycleError> {
 		let result = self.docker_compose(["restart", service]).await;
 		self.invalidate_status_cache().await;
