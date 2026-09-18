@@ -106,9 +106,12 @@
 	// wants Start instead — and Start is safe in any state because
 	// the backend's `start_service` runs `up -d --no-deps <svc>`
 	// (creates + network-joins + starts), not bare `start`. See
-	// `ProjectCompose::start_service` in moon-container.
+	// `ProjectCompose::start_service` in moon-container. `absent`
+	// (declared in config, no container — typically profile-gated)
+	// starts the same way: explicitly targeting a service
+	// auto-activates its profiles.
 	function canStart(svc: ServiceStatus): boolean {
-		return svc.raw_state === 'created' || svc.raw_state === 'exited';
+		return svc.raw_state === 'created' || svc.raw_state === 'exited' || svc.raw_state === 'absent';
 	}
 	function canStop(svc: ServiceStatus): boolean {
 		return svc.raw_state === 'running' || svc.raw_state === 'restarting';
@@ -236,11 +239,29 @@
 									<span class="dot waiting-dot"></span>
 								{:else if failed}
 									<span class="dot failed-dot"></span>
+								{:else if svc.raw_state === 'absent'}
+									<span class="dot absent-dot"></span>
 								{:else}
 									<span class="dot done-dot"></span>
 								{/if}
 							</span>
-							<span class="svc-name">{svc.name}</span>
+							<span class="svc-name" class:svc-name-absent={svc.raw_state === 'absent'}>
+								{svc.name}
+								{#if svc.profiles.length > 0}
+									<!-- Opt-in marker: profile-gated services are
+									     excluded from project-wide Start; the per-row
+									     ▶ starts them (explicit targeting activates
+									     the profile). -->
+									<span
+										class="svc-profile"
+										title="Behind compose profile “{svc.profiles.join(
+											'”, “',
+										)}” — excluded from the project-wide Start; use this row's ▶ to start it individually."
+									>
+										{svc.profiles.join(', ')}
+									</span>
+								{/if}
+							</span>
 							<span class="svc-controls" aria-label="{svc.name} actions">
 								{#if canStart(svc)}
 									<button
@@ -278,19 +299,24 @@
 										◼
 									</button>
 								{/if}
-								<button
-									type="button"
-									class="svc-btn"
-									title="Stream logs for {svc.name}"
-									aria-label="Logs for {svc.name}"
-									onclick={() => void composeLogs.open(folderPath, svc.name)}
-								>
-									≡
-								</button>
+								{#if svc.raw_state !== 'absent'}
+									<!-- No container yet → nothing to stream. -->
+									<button
+										type="button"
+										class="svc-btn"
+										title="Stream logs for {svc.name}"
+										aria-label="Logs for {svc.name}"
+										onclick={() => void composeLogs.open(folderPath, svc.name)}
+									>
+										≡
+									</button>
+								{/if}
 							</span>
 							<span class="svc-state svc-{svc.raw_state}" class:svc-bad-exit={failed}>
 								<span class="state-text">
-									{svc.raw_state}{svc.raw_state === 'exited' ? ` (${svc.exit_code})` : ''}
+									{svc.raw_state === 'absent' ? 'not created' : svc.raw_state}{svc.raw_state === 'exited'
+										? ` (${svc.exit_code})`
+										: ''}
 								</span>
 								{#if svc.networkless}
 									<!-- Takes priority over the healthcheck verdict: with no
@@ -589,6 +615,14 @@
 	.svc-marker .waiting-dot {
 		background: var(--m-warning, var(--m-fg-muted));
 	}
+	/* Hollow ring: the service exists only in the compose config —
+	   no container on the daemon (never created, or behind an
+	   inactive profile). */
+	.svc-marker .absent-dot {
+		background: transparent;
+		border: 1px solid var(--m-fg-subtle);
+		box-sizing: border-box;
+	}
 	/* Pulse the rows compose is still blocked on so the user can
 	   spot the hold-up at a glance. Solid red rows are failures
 	   that won't recover on their own — never pulse those. */
@@ -597,6 +631,21 @@
 	}
 	.svc-name {
 		color: var(--m-fg);
+	}
+	.svc-name-absent {
+		color: var(--m-fg-muted);
+	}
+	/* Compose-profile chip: marks a row as opt-in (excluded from
+	   project-wide Start). Quiet by design — the tooltip carries
+	   the explanation. */
+	.svc-profile {
+		font-size: 10px;
+		color: var(--m-fg-subtle);
+		background: var(--m-bg-overlay);
+		border: 1px solid var(--m-border);
+		border-radius: 3px;
+		padding: 0 4px;
+		margin-left: 4px;
 	}
 	.services li.waiting .svc-name {
 		color: var(--m-warning, var(--m-fg));
@@ -639,6 +688,9 @@
 	.svc-exited,
 	.svc-created {
 		color: var(--m-fg-muted);
+	}
+	.svc-absent {
+		color: var(--m-fg-subtle);
 	}
 	.svc-restarting {
 		color: var(--m-warning, var(--m-fg-muted));

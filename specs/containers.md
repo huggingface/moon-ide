@@ -163,6 +163,23 @@ The per-service "▶" runs `up -d --no-deps <service>`, not `start` —
 partially-failed `up`, while `up -d --no-deps` (re)creates and
 (re)joins the one service idempotently.
 
+### Compose profiles ([ADR 0083](decisions/0083-compose-profiles.md))
+
+Services gated behind a compose `profiles:` list (moon-landing's
+`moongit-index`, `shell`, `rabbitmq`, …) stay **opt-in** but are no
+longer invisible: the status probe merges the config's full service
+list (`docker compose --profile "*" config --format json`, falling
+back to the plain profile-less list on older compose) into the
+`ps --all` snapshot, so a declared service with no container renders
+as a muted `not created` row with a profile chip and the per-service
+"▶". That start needs no profile flag — compose auto-activates a
+service's profiles when it's targeted explicitly. Project-wide
+**Start stays profile-less** (opt-in means opt-in); project-wide
+teardown (Stop / Down / Pause / Resume) passes `--profile "*"` when
+the config declares any profiled service, so a profile-started
+container is never left running as an orphan after a Down. Absent
+rows never influence the aggregate project state.
+
 ### Networkless containers (failed-start residue)
 
 When the daemon aborts a container start midway (classic trigger:

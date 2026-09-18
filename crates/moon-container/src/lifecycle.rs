@@ -1107,6 +1107,11 @@ impl From<PsEntry> for ServiceStatus {
 			// the flag is filled in by `flag_networkless_services`
 			// from a separate `docker ps` probe.
 			networkless: false,
+			// Nor profiles — the per-folder status merge fills
+			// them in from the compose config (see
+			// `ProjectCompose::status`). Workspace-shell services
+			// (a compose file we author) never carry any.
+			profiles: Vec::new(),
 		}
 	}
 }
@@ -1287,6 +1292,7 @@ mod tests {
 			exit_code: 0,
 			health: String::new(),
 			networkless: false,
+			profiles: Vec::new(),
 		}
 	}
 
@@ -1297,6 +1303,7 @@ mod tests {
 			exit_code: code,
 			health: String::new(),
 			networkless: false,
+			profiles: Vec::new(),
 		}
 	}
 

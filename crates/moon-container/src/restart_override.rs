@@ -84,7 +84,15 @@ pub async fn ensure_restart_override(
 	slug: &str,
 	user_compose_file: &Utf8Path,
 ) -> Result<Utf8PathBuf, LifecycleError> {
-	let services = list_services(user_compose_file).await?;
+	// Profile-aware so profile-gated services get `restart: "no"`
+	// too — inert while the profile is inactive (the override
+	// merge keeps the base file's `profiles:` list), effective the
+	// moment the user starts one from the popover.
+	let services: Vec<String> = list_services_with_profiles(user_compose_file)
+		.await?
+		.into_iter()
+		.map(|s| s.name)
+		.collect();
 	let path = override_path(state_dir, slug);
 	let body = render_override(&services);
 
@@ -93,6 +101,103 @@ pub async fn ensure_restart_override(
 	}
 	tokio::fs::write(path.as_std_path(), body.as_bytes()).await?;
 	Ok(path)
+}
+
+/// One service as resolved from the compose config, with the
+/// compose profiles it's gated behind (empty for ordinary
+/// services).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigService {
+	pub name: String,
+	pub profiles: Vec<String>,
+}
+
+/// Resolve the **full** service list of `user_compose_file` —
+/// including profile-gated services — with each service's
+/// `profiles:` list.
+///
+/// Runs `docker compose -f <file> --profile "*" config --format
+/// json` (the `"*"` wildcard enables every profile; compose ≥
+/// 2.24) and reads `services.<name>.profiles`. On any failure —
+/// older compose without the wildcard, a config that errors only
+/// under some profile — falls back to the plain profile-less
+/// `config --services` list with empty profiles, which is exactly
+/// the pre-profile-support behaviour, so profile support degrades
+/// gracefully instead of breaking every lifecycle op.
+pub(crate) async fn list_services_with_profiles(
+	user_compose_file: &Utf8Path,
+) -> Result<Vec<ConfigService>, LifecycleError> {
+	match list_services_json_all_profiles(user_compose_file).await {
+		Ok(services) => Ok(services),
+		Err(err) => {
+			tracing::debug!(
+				%err,
+				compose = %user_compose_file,
+				"profile-aware `config --format json` failed; falling back to plain `config --services`",
+			);
+			Ok(
+				list_services(user_compose_file)
+					.await?
+					.into_iter()
+					.map(|name| ConfigService {
+						name,
+						profiles: Vec::new(),
+					})
+					.collect(),
+			)
+		}
+	}
+}
+
+/// `docker compose -f <file> --profile "*" config --format json`,
+/// parsed down to name + profiles per service. `BTreeMap` keys the
+/// output alphabetically, which matches the ordering `docker
+/// compose ps` already gives the panel.
+async fn list_services_json_all_profiles(user_compose_file: &Utf8Path) -> Result<Vec<ConfigService>, LifecycleError> {
+	#[derive(serde::Deserialize)]
+	struct ConfigJson {
+		#[serde(default)]
+		services: std::collections::BTreeMap<String, ConfigJsonService>,
+	}
+	#[derive(serde::Deserialize)]
+	struct ConfigJsonService {
+		#[serde(default)]
+		profiles: Vec<String>,
+	}
+
+	let mut cmd = Command::new("docker");
+	cmd.arg("compose");
+	cmd.arg("-f").arg(user_compose_file.as_std_path());
+	cmd.args(["--profile", "*", "config", "--format", "json"]);
+	let output = cmd.output().await.map_err(|err| {
+		if err.kind() == std::io::ErrorKind::NotFound {
+			LifecycleError::DockerMissing
+		} else {
+			LifecycleError::Io(err)
+		}
+	})?;
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+		if stderr.contains("Cannot connect to the Docker daemon") {
+			return Err(LifecycleError::DaemonUnreachable(stderr));
+		}
+		return Err(LifecycleError::ComposeFailed {
+			code: output.status.code().unwrap_or(-1),
+			stderr,
+		});
+	}
+	let parsed: ConfigJson =
+		serde_json::from_slice(&output.stdout).map_err(|err| LifecycleError::ParseError(err.to_string()))?;
+	Ok(
+		parsed
+			.services
+			.into_iter()
+			.map(|(name, svc)| ConfigService {
+				name,
+				profiles: svc.profiles,
+			})
+			.collect(),
+	)
 }
 
 /// `docker compose -f <user_compose_file> config --services`.

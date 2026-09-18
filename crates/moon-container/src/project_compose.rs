@@ -82,7 +82,7 @@ use crate::network::{
 	project_default_network,
 };
 use crate::project::{folder_slug, project_name_for_folder, project_name_for_id, ProjectName};
-use crate::restart_override::ensure_restart_override;
+use crate::restart_override::{self, ensure_restart_override};
 use crate::status_cache;
 
 /// Handle for a single bound folder's compose project.
@@ -192,7 +192,26 @@ impl ProjectCompose {
 			let output = self.docker_compose(["ps", "--all", "--format", "json"]).await?;
 			let mut services = parse_ps_output(&output.stdout).map_err(LifecycleError::ParseError)?;
 			flag_networkless_services(&self.project, &mut services).await;
+			// Aggregate over the containers that exist — the
+			// config-declared merge below must not drag the
+			// project state around (a stack whose profiled
+			// services were never started is still `Running`,
+			// and an empty daemon is still `Absent` no matter
+			// how many services the config declares).
 			let state = aggregate_state(&services);
+			// Merge in the compose config's full service list
+			// (profiles included) so never-created services —
+			// most notably profile-gated ones, which project-wide
+			// `up` skips — show up as `absent` rows with a start
+			// affordance instead of being invisible. Best-effort:
+			// a config that stopped resolving must not take the
+			// status probe down with it.
+			match restart_override::list_services_with_profiles(&self.compose_file).await {
+				Ok(config) => merge_config_services(&mut services, config),
+				Err(err) => {
+					tracing::debug!(%err, project = %self.project, "compose config probe failed; skipping absent-service merge");
+				}
+			}
 			Ok(ContainerStatus { state, services })
 		})
 		.await
@@ -235,15 +254,38 @@ impl ProjectCompose {
 	}
 
 	pub async fn pause(&self) -> Result<(), LifecycleError> {
-		self.docker_compose(["pause"]).await?;
+		let mut args = self.all_profiles_args().await;
+		args.push("pause");
+		self.docker_compose(args).await?;
 		self.invalidate_status_cache().await;
 		Ok(())
 	}
 
 	pub async fn resume(&self) -> Result<(), LifecycleError> {
-		self.docker_compose(["unpause"]).await?;
+		let mut args = self.all_profiles_args().await;
+		args.push("unpause");
+		self.docker_compose(args).await?;
 		self.invalidate_status_cache().await;
 		Ok(())
+	}
+
+	/// `["--profile", "*"]` when the config declares any
+	/// profile-gated service, else empty. Project-wide teardown
+	/// ops (stop / down / pause / unpause) pass this so they cover
+	/// containers the user started from a profile — without it,
+	/// compose skips inactive-profile services and a `Down` leaves
+	/// them running as orphans. Project-wide **`up` deliberately
+	/// does not**: profiles are opt-in by design; the per-service
+	/// start covers them (explicit targeting auto-activates a
+	/// service's profiles). The conditional keeps profile-less
+	/// projects — and older compose without the `"*"` wildcard
+	/// (< 2.24, where the lister falls back and reports no
+	/// profiles) — on today's exact invocation.
+	async fn all_profiles_args(&self) -> Vec<&'static str> {
+		match restart_override::list_services_with_profiles(&self.compose_file).await {
+			Ok(config) if config.iter().any(|s| !s.profiles.is_empty()) => vec!["--profile", "*"],
+			_ => Vec::new(),
+		}
 	}
 
 	/// Hammer: `up -d --force-recreate --pull always --wait`.
@@ -275,7 +317,9 @@ impl ProjectCompose {
 	/// Detaching here would force an extra `connect` round-trip on
 	/// every start/stop cycle for no benefit.
 	pub async fn stop(&self) -> Result<(), LifecycleError> {
-		self.docker_compose(["stop"]).await?;
+		let mut args = self.all_profiles_args().await;
+		args.push("stop");
+		self.docker_compose(args).await?;
 		self.invalidate_status_cache().await;
 		Ok(())
 	}
@@ -294,7 +338,9 @@ impl ProjectCompose {
 	/// so the cleanup remains best-effort.
 	pub async fn down(&self) -> Result<(), LifecycleError> {
 		self.detach_workspace_dev().await;
-		self.docker_compose(["down"]).await?;
+		let mut args = self.all_profiles_args().await;
+		args.push("down");
+		self.docker_compose(args).await?;
 		self.invalidate_status_cache().await;
 		Ok(())
 	}
@@ -472,6 +518,31 @@ impl ProjectCompose {
 	}
 }
 
+/// Fold the compose config's declared service list into the
+/// `ps`-derived rows: annotate existing containers with their
+/// service's `profiles:` list, and append an `absent` row for
+/// every declared service with no container on the daemon (never
+/// created, or gated behind an inactive profile). Appended rows
+/// keep the config lister's alphabetical order, matching `ps`.
+fn merge_config_services(
+	services: &mut Vec<moon_protocol::container::ServiceStatus>,
+	config: Vec<restart_override::ConfigService>,
+) {
+	for cfg in config {
+		match services.iter_mut().find(|s| s.name == cfg.name) {
+			Some(existing) => existing.profiles = cfg.profiles,
+			None => services.push(moon_protocol::container::ServiceStatus {
+				name: cfg.name,
+				raw_state: "absent".into(),
+				exit_code: 0,
+				health: String::new(),
+				networkless: false,
+				profiles: cfg.profiles,
+			}),
+		}
+	}
+}
+
 /// Slug a folder basename into the suffix used for its compose
 /// project name.
 ///
@@ -536,6 +607,48 @@ mod tests {
 
 	fn state_dir() -> Utf8PathBuf {
 		Utf8PathBuf::from("/tmp/moon-ide-test-state")
+	}
+
+	#[test]
+	fn merge_config_services_annotates_and_appends_absent() {
+		use moon_protocol::container::ServiceStatus;
+		let running = |name: &str| ServiceStatus {
+			name: name.into(),
+			raw_state: "running".into(),
+			exit_code: 0,
+			health: String::new(),
+			networkless: false,
+			profiles: Vec::new(),
+		};
+		let mut services = vec![running("mongo"), running("shell")];
+		merge_config_services(
+			&mut services,
+			vec![
+				restart_override::ConfigService {
+					name: "mongo".into(),
+					profiles: Vec::new(),
+				},
+				restart_override::ConfigService {
+					name: "moongit-index".into(),
+					profiles: vec!["moongit".into()],
+				},
+				restart_override::ConfigService {
+					name: "shell".into(),
+					profiles: vec!["ssh".into()],
+				},
+			],
+		);
+		// Existing rows annotated in place (a running profiled
+		// container keeps its ps-derived state), missing ones
+		// appended as `absent` with their profiles.
+		assert_eq!(services.len(), 3);
+		assert_eq!(services[0].profiles, Vec::<String>::new());
+		assert_eq!(services[1].name, "shell");
+		assert_eq!(services[1].raw_state, "running");
+		assert_eq!(services[1].profiles, vec!["ssh".to_string()]);
+		assert_eq!(services[2].name, "moongit-index");
+		assert_eq!(services[2].raw_state, "absent");
+		assert_eq!(services[2].profiles, vec!["moongit".to_string()]);
 	}
 
 	#[test]

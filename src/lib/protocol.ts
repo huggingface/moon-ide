@@ -1382,12 +1382,15 @@ export type ContainerState = 'absent' | 'creating' | 'running' | 'paused' | 'sto
 
 /**
  * One container in the compose project, as reported by
- * `docker compose ps --format json`. Mirrors
+ * `docker compose ps --format json` — plus, for per-folder
+ * projects, config-declared services with no container yet
+ * (never created, or behind an inactive compose profile), which
+ * carry the synthetic `raw_state: 'absent'`. Mirrors
  * `moon_protocol::container::ServiceStatus`.
  */
 export type ServiceStatus = {
 	name: string;
-	/** Raw Docker container state (`running`, `paused`, `exited`, `created`, `restarting`, `dead`). */
+	/** Raw Docker container state (`running`, `paused`, `exited`, `created`, `restarting`, `dead`) — or the synthetic `absent` (declared in config, no container on the daemon). */
 	raw_state: string;
 	/** Process exit code. Compose emits `0` for non-exited states too — only meaningful when `raw_state === 'exited'`. */
 	exit_code: number;
@@ -1401,6 +1404,14 @@ export type ServiceStatus = {
 	 * action; until then the row renders as failed.
 	 */
 	networkless: boolean;
+	/**
+	 * Compose profiles this service is gated behind (its
+	 * `profiles:` list); empty for ordinary services. Profiled
+	 * services are excluded from project-wide `up` — the
+	 * per-service start targets them explicitly, which
+	 * auto-activates their profiles.
+	 */
+	profiles: string[];
 };
 
 /**

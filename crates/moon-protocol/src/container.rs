@@ -60,7 +60,12 @@ pub enum ContainerState {
 }
 
 /// One container in the compose project, as reported by
-/// `docker compose ps --format json`.
+/// `docker compose ps --format json` — plus, for per-folder
+/// projects, config-declared services whose container doesn't
+/// exist yet (never created, or gated behind an inactive compose
+/// profile). Those synthetic rows carry `raw_state: "absent"` so
+/// the UI can offer a start affordance instead of hiding the
+/// service entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ServiceStatus {
@@ -69,7 +74,9 @@ pub struct ServiceStatus {
 	/// Raw Docker container state (`running`, `paused`,
 	/// `exited`, `created`, `restarting`, `dead`). Forwarded
 	/// verbatim so the UI can show it without us re-encoding
-	/// nuance away.
+	/// nuance away. The one synthetic value is `"absent"`: the
+	/// service is declared in the compose config but has no
+	/// container on the daemon (see the struct doc).
 	pub raw_state: String,
 	/// Process exit code. Compose emits `0` for non-exited
 	/// states too, so this is meaningful only when
@@ -93,6 +100,14 @@ pub struct ServiceStatus {
 	/// containers that aren't running (stopped containers hold
 	/// no endpoints, so the question is meaningless).
 	pub networkless: bool,
+	/// Compose profiles this service is gated behind (the
+	/// service's `profiles:` list). Empty for ordinary services.
+	/// Profile-gated services are excluded from project-wide
+	/// `up`, so the UI badges them as opt-in; the per-service
+	/// start works because compose auto-activates a service's
+	/// profiles when it's targeted explicitly.
+	#[serde(default)]
+	pub profiles: Vec<String>,
 }
 
 /// Snapshot returned by `container_status` and embedded in

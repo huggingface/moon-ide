@@ -648,12 +648,14 @@
 							</div>
 							{#each pc.status.services as svc (svc.name)}
 								<div class="services-svc {svc.raw_state}">
-									<span class="svc-name">{svc.name}</span>
+									<span class="svc-name"
+										>{svc.name}{#if svc.profiles.length > 0}<span class="svc-profile">{svc.profiles.join(', ')}</span
+											>{/if}</span
+									>
 									<span class="svc-state"
-										>{svc.raw_state}{svc.health ? ` · ${svc.health}` : ''}{svc.raw_state === 'exited' &&
-										svc.exit_code !== 0
-											? ` (${svc.exit_code})`
-											: ''}</span
+										>{svc.raw_state === 'absent' ? 'not created' : svc.raw_state}{svc.health
+											? ` · ${svc.health}`
+											: ''}{svc.raw_state === 'exited' && svc.exit_code !== 0 ? ` (${svc.exit_code})` : ''}</span
 									>
 									{#if svc.raw_state === 'running'}
 										<button
@@ -662,7 +664,7 @@
 											onclick={() =>
 												app.projectComposeAction('project_compose_service_restart', pc.folder_path, svc.name)}>↻</button
 										>
-									{:else if svc.raw_state === 'exited' || svc.raw_state === 'created'}
+									{:else if svc.raw_state === 'exited' || svc.raw_state === 'created' || svc.raw_state === 'absent'}
 										<button
 											class="ghost svc-btn"
 											disabled={app.containerBusy}
@@ -1100,6 +1102,21 @@
 	}
 	.services-svc.exited .svc-state {
 		color: var(--danger, #e5484d);
+	}
+	/* Declared in the compose config but no container yet —
+	   typically profile-gated. Muted, not alarming. */
+	.services-svc.absent .svc-name,
+	.services-svc.absent .svc-state {
+		color: var(--fg-muted);
+	}
+	.svc-profile {
+		font-size: 0.65rem;
+		color: var(--fg-muted);
+		border: 1px solid var(--border, rgba(255, 255, 255, 0.15));
+		border-radius: 3px;
+		padding: 0 0.25rem;
+		margin-left: 0.3rem;
+		font-weight: 400;
 	}
 	.svc-btn {
 		padding: 0.05rem 0.4rem;

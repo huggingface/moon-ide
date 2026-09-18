@@ -51,13 +51,18 @@ export type McpServerRow = {
 	enabled: boolean;
 };
 
-/** One service of a compose project (`docker compose ps`). */
+/** One service of a compose project (`docker compose ps`, plus
+ *  config-declared services with no container yet — synthetic
+ *  `raw_state: 'absent'`, typically compose-profile-gated). */
 export type ServiceStatus = {
 	name: string;
 	raw_state: string;
 	exit_code: number;
 	health: string;
 	networkless: boolean;
+	/** Compose profiles the service is gated behind; empty for
+	 *  ordinary services. */
+	profiles: string[];
 };
 
 export type ContainerStatus = {
