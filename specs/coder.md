@@ -1667,6 +1667,15 @@ the parent's standard model. (A `fast | large` selector existed and
 was dropped: it biased the parent against delegating non-trivial
 work.)
 
+Sub-agents also inherit the parent session's **host-mode override**
+([ADR 0022](decisions/0022-coder-host-mode-override.md)) as a live
+shared flag ([ADR 0082](decisions/0082-inherited-host-mode.md)): a
+force-host parent's delegated `bash` runs on the host too, and a
+mid-run toggle re-routes the sub-agent's next command (ADR 0041
+semantics, one level down). Nested and detached runs ride the same
+handle; a user-resumed sub-agent re-resolves the flag from the
+parent's runtime, falling back to auto when the parent is unmounted.
+
 ### Modes
 
 - **`research`** — read-only intent: `read_file`, `list_dir`,
@@ -1998,7 +2007,11 @@ A **coordinator-spawned worker** skips that default: `spawn_worker`
 requires a `name` and the branch is `moon/<name-slug>`
 ([ADR 0042](decisions/0042-named-worker-branches.md)), so the branch,
 the worktree directory, the session row's branch chip, and the
-session's **title** all read as the work the worker was given.
+session's **title** all read as the work the worker was given. The
+worker also **snapshots the coordinator's host-mode override** at
+spawn ([ADR 0082](decisions/0082-inherited-host-mode.md)): a
+force-host coordinator mints force-host workers, each keeping its own
+independent toggle from there on.
 
 An isolated session can either start a **fresh** `moon/agent-<id>`
 branch off the parent's current `HEAD` (the default), or be based on

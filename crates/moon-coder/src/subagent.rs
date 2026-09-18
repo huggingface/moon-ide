@@ -334,6 +334,12 @@ pub struct Subagent {
 	/// `folder` argument to `task`. Surfaced as `target_folder`
 	/// in events / persistence metadata.
 	pub folder: Arc<WorkspaceFolderEntry>,
+	/// The parent session's **live** host-mode flag (ADR 0022 /
+	/// ADR 0041), shared by `Arc` so sub-agents inherit the
+	/// parent's bash routing — including a mid-run toggle — instead
+	/// of silently auto-routing delegated commands into a different
+	/// environment. Nested sub-agents share the same handle.
+	pub force_host_bash: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What the sub-agent runner returns to the parent's tool
@@ -634,8 +640,12 @@ async fn run_subagent_in_dir(
 		// `mode` — their mode lives in `subagent_mode` above.
 		mode: None,
 		subagent_target_folder: if target_differs { Some(target_folder_path) } else { None },
-		// Sub-agents always run with auto bash routing; a forced-host
-		// parent session doesn't leak its override into delegated work.
+		// Sub-agents inherit the parent's **live** host-mode flag via
+		// `spec.force_host_bash`, not through the header: the header
+		// field persists a top-level session's own toggle, while
+		// inheritance is runtime state. A user-driven resume
+		// re-resolves the flag from the parent's runtime (falling
+		// back to auto when the parent is unmounted).
 		bash_target_override: None,
 		// Sub-agents don't re-route via the header: their tools already
 		// run against `spec.folder` (which is the worktree when the
@@ -927,7 +937,14 @@ async fn run_subagent_loop(
 	// servers — a sub-agent driving playwright against its target
 	// folder's dev server is a natural delegation.
 	tool_defs.extend(tools.mcp_definitions().await);
-	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue).with_background(background);
+	// Inherit the parent's live host-mode flag (shared `Arc`, same
+	// as the parent's own `ToolContext`): a force-host parent's
+	// delegated commands run against the same environment, and a
+	// mid-run toggle re-routes the sub-agent's next command too
+	// (ADR 0041 semantics, one level down).
+	let cx = ToolContext::with_format_queue(spec.folder.clone(), spec.mode, format_queue)
+		.with_force_host_bash(spec.force_host_bash.clone())
+		.with_background(background);
 	// Terminals of the sub-agent's *own* target folder (ADR 0048) —
 	// the same folder its `bash` and `grep` run against.
 	tool_defs.extend(tools.terminal_definitions(&cx).await);
@@ -1449,6 +1466,9 @@ async fn handle_nested_task(
 		args,
 		&outer.folder,
 		&bound,
+		// Same live handle all the way down: outer inherited it
+		// from the top-level session.
+		outer.force_host_bash.clone(),
 	)?;
 	// The nested schema has no `mode` (validated above), so the
 	// spec builder's `agent` default must be overridden here.
@@ -1913,6 +1933,9 @@ pub(crate) fn build_subagent_system_prompt(mode: CoderMode, folder: &Arc<Workspa
 /// folder's slug so the sub-agent file shows up in the parent
 /// project's session list, regardless of which folder the
 /// sub-agent's tools operate against.
+///
+/// `force_host_bash` is the parent's live host-mode flag (shared,
+/// not snapshotted) — see the field doc on [`Subagent`].
 pub fn build_subagent_spec(
 	parent_session_id: String,
 	parent_tool_call_id: String,
@@ -1920,6 +1943,7 @@ pub fn build_subagent_spec(
 	args: &Value,
 	parent_active_folder: &Arc<WorkspaceFolderEntry>,
 	bound_folders: &[Arc<WorkspaceFolderEntry>],
+	force_host_bash: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Subagent, CoderError> {
 	let task = args
 		.get("task")
@@ -1978,6 +2002,7 @@ pub fn build_subagent_spec(
 		mode,
 		detach,
 		folder,
+		force_host_bash,
 	})
 }
 
@@ -2029,6 +2054,7 @@ mod tests {
 			&args,
 			&active,
 			&folders,
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		)
 		.unwrap();
 		assert_eq!(spec.mode, CoderMode::Agent);
@@ -2066,12 +2092,36 @@ mod tests {
 			&args,
 			&worktree,
 			&folders,
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		)
 		.unwrap();
 		assert!(
 			Arc::ptr_eq(&spec.folder, &worktree),
 			"parent-named target from a worktree session must collapse to the worktree"
 		);
+	}
+
+	#[tokio::test]
+	async fn build_spec_shares_parent_host_mode_flag() {
+		// Shared handle, not a snapshot — a mid-run toggle on the
+		// parent must re-route the sub-agent's next command too.
+		let dir = TempDir::new().unwrap();
+		let path = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+		let folders = registry_with_folders(&[path.as_path()]).await;
+		let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+		let spec = build_subagent_spec(
+			"sess-x".into(),
+			"call-1".into(),
+			parent_folder_for(&folders, 0),
+			&make_args(r#"{ "task": "do the thing" }"#),
+			&folders[0],
+			&folders,
+			flag.clone(),
+		)
+		.unwrap();
+		assert!(Arc::ptr_eq(&spec.force_host_bash, &flag));
+		flag.store(false, std::sync::atomic::Ordering::Relaxed);
+		assert!(!spec.force_host_bash.load(std::sync::atomic::Ordering::Relaxed));
 	}
 
 	#[tokio::test]
@@ -2088,6 +2138,7 @@ mod tests {
 			&args,
 			&active,
 			&folders,
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		)
 		.unwrap();
 		assert_eq!(spec.mode, CoderMode::Research);
@@ -2106,6 +2157,7 @@ mod tests {
 			&args,
 			&folders[0],
 			&folders,
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		)
 		.unwrap_err();
 		assert!(matches!(err, CoderError::InvalidToolArgs { .. }), "got {err:?}");
@@ -2124,6 +2176,7 @@ mod tests {
 			&args,
 			&folders[0],
 			&folders,
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		)
 		.unwrap_err();
 		assert!(matches!(err, CoderError::ToolFailed { .. }), "got {err:?}");
@@ -2145,6 +2198,7 @@ mod tests {
 			&make_args(&args_text),
 			&folders[0],
 			&folders,
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		)
 		.unwrap();
 		assert!(Arc::ptr_eq(&spec.folder, &folders[1]));

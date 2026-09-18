@@ -4652,6 +4652,13 @@ impl CoderHandle {
 		messages[0] = ChatMessage::System {
 			content: crate::subagent::build_subagent_system_prompt(mode, &target_entry, &task),
 		};
+		// Re-inherit the parent session's live host-mode flag; a
+		// parent that's no longer mounted has no live toggle to
+		// follow, so the resumed run falls back to auto routing.
+		let force_host_bash = match self.state.runtime_for_session(&parent_session_id).await {
+			Some((parent_rt, _)) => parent_rt.force_host_bash.clone(),
+			None => Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		};
 		let spec = crate::subagent::Subagent {
 			id: subagent_id.to_string(),
 			parent_session_id: parent_session_id.clone(),
@@ -4667,6 +4674,7 @@ impl CoderHandle {
 			// registry recorded at spawn, so we don't restamp here.
 			detach: false,
 			folder: target_entry,
+			force_host_bash,
 		};
 		// Events land in the parent session's UI bucket, same as
 		// the original run.
@@ -7231,6 +7239,9 @@ async fn handle_task(
 		args,
 		&cx.folder,
 		&bound,
+		// The parent's live host-mode flag (ADR 0022 / 0041):
+		// sub-agents run their bash where the parent's runs.
+		rt.force_host_bash.clone(),
 	)?;
 	// Detached spawn ([ADR 0053]): register, spawn, return a
 	// handle. The sub-agent runs on its own root token; its finish
@@ -8011,12 +8022,34 @@ async fn handle_spawn_worker(
 	// old order) raced that guard: the worker's `SessionLoaded` landed
 	// first, read as a plain open, and the panel jumped to the worker.
 	let orchestrator_id = sink.session_id.clone();
+	// A force-host coordinator's workers start force-host too
+	// (snapshot, not live link — a worker is a top-level session
+	// with its own toggle from here on). Read the coordinator's
+	// live flag so a mid-turn toggle is honoured at spawn time.
+	let coordinator_force_host = match state.runtime_for_session(&orchestrator_id).await {
+		Some((orchestrator_rt, _)) => orchestrator_rt
+			.force_host_bash
+			.load(std::sync::atomic::Ordering::Relaxed),
+		None => false,
+	};
 	// Stamp the reverse link (ADR 0065) before the seed send persists
 	// the header: a restarted process re-links the fleet from disk,
 	// and this field is the worker-side half (the coordinator side
-	// rebuilds from its own spawn/detach records).
+	// rebuilds from its own spawn/detach records). The host-mode
+	// snapshot rides the same pre-seed header write.
 	if let Some((worker_rt, _)) = state.runtime_for_session(&summary.id).await {
-		worker_rt.session.lock().await.header.orchestrator_session_id = Some(orchestrator_id.clone());
+		{
+			let mut session = worker_rt.session.lock().await;
+			session.header.orchestrator_session_id = Some(orchestrator_id.clone());
+			if coordinator_force_host {
+				session.header.bash_target_override = Some(BashTargetOverride::ForceHost);
+			}
+		}
+		if coordinator_force_host {
+			worker_rt
+				.force_host_bash
+				.store(true, std::sync::atomic::Ordering::Relaxed);
+		}
 	}
 	let spawn_feeder = state
 		.coordinator_workers
@@ -11502,10 +11535,7 @@ fn message_bytes(messages: &[ChatMessage]) -> usize {
 				}
 			}
 			ChatMessage::Tool {
-				tool_call_id,
-				content,
-				images: _,
-				..
+				tool_call_id, content, ..
 			} => {
 				bytes += tool_call_id.len();
 				bytes += content.len();
