@@ -5,10 +5,10 @@
 # not come back.
 version: 2
 updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
+  - package-ecosystem: 'github-actions'
+    directory: '/'
     schedule:
-      interval: "weekly"
+      interval: 'weekly'
     # Releases younger than this are not adopted. The hours right after a
     # maintainer account is compromised are exactly when a fresh release
     # is most dangerous — tj-actions and the reviewdog actions both
@@ -19,4 +19,4 @@ updates:
     groups:
       actions:
         patterns:
-          - "*"
+          - '*'

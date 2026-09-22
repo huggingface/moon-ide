@@ -722,6 +722,21 @@ impl FolderEventSink {
 		&self.folder
 	}
 
+	/// A sibling sink for **folder-scoped** events: same folder,
+	/// empty `session_id`. `SessionListChanged` must ride this —
+	/// the frontend routes session-tagged envelopes into the one
+	/// session's bucket and deliberately drops folder-level events
+	/// found there, so a list invalidation stamped with a session id
+	/// silently never refreshes the list (the cross-project-worker
+	/// "spawned session missing from the list" bug).
+	pub(crate) fn folder_scoped(&self) -> FolderEventSink {
+		FolderEventSink {
+			sender: self.sender.clone(),
+			folder: self.folder.clone(),
+			session_id: String::new(),
+		}
+	}
+
 	/// The session this sink's events are stamped with. For a
 	/// coordinator session this is the orchestrator id its workers are
 	/// registered under — `list_workers` reads it to look up the fleet.
@@ -3484,7 +3499,7 @@ impl CoderHandle {
 			id: id.clone(),
 			title: title.to_string(),
 		});
-		sink.send(CoderEvent::SessionListChanged);
+		sink.folder_scoped().send(CoderEvent::SessionListChanged);
 
 		Ok(SessionSummary {
 			id: header.id,
@@ -4345,7 +4360,7 @@ impl CoderHandle {
 				committed_branch: summary.committed_branch.clone(),
 				mode: summary.mode.clone(),
 			});
-			sink.send(CoderEvent::SessionListChanged);
+			sink.folder_scoped().send(CoderEvent::SessionListChanged);
 		}
 
 		// Older queued steers drain *before* the fresh prompt.
@@ -5094,7 +5109,7 @@ impl CoderHandle {
 				committed_branch: summary.committed_branch.clone(),
 				mode: summary.mode.clone(),
 			});
-			sink.send(CoderEvent::SessionListChanged);
+			sink.folder_scoped().send(CoderEvent::SessionListChanged);
 		}
 		sink.send(CoderEvent::UserMessage {
 			id: new_message_id(),
@@ -10735,7 +10750,7 @@ fn spawn_auto_rename(state: Arc<CoderState>, rt: Arc<SessionRuntime>, sink: Fold
 			id: header_for_disk.id,
 			title: new_title,
 		});
-		sink.send(CoderEvent::SessionListChanged);
+		sink.folder_scoped().send(CoderEvent::SessionListChanged);
 	});
 }
 

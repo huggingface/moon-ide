@@ -2462,11 +2462,20 @@ export class CoderPanelState {
 	 *  the user can pick one or start a new one. */
 	async #selectSessionForActiveFolder(): Promise<void> {
 		const folder = this.current;
+		// Snapshot the visible pointer: this pass runs detached from
+		// the folder switch, racing any *explicit* open issued right
+		// after it (`openWorkerSession` — the coordinator's worker
+		// card switches folder, then opens the worker by id). If the
+		// pointer moves while we're awaiting below, the explicit open
+		// won; clobbering it to the list view was the "worker session
+		// flashes then bounces to the sessions list" bug.
+		const visibleAtStart = folder.visibleSessionId;
+		const explicitOpenLanded = () => this.current !== folder || folder.visibleSessionId !== visibleAtStart;
 		if (folder.sessions === null) {
 			await this.refreshSessions();
-			if (this.current !== folder) {
-				// Folder switched while the list was loading — the
-				// switch's own select pass owns the new folder.
+			if (explicitOpenLanded()) {
+				// Folder switched (the switch's own select pass owns
+				// the new folder) or an explicit open landed.
 				return;
 			}
 		}
@@ -2495,12 +2504,12 @@ export class CoderPanelState {
 		} catch {
 			// AppState read failed — fall back to mtime ranking.
 		}
-		if (this.current !== folder) {
-			// Folder switched while the pointer was loading — the
-			// IPC read the *new* folder's pointer (the backend keys
-			// it off its live active folder), so acting on it here
-			// would open the wrong folder's session. The new
-			// switch's own select pass owns it.
+		if (explicitOpenLanded()) {
+			// Folder switched while the pointer was loading (the IPC
+			// read the *new* folder's pointer — acting on it here
+			// would open the wrong folder's session), or an explicit
+			// open moved the visible pointer. Either way this pass
+			// no longer owns the view.
 			return;
 		}
 		let match: CoderSessionSummary | null = null;
@@ -2516,6 +2525,19 @@ export class CoderPanelState {
 		}
 		if (match === null) {
 			match = this.#latestSessionForActiveFolder(sessions);
+		}
+		if (match === null) {
+			// The cached list can predate a just-created session (a
+			// coordinator's cross-project worker spawned moments
+			// ago). Never evict the view to the list off a stale
+			// cache — refetch once and re-rank first.
+			await this.refreshSessions();
+			if (explicitOpenLanded()) {
+				return;
+			}
+			if (folder.sessions !== null) {
+				match = this.#latestSessionForActiveFolder(folder.sessions);
+			}
 		}
 		if (match !== null) {
 			// Already viewing the right session — nothing to do.
@@ -2597,6 +2619,12 @@ export class CoderPanelState {
 	async #hydrateSession(): Promise<void> {
 		const folderKey = this.activeFolderPath ?? NO_FOLDER_KEY;
 		const folder = this.current;
+		// Same explicit-open race guard as
+		// `#selectSessionForActiveFolder`: if an open lands while we
+		// await (a worker card click racing first-visit hydration),
+		// that open owns the view — never clobber it to the list.
+		const visibleAtStart = folder.visibleSessionId;
+		const explicitOpenLanded = () => this.current !== folder || folder.visibleSessionId !== visibleAtStart;
 		// Determine the worktree context: when the actual active
 		// folder is a worktree, only sessions whose
 		// `worktree_root` matches are candidates; when it's the
@@ -2639,6 +2667,9 @@ export class CoderPanelState {
 		}
 		// Load the sessions list so we can pick by worktree_root.
 		await this.refreshSessions();
+		if (explicitOpenLanded()) {
+			return;
+		}
 		const sessions = folder.sessions;
 		if (sessions !== null && sessions.length > 0) {
 			// Same "last opened, else most recent" ranking the
@@ -2676,6 +2707,9 @@ export class CoderPanelState {
 					// fall through to the list view.
 				}
 			}
+		}
+		if (explicitOpenLanded()) {
+			return;
 		}
 		// With no folder bound there is no sessions list to pick
 		// from (the list IPC errors); land on a blank session view
@@ -3682,14 +3716,19 @@ export class CoderPanelState {
 				// visible session — the user is looking at the
 				// coordinator, and the `SubagentSpawned` event
 				// already registered the worker. Detect this by
-				// scanning the folder's session buckets for a
-				// `subagentSummaries` entry whose id matches —
-				// the coordinator's bucket holds the worker card.
+				// scanning **every** folder's session buckets for a
+				// `subagentSummaries` entry whose id matches: the
+				// coordinator's bucket holds the worker card, and
+				// for a cross-project worker (ADR 0037) that bucket
+				// belongs to a *different* folder than the one this
+				// event is tagged with (the worker's own project).
 				let isWorker = false;
-				for (const sb of folder.sessionsById.values()) {
-					if ([...sb.subagentSummaries.values()].some((s) => s.id === event.id)) {
-						isWorker = true;
-						break;
+				outer: for (const fb of this.byFolder.values()) {
+					for (const sb of fb.sessionsById.values()) {
+						if ([...sb.subagentSummaries.values()].some((s) => s.id === event.id)) {
+							isWorker = true;
+							break outer;
+						}
 					}
 				}
 				// Rebind the folder's visible-session pointer to

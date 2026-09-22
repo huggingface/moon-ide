@@ -919,7 +919,10 @@ same rail when a concrete need shows up.
 `CoderEventEnvelope { folder, session_id, event }` so the frontend
 routes updates to the right per-`(folder, session)` bucket.
 Sub-agent events carry the **parent's** coordinates. A few
-folder-scoped variants (`folder_summary_ready`, `hub_sync_*`) arrive
+folder-scoped variants (`folder_summary_ready`, `hub_sync_*`,
+`session_list_changed` — a list invalidation is about the folder's
+sessions dir, never one runtime, and the frontend drops folder-level
+events found inside a session bucket) arrive
 with an empty `session_id`, and `workspace_folders_changed` is
 workspace-global — the frontend re-fetches the workspace snapshot when
 a coordinator binds or unbinds a folder
