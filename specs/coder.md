@@ -879,6 +879,36 @@ gets one final notice, and its mutating control tools
 transcript, branch, and worktree, and an in-flight turn runs to
 completion; clicking the button a second time cancels that turn.
 
+The inverse is the **`/attach` composer command**
+([ADR 0084](decisions/0084-composer-slash-commands.md)): attach an
+**existing** session to a coordinator as a worker — adopt a session
+the user has been driving, or re-attach a disconnected one. Typed in
+a coordinator's composer it picks the session to adopt; typed in an
+ordinary session it picks the coordinator to hand the session to
+(same operation, argument order flipped). After the attach the link
+is indistinguishable from a spawned worker's: registry + dispatch
+feeder, `orchestrator_session_id` header stamp (rewritten on disk —
+attach targets an already-persisted session), a coordinator-side
+`SubagentSpawned { worker: true }` record so the ADR 0065 rebuild
+survives restarts, and a **parked** notice (ADR 0062) with a branch
+snapshot so the coordinator plans from the handover state at its
+next turn. A worker still attached to a _different_ coordinator is
+refused (disconnect it there first); disconnected residue is purged
+and re-linked. No task is seeded — the notice tells the coordinator
+to read the worker's state before dispatching. The synthetic spawn
+record's `tool_call_id` matches no tool row, so no collapsed card
+renders in the coordinator transcript; the parked notice and
+`list_workers` are the visible surface.
+
+Slash commands are a composer surface: a single-line draft starting
+with `/` mounts a completion menu (same interaction grammar as the
+`@`-mention picker — arrows / Enter / Tab / Escape, mouse picks);
+picking an `/attach` target executes immediately and the command
+never reaches the model. A leading `/` that resolves to no known
+command falls through to a plain send, so prose starting with `/`
+still works. `/attach` is the only command today; new ones ride the
+same rail when a concrete need shows up.
+
 `coder:event` payloads are wrapped in a
 `CoderEventEnvelope { folder, session_id, event }` so the frontend
 routes updates to the right per-`(folder, session)` bucket.

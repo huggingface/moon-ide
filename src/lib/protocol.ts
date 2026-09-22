@@ -1650,6 +1650,19 @@ export type RerunToolOutcome = {
  *    nothing happened. */
 export type DisconnectWorkerOutcome = 'disconnected' | 'aborted' | 'already_disconnected' | 'not_a_worker';
 
+/**
+ * Outcome of `coder_attach_worker` (the `/attach` composer command,
+ * ADR 0084). Internally tagged because `attached_elsewhere` carries
+ * the owning coordinator's label for the flash. Mirrors
+ * `moon_coder::AttachWorkerOutcome`.
+ */
+export type AttachWorkerOutcome =
+	| { outcome: 'attached' }
+	| { outcome: 'already_attached' }
+	| { outcome: 'attached_elsewhere'; coordinator: string }
+	| { outcome: 'not_a_coordinator' }
+	| { outcome: 'target_is_coordinator' };
+
 /** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
 export type CoderStatus = {
 	signed_in: boolean;

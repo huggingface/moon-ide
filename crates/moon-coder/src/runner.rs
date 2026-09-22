@@ -292,6 +292,32 @@ impl CoordinatorRegistry {
 			.map(|(orchestrator_id, _)| orchestrator_id.as_str())
 	}
 
+	/// Ownership including the attached/disconnected split:
+	/// `(orchestrator_id, attached)`. The attach path (`/attach`,
+	/// ADR 0084) uses it to tell apart "already yours", "still
+	/// attached to another coordinator" (refused), and
+	/// "disconnected residue" (purged, then re-linked).
+	fn ownership_of(&self, worker_id: &str) -> Option<(String, bool)> {
+		self.by_orchestrator.iter().find_map(|(orchestrator_id, entry)| {
+			entry
+				.workers
+				.contains(worker_id)
+				.then(|| (orchestrator_id.clone(), !entry.disconnected.contains(worker_id)))
+		})
+	}
+
+	/// Drop `worker_id` from every orchestrator's sets — the attach
+	/// path's clean-slate step. Without it a stale disconnected mark
+	/// under a previous coordinator keeps vetoing the new link's
+	/// control tools forever (`controls` refuses ids in *any*
+	/// disconnected set).
+	fn purge_worker(&mut self, worker_id: &str) {
+		for entry in self.by_orchestrator.values_mut() {
+			entry.workers.remove(worker_id);
+			entry.disconnected.remove(worker_id);
+		}
+	}
+
 	/// Whether the coordinator's control tools may still act on
 	/// `worker_id` — i.e. it's a registered, still-attached worker
 	/// (ADR 0052). Unregistered sessions stay unaffected: nothing
@@ -5297,6 +5323,154 @@ impl CoderHandle {
 		});
 		DisconnectWorkerOutcome::Disconnected
 	}
+
+	/// Attach an **existing** session to a coordinator as a worker
+	/// (ADR 0084) — the user-driven inverse of ADR 0052's
+	/// disconnect, and the adoption path `spawn_worker` never
+	/// covers. After it returns `Attached`, the link is
+	/// indistinguishable from a spawned worker's (post-seed):
+	/// registry + feeder, worker header stamp, coordinator-side
+	/// spawn record (so the ADR 0065 fleet rebuild survives
+	/// restarts), live `SubagentSpawned` event, and a parked notice
+	/// (ADR 0062) telling the coordinator at its next turn.
+	///
+	/// Mounts either session from disk when needed. A worker still
+	/// attached to a *different* coordinator is refused — disconnect
+	/// it first; disconnected residue (any coordinator) is purged
+	/// and re-linked.
+	pub async fn attach_worker(&self, coordinator_id: &str, worker_id: &str) -> Result<AttachWorkerOutcome, CoderError> {
+		if coordinator_id == worker_id {
+			return Ok(AttachWorkerOutcome::TargetIsCoordinator);
+		}
+		let (coordinator_rt, coordinator_folder) = self.mount_session_anywhere(coordinator_id).await?;
+		let coordinator_mode = {
+			let session = coordinator_rt.session.lock().await;
+			CoderMode::from_top_level_wire(session.header.mode.as_deref())
+		};
+		if coordinator_mode != CoderMode::Coordinator {
+			return Ok(AttachWorkerOutcome::NotACoordinator);
+		}
+		let (worker_rt, worker_folder) = self.mount_session_anywhere(worker_id).await?;
+		{
+			let session = worker_rt.session.lock().await;
+			if CoderMode::from_top_level_wire(session.header.mode.as_deref()) == CoderMode::Coordinator {
+				return Ok(AttachWorkerOutcome::TargetIsCoordinator);
+			}
+		}
+		match self.state.coordinator_workers.read().await.ownership_of(worker_id) {
+			Some((owner, true)) if owner == coordinator_id => {
+				return Ok(AttachWorkerOutcome::AlreadyAttached);
+			}
+			Some((owner, true)) => {
+				let label = worker_label(&self.state, &owner).await;
+				return Ok(AttachWorkerOutcome::AttachedElsewhere { coordinator: label });
+			}
+			// Disconnected residue (this or another coordinator):
+			// purged below, then re-linked fresh.
+			Some((_, false)) | None => {}
+		}
+
+		// Worker header: stamp the reverse link (ADR 0065) and
+		// rewrite it on disk — unlike a spawn, an attached session
+		// is already persisted, so the pre-seed lazy header write
+		// never happens. Same pattern as `set_bash_target_override`.
+		let (worker_dir, worker_header, worktree_root) = {
+			let mut session = worker_rt.session.lock().await;
+			session.header.orchestrator_session_id = Some(coordinator_id.to_string());
+			(
+				session.session_dir.clone(),
+				session.header.clone(),
+				session.header.worktree_root.clone(),
+			)
+		};
+		if let Some(dir) = worker_dir {
+			if let Err(err) = sessions::rewrite_header(&dir, &worker_header).await {
+				tracing::warn!(?err, worker_id, "attach: failed to persist worker header rewrite");
+			}
+		}
+
+		// Registry: clean slate, then link; first link spawns the
+		// coordinator's dispatch feeder.
+		let spawn_feeder = {
+			let mut registry = self.state.coordinator_workers.write().await;
+			registry.purge_worker(worker_id);
+			registry.register(coordinator_id, worker_id)
+		};
+		if spawn_feeder {
+			spawn_dispatch_feeder(self.state.clone(), coordinator_id.to_string());
+		}
+
+		// Coordinator-side spawn record (ADR 0065 rebuild) + live
+		// event. The synthetic tool_call_id matches no tool row, so
+		// no collapsed card renders in the transcript — the parked
+		// notice below and `list_workers` are the visible surface.
+		let target_folder = worktree_root.clone().unwrap_or_else(|| worker_folder.to_string());
+		let record = SessionRecord::SubagentSpawned {
+			tool_call_id: format!("attach-{}", new_message_id()),
+			subagent_id: worker_id.to_string(),
+			target_folder: target_folder.clone(),
+			mode: CoderMode::Agent.as_wire().to_string(),
+			worktree_root: worktree_root.clone(),
+			worker: true,
+			detached: false,
+		};
+		persist_parent_record(&coordinator_rt, record.clone()).await;
+		let sink = FolderEventSink::new(
+			self.state.events.clone(),
+			coordinator_folder.to_string(),
+			coordinator_id.to_string(),
+		);
+		if let SessionRecord::SubagentSpawned { tool_call_id, .. } = &record {
+			sink.send(CoderEvent::SubagentSpawned {
+				tool_call_id: tool_call_id.clone(),
+				subagent_id: worker_id.to_string(),
+				target_folder,
+				mode: CoderMode::Agent.as_wire().to_string(),
+				worktree_root,
+				worker: true,
+				detached: false,
+			});
+		}
+
+		// Tell the coordinator — parked, never a wake (ADR 0062):
+		// an attach is information; the worker's own next
+		// `TurnComplete` (or the user's next instruction) is the
+		// actionable moment. Include the branch snapshot so the
+		// coordinator can plan from the handover state (ADR 0056).
+		let label = worker_label(&self.state, worker_id).await;
+		let snapshot = worker_branch_snapshot(&self.state, worker_id).await;
+		let state_line = snapshot.map(|s| format!(" Current state: {s}.")).unwrap_or_default();
+		let notice = format!(
+			"The user attached the existing session {label} to your fleet as a worker. Its turn updates \
+			 now reach you and your control tools (observe / steer / commit / merge / respond) accept it. \
+			 You did not seed it — read its state before dispatching anything.{state_line}"
+		);
+		park_coordinator_notice(&coordinator_rt, &sink, notice).await;
+		Ok(AttachWorkerOutcome::Attached)
+	}
+
+	/// Resolve a session's runtime, mounting it from disk when
+	/// needed — searching every bound folder's sessions directory
+	/// (the coordinator and the session being attached may live in
+	/// different projects, ADR 0037).
+	async fn mount_session_anywhere(&self, session_id: &str) -> Result<(Arc<SessionRuntime>, Utf8PathBuf), CoderError> {
+		if let Some(found) = self.state.runtime_for_session(session_id).await {
+			return Ok(found);
+		}
+		let Some(folder) = find_session_folder(&self.state, session_id).await else {
+			return Err(CoderError::Internal(format!(
+				"session {session_id} not found in any bound folder"
+			)));
+		};
+		self
+			.open_session_boxed(folder.to_string(), session_id.to_string())
+			.await?;
+		self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session {session_id} failed to mount")))
+	}
 }
 
 /// A short human label for a worker — its title, or the session id when
@@ -5351,6 +5525,28 @@ async fn worker_branch_snapshot(state: &Arc<CoderState>, worker_id: &str) -> Opt
 		"branch `{name}` ({} ahead, {} behind upstream{drift}, {uncommitted} uncommitted file(s))",
 		branch.ahead, branch.behind,
 	))
+}
+
+/// Outcome of [`CoderHandle::attach_worker`] (ADR 0084). Internally
+/// tagged (`{ "outcome": … }`) because `AttachedElsewhere` carries
+/// the owning coordinator's label for the UI flash.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AttachWorkerOutcome {
+	/// The link is live: registry + feeder + records + notice all
+	/// landed. The session is now this coordinator's worker.
+	Attached,
+	/// Already this coordinator's attached worker; nothing changed.
+	AlreadyAttached,
+	/// Still attached to a different coordinator — refused. The
+	/// user disconnects it there first; auto-stealing a live link
+	/// would silently break the other fleet's plan.
+	AttachedElsewhere { coordinator: String },
+	/// The named coordinator session isn't in coordinator mode.
+	NotACoordinator,
+	/// The session to attach is itself a coordinator (or the same
+	/// session as the coordinator) — fleets don't nest.
+	TargetIsCoordinator,
 }
 
 /// Outcome of [`CoderHandle::disconnect_worker`] (ADR 0052).
@@ -11677,6 +11873,46 @@ pub(crate) fn new_message_id() -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn coordinator_registry_ownership_and_purge_for_attach() {
+		let mut registry = CoordinatorRegistry::default();
+		registry.register("coord-a", "w-1");
+		assert_eq!(registry.ownership_of("w-1"), Some(("coord-a".to_string(), true)));
+		assert_eq!(registry.ownership_of("w-2"), None);
+
+		// Disconnected residue reads as owned-but-detached, and it
+		// vetoes control tools until purged (the attach path's
+		// clean-slate step).
+		registry.disconnect("coord-a", "w-1");
+		assert_eq!(registry.ownership_of("w-1"), Some(("coord-a".to_string(), false)));
+		assert!(!registry.controls("w-1"));
+		registry.purge_worker("w-1");
+		assert_eq!(registry.ownership_of("w-1"), None);
+		assert!(registry.controls("w-1"));
+
+		// Re-attach under a new coordinator is a clean link again.
+		registry.register("coord-b", "w-1");
+		assert_eq!(registry.ownership_of("w-1"), Some(("coord-b".to_string(), true)));
+		assert!(registry.feeds("coord-b", "w-1"));
+	}
+
+	#[test]
+	fn attach_worker_outcome_wire_shape() {
+		// Internally tagged so `attached_elsewhere` can carry the
+		// owning coordinator's label — mirrored in protocol.ts.
+		assert_eq!(
+			serde_json::to_value(AttachWorkerOutcome::Attached).unwrap(),
+			json!({ "outcome": "attached" })
+		);
+		assert_eq!(
+			serde_json::to_value(AttachWorkerOutcome::AttachedElsewhere {
+				coordinator: "`fleet` (sess-1)".into()
+			})
+			.unwrap(),
+			json!({ "outcome": "attached_elsewhere", "coordinator": "`fleet` (sess-1)" })
+		);
+	}
 
 	#[test]
 	fn parse_worker_ids_accepts_single_multiple_and_both() {

@@ -7,8 +7,8 @@
 
 use camino::Utf8PathBuf;
 use moon_coder::{
-	CoderHandle, CoderStatus, DeviceCode, DisconnectWorkerOutcome, HfIdentity, ImageAttachment, PromptResponse,
-	RerunToolOutcome, RevertedMessage, SessionSummary, UnqueuedSteer,
+	AttachWorkerOutcome, CoderHandle, CoderStatus, DeviceCode, DisconnectWorkerOutcome, HfIdentity, ImageAttachment,
+	PromptResponse, RerunToolOutcome, RevertedMessage, SessionSummary, UnqueuedSteer,
 };
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
@@ -500,6 +500,19 @@ pub async fn coder_disconnect_worker(
 	session_id: String,
 ) -> Result<DisconnectWorkerOutcome, MoonError> {
 	Ok(state.coder.disconnect_worker(&session_id).await)
+}
+
+/// Attach an existing session to a coordinator as a worker (ADR
+/// 0084) — the `/attach` composer command. Mounts either session
+/// from disk when needed; refuses when the target is still attached
+/// to a different coordinator.
+#[tauri::command]
+pub async fn coder_attach_worker(
+	state: State<'_, AppState>,
+	coordinator_id: String,
+	session_id: String,
+) -> Result<AttachWorkerOutcome, MoonError> {
+	Ok(state.coder.attach_worker(&coordinator_id, &session_id).await?)
 }
 
 /// Result of [`coder_new_worktree_session`]: the new bound-folder

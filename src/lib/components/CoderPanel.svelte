@@ -1095,6 +1095,108 @@
 		});
 	}
 
+	// Composer slash commands (ADR 0084). Active while the draft is
+	// a single line starting with `/`. Two stages: `command` (typing
+	// the verb — `/att…`) and `arg` (after `/attach ` — picking a
+	// session). Unlike the `@`-mention menu the state derives
+	// straight from `coder.draft`, so it survives the textarea
+	// remounting and needs no input-handler bookkeeping. A draft
+	// whose leading `/` resolves to no known command falls through
+	// to a normal send — prose that happens to start with `/` still
+	// goes to the model.
+	type SlashCommand = { name: string; hint: string };
+	const SLASH_COMMANDS: SlashCommand[] = [{ name: 'attach', hint: 'Attach a session to a coordinator fleet' }];
+	type SlashState = { stage: 'command'; query: string } | { stage: 'arg'; command: string; query: string };
+	const slashState = $derived.by((): SlashState | null => {
+		const value = coder.draft;
+		if (!value.startsWith('/') || value.includes('\n')) {
+			return null;
+		}
+		const body = value.slice(1);
+		const spaceIdx = body.indexOf(' ');
+		if (spaceIdx === -1) {
+			return { stage: 'command', query: body };
+		}
+		return { stage: 'arg', command: body.slice(0, spaceIdx), query: body.slice(spaceIdx + 1) };
+	});
+	const slashCommandMatches = $derived.by(() => {
+		if (slashState?.stage !== 'command') {
+			return [];
+		}
+		const q = slashState.query.toLowerCase();
+		return SLASH_COMMANDS.filter((c) => c.name.startsWith(q));
+	});
+	// `/attach` candidates, direction-aware: typed in a coordinator
+	// it lists attachable (non-coordinator) sessions; typed in an
+	// ordinary session it lists coordinators to hand this session
+	// to. Either way the same backend call runs — only the argument
+	// order flips.
+	const slashArgMatches = $derived.by(() => {
+		if (slashState?.stage !== 'arg' || slashState.command !== 'attach') {
+			return [];
+		}
+		const visible = coder.activeSession;
+		if (visible === null) {
+			return [];
+		}
+		const wantCoordinators = !isCoordinatorSession(visible);
+		const q = slashState.query.trim().toLowerCase();
+		return (coder.sessions ?? [])
+			.filter((s) => s.id !== visible.id && isCoordinatorSession(s) === wantCoordinators)
+			.filter((s) => q.length === 0 || s.title.toLowerCase().includes(q) || s.id.toLowerCase().startsWith(q))
+			.slice(0, 8);
+	});
+	const slashMenuVisible = $derived(
+		(slashState?.stage === 'command' && slashCommandMatches.length > 0) ||
+			(slashState?.stage === 'arg' && slashState.command === 'attach'),
+	);
+	let slashSelected = $state(0);
+	// Keep the highlight in range as the query narrows, and make
+	// sure the sessions list is loaded the moment `/attach ` needs
+	// candidates (it's lazy-loaded with the sessions panel).
+	$effect(() => {
+		const len = slashState?.stage === 'command' ? slashCommandMatches.length : slashArgMatches.length;
+		if (slashSelected >= len) {
+			slashSelected = 0;
+		}
+		if (slashState?.stage === 'arg' && coder.sessions === null) {
+			void coder.refreshSessions();
+		}
+	});
+
+	/** Execute `/attach` with the picked session. Direction depends
+	 *  on where it was typed (see `slashArgMatches`). */
+	async function runSlashAttach(target: CoderSessionSummary): Promise<void> {
+		const visible = coder.activeSession;
+		if (visible === null) {
+			return;
+		}
+		const coordinatorId = isCoordinatorSession(visible) ? visible.id : target.id;
+		const workerId = isCoordinatorSession(visible) ? target.id : visible.id;
+		coder.draft = '';
+		try {
+			workspace.flash(await coder.attachWorker(coordinatorId, workerId));
+		} catch (err) {
+			workspace.flash(`Attach failed: ${formatError(err)}`);
+		}
+	}
+
+	function pickSlash(index: number): void {
+		if (slashState?.stage === 'command') {
+			const cmd = slashCommandMatches[index];
+			if (cmd !== undefined) {
+				coder.draft = `/${cmd.name} `;
+			}
+			return;
+		}
+		if (slashState?.stage === 'arg' && slashState.command === 'attach') {
+			const target = slashArgMatches[index];
+			if (target !== undefined) {
+				void runSlashAttach(target);
+			}
+		}
+	}
+
 	// Pull focus into the composer whenever the store bumps its
 	// focus tick (e.g. Ctrl+L from the editor pushes a selection
 	// onto `coder.attachments` and wants the user typing
@@ -1130,6 +1232,39 @@
 		// the user can drive the picker without those keys firing
 		// their default composer behaviour. Escape dismisses the
 		// menu only — it doesn't abort the turn at the same time.
+		// `/`-command menu (ADR 0084): same key interception as the
+		// mention menu below. Enter picks (a picked `/attach` target
+		// executes immediately — the command never reaches the
+		// model); Escape wipes the command draft. An unresolvable
+		// leading `/` never mounts the menu, so those drafts keep
+		// plain send behaviour.
+		if (slashMenuVisible) {
+			const matches = slashState?.stage === 'command' ? slashCommandMatches.length : slashArgMatches.length;
+			if (event.key === 'ArrowDown' && matches > 0) {
+				event.preventDefault();
+				slashSelected = (slashSelected + 1) % matches;
+				return;
+			}
+			if (event.key === 'ArrowUp' && matches > 0) {
+				event.preventDefault();
+				slashSelected = (slashSelected - 1 + matches) % matches;
+				return;
+			}
+			if (event.key === 'Enter' || event.key === 'Tab') {
+				event.preventDefault();
+				if (matches > 0) {
+					pickSlash(slashSelected);
+				} else {
+					workspace.flash('No matching session.');
+				}
+				return;
+			}
+			if (event.key === 'Escape') {
+				event.preventDefault();
+				coder.draft = '';
+				return;
+			}
+		}
 		if (mention !== null && mentionResults.length > 0) {
 			if (event.key === 'ArrowDown') {
 				event.preventDefault();
@@ -2930,6 +3065,62 @@
 							</button>
 						</div>
 					{/each}
+				</div>
+			{/if}
+			{#if slashMenuVisible}
+				<!-- `/`-command picker (ADR 0084). Reuses the mention
+				     menu's classes — same visual language, different
+				     content. Mouse picks on `mousedown` for the same
+				     blur-race reason as below. -->
+				<div class="mention-menu" role="listbox" aria-label="Command suggestions">
+					{#if slashState?.stage === 'command'}
+						{#each slashCommandMatches as cmd, i (cmd.name)}
+							<button
+								type="button"
+								class="mention-row"
+								class:active={i === slashSelected}
+								role="option"
+								aria-selected={i === slashSelected}
+								onmousedown={(e) => {
+									e.preventDefault();
+									pickSlash(i);
+								}}
+								onmouseenter={() => (slashSelected = i)}
+							>
+								<span class="mention-name">/{cmd.name}</span>
+								<span class="mention-path">{cmd.hint}</span>
+							</button>
+						{/each}
+					{:else if slashArgMatches.length === 0}
+						<div class="mention-hint">
+							{coder.sessions === null
+								? 'Loading sessions…'
+								: isCoordinatorSession(coder.activeSession)
+									? 'No attachable session in this project'
+									: 'No coordinator session in this project'}
+						</div>
+					{:else}
+						{#each slashArgMatches as target, i (target.id)}
+							<button
+								type="button"
+								class="mention-row"
+								class:active={i === slashSelected}
+								role="option"
+								aria-selected={i === slashSelected}
+								title={target.id}
+								onmousedown={(e) => {
+									e.preventDefault();
+									pickSlash(i);
+								}}
+								onmouseenter={() => (slashSelected = i)}
+							>
+								<span class="mention-name">{target.title || target.id}</span>
+								<span class="mention-path">
+									{isCoordinatorSession(target) ? 'coordinator · ' : ''}{target.id}
+								</span>
+							</button>
+						{/each}
+					{/if}
 				</div>
 			{/if}
 			{#if mention !== null}

@@ -2163,6 +2163,25 @@ export class CoderPanelState {
 		return null;
 	}
 
+	/** Attach an existing session to a coordinator as a worker (the
+	 *  `/attach` composer command, ADR 0084). Returns a user-facing
+	 *  line for the caller to flash. */
+	async attachWorker(coordinatorId: string, sessionId: string): Promise<string> {
+		const result = await ipc.coder.attachWorker(coordinatorId, sessionId);
+		switch (result.outcome) {
+			case 'attached':
+				return 'Session attached to the coordinator.';
+			case 'already_attached':
+				return 'Session is already attached to this coordinator.';
+			case 'attached_elsewhere':
+				return `Session is still attached to coordinator ${result.coordinator} — disconnect it there first.`;
+			case 'not_a_coordinator':
+				return 'That session is not a coordinator.';
+			case 'target_is_coordinator':
+				return 'Coordinators cannot be attached as workers.';
+		}
+	}
+
 	/** Render an error inline in the active session's transcript —
 	 *  used by flows orchestrated outside this store (e.g. the
 	 *  worktree-session creation in `WorkspaceState`). */
