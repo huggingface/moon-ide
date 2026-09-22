@@ -10169,15 +10169,25 @@ async fn compose_system_prompt(
 			}
 		}
 		// Personal coder instructions (gitignored, per-dev). Lives at
-		// `<active>/.moon/AGENTS.md` — not the repo's committed `AGENTS.md`,
+		// `<project>/.moon/AGENTS.md` — not the repo's committed `AGENTS.md`,
 		// but a private addendum for overrides like "ignore TS crashes in
 		// dev". Same shape, separate section so the model treats it as a
-		// distinct layer (personal > team > base).
-		if let Some(personal) = read_personal_instructions(Utf8Path::new(active)).await {
+		// distinct layer (personal > team > base). Being gitignored, a
+		// worktree checkout never contains the file — a worktree-backed
+		// session falls back to the parent project's copy, so the dev's
+		// overrides follow their work into branches. A worktree-local
+		// `.moon/AGENTS.md` (deliberately placed) still wins.
+		let mut personal = read_personal_instructions(Utf8Path::new(active)).await;
+		if personal.is_none() {
+			if let Some(parent) = worktree_parent_path(folders, active) {
+				personal = read_personal_instructions(parent).await;
+			}
+		}
+		if let Some(personal) = personal {
 			out.push('\n');
 			out.push_str("## Personal coder instructions\n\n");
 			out.push_str(
-				"Verbatim contents of `.moon/AGENTS.md` from the active folder — your personal, gitignored overrides. These are authoritative for this dev's workflow and override both the project rules above and the base prompt when the three disagree.\n\n",
+				"Verbatim contents of the project's `.moon/AGENTS.md` — your personal, gitignored overrides (a worktree session inherits the parent project's copy). These are authoritative for this dev's workflow and override both the project rules above and the base prompt when the three disagree.\n\n",
 			);
 			out.push_str(&personal);
 			if !out.ends_with('\n') {
@@ -10369,6 +10379,19 @@ async fn read_agent_rules(folder_root: &Utf8Path) -> Option<String> {
 		return Some(text);
 	}
 	None
+}
+
+/// The parent project's root when `active` is a bound worktree
+/// folder, `None` otherwise. Used by the personal-instructions
+/// fallback in [`compose_system_prompt`]: `.moon/AGENTS.md` is
+/// gitignored, so a worktree checkout never has one of its own.
+fn worktree_parent_path<'a>(folders: &'a [Arc<WorkspaceFolderEntry>], active: &str) -> Option<&'a Utf8Path> {
+	folders.iter().find_map(|entry| match &entry.folder.origin {
+		moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } if entry.folder.path == active => {
+			Some(Utf8Path::new(parent_path.as_str()))
+		}
+		_ => None,
+	})
 }
 
 /// Read `.moon/AGENTS.md` from `folder_root` — a gitignored,
@@ -12740,6 +12763,45 @@ mod tests {
 		));
 		let prompt = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, CoderMode::Agent).await;
 		assert!(!prompt.contains("## No folders bound"));
+	}
+
+	#[tokio::test]
+	async fn compose_system_prompt_worktree_inherits_parent_personal_instructions() {
+		// `.moon/AGENTS.md` is gitignored, so a worktree checkout
+		// never contains it — the section must fall back to the
+		// parent project's copy. A worktree-local file (deliberate)
+		// still wins over the parent's.
+		let cache = tempfile::TempDir::new().unwrap();
+		let summaries = Arc::new(FolderSummaryService::new(
+			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
+		));
+		let dir = tempfile::TempDir::new().unwrap();
+		let parent = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+		let wt = parent.join(".worktrees/moon-agent-1");
+		std::fs::create_dir_all(wt.join(".moon").as_std_path()).unwrap();
+		std::fs::create_dir_all(parent.join(".moon").as_std_path()).unwrap();
+		std::fs::write(parent.join(".moon/AGENTS.md").as_std_path(), "parent personal rules\n").unwrap();
+
+		let registry = moon_core::WorkspaceRegistry::new("test-workspace".into());
+		registry.add_folder(parent.clone()).await.unwrap();
+		registry
+			.add_worktree_folder(wt.clone(), parent.to_string(), "moon/agent-1".into())
+			.await
+			.unwrap();
+		let folders = registry.folders().await;
+
+		let prompt = compose_system_prompt(&folders, Some(wt.as_str()), None, &summaries, false, CoderMode::Agent).await;
+		assert!(
+			prompt.contains("## Personal coder instructions"),
+			"fallback section missing"
+		);
+		assert!(prompt.contains("parent personal rules"));
+
+		// Worktree-local copy takes precedence.
+		std::fs::write(wt.join(".moon/AGENTS.md").as_std_path(), "worktree-local rules\n").unwrap();
+		let prompt = compose_system_prompt(&folders, Some(wt.as_str()), None, &summaries, false, CoderMode::Agent).await;
+		assert!(prompt.contains("worktree-local rules"));
+		assert!(!prompt.contains("parent personal rules"));
 	}
 
 	#[tokio::test]

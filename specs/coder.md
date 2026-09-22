@@ -783,7 +783,13 @@ Concatenated, in this order:
 2. **`AGENTS.md`** from the active workspace root (case-insensitive,
    `CLAUDE.md` fallback, AGENTS.md wins when both exist). Verbatim up
    to a 20 KB cap with a `… (truncated)` sentinel.
-3. **Skills** discovered from `skills/`, `.claude/skills/`,
+3. **`.moon/AGENTS.md`** — personal, gitignored per-dev overrides,
+   as a separate section layered above the project rules
+   (personal > team > base). Same cap/truncation. Because it's
+   gitignored, a worktree checkout never contains it: worktree
+   sessions inherit the **parent project's** copy (a deliberately
+   placed worktree-local file still wins).
+4. **Skills** discovered from `skills/`, `.claude/skills/`,
    `.cursor/skills*/`, `.agents/skills/` (`SKILL.md` with `name` +
    `description` frontmatter per the
    [agent-skills standard](https://agentskills.io)). Only the
