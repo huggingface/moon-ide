@@ -49,6 +49,8 @@ import type {
 	AttachWorkerOutcome,
 	BackgroundProcessSnapshot,
 	DisconnectWorkerOutcome,
+	FleetMember,
+	WorkerLinkState,
 	PromptResponse,
 	LogEntry,
 	LogLevel,
@@ -421,10 +423,11 @@ export const ipc = {
 		lastOpenedSession: () => invoke<string | null>('coder_last_opened_session'),
 		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
 		newCoordinatorSession: () => invoke<CoderSessionSummary>('coder_new_coordinator_session'),
-		isCoordinatorWorker: (sessionId: string) => invoke<boolean>('coder_is_coordinator_worker', { sessionId }),
+		workerLinkState: (sessionId: string) => invoke<WorkerLinkState>('coder_worker_link_state', { sessionId }),
 		disconnectWorker: (sessionId: string) => invoke<DisconnectWorkerOutcome>('coder_disconnect_worker', { sessionId }),
 		attachWorker: (coordinatorId: string, sessionId: string) =>
 			invoke<AttachWorkerOutcome>('coder_attach_worker', { coordinatorId, sessionId }),
+		attachedWorkers: (coordinatorId: string) => invoke<FleetMember[]>('coder_attached_workers', { coordinatorId }),
 		readBackgroundProcess: (sessionId: string, id: string) =>
 			invoke<BackgroundProcessSnapshot>('coder_read_background_process', { sessionId, id }),
 		stopBackgroundProcess: (sessionId: string, id: string) =>

@@ -45,7 +45,13 @@
 	import ReplayIcon from './icons/ReplayIcon.svelte';
 	import DisconnectIcon from './icons/DisconnectIcon.svelte';
 	import { ipc } from '../ipc';
-	import { formatError, type FileSearchResult, type CoderSessionSummary } from '../protocol';
+	import {
+		formatError,
+		type FileSearchResult,
+		type CoderSessionSummary,
+		type FleetMember,
+		type WorkerLinkState,
+	} from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
@@ -69,23 +75,28 @@
 	// and the parent never clobbers either text.
 	let subagentDraft = $state('');
 
-	// Whether the visible session is registered as a coordinator-
-	// spawned worker (ADR 0052). Probed backend-side (the link is
-	// in-memory only — nothing on the summary marks a worker) and
-	// re-checked whenever the panel switches sessions, so a worker
-	// shows the disconnect affordance and an ordinary session never
-	// does.
-	let visibleIsWorker = $state(false);
+	// The visible session's fleet link (ADR 0052 / 0084). Probed
+	// backend-side (the link is in-memory — nothing on the summary
+	// marks a worker). Re-probed when the visible session changes,
+	// when its busy flag flips (a disconnected worker's final turn
+	// landing is what drops the link for good), and after every
+	// attach / detach the panel issues (`workerLinkTick`) — a probe
+	// that only ran on session switch left the disconnect button
+	// stuck after a click.
+	let workerLink = $state<WorkerLinkState>('none');
+	let workerLinkTick = $state(0);
 	$effect(() => {
 		const id = coder.current.visibleSessionId;
+		void coder.busy;
+		void workerLinkTick;
 		if (id === null) {
-			visibleIsWorker = false;
+			workerLink = 'none';
 			return;
 		}
 		let cancelled = false;
-		void ipc.coder.isCoordinatorWorker(id).then((isWorker) => {
+		void ipc.coder.workerLinkState(id).then((state) => {
 			if (!cancelled) {
-				visibleIsWorker = isWorker;
+				workerLink = state;
 			}
 		});
 		return () => {
@@ -1100,14 +1111,25 @@
 	// Composer slash commands (ADR 0084). Active while the draft is
 	// a single line starting with `/`. Two stages: `command` (typing
 	// the verb — `/att…`) and `arg` (after `/attach ` — picking a
-	// session). Unlike the `@`-mention menu the state derives
-	// straight from `coder.draft`, so it survives the textarea
-	// remounting and needs no input-handler bookkeeping. A draft
-	// whose leading `/` resolves to no known command falls through
-	// to a normal send — prose that happens to start with `/` still
-	// goes to the model.
-	type SlashCommand = { name: string; hint: string };
-	const SLASH_COMMANDS: SlashCommand[] = [{ name: 'attach', hint: 'Attach a session to a coordinator fleet' }];
+	// target). Unlike the `@`-mention menu the state derives straight
+	// from `coder.draft`, so it survives the textarea remounting and
+	// needs no input-handler bookkeeping. A draft whose leading `/`
+	// resolves to no known command falls through to a normal send —
+	// prose that happens to start with `/` still goes to the model.
+	type SlashCommand = { name: 'attach' | 'detach'; hint: string };
+	const visibleIsCoordinator = $derived(isCoordinatorSession(coder.activeSession));
+	// `/detach` only where it can do something: in a coordinator
+	// (pick a worker to drop) or in a session that is currently an
+	// attached worker (drop itself — no argument).
+	const slashCommands = $derived.by((): SlashCommand[] => {
+		const cmds: SlashCommand[] = [{ name: 'attach', hint: 'Attach a session to a coordinator fleet' }];
+		if (visibleIsCoordinator) {
+			cmds.push({ name: 'detach', hint: 'Disconnect one of your workers' });
+		} else if (workerLink === 'attached') {
+			cmds.push({ name: 'detach', hint: 'Disconnect this session from its coordinator' });
+		}
+		return cmds;
+	});
 	type SlashState = { stage: 'command'; query: string } | { stage: 'arg'; command: string; query: string };
 	const slashState = $derived.by((): SlashState | null => {
 		const value = coder.draft;
@@ -1126,31 +1148,85 @@
 			return [];
 		}
 		const q = slashState.query.toLowerCase();
-		return SLASH_COMMANDS.filter((c) => c.name.startsWith(q));
+		return slashCommands.filter((c) => c.name.startsWith(q));
 	});
-	// `/attach` candidates, direction-aware: typed in a coordinator
-	// it lists attachable (non-coordinator) sessions; typed in an
-	// ordinary session it lists coordinators to hand this session
-	// to. Either way the same backend call runs — only the argument
-	// order flips.
-	const slashArgMatches = $derived.by(() => {
-		if (slashState?.stage !== 'arg' || slashState.command !== 'attach') {
-			return [];
+	// Commands that take a target argument in the current context.
+	const slashArgCommand = $derived.by((): 'attach' | 'detach' | null => {
+		if (slashState?.stage !== 'arg') {
+			return null;
 		}
+		if (slashState.command === 'attach') {
+			return 'attach';
+		}
+		if (slashState.command === 'detach' && visibleIsCoordinator) {
+			return 'detach';
+		}
+		return null;
+	});
+	// A coordinator's attached workers, fetched when `/detach ` needs
+	// them (the registry is backend-only; no summary marks workers).
+	let fleet = $state<FleetMember[] | null>(null);
+	$effect(() => {
 		const visible = coder.activeSession;
-		if (visible === null) {
+		if (slashArgCommand !== 'detach' || visible === null) {
+			fleet = null;
+			return;
+		}
+		let cancelled = false;
+		void ipc.coder.attachedWorkers(visible.id).then((members) => {
+			if (!cancelled) {
+				fleet = members;
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+	type SlashPick = { id: string; label: string; detail: string };
+	// Arg-stage candidates. `/attach` is direction-aware: typed in a
+	// coordinator it lists attachable (non-coordinator) sessions;
+	// typed elsewhere it lists coordinators to hand this session to —
+	// same backend call, argument order flipped. `/detach` in a
+	// coordinator lists its attached workers.
+	const slashArgMatches = $derived.by((): SlashPick[] => {
+		const visible = coder.activeSession;
+		if (slashState?.stage !== 'arg' || visible === null) {
 			return [];
 		}
-		const wantCoordinators = !isCoordinatorSession(visible);
 		const q = slashState.query.trim().toLowerCase();
-		return (coder.sessions ?? [])
-			.filter((s) => s.id !== visible.id && isCoordinatorSession(s) === wantCoordinators)
-			.filter((s) => q.length === 0 || s.title.toLowerCase().includes(q) || s.id.toLowerCase().startsWith(q))
-			.slice(0, 8);
+		const matchesQuery = (label: string, id: string) =>
+			q.length === 0 || label.toLowerCase().includes(q) || id.toLowerCase().startsWith(q);
+		if (slashArgCommand === 'attach') {
+			const wantCoordinators = !visibleIsCoordinator;
+			return (coder.sessions ?? [])
+				.filter((s) => s.id !== visible.id && isCoordinatorSession(s) === wantCoordinators)
+				.filter((s) => matchesQuery(s.title, s.id))
+				.slice(0, 8)
+				.map((s) => ({
+					id: s.id,
+					label: s.title || s.id,
+					detail: `${isCoordinatorSession(s) ? 'coordinator · ' : ''}${s.id}`,
+				}));
+		}
+		if (slashArgCommand === 'detach') {
+			return (fleet ?? [])
+				.filter((m) => matchesQuery(m.title, m.id))
+				.slice(0, 8)
+				.map((m) => ({ id: m.id, label: m.title || m.id, detail: `worker · ${m.id}` }));
+		}
+		return [];
+	});
+	const slashArgEmptyHint = $derived.by(() => {
+		if (slashArgCommand === 'detach') {
+			return fleet === null ? 'Loading workers…' : 'No attached worker';
+		}
+		if (coder.sessions === null) {
+			return 'Loading sessions…';
+		}
+		return visibleIsCoordinator ? 'No attachable session in this project' : 'No coordinator session in this project';
 	});
 	const slashMenuVisible = $derived(
-		(slashState?.stage === 'command' && slashCommandMatches.length > 0) ||
-			(slashState?.stage === 'arg' && slashState.command === 'attach'),
+		(slashState?.stage === 'command' && slashCommandMatches.length > 0) || slashArgCommand !== null,
 	);
 	let slashSelected = $state(0);
 	// Keep the highlight in range as the query narrows, and make
@@ -1161,41 +1237,61 @@
 		if (slashSelected >= len) {
 			slashSelected = 0;
 		}
-		if (slashState?.stage === 'arg' && coder.sessions === null) {
+		if (slashArgCommand === 'attach' && coder.sessions === null) {
 			void coder.refreshSessions();
 		}
 	});
 
-	/** Execute `/attach` with the picked session. Direction depends
-	 *  on where it was typed (see `slashArgMatches`). */
-	async function runSlashAttach(target: CoderSessionSummary): Promise<void> {
+	/** Execute `/attach` with the picked session id. Direction
+	 *  depends on where it was typed (see `slashArgMatches`). */
+	async function runSlashAttach(targetId: string): Promise<void> {
 		const visible = coder.activeSession;
 		if (visible === null) {
 			return;
 		}
-		const coordinatorId = isCoordinatorSession(visible) ? visible.id : target.id;
-		const workerId = isCoordinatorSession(visible) ? target.id : visible.id;
+		const coordinatorId = visibleIsCoordinator ? visible.id : targetId;
+		const workerId = visibleIsCoordinator ? targetId : visible.id;
 		coder.draft = '';
 		try {
 			workspace.flash(await coder.attachWorker(coordinatorId, workerId));
 		} catch (err) {
 			workspace.flash(`Attach failed: ${formatError(err)}`);
+		} finally {
+			workerLinkTick++;
 		}
+	}
+
+	/** Execute `/detach`: the named worker (typed in a coordinator)
+	 *  or the visible session itself. Same path as the session bar's
+	 *  disconnect button (ADR 0052). */
+	async function runSlashDetach(workerId: string): Promise<void> {
+		coder.draft = '';
+		await onDisconnectWorker(workerId);
 	}
 
 	function pickSlash(index: number): void {
 		if (slashState?.stage === 'command') {
 			const cmd = slashCommandMatches[index];
-			if (cmd !== undefined) {
-				coder.draft = `/${cmd.name} `;
+			if (cmd === undefined) {
+				return;
 			}
+			// Argument-less form: `/detach` in a worker session acts
+			// on itself immediately.
+			if (cmd.name === 'detach' && !visibleIsCoordinator && coder.activeSession !== null) {
+				void runSlashDetach(coder.activeSession.id);
+				return;
+			}
+			coder.draft = `/${cmd.name} `;
 			return;
 		}
-		if (slashState?.stage === 'arg' && slashState.command === 'attach') {
-			const target = slashArgMatches[index];
-			if (target !== undefined) {
-				void runSlashAttach(target);
-			}
+		const target = slashArgMatches[index];
+		if (target === undefined) {
+			return;
+		}
+		if (slashArgCommand === 'attach') {
+			void runSlashAttach(target.id);
+		} else if (slashArgCommand === 'detach') {
+			void runSlashDetach(target.id);
 		}
 	}
 
@@ -2286,6 +2382,8 @@
 			}
 		} catch (err) {
 			workspace.flash(`Could not disconnect worker: ${formatError(err)}`);
+		} finally {
+			workerLinkTick++;
 		}
 	}
 
@@ -2886,18 +2984,29 @@
 					</button>
 				{/if}
 			{/if}
-			{#if visibleIsWorker && coder.activeSession}
-				<!-- A coordinator-spawned worker (ADR 0052). The first
-				     click unhooks it from its orchestrator (the
-				     coordinator is told and loses control); a second
-				     click, while a turn is still running, is the "stop
-				     it now" path. Hidden for every other session. -->
+			{#if workerLink === 'attached' && coder.activeSession}
+				<!-- A coordinator's worker (ADR 0052 / 0084): click to
+				     unhook it (the coordinator is told and loses
+				     control). Same as `/detach`. Hidden once cut. -->
 				<button
 					type="button"
 					class="icon"
 					onclick={() => onDisconnectWorker(coder.activeSession!.id)}
-					title="Disconnect from coordinator — it stops receiving this session's updates and loses its control tools; click again to stop the current turn"
+					title="Disconnect from coordinator — it stops receiving this session's updates and loses its control tools (same as /detach)"
 					aria-label="Disconnect session from its coordinator"
+				>
+					<DisconnectIcon />
+				</button>
+			{:else if workerLink === 'disconnected' && coder.activeSession && coder.busy}
+				<!-- Already cut, final turn still running: the only
+				     remaining action is "stop that turn now". Vanishes
+				     when the turn lands and the link drops. -->
+				<button
+					type="button"
+					class="icon disconnect-pending"
+					onclick={() => onDisconnectWorker(coder.activeSession!.id)}
+					title="Disconnected — the coordinator is told once this turn ends. Click to stop the turn now."
+					aria-label="Stop the disconnected worker's current turn"
 				>
 					<DisconnectIcon />
 				</button>
@@ -3128,13 +3237,7 @@
 							</button>
 						{/each}
 					{:else if slashArgMatches.length === 0}
-						<div class="mention-hint">
-							{coder.sessions === null
-								? 'Loading sessions…'
-								: isCoordinatorSession(coder.activeSession)
-									? 'No attachable session in this project'
-									: 'No coordinator session in this project'}
-						</div>
+						<div class="mention-hint">{slashArgEmptyHint}</div>
 					{:else}
 						{#each slashArgMatches as target, i (target.id)}
 							<button
@@ -3150,10 +3253,8 @@
 								}}
 								onmouseenter={() => (slashSelected = i)}
 							>
-								<span class="mention-name">{target.title || target.id}</span>
-								<span class="mention-path">
-									{isCoordinatorSession(target) ? 'coordinator · ' : ''}{target.id}
-								</span>
+								<span class="mention-name">{target.label}</span>
+								<span class="mention-path">{target.detail}</span>
 							</button>
 						{/each}
 					{/if}
@@ -4235,6 +4336,12 @@
 	.icon.active:hover {
 		color: var(--m-accent);
 		filter: brightness(1.15);
+	}
+	/* Disconnected worker whose final turn still runs: warning tint
+	   so it reads as "pending, click to stop" rather than the plain
+	   disconnect action. */
+	.icon.disconnect-pending {
+		color: var(--m-warning, var(--m-fg-muted));
 	}
 	/* Worktree-create in flight: spin the branch glyph + tint it
 	   accent so the click clearly registered while git works. */

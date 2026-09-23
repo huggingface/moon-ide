@@ -912,8 +912,19 @@ with `/` mounts a completion menu (same interaction grammar as the
 picking an `/attach` target executes immediately and the command
 never reaches the model. A leading `/` that resolves to no known
 command falls through to a plain send, so prose starting with `/`
-still works. `/attach` is the only command today; new ones ride the
-same rail when a concrete need shows up.
+still works. **`/detach`** is the inverse: typed in an attached
+worker it disconnects that session (no argument — same as the session
+bar's disconnect button); typed in a coordinator it lists the
+coordinator's still-attached workers to pick from. It only appears in
+the menu where it can act. New commands ride the same rail when a
+concrete need shows up.
+
+The session bar's fleet affordance follows a three-state probe
+(`none` / `attached` / `disconnected`), re-run on session switch, on
+the visible session's busy flip, and after every attach / detach: an
+attached worker shows the disconnect button; a disconnected worker
+whose final turn is still running shows a warning-tinted "stop the
+turn now" variant; everything else shows nothing.
 
 `coder:event` payloads are wrapped in a
 `CoderEventEnvelope { folder, session_id, event }` so the frontend

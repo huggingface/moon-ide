@@ -1651,6 +1651,18 @@ export type RerunToolOutcome = {
 export type DisconnectWorkerOutcome = 'disconnected' | 'aborted' | 'already_disconnected' | 'not_a_worker';
 
 /**
+ * Where a session stands relative to a coordinator fleet (ADR 0052 /
+ * 0084). `disconnected` = cut by the user, still registered only
+ * until its in-flight turn lands. Mirrors `moon_coder::WorkerLinkState`.
+ */
+export type WorkerLinkState = 'none' | 'attached' | 'disconnected';
+
+/** One still-attached worker of a coordinator (the `/detach` picker,
+ *  ADR 0084). `title` is empty when the worker has none yet. Mirrors
+ *  `moon_coder::FleetMember`. */
+export type FleetMember = { id: string; title: string };
+
+/**
  * Outcome of `coder_attach_worker` (the `/attach` composer command,
  * ADR 0084). Internally tagged because `attached_elsewhere` carries
  * the owning coordinator's label for the flash. Mirrors

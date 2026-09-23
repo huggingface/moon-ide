@@ -7,8 +7,8 @@
 
 use camino::Utf8PathBuf;
 use moon_coder::{
-	AttachWorkerOutcome, CoderHandle, CoderStatus, DeviceCode, DisconnectWorkerOutcome, HfIdentity, ImageAttachment,
-	PromptResponse, RerunToolOutcome, RevertedMessage, SessionSummary, UnqueuedSteer,
+	AttachWorkerOutcome, CoderHandle, CoderStatus, DeviceCode, DisconnectWorkerOutcome, FleetMember, HfIdentity,
+	ImageAttachment, PromptResponse, RerunToolOutcome, RevertedMessage, SessionSummary, UnqueuedSteer, WorkerLinkState,
 };
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
@@ -481,12 +481,15 @@ pub async fn coder_new_coordinator_session(state: State<'_, AppState>) -> Result
 	state.coder.new_coordinator_session().await.map_err(MoonError::from)
 }
 
-/// Whether `session_id` is registered as a coordinator-spawned worker
-/// (ADR 0052) — attached or already disconnected. The session bar
-/// shows its disconnect affordance only when this is true.
+/// Where `session_id` stands relative to a coordinator fleet (ADR 0052
+/// / 0084): `none`, `attached`, or `disconnected` (cut, final turn
+/// still running). Drives the session bar's disconnect / stop button.
 #[tauri::command]
-pub async fn coder_is_coordinator_worker(state: State<'_, AppState>, session_id: String) -> Result<bool, MoonError> {
-	Ok(state.coder.is_coordinator_worker(&session_id).await)
+pub async fn coder_worker_link_state(
+	state: State<'_, AppState>,
+	session_id: String,
+) -> Result<WorkerLinkState, MoonError> {
+	Ok(state.coder.worker_link_state(&session_id).await)
 }
 
 /// Unhook a coordinator-spawned worker from its orchestrator (ADR
@@ -513,6 +516,16 @@ pub async fn coder_attach_worker(
 	session_id: String,
 ) -> Result<AttachWorkerOutcome, MoonError> {
 	Ok(state.coder.attach_worker(&coordinator_id, &session_id).await?)
+}
+
+/// A coordinator's still-attached workers — the `/detach` picker when
+/// typed in a coordinator (ADR 0084).
+#[tauri::command]
+pub async fn coder_attached_workers(
+	state: State<'_, AppState>,
+	coordinator_id: String,
+) -> Result<Vec<FleetMember>, MoonError> {
+	Ok(state.coder.attached_workers(&coordinator_id).await)
 }
 
 /// Live snapshot of a session's detached background process (ADR

@@ -268,18 +268,6 @@ impl CoordinatorRegistry {
 		was_worker
 	}
 
-	/// Whether `worker_id` is registered as a worker of any
-	/// orchestrator — attached or disconnected. Drives the
-	/// session-bar disconnect affordance (ADR 0052), which must
-	/// also reach an already-disconnected worker so a second click
-	/// can end its current turn.
-	fn is_worker(&self, worker_id: &str) -> bool {
-		self
-			.by_orchestrator
-			.values()
-			.any(|entry| entry.workers.contains(worker_id))
-	}
-
 	/// The orchestrator `worker_id` belongs to — **including** when
 	/// already disconnected. The disconnect command targets the
 	/// entry regardless of attachment so the control-tool refusal
@@ -5240,13 +5228,17 @@ impl CoderHandle {
 		})
 	}
 
-	/// Whether `session_id` is registered as a coordinator-spawned
-	/// worker — attached or already disconnected (ADR 0052). Drives
-	/// the session-bar disconnect affordance, which must also reach
-	/// an already-disconnected worker so a second click can end its
-	/// current turn.
-	pub async fn is_coordinator_worker(&self, session_id: &str) -> bool {
-		self.state.coordinator_workers.read().await.is_worker(session_id)
+	/// Where `session_id` stands relative to a coordinator fleet
+	/// (ADR 0052 / 0084). Drives the session bar: `Attached` shows
+	/// the disconnect button; `Disconnected` (cut, but its final turn
+	/// is still running — the feeder drops the link when it lands)
+	/// shows the "stop its turn now" variant; `None` hides both.
+	pub async fn worker_link_state(&self, session_id: &str) -> WorkerLinkState {
+		match self.state.coordinator_workers.read().await.ownership_of(session_id) {
+			Some((_, true)) => WorkerLinkState::Attached,
+			Some((_, false)) => WorkerLinkState::Disconnected,
+			None => WorkerLinkState::None,
+		}
 	}
 
 	/// Unhook a coordinator-spawned worker from its orchestrator
@@ -5472,6 +5464,32 @@ impl CoderHandle {
 		Ok(AttachWorkerOutcome::Attached)
 	}
 
+	/// A coordinator's still-attached workers, labelled for a picker
+	/// (the `/detach` command typed in a coordinator, ADR 0084).
+	/// Disconnected-but-still-running workers are excluded — there's
+	/// nothing left to detach. Sorted by label for a stable menu.
+	pub async fn attached_workers(&self, coordinator_id: &str) -> Vec<FleetMember> {
+		let ids: Vec<String> = self
+			.state
+			.coordinator_workers
+			.read()
+			.await
+			.workers_of(coordinator_id)
+			.into_iter()
+			.filter_map(|(id, attached)| attached.then_some(id))
+			.collect();
+		let mut members = Vec::with_capacity(ids.len());
+		for id in ids {
+			let title = match self.state.runtime_for_session(&id).await {
+				Some((rt, _)) => rt.session.lock().await.header.title.trim().to_string(),
+				None => String::new(),
+			};
+			members.push(FleetMember { id, title });
+		}
+		members.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
+		members
+	}
+
 	/// Live snapshot of one of a session's detached background
 	/// processes (ADR 0085): running status, exit code, log tail.
 	/// The panel's real-time view reads the same registry
@@ -5595,6 +5613,28 @@ async fn worker_branch_snapshot(state: &Arc<CoderState>, worker_id: &str) -> Opt
 		"branch `{name}` ({} ahead, {} behind upstream{drift}, {uncommitted} uncommitted file(s))",
 		branch.ahead, branch.behind,
 	))
+}
+
+/// One entry of [`CoderHandle::attached_workers`]. `title` is empty
+/// when the worker has none yet (or isn't mounted); the UI falls back
+/// to the id.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct FleetMember {
+	pub id: String,
+	pub title: String,
+}
+
+/// Result of [`CoderHandle::worker_link_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLinkState {
+	/// Not linked to any coordinator.
+	None,
+	/// A live worker of some coordinator.
+	Attached,
+	/// Disconnected by the user; still registered only because its
+	/// in-flight turn hasn't landed yet.
+	Disconnected,
 }
 
 /// Outcome of [`CoderHandle::attach_worker`] (ADR 0084). Internally
@@ -12229,7 +12269,7 @@ mod tests {
 			// …but the membership itself is still visible so the
 			// UI can offer the second-click abort, and a repeated
 			// disconnect reports "already cut".
-			assert!(reg.is_worker("w-1"));
+			assert_eq!(reg.ownership_of("w-1"), Some(("orch-1".to_string(), false)));
 			assert_eq!(reg.owning_orchestrator_of("w-1"), Some("orch-1"));
 			assert!(!reg.disconnect("orch-1", "w-1"));
 		}
@@ -12251,7 +12291,7 @@ mod tests {
 			reg.register("orch-1", "w-1");
 			reg.disconnect("orch-1", "w-1");
 			assert!(reg.remove("orch-1", "w-1"));
-			assert!(!reg.is_worker("w-1"));
+			assert_eq!(reg.ownership_of("w-1"), None);
 			assert_eq!(reg.owning_orchestrator_of("w-1"), None);
 			assert!(reg.controls("w-1"));
 			assert!(!reg.remove("orch-1", "w-1"));
