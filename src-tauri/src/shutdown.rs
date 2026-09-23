@@ -55,6 +55,14 @@ pub async fn stop_all(state: &AppState) {
 		}
 	}
 
+	// Kill the coder's detached background processes (ADR 0085).
+	// They're session-scoped (survive turn ends and aborts), so
+	// shutdown is the one place that must sweep them — process exit
+	// doesn't run destructors, so `kill_on_drop` alone would leak
+	// orphans past the IDE's lifetime.
+	state.coder.kill_all_background_processes().await;
+	tracing::info!("stop_all: killed coder background processes");
+
 	// Shut down any spawned LSP servers. `kill_on_drop` on the
 	// child handles the SIGKILL escape hatch, but `shutdown_all`
 	// gives each server ~2s to flush state first (tsserver persists

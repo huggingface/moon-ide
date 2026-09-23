@@ -515,6 +515,37 @@ pub async fn coder_attach_worker(
 	Ok(state.coder.attach_worker(&coordinator_id, &session_id).await?)
 }
 
+/// Live snapshot of a session's detached background process (ADR
+/// 0085): running status, exit code, log tail. The panel's live
+/// tail polls this while the row is expanded — same registry the
+/// model's `read_process` reads.
+#[tauri::command]
+pub async fn coder_read_background_process(
+	state: State<'_, AppState>,
+	session_id: String,
+	id: String,
+	tail_bytes: Option<usize>,
+) -> Result<serde_json::Value, MoonError> {
+	Ok(
+		state
+			.coder
+			.read_background_process(&session_id, &id, tail_bytes.unwrap_or(8_000))
+			.await?,
+	)
+}
+
+/// Kill a session's detached background process — the panel's stop
+/// affordance (ADR 0085). Same semantics as the model's
+/// `stop_process` tool; the settlement event flips the row.
+#[tauri::command]
+pub async fn coder_stop_background_process(
+	state: State<'_, AppState>,
+	session_id: String,
+	id: String,
+) -> Result<serde_json::Value, MoonError> {
+	Ok(state.coder.stop_background_process(&session_id, &id).await?)
+}
+
 /// Result of [`coder_new_worktree_session`]: the new bound-folder
 /// snapshot (so the frontend renders the nested worktree row) plus
 /// the freshly-minted session to open.

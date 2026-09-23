@@ -122,6 +122,12 @@ export type CoderRow =
 			 *  event is live-only), so a reopened session shows the
 			 *  plain detached body with no live claim. */
 			bgStatus: { state: 'running' } | { state: 'exited'; exitCode: number | null } | { state: 'killed' } | null;
+			/** Output a running foreground `bash` has printed so far,
+			 *  accumulated from live `tool_output_delta` events (ADR
+			 *  0085), stdout and stderr interleaved in arrival order
+			 *  like a terminal. Tail-capped. Absent on replay — the
+			 *  settled result is what renders once it lands. */
+			liveOutput?: string;
 	  }
 	| { kind: 'error'; id: string; text: string }
 	| { kind: 'aborted'; id: string }
@@ -3613,6 +3619,9 @@ export class CoderPanelState {
 				}
 				return;
 			}
+			case 'tool_output_delta':
+				appendLiveOutput(session.rows, event.tool_call_id, event.chunk);
+				return;
 			case 'turn_diff': {
 				// Per-turn diff row (ADR 0030). Pushed alongside
 				// `turn_complete` when the agent's tools changed files.
@@ -4125,6 +4134,21 @@ export class CoderPanelState {
 	}
 }
 
+/** Tail cap for a tool row's live output buffer — enough to show
+ *  what a build is doing right now without growing unbounded. */
+const LIVE_OUTPUT_MAX_CHARS = 64_000;
+
+/** Append a live `tool_output_delta` chunk to its row (ADR 0085).
+ *  Ignored once the row has a result — the settled output wins. */
+function appendLiveOutput(rows: CoderRow[], toolCallId: string, chunk: string): void {
+	const row = findRowById(rows, toolCallId);
+	if (row?.kind !== 'tool' || row.hasResult) {
+		return;
+	}
+	const next = (row.liveOutput ?? '') + chunk;
+	row.liveOutput = next.length > LIVE_OUTPUT_MAX_CHARS ? next.slice(next.length - LIVE_OUTPUT_MAX_CHARS) : next;
+}
+
 /** Find a `SubagentSummary` in `summaries` whose `id` matches.
  *  Used by `subagent_finished` (which carries `subagent_id`, not
  *  the parent's `tool_call_id` we keyed by). */
@@ -4243,6 +4267,9 @@ function applyInnerEventToRows(rows: CoderRow[], event: CoderEvent): void {
 			}
 			return;
 		}
+		case 'tool_output_delta':
+			appendLiveOutput(rows, event.tool_call_id, event.chunk);
+			return;
 		case 'compaction_started':
 			rows.push({
 				kind: 'compaction',

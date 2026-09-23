@@ -1656,6 +1656,20 @@ export type DisconnectWorkerOutcome = 'disconnected' | 'aborted' | 'already_disc
  * the owning coordinator's label for the flash. Mirrors
  * `moon_coder::AttachWorkerOutcome`.
  */
+/**
+ * Snapshot of a detached background process (ADR 0085), as returned
+ * by `coder_read_background_process` — the same shape the model's
+ * `read_process` tool sees.
+ */
+export type BackgroundProcessSnapshot = {
+	id: string;
+	running: boolean;
+	exit_code: number | null;
+	tail: string;
+	cmd: string;
+	target: string;
+};
+
 export type AttachWorkerOutcome =
 	| { outcome: 'attached' }
 	| { outcome: 'already_attached' }
@@ -1770,6 +1784,9 @@ export type CoderEvent =
 	 *  natural exit; `exit_code` is whatever status was collected
 	 *  (`null` when a kill couldn't reap one). */
 	| { kind: 'background_process_exited'; tool_call_id: string; id: string; killed: boolean; exit_code: number | null }
+	/** Live-only chunk of a running foreground `bash` call's output
+	 *  (ADR 0085); the settled `tool_result` carries the full output. */
+	| { kind: 'tool_output_delta'; tool_call_id: string; stream: 'stdout' | 'stderr'; chunk: string }
 	| { kind: 'turn_complete' }
 	| { kind: 'aborted' }
 	| { kind: 'error'; message: string }

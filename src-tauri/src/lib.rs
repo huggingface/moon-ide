@@ -292,6 +292,8 @@ pub fn run() {
 			commands::coder::coder_is_coordinator_worker,
 			commands::coder::coder_disconnect_worker,
 			commands::coder::coder_attach_worker,
+			commands::coder::coder_read_background_process,
+			commands::coder::coder_stop_background_process,
 			commands::coder::coder_new_worktree_session,
 			commands::coder::coder_discard_worktree,
 			commands::coder::coder_merge_and_remove_worktree,

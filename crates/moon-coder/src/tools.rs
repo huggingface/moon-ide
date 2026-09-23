@@ -368,18 +368,26 @@ impl FormatQueue {
 /// `bash` with `detach: true` (ADR 0034). Each entry holds the child
 /// handle and the host-side log file path; `read_process` tails the
 /// log and `stop_process` kills + reaps. At turn end
-/// [`BackgroundProcessRegistry::cleanup`] kills every still-running
-/// process and deletes the log files — for every termination
-/// (Ok / Aborted / Err), mirroring `FormatQueue::drain`.
+/// Registry of detached background processes (ADR 0034, lifetime
+/// revised by ADR 0085).
 ///
-/// Scoped to the turn (same lifetime as `FormatQueue`): the model is
-/// expected to poll `read_process` until completion before finishing
-/// its answer. Processes that are still running when the turn ends
-/// are killed as a safety net.
+/// **Session-scoped for top-level sessions**: the registry lives on
+/// the `SessionRuntime` and processes survive turn boundaries —
+/// including a user abort (Esc), which ends the *turn* but not the
+/// *conversation*. `read_process` therefore works across turns: the
+/// model can launch a long build, get interrupted, and pick the
+/// handle back up on the next turn. Settled entries (and their log
+/// files) are retained for the same reason. Processes die with the
+/// registry (`kill_on_drop` — session deletion, runtime replacement)
+/// or at IDE shutdown via [`Self::cleanup`].
+///
+/// **Per-run for sub-agents**: a sub-agent's report is its end, so
+/// its runner still calls [`Self::cleanup`] when the run settles —
+/// the pre-ADR-0085 behaviour.
 ///
 /// When a sink is attached ([`Self::set_event_sink`]), every
-/// settlement — natural exit observed by `read_process`, a
-/// `stop_process` kill, or the turn-end cleanup — emits a live-only
+/// settlement — natural exit observed by a poll, a `stop_process`
+/// kill, or a cleanup kill — emits a live-only
 /// [`CoderEvent::BackgroundProcessExited`] so the panel can flip the
 /// spawning `bash` row out of its "detached, still running" state.
 /// Settlement-event sink for a [`BackgroundProcessRegistry`]: the
@@ -431,6 +439,20 @@ impl BackgroundProcessRegistry {
 		}
 	}
 
+	/// Forward an arbitrary live event through the turn's sink — the
+	/// foreground `bash` output stream (ADR 0085) rides the same
+	/// sink the settlement events use, so sub-agent runs get their
+	/// `SubagentEvent` wrapping for free. No-op without a sink
+	/// (tool contexts built outside a turn).
+	pub(crate) fn emit_live(&self, event: crate::event::CoderEvent) {
+		let Ok(guard) = self.event_sink.lock() else {
+			return;
+		};
+		if let Some(sink) = guard.as_ref() {
+			sink(event);
+		}
+	}
+
 	/// Emit the settlement event for `proc` if not already sent.
 	/// Callers must hold the `entries` lock. `killed` distinguishes
 	/// `stop_process` / turn-end-cleanup kills from natural exits.
@@ -452,20 +474,23 @@ impl BackgroundProcessRegistry {
 		}
 	}
 
-	/// Allocate the next monotonic id for a background process.
-	/// Uses the current entry count so ids are unique within a turn
-	/// (`bg_0`, `bg_1`, …). Concurrent calls are serialized by the
-	/// mutex inside `spawn`.
+	/// Allocate the next id for a background process. Process-global
+	/// monotonic counter (`bg_0`, `bg_1`, …) rather than per-registry:
+	/// the log file path derives from the id, and per-registry
+	/// counters had two concurrent sessions clobbering each other's
+	/// `/tmp/moon-coder-bg/bg_0.log`.
 	fn next_id(&self) -> String {
-		let count = self.entries.lock().map(|g| g.len()).unwrap_or(0);
-		format!("bg_{count}")
+		static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+		let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		format!("bg_{n}")
 	}
 
 	/// Spawn a detached process: the child's stdout+stderr are
 	/// redirected to a host-side log file, the handle is stored, and
 	/// the opaque id + log path are returned for the tool result.
-	/// The process runs until it exits, `stop_process` kills it, or
-	/// `cleanup` reaps it at turn end.
+	/// The process runs until it exits, `stop_process` (or the UI's
+	/// stop affordance) kills it, or the registry itself goes away
+	/// (session deletion, sub-agent settle, IDE shutdown — ADR 0085).
 	fn spawn(
 		&self,
 		id: String,
@@ -514,8 +539,10 @@ impl BackgroundProcessRegistry {
 
 	/// Poll a detached process: optionally wait up to `wait_ms` for
 	/// it to exit, then return its running status, exit code (if
-	/// finished), and the tail of its log file.
-	async fn read(
+	/// finished), and the tail of its log file. `pub(crate)` so the
+	/// UI's live-tail command reads the same source of truth the
+	/// model does (ADR 0085).
+	pub(crate) async fn read(
 		&self,
 		id: &str,
 		wait_ms: u64,
@@ -577,8 +604,9 @@ impl BackgroundProcessRegistry {
 	/// Kill a running process if it hasn't exited yet, then reap it.
 	/// Returns the exit code (0 if we killed it, the natural code if
 	/// it had already finished). No-op if the id doesn't exist or the
-	/// process was already reaped.
-	async fn stop(&self, id: &str) -> Result<Value, CoderError> {
+	/// process was already reaped. `pub(crate)` for the UI's stop
+	/// affordance (ADR 0085).
+	pub(crate) async fn stop(&self, id: &str) -> Result<Value, CoderError> {
 		// Take the child out of the entry under the lock, then drop
 		// the lock before awaiting `wait()` — `tokio::process::Child`
 		// is `Send` but `std::sync::MutexGuard` is not, and the guard
@@ -646,7 +674,11 @@ impl BackgroundProcessRegistry {
 	}
 
 	/// Kill + reap every still-running process and delete log files.
-	/// Called at turn end by the runner, for every termination path.
+	/// Called when the registry's owner is done for good: a sub-agent
+	/// run settling, or IDE shutdown for session registries. **Not**
+	/// called at a top-level turn's end any more (ADR 0085) — an
+	/// interrupted turn isn't the end of the conversation, and
+	/// killing the model's long build on Esc threw its work away.
 	pub async fn cleanup(&self) {
 		let entries = {
 			let Ok(mut guard) = self.entries.lock() else {
@@ -787,6 +819,82 @@ const BG_MAX_TAIL_BYTES: usize = 64_000;
 /// Default + cap for `read_process`'s `wait_ms` parameter.
 const BG_DEFAULT_WAIT_MS: u64 = 0;
 const BG_MAX_WAIT_MS: u64 = 600_000;
+
+/// Live-stream callback for [`drain_pipe`]: receives decoded text
+/// chunks as the command prints them.
+type LiveChunkSink = Arc<dyn Fn(String) + Send + Sync>;
+
+/// How long [`drain_pipe`] holds pending output before flushing it
+/// to the live stream. Coalesces line-buffered chatter (a build
+/// printing hundreds of short lines a second) into a few events per
+/// second without making a quiet command feel laggy.
+const LIVE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Incrementally drain one of a child's output pipes into a shared
+/// buffer, so a command cut short (interrupt / timeout) still
+/// surfaces the output it produced (ADR 0085). With a `live` sink,
+/// the same bytes are also streamed to the panel: pending output is
+/// flushed every [`LIVE_FLUSH_INTERVAL`] (a read timeout drives the
+/// flush while the command is silent) and on EOF, split on UTF-8
+/// boundaries so a multi-byte char straddling two reads is never
+/// mangled. EOF or a read error ends the drain.
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
+	mut pipe: R,
+	buf: Arc<std::sync::Mutex<Vec<u8>>>,
+	live: Option<LiveChunkSink>,
+) {
+	use tokio::io::AsyncReadExt as _;
+	let mut chunk = [0u8; 8192];
+	let mut pending: Vec<u8> = Vec::new();
+	let mut last_flush = std::time::Instant::now();
+	let flush = |pending: &mut Vec<u8>, force: bool| {
+		let Some(live) = live.as_ref() else {
+			pending.clear();
+			return;
+		};
+		if pending.is_empty() {
+			return;
+		}
+		// Emit the longest valid UTF-8 prefix; keep an incomplete
+		// trailing sequence for the next read (unless forced at EOF,
+		// where lossy decoding is the best we can do).
+		let valid = match std::str::from_utf8(pending) {
+			Ok(_) => pending.len(),
+			Err(err) if err.error_len().is_none() && !force => err.valid_up_to(),
+			Err(_) => pending.len(),
+		};
+		if valid == 0 {
+			return;
+		}
+		let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
+		pending.drain(..valid);
+		live(text);
+	};
+	loop {
+		let read = tokio::time::timeout(LIVE_FLUSH_INTERVAL, pipe.read(&mut chunk)).await;
+		match read {
+			// Silent for a flush interval: push whatever's pending.
+			Err(_) => {
+				flush(&mut pending, false);
+				last_flush = std::time::Instant::now();
+			}
+			Ok(Ok(0)) | Ok(Err(_)) => break,
+			Ok(Ok(n)) => {
+				if let Ok(mut guard) = buf.lock() {
+					guard.extend_from_slice(&chunk[..n]);
+				}
+				if live.is_some() {
+					pending.extend_from_slice(&chunk[..n]);
+					if last_flush.elapsed() >= LIVE_FLUSH_INTERVAL {
+						flush(&mut pending, false);
+						last_flush = std::time::Instant::now();
+					}
+				}
+			}
+		}
+	}
+	flush(&mut pending, true);
+}
 
 /// Generate a host-side log file path for a background process.
 fn background_log_path(id: &str) -> PathBuf {
@@ -1182,7 +1290,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"bash",
-				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default. For long-running commands, pass `detach: true` — the process keeps running and you get back an `id` to poll with `read_process`.",
+				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default; a timeout (or a user interrupt) kills the command but still returns the partial output it produced, flagged `timed_out` / `interrupted`. For long-running commands, pass `detach: true` — the process keeps running and you get back an `id` to poll with `read_process`.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -1196,7 +1304,7 @@ impl ToolRegistry {
 						},
 						"detach": {
 							"type": "boolean",
-							"description": "When true, spawn the command as a detached background process. Returns immediately with `{ detached, id, pid, log_path }` instead of waiting for completion. Use `read_process(id)` to poll status and tail output, and `stop_process(id)` to kill it. The process is killed automatically when the turn ends if still running."
+							"description": "When true, spawn the command as a detached background process. Returns immediately with `{ detached, id, pid, log_path }` instead of waiting for completion. Use `read_process(id)` to poll status and tail output, and `stop_process(id)` to kill it. The process survives turn boundaries — including an interrupted turn — so an id from an earlier turn still works; it is killed when the session is deleted or the IDE quits."
 						}
 					},
 					"required": ["cmd"]
@@ -1204,7 +1312,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"read_process",
-				"Poll a detached background process spawned by `bash` with `detach: true`. Returns its running status, exit code (if finished), and the tail of its stdout+stderr log. Pass `wait_ms` to block until the process exits (avoids busy-polling) — the call returns as soon as the process finishes or the wait elapses.",
+				"Poll a detached background process spawned by `bash` with `detach: true`. Returns its running status, exit code (if finished), and the tail of its stdout+stderr log. Works across turns: ids from earlier turns of this session stay valid, and settled processes keep reporting their exit code and log tail. Pass `wait_ms` to block until the process exits (avoids busy-polling) — the call returns as soon as the process finishes or the wait elapses.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -2105,36 +2213,112 @@ impl ToolRegistry {
 			.stdout(std::process::Stdio::piped())
 			.stderr(std::process::Stdio::piped());
 
-		let child = command
+		let mut child = command
 			.spawn()
 			.map_err(|err| CoderError::tool_failed("bash", format!("spawn failed: {err}")))?;
 
-		let output = tokio::select! {
-			biased;
-			_ = cancel.cancelled() => return Err(CoderError::Aborted),
-			result = tokio::time::timeout(timeout, child.wait_with_output()) => result,
+		// Drain the pipes incrementally instead of `wait_with_output`
+		// (ADR 0085): a command cut short — user interrupt or the
+		// timeout — still hands the model everything it printed,
+		// instead of an opaque `Aborted` / "timed out" that threw the
+		// partial output away. The drains own the pipe halves; the
+		// buffers are shared so the cut-short paths can read them.
+		let stdout_buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+		let stderr_buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+		// Live stream to the panel (ADR 0085): each drain forwards
+		// decoded chunks as `ToolOutputDelta` through the turn's
+		// sink, tagged with this call's id so the row can render
+		// output while the command runs.
+		let live_for = |stream: &'static str| -> LiveChunkSink {
+			let background = cx.background.clone();
+			let tool_call_id = tool_call_id.to_string();
+			Arc::new(move |chunk: String| {
+				background.emit_live(crate::event::CoderEvent::ToolOutputDelta {
+					tool_call_id: tool_call_id.clone(),
+					stream: stream.to_string(),
+					chunk,
+				});
+			})
 		};
-
-		let output = match output {
-			Ok(Ok(o)) => o,
-			Ok(Err(err)) => return Err(CoderError::tool_failed("bash", err.to_string())),
-			Err(_) => {
-				return Err(CoderError::tool_failed(
-					"bash",
-					format!("timed out after {} ms", timeout.as_millis()),
-				));
+		let stdout_task = child
+			.stdout
+			.take()
+			.map(|pipe| tokio::spawn(drain_pipe(pipe, stdout_buf.clone(), Some(live_for("stdout")))));
+		let stderr_task = child
+			.stderr
+			.take()
+			.map(|pipe| tokio::spawn(drain_pipe(pipe, stderr_buf.clone(), Some(live_for("stderr")))));
+		let join_drains = |stdout_task: Option<tokio::task::JoinHandle<()>>,
+		                   stderr_task: Option<tokio::task::JoinHandle<()>>| async move {
+			if let Some(task) = stdout_task {
+				let _ = task.await;
+			}
+			if let Some(task) = stderr_task {
+				let _ = task.await;
 			}
 		};
 
-		let stdout = truncate_bytes(&output.stdout, BASH_OUTPUT_MAX_BYTES);
-		let stderr = truncate_bytes(&output.stderr, BASH_OUTPUT_MAX_BYTES);
-		Ok(json!({
+		// `None` = interrupted by the turn's cancel token.
+		let waited = tokio::select! {
+			biased;
+			_ = cancel.cancelled() => None,
+			result = tokio::time::timeout(timeout, child.wait()) => Some(result),
+		};
+
+		let (exit_code, interrupted, timed_out) = match waited {
+			Some(Ok(Ok(status))) => {
+				join_drains(stdout_task, stderr_task).await;
+				(status.code(), false, false)
+			}
+			Some(Ok(Err(err))) => return Err(CoderError::tool_failed("bash", err.to_string())),
+			// Timeout / interrupt: kill, reap briefly, give the
+			// drains a beat to flush whatever the pipes still hold.
+			cut_short => {
+				let _ = child.start_kill();
+				let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+				let _ = tokio::time::timeout(Duration::from_millis(250), join_drains(stdout_task, stderr_task)).await;
+				(None, cut_short.is_none(), cut_short.is_some())
+			}
+		};
+
+		let stdout = truncate_bytes(
+			&stdout_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+			BASH_OUTPUT_MAX_BYTES,
+		);
+		let stderr = truncate_bytes(
+			&stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+			BASH_OUTPUT_MAX_BYTES,
+		);
+		let mut result = json!({
 			"cmd": parsed.cmd,
 			"target": target_kind,
-			"exit_code": output.status.code(),
+			"exit_code": exit_code,
 			"stdout": stdout,
 			"stderr": stderr,
-		}))
+		});
+		let obj = result.as_object_mut().expect("literal object");
+		if interrupted {
+			// The turn is about to abort (the dispatch loop's next
+			// cancel check ends it); this result is persisted first,
+			// so the next turn's model sees what the command managed
+			// to print before the user hit stop.
+			obj.insert("interrupted".into(), json!(true));
+			obj.insert(
+				"note".into(),
+				json!("the user interrupted the turn; the command was killed after producing this partial output"),
+			);
+		}
+		if timed_out {
+			obj.insert("timed_out".into(), json!(true));
+			obj.insert(
+				"note".into(),
+				json!(format!(
+					"killed after the {} ms timeout; stdout/stderr hold the partial output — pass a larger timeout_ms or detach: true to let it finish",
+					timeout.as_millis()
+				)),
+			);
+		}
+		Ok(result)
 	}
 
 	/// Poll a detached background process (ADR 0034). Tails the log
@@ -3832,6 +4016,30 @@ mod tests {
 		byte_offsets_of, format_grep_hits, format_numbered_lines, locate_edit, truncate_grep_line, GREP_MAX_LINE_CHARS,
 	};
 	use moon_protocol::search::ContentSearchHit;
+
+	#[tokio::test]
+	async fn drain_pipe_streams_utf8_safe_chunks_and_keeps_full_buffer() {
+		use tokio::io::AsyncWriteExt as _;
+		let (mut writer, reader) = tokio::io::duplex(64);
+		let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+		let sink_chunks = chunks.clone();
+		let live: super::LiveChunkSink = std::sync::Arc::new(move |c| sink_chunks.lock().unwrap().push(c));
+		let drain = tokio::spawn(super::drain_pipe(reader, buf.clone(), Some(live)));
+		// "é" is two bytes; split it across writes separated by a
+		// silence longer than the flush interval, so a naive decoder
+		// would emit a replacement char.
+		let bytes = "café ok\n".as_bytes();
+		writer.write_all(&bytes[..4]).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+		writer.write_all(&bytes[4..]).await.unwrap();
+		drop(writer);
+		drain.await.unwrap();
+		let streamed = chunks.lock().unwrap().concat();
+		assert_eq!(streamed, "café ok\n");
+		assert!(!streamed.contains('\u{FFFD}'));
+		assert_eq!(buf.lock().unwrap().as_slice(), bytes);
+	}
 
 	#[test]
 	fn locate_edit_exact_match_returns_byte_range_and_replacement() {

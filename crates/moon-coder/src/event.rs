@@ -200,6 +200,18 @@ pub enum CoderEvent {
 		exit_code: Option<i32>,
 	},
 
+	/// A chunk of a **foreground** `bash` call's output, streamed
+	/// while the command runs (ADR 0085). Live-only — never persisted
+	/// or replayed; the settled `tool_result` carries the full
+	/// (truncated) stdout/stderr, so a reopened session loses nothing
+	/// but the live view. `stream` is `"stdout"` or `"stderr"`;
+	/// chunks are coalesced (~100 ms) and split on UTF-8 boundaries.
+	ToolOutputDelta {
+		tool_call_id: String,
+		stream: String,
+		chunk: String,
+	},
+
 	/// The whole turn ended cleanly.
 	TurnComplete,
 	/// Live-only heads-up that the provider returned a transient

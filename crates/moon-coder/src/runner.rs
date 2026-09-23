@@ -474,6 +474,13 @@ struct SessionRuntime {
 	/// stays the persisted source of truth; this is its in-memory
 	/// shadow.
 	force_host_bash: Arc<std::sync::atomic::AtomicBool>,
+	/// Detached background processes launched by this session's
+	/// turns (ADR 0085). Session-scoped — not per-turn — so an
+	/// interrupted turn doesn't kill the model's long build and
+	/// `read_process` ids stay valid across turns. Children die
+	/// with the runtime (`kill_on_drop`) or at IDE shutdown via
+	/// [`CoderHandle::kill_all_background_processes`].
+	background: Arc<crate::tools::BackgroundProcessRegistry>,
 }
 
 impl SessionRuntime {
@@ -484,6 +491,7 @@ impl SessionRuntime {
 			turn: Mutex::new(TurnState::default()),
 			prompts: crate::prompts::PromptRegistry::default(),
 			force_host_bash: Arc::new(std::sync::atomic::AtomicBool::new(force_host)),
+			background: Arc::new(crate::tools::BackgroundProcessRegistry::default()),
 		}
 	}
 }
@@ -5464,6 +5472,53 @@ impl CoderHandle {
 		Ok(AttachWorkerOutcome::Attached)
 	}
 
+	/// Live snapshot of one of a session's detached background
+	/// processes (ADR 0085): running status, exit code, log tail.
+	/// The panel's real-time view reads the same registry
+	/// `read_process` does, so the two can never disagree.
+	pub async fn read_background_process(
+		&self,
+		session_id: &str,
+		id: &str,
+		tail_bytes: usize,
+	) -> Result<Value, CoderError> {
+		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
+			return Err(CoderError::Internal(format!(
+				"no mounted runtime for session {session_id}"
+			)));
+		};
+		rt.background
+			.read(id, 0, tail_bytes.clamp(1, 64_000), &CancellationToken::new())
+			.await
+	}
+
+	/// Kill one of a session's detached background processes — the
+	/// panel's stop affordance (ADR 0085). Same semantics as the
+	/// model's `stop_process` tool.
+	pub async fn stop_background_process(&self, session_id: &str, id: &str) -> Result<Value, CoderError> {
+		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
+			return Err(CoderError::Internal(format!(
+				"no mounted runtime for session {session_id}"
+			)));
+		};
+		rt.background.stop(id).await
+	}
+
+	/// Kill + reap every mounted session's detached background
+	/// processes. Called by the IDE's graceful-shutdown hook (ADR
+	/// 0085): `kill_on_drop` covers runtime drops during a run, but
+	/// process exit doesn't run destructors, so shutdown sweeps
+	/// explicitly to keep the no-orphan-daemon guarantee.
+	pub async fn kill_all_background_processes(&self) {
+		let folders: Vec<Arc<FolderSession>> = self.state.sessions_by_folder.read().await.values().cloned().collect();
+		for fs in folders {
+			let runtimes: Vec<Arc<SessionRuntime>> = fs.runtimes.read().await.values().cloned().collect();
+			for rt in runtimes {
+				rt.background.cleanup().await;
+			}
+		}
+	}
+
 	/// Resolve a session's runtime, mounting it from disk when
 	/// needed — searching every bound folder's sessions directory
 	/// (the coordinator and the session being attached may live in
@@ -6145,11 +6200,16 @@ fn spawn_turn_loop(
 				let mut resume = resume_tool_calls;
 				let result = loop {
 					let format_queue = Arc::new(crate::tools::FormatQueue::default());
-					let background = Arc::new(crate::tools::BackgroundProcessRegistry::default());
+					// Session-scoped background-process registry (ADR
+					// 0085): survives turn boundaries — an interrupted
+					// turn keeps the model's detached builds running
+					// and its `read_process` ids valid.
+					let background = rt_for_turn.background.clone();
 					// Live settlement notices for detached background
 					// processes (ADR 0034): the panel flips the spawning
 					// `bash` row out of "detached, still running" the
-					// moment the process exits or is reaped.
+					// moment the process exits or is reaped. Re-set per
+					// turn — same session, equivalent sink.
 					{
 						let sink = sink_for_turn.clone();
 						background.set_event_sink(Arc::new(move |event| sink.send(event)));
@@ -6176,10 +6236,10 @@ fn spawn_turn_loop(
 					)
 					.await;
 					let flushed_files = flush_format_queue(&state, &format_queue).await;
-					// Kill + reap any detached background processes still
-					// running at turn end (ADR 0034). Runs on every
-					// termination path, same as `flush_format_queue`.
-					background.cleanup().await;
+					// Deliberately no `background.cleanup()` here (ADR
+					// 0085): detached processes outlive the turn. They
+					// die with the session runtime (`kill_on_drop`) or
+					// at IDE shutdown.
 					// Compute + emit the per-turn diff on a successful turn
 					// that touched files. Best-effort — a git failure or no
 					// baseline just means no diff row, not an error.

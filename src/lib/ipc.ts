@@ -47,6 +47,7 @@ import type {
 	RevertedMessage,
 	RerunToolOutcome,
 	AttachWorkerOutcome,
+	BackgroundProcessSnapshot,
 	DisconnectWorkerOutcome,
 	PromptResponse,
 	LogEntry,
@@ -424,6 +425,10 @@ export const ipc = {
 		disconnectWorker: (sessionId: string) => invoke<DisconnectWorkerOutcome>('coder_disconnect_worker', { sessionId }),
 		attachWorker: (coordinatorId: string, sessionId: string) =>
 			invoke<AttachWorkerOutcome>('coder_attach_worker', { coordinatorId, sessionId }),
+		readBackgroundProcess: (sessionId: string, id: string) =>
+			invoke<BackgroundProcessSnapshot>('coder_read_background_process', { sessionId, id }),
+		stopBackgroundProcess: (sessionId: string, id: string) =>
+			invoke<unknown>('coder_stop_background_process', { sessionId, id }),
 		newWorktreeSession: (baseBranch?: string) =>
 			invoke<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
 		discardWorktree: (path: string, force: boolean) => invoke<Workspace>('coder_discard_worktree', { path, force }),

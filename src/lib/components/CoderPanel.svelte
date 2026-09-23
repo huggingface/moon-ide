@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
+	import type { Attachment } from 'svelte/attachments';
 	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { readImage, writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -12,6 +13,7 @@
 	import CoderModelSettingsModal from './CoderModelSettingsModal.svelte';
 	import HfBucketSettingsModal from './HfBucketSettingsModal.svelte';
 	import CoderThinking from './CoderThinking.svelte';
+	import BashLiveTail from './BashLiveTail.svelte';
 	import ToolBodyAskUser from './ToolBodyAskUser.svelte';
 	import ToolBodyEditFile from './ToolBodyEditFile.svelte';
 	import ToolBodyGrep from './ToolBodyGrep.svelte';
@@ -2023,6 +2025,40 @@
 	 *    the precise duration the user wants for spotting slow
 	 *    tools after the fact.
 	 */
+	/** Attachment for a live-streaming `<pre>` (ADR 0085): pins the
+	 *  scroll to the bottom as `content` grows — unless the user
+	 *  scrolled up to read, in which case it leaves them there. The
+	 *  argument is read so the attachment re-runs on every chunk. */
+	function scrollToBottom(content: string): Attachment<HTMLElement> {
+		return (node) => {
+			void content;
+			const slack = node.scrollHeight - node.clientHeight - node.scrollTop;
+			// ~2 lines of tolerance: "at the bottom" survives the
+			// previous chunk's growth.
+			if (slack < 40 || node.dataset.pinned !== 'no') {
+				node.scrollTop = node.scrollHeight;
+			}
+			const onScroll = () => {
+				node.dataset.pinned = node.scrollHeight - node.clientHeight - node.scrollTop < 40 ? 'yes' : 'no';
+			};
+			node.addEventListener('scroll', onScroll, { passive: true });
+			return () => node.removeEventListener('scroll', onScroll);
+		};
+	}
+
+	/** Last non-empty line of a live output buffer, for the collapsed
+	 *  row's "what is it doing right now" glance. */
+	function lastOutputLine(output: string): string {
+		const lines = output.split('\n');
+		for (let i = lines.length - 1; i >= 0; i--) {
+			const line = lines[i].trim();
+			if (line.length > 0) {
+				return line;
+			}
+		}
+		return '';
+	}
+
 	function fmtElapsed(ms: number, live: boolean): string {
 		if (ms < 0) {
 			return '0ms';
@@ -3638,6 +3674,14 @@
 							 full payload. -->
 						<span class="tool-hint" title={hint}>{hint}</span>
 					{/if}
+					{#if !row.hasResult && row.liveOutput}
+						<!-- Streaming glance (ADR 0085): the running command's
+						     latest output line, readable without expanding. -->
+						{@const liveLine = lastOutputLine(row.liveOutput)}
+						{#if liveLine.length > 0}
+							<span class="tool-live-line" title={liveLine}>{liveLine}</span>
+						{/if}
+					{/if}
 					<span class="tool-status"
 						>{!row.hasResult
 							? 'running…'
@@ -3704,6 +3748,17 @@
 										· killed
 									{/if}
 								</div>
+								<!-- Live tail (ADR 0085): polls the session's
+								     background registry while the row is open.
+								     Parent transcript only — a sub-agent's
+								     registry isn't addressable by session id. -->
+								{#if inParentTranscript && coder.activeSession !== null}
+									<BashLiveTail
+										sessionId={coder.activeSession.id}
+										bgId={bDetached.id}
+										running={row.bgStatus?.state === 'running'}
+									/>
+								{/if}
 							</div>
 						{:else if bArgs !== null || bResult !== null}
 							<!-- Terminal-style view: a `$ <cmd>` line, then
@@ -3720,6 +3775,14 @@
 									<span class="bash-prompt" aria-hidden="true">$</span>
 									<span class="bash-cmd-text">{bashCmd}</span>
 								</div>
+								{#if bResult === null && row.liveOutput}
+									<!-- Live stream (ADR 0085): what the command has
+									     printed so far, stdout+stderr interleaved. The
+									     settled result replaces it on completion. -->
+									<pre
+										class="bash-stream bash-stdout bash-live"
+										{@attach scrollToBottom(row.liveOutput)}>{row.liveOutput}</pre>
+								{/if}
 								{#if bResult !== null}
 									{#if bResult.stdout.length > 0}
 										<pre class="bash-stream bash-stdout">{bResult.stdout}</pre>
@@ -5139,6 +5202,20 @@
 		font-family: var(--m-font-mono, ui-monospace, monospace);
 		font-size: 11px;
 		color: var(--m-fg-muted);
+	}
+	/* Latest line of a running command's live output. Shares the
+	   row's flexible width with the hint; tinted so it reads as
+	   "output", not "argument". */
+	.row.tool .tool-live-line {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+		font-style: italic;
 	}
 	.row.tool .tool-status {
 		flex: 0 0 auto;
