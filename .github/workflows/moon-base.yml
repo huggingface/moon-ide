@@ -200,8 +200,10 @@ jobs:
           # shellcheck disable=SC2046,SC2086
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "${{ env.REGISTRY_IMAGE }}@sha256:%s " *)
+            $(printf "${REGISTRY_IMAGE}@sha256:%s " *)
 
       - name: Inspect
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${REGISTRY_IMAGE}:${STEPS_META_OUTPUTS_VERSION}
+        env:
+          STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
