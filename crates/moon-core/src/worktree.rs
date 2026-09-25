@@ -71,30 +71,49 @@ pub fn effective_mount_root(folder: &moon_protocol::workspace::WorkspaceFolder) 
 }
 
 /// Rewrite a worktree's two git link files when they carry an
-/// **absolute path under the dev-container mount** (`/workspace/…`) —
-/// the signature of an agent running `git worktree add` from inside
-/// the container without `--relative-paths` (the `bash` tool can't
-/// intercept a raw git call, so the host-side creation path in
-/// `host.rs` is bypassed). Both links are rewritten to the relative
-/// form `--relative-paths` would have written, after which host git
-/// resolves the worktree again:
+/// **absolute path into the parent repo** — either spelling of it:
+///
+/// - the dev-container mount (`/workspace/<parent-basename>/…`): an
+///   agent ran `git worktree add` inside the container without
+///   `--relative-paths` (ADR 0080) — unresolvable on the host;
+/// - the parent's host path (`<parent_host>/…`): a `git worktree add`
+///   run on the host outside moon-ide (a shell, another tool) —
+///   unresolvable **inside the container**, so container-side git
+///   (`worktree remove` when the workspace runs there) reports "is
+///   not a working tree" (ADR 0086).
+///
+/// Both links are rewritten to the relative form `--relative-paths`
+/// would have written, after which git resolves the worktree from
+/// either side of the bind mount:
 ///
 /// - `<worktree>/.git` — the `gitdir:` pointer to the metadata dir
 ///   (`../../.git/worktrees/<name>`),
 /// - `<parent>/.git/worktrees/<name>/gitdir` — the back-pointer to
 ///   the checkout (`../../../.worktrees/<name>/.git`).
 ///
-/// Either link is rewritten only when it is absolute **and** points
-/// inside the parent's container mount — a link naming anything else
-/// (a real host path, a foreign mount) is left alone: it may be
-/// valid, and rewriting a link we can't place would corrupt it.
-/// Missing files (mid-removal) are skipped, matching the liveness
-/// checks callers already do. Returns `true` when something was
-/// repaired.
+/// A link naming anything outside the parent repo (a foreign mount,
+/// an unrelated host path) is left alone: it may be valid, and
+/// rewriting a link we can't place would corrupt it. Missing files
+/// (mid-removal) are skipped, matching the liveness checks callers
+/// already do. Returns `true` when something was repaired.
 pub fn repair_absolute_worktree_links(worktree_host: &Utf8Path, parent_host: &Utf8Path) -> MoonResult<bool> {
-	let mount_prefix = match parent_host.file_name() {
-		Some(b) => format!("{CONTAINER_MOUNT_ROOT}/{b}"),
-		None => return Ok(false),
+	let Some(base) = parent_host.file_name() else {
+		return Ok(false);
+	};
+	let prefixes = [
+		format!("{CONTAINER_MOUNT_ROOT}/{base}"),
+		parent_host.as_str().trim_end_matches('/').to_string(),
+	];
+	// The path tail after whichever placeable prefix `target` starts
+	// with — `/.git/worktrees/<name>` etc. Requires a `/` boundary so
+	// `<parent>-other/…` never matches `<parent>`.
+	let placeable_tail = |target: &str| -> Option<String> {
+		prefixes.iter().find_map(|prefix| {
+			target
+				.strip_prefix(prefix.as_str())
+				.filter(|rest| rest.starts_with('/'))
+				.map(str::to_string)
+		})
 	};
 	let mut repaired = false;
 
@@ -102,9 +121,9 @@ pub fn repair_absolute_worktree_links(worktree_host: &Utf8Path, parent_host: &Ut
 	let link = worktree_host.join(".git");
 	if let Ok(content) = std::fs::read_to_string(&link) {
 		if let Some(target) = content.trim().strip_prefix("gitdir:").map(str::trim) {
-			if let Some(gitdir) = target.strip_prefix(mount_prefix.as_str()) {
-				// `/workspace/<base>/.git/worktrees/<name>` → relative from
-				// the checkout: up past the worktree name and `.worktrees/`.
+			if let Some(gitdir) = placeable_tail(target) {
+				// `<prefix>/.git/worktrees/<name>` → relative from the
+				// checkout: up past the worktree name and `.worktrees/`.
 				let rel = format!("gitdir: ../..{gitdir}\n");
 				std::fs::write(&link, rel)?;
 				repaired = true;
@@ -115,7 +134,6 @@ pub fn repair_absolute_worktree_links(worktree_host: &Utf8Path, parent_host: &Ut
 	// Back link: `<parent>/.git/worktrees/<name>/gitdir` → checkout's
 	// `.git` file. Resolve the (possibly already-repaired) forward
 	// link to find the metadata dir rather than re-deriving the name.
-	let link = worktree_host.join(".git");
 	let Ok(content) = std::fs::read_to_string(&link) else {
 		return Ok(repaired);
 	};
@@ -131,9 +149,8 @@ pub fn repair_absolute_worktree_links(worktree_host: &Utf8Path, parent_host: &Ut
 		abs
 	};
 	if let Ok(back) = std::fs::read_to_string(metadata_dir.join("gitdir")) {
-		let back_target = back.trim();
-		if let Some(checkout) = back_target.strip_prefix(mount_prefix.as_str()) {
-			// `/workspace/<base>/.worktrees/<name>/.git` → relative from the
+		if let Some(checkout) = placeable_tail(back.trim()) {
+			// `<prefix>/.worktrees/<name>/.git` → relative from the
 			// metadata dir: up past `<name>`, `worktrees/`, `.git/`.
 			let rel = format!("../../..{checkout}\n");
 			std::fs::write(metadata_dir.join("gitdir"), rel)?;
@@ -362,6 +379,47 @@ mod tests {
 		);
 		// A second pass is a no-op.
 		assert!(!repair_absolute_worktree_links(&wt, &root).unwrap());
+	}
+
+	#[test]
+	fn repair_rewrites_absolute_host_links_into_the_parent() {
+		// ADR 0086: a host-side `git worktree add` without
+		// `--relative-paths` writes absolute *host* paths, which the
+		// container can't resolve ("is not a working tree").
+		let dir = tempfile::TempDir::new().unwrap();
+		let root = Utf8Path::from_path(dir.path()).unwrap().join("moon-landing");
+		let name = "index-client-hang-fix";
+		let wt = root.join(".worktrees").join(name);
+		let metadata = root.join(".git").join("worktrees").join(name);
+		std::fs::create_dir_all(&wt).unwrap();
+		std::fs::create_dir_all(&metadata).unwrap();
+		std::fs::write(wt.join(".git"), format!("gitdir: {root}/.git/worktrees/{name}\n")).unwrap();
+		std::fs::write(metadata.join("gitdir"), format!("{root}/.worktrees/{name}/.git\n")).unwrap();
+
+		assert!(repair_absolute_worktree_links(&wt, &root).unwrap());
+		assert_eq!(
+			std::fs::read_to_string(wt.join(".git")).unwrap(),
+			format!("gitdir: ../../.git/worktrees/{name}\n")
+		);
+		assert_eq!(
+			std::fs::read_to_string(metadata.join("gitdir")).unwrap(),
+			format!("../../../.worktrees/{name}/.git\n")
+		);
+		assert!(!repair_absolute_worktree_links(&wt, &root).unwrap());
+	}
+
+	#[test]
+	fn repair_requires_a_path_boundary_after_the_parent_prefix() {
+		// `<parent>-other/…` shares the parent's string prefix but is a
+		// different repo — never ours to rewrite.
+		let dir = tempfile::TempDir::new().unwrap();
+		let root = Utf8Path::from_path(dir.path()).unwrap().join("moon-landing");
+		let wt = root.join(".worktrees").join("x");
+		std::fs::create_dir_all(&wt).unwrap();
+		let foreign = format!("gitdir: {root}-other/.git/worktrees/x\n");
+		std::fs::write(wt.join(".git"), &foreign).unwrap();
+		assert!(!repair_absolute_worktree_links(&wt, &root).unwrap());
+		assert_eq!(std::fs::read_to_string(wt.join(".git")).unwrap(), foreign);
 	}
 
 	#[test]

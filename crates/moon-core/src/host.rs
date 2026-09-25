@@ -2134,6 +2134,17 @@ impl WorkspaceHost for LocalHost {
 		let path = path.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
+			// Normalise absolute git links to relative first (ADR
+			// 0086): a worktree created outside moon-ide carries
+			// absolute host (or container) paths that only resolve on
+			// one side of the bind mount, and the remove may run on
+			// the other — "is not a working tree". Host-side file I/O,
+			// no-op for healthy links; a failure just lets git report
+			// the original error.
+			let host_path = crate::worktree::container_path_to_host(&path, &root);
+			if let Err(e) = crate::worktree::repair_absolute_worktree_links(Utf8Path::new(&host_path), &root) {
+				tracing::warn!(error = %e, worktree = %host_path, "could not normalise worktree links before remove");
+			}
 			run_git_worktree_remove(&root, &path, force, &target)
 		})
 		.await

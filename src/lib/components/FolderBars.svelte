@@ -269,7 +269,7 @@
 						void workspace.mergeAndRemoveWorktree(folder.path, defaultBranchShort);
 					}}
 				>
-					<MergeIcon size={13} />
+					<MergeIcon size={15} />
 				</button>
 			{/if}
 			<button
@@ -559,7 +559,9 @@
 		justify-content: center;
 		background: transparent;
 		border: none;
-		color: var(--m-fg-subtle);
+		/* One notch brighter than the sibling `×`: the glyph is thin
+		   line art, and it's the action the row exists for. */
+		color: var(--m-fg-muted);
 		cursor: pointer;
 		opacity: 0;
 		transition: opacity 80ms;
