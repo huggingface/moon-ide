@@ -1121,13 +1121,17 @@ mod tests {
 			"invite_id": invite_id("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"),
 		});
 		let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../companion/src/lib/e2e-vectors.json");
-		let rendered = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
 		if std::env::var_os("MOON_WRITE_E2E_VECTORS").is_some() {
-			std::fs::write(&path, &rendered).unwrap();
+			// Tab-indented so the repo formatter leaves the file alone.
+			let mut out = Vec::new();
+			let fmt = serde_json::ser::PrettyFormatter::with_indent(b"\t");
+			Serialize::serialize(&v, &mut serde_json::Serializer::with_formatter(&mut out, fmt)).unwrap();
+			out.push(b'\n');
+			std::fs::write(&path, out).unwrap();
 		}
-		let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+		let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_default()).unwrap_or_default();
 		assert_eq!(
-			on_disk, rendered,
+			on_disk, v,
 			"e2e vectors drifted — regenerate with MOON_WRITE_E2E_VECTORS=1"
 		);
 	}
