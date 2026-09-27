@@ -262,6 +262,8 @@ pub fn run() {
 			commands::companion::companion_remote_disconnect,
 			commands::companion::companion_remote_pair_code,
 			commands::companion::companion_pair_code,
+			commands::companion::companion_e2e_devices,
+			commands::companion::companion_e2e_revoke,
 			commands::coder::coder_status,
 			commands::coder::coder_folder_summary,
 			commands::coder::coder_start_device_flow,
@@ -590,17 +592,31 @@ pub fn run() {
 					_ => None,
 				},
 			);
-			// Manage the bridge_rpc in Tauri state so the remote-bridge
-			// client (Phase 14.3) can reach it via `companion_enroll` —
-			// forwarded calls dispatch against the same handler the focus
-			// listener uses, reused unchanged.
-			app.manage(std::sync::Arc::clone(&bridge_rpc));
+			// Companion end-to-end encryption (ADR 0087). The relay path
+			// (managed below, used by `companion_enroll` and the stored-
+			// credential reconnect) is strict: only sealed calls pass. The
+			// local instance.sock stays lenient — the local bridge is this
+			// host and user already.
+			let e2e = std::sync::Arc::new(moon_remote::e2e::E2eEndpoint::keyring(
+				match &mode {
+					AppMode::Workspace { .. } => workspace_id.clone(),
+					_ => String::new(),
+				},
+				moon_remote::e2e::host_label(),
+			));
+			app.manage(std::sync::Arc::clone(&e2e));
+			let relay_rpc: std::sync::Arc<dyn focus_socket::BridgeRpcHandler> = std::sync::Arc::new(
+				moon_remote::e2e::E2eRpc::new(std::sync::Arc::clone(&bridge_rpc), std::sync::Arc::clone(&e2e), true),
+			);
+			app.manage(relay_rpc);
+			let local_rpc: std::sync::Arc<dyn focus_socket::BridgeRpcHandler> =
+				std::sync::Arc::new(moon_remote::e2e::E2eRpc::new(bridge_rpc, e2e, false));
 			let focus_listener_abort = deferred_focus_listener.map(|listener| {
 				focus_socket::spawn_focus_listener(
 					listener,
 					app.handle().clone(),
 					std::sync::Arc::clone(&editor_registry),
-					bridge_rpc,
+					local_rpc,
 				)
 			});
 

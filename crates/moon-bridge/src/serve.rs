@@ -92,6 +92,10 @@ enum ClientMessage {
 		workspace: String,
 		#[serde(default)]
 		ide: String,
+		/// Forwarded verbatim to the IDE (ADR 0087: `{ sid }` names the
+		/// end-to-end session the events are sealed for).
+		#[serde(default)]
+		params: serde_json::Value,
 	},
 	/// Present an enrollment code to obtain an IDE token (Phase 14,
 	/// ADR 0031). Mirror of `Pair` for the IDE↔bridge relationship.
@@ -188,7 +192,12 @@ enum ServerMessage {
 	/// Forward a phone's `subscribe` to an enrolled IDE. The IDE
 	/// pushes `ForwardEvent` frames until the stream ends, then
 	/// `ForwardEnd`.
-	ForwardSubscribe { id: u64, workspace: String, method: String },
+	ForwardSubscribe {
+		id: u64,
+		workspace: String,
+		method: String,
+		params: serde_json::Value,
+	},
 }
 
 /// A workspace an enrolled IDE reports via `Register` (Phase 14). The
@@ -907,8 +916,13 @@ async fn handle_message(
 		} => {
 			handle_call(Arc::clone(ctx), &token, &workspace, &method, params, &ide, call_id, out).await;
 		}
-		ClientMessage::Subscribe { token, workspace, ide } => {
-			handle_subscribe(ctx, &token, &workspace, &ide, out).await;
+		ClientMessage::Subscribe {
+			token,
+			workspace,
+			ide,
+			params,
+		} => {
+			handle_subscribe(ctx, &token, &workspace, &ide, params, out).await;
 		}
 		ClientMessage::Enroll { code, label, ide_id } => {
 			// Enrollment only mints the token; the connection joins
@@ -996,6 +1010,7 @@ async fn handle_subscribe(
 	token: &str,
 	workspace: &str,
 	ide: &str,
+	params: serde_json::Value,
 	out: &tokio::sync::mpsc::Sender<ServerMessage>,
 ) {
 	if let Err(reply) = check_token(ctx, token) {
@@ -1017,7 +1032,7 @@ async fn handle_subscribe(
 					})
 					.is_ok()
 			};
-			if let Err(err) = crate::relay::subscribe(&socket, "coder_events", forward).await {
+			if let Err(err) = crate::relay::subscribe(&socket, "coder_events", params, forward).await {
 				let _ = out
 					.send(ServerMessage::Error {
 						call_id: None,
@@ -1068,6 +1083,7 @@ async fn handle_subscribe(
 			id,
 			workspace: workspace.to_owned(),
 			method: "coder_events".to_owned(),
+			params,
 		})
 		.await
 		.is_err()

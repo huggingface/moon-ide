@@ -1,18 +1,44 @@
 // WSS transport to moon-bridge. This is the companion's equivalent of
 // the desktop app's `invoke` — every workspace call goes through here.
 //
-// Wire shapes mirror `crates/moon-bridge/src/serve.rs`:
-//   out: { type: "pair", code, label } | { type: "call", token, workspace, method, params }
-//   in:  { type: "paired", device_id, token } | { type: "result", value } | { type: "error", message }
+// Wire shapes mirror `crates/moon-bridge/src/serve.rs`. Two layers:
 //
-// The connection is paired once (device token persisted in
-// localStorage), then reused for calls. Each call is matched to its
-// reply by send-order: the bridge answers one frame per message on a
-// single connection, and the UI issues calls sequentially, so a FIFO
-// queue of pending resolvers is sufficient and avoids needing request
-// ids on the wire.
+// - Relay routing: `pair` → device token, `workspaces`, and `call` /
+//   `subscribe` frames addressed by (ide, workspace). The relay sees
+//   only these envelopes.
+// - End-to-end (ADR 0087): every workspace method rides inside an
+//   `e2e_call` sealed for the IDE, and event streams are sealed per
+//   session. The relay can route, delay or drop — not read or forge.
+//
+// Calls carry a `call_id` the bridge echoes (replies arrive in
+// completion order); pair / workspaces fall back to a FIFO queue.
+
+import {
+	E2eError,
+	asRecord,
+	E2eSession,
+	UNKNOWN_SESSION,
+	cacheSession,
+	cachedSession,
+	dropSession,
+	ideFor,
+	pairWithIde,
+	sessionKey,
+	type IdePin,
+	type PairLink,
+} from './e2e';
 
 const STORAGE_KEY = 'moon-bridge-connection';
+
+/** Relay-routed methods that may travel in the clear (ADR 0087): the
+ * handshakes themselves, plus `workspace_launch`, which the relay
+ * routes to any live process of the IDE and so can't ride a
+ * per-process session. Starting an existing workspace is all it
+ * grants. */
+const PLAINTEXT_METHODS = new Set(['workspace_launch']);
+
+export const NOT_PAIRED_WITH_IDE =
+	"This phone isn't paired with that IDE. Open its Companion panel (or run `moon-remote pair`) and scan the pairing QR.";
 
 export type Connection = {
 	url: string;
@@ -72,6 +98,13 @@ export class BridgeSocket {
 	#pendingCalls = new Map<number, { resolve: (m: ServerMessage) => void; reject: (e: Error) => void }>();
 	#nextCallId = 1;
 	#onEvent: ((event: unknown) => void) | null = null;
+	/** Sealed event streams by session id. Events that don't decrypt
+	 * under one of these are dropped — a relay can't inject rows. */
+	#streamSessions = new Map<string, E2eSession>();
+	/** Streams to re-open when their session is replaced (the IDE
+	 * process restarted and forgot the old one). */
+	#streams = new Map<string, { token: string; workspace: string; ide: string }>();
+	#nextRequestId = 1;
 	readonly url: string;
 
 	constructor(url: string) {
@@ -116,7 +149,7 @@ export class BridgeSocket {
 				// Pushed events are unsolicited — route them to the event
 				// handler rather than consuming a pending reply.
 				if (msg.type === 'event') {
-					this.#onEvent?.(msg.event);
+					this.#routeEvent(msg.event);
 					return;
 				}
 				// Correlated replies (calls) resolve by id; everything
@@ -223,26 +256,32 @@ export class BridgeSocket {
 		return reply.workspaces as T;
 	}
 
-	/** Subscribe to a workspace's coder event stream. Events arrive via
-	 * the `onEvent` handler; this send has no direct reply. `ide`
-	 * selects the carrier (empty = local, present = remote IDE). */
-	subscribe(token: string, workspace: string, ide = ''): void {
-		const ws = this.#ws;
-		if (!ws || ws.readyState !== WebSocket.OPEN) {
+	#routeEvent(raw: unknown): void {
+		const frame = asRecord(raw);
+		const sid = frame.sid;
+		const session = typeof sid === 'string' ? this.#streamSessions.get(sid) : undefined;
+		if (!session) {
 			return;
 		}
-		ws.send(JSON.stringify({ type: 'subscribe', token, workspace, ide }));
+		let plain: unknown;
+		try {
+			plain = session.openEvent(frame);
+		} catch {
+			return;
+		}
+		if (plain && typeof plain === 'object') {
+			// Attribution comes from the session, not from the
+			// relay-injected `ide`/`workspace` tags on the wrapper.
+			const envelope = asRecord(plain);
+			envelope.ide = session.ide;
+			envelope.workspace = session.workspace;
+		}
+		this.#onEvent?.(plain);
 	}
 
-	/** Invoke a relayed method on `workspace`, authenticated by `token`.
-	 * `ide` selects the carrier (empty = local, present = remote IDE). */
-	async call<T = unknown>(
-		token: string,
-		workspace: string,
-		method: string,
-		params: unknown = {},
-		ide = '',
-	): Promise<T> {
+	/** One-shot plaintext relay call — only for handshakes and
+	 * `PLAINTEXT_METHODS`. */
+	async #plainCall(token: string, workspace: string, method: string, params: unknown, ide: string): Promise<unknown> {
 		const reply = await this.#sendCall({ type: 'call', token, workspace, method, params, ide });
 		if (reply.type === 'error') {
 			throw new BridgeError(reply.message);
@@ -250,8 +289,108 @@ export class BridgeSocket {
 		if (reply.type !== 'result') {
 			throw new BridgeError('unexpected reply to call');
 		}
-		// Untyped JSON boundary — the caller declares the shape it expects.
-		// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
-		return reply.value as T;
+		return reply.value;
+	}
+
+	#pinFor(ide: string): IdePin {
+		const pin = ideFor(this.url, ide);
+		if (!pin) {
+			throw new BridgeError(NOT_PAIRED_WITH_IDE);
+		}
+		return pin;
+	}
+
+	/** The live session for (ide, workspace), handshaking if needed.
+	 * Concurrent callers share one handshake. */
+	#session(token: string, workspace: string, ide: string): Promise<E2eSession> {
+		const key = sessionKey(this.url, ide, workspace);
+		const existing = cachedSession(key);
+		if (existing) {
+			return existing;
+		}
+		const pin = this.#pinFor(ide);
+		const opening = E2eSession.open((m, p) => this.#plainCall(token, workspace, m, p, ide), pin, ide, workspace);
+		cacheSession(key, opening);
+		return opening;
+	}
+
+	/** Forget a session the IDE no longer knows, handshake again, and
+	 * move any event streams onto the new one. */
+	async #renew(token: string, workspace: string, ide: string, stale: Promise<E2eSession>): Promise<E2eSession> {
+		dropSession(sessionKey(this.url, ide, workspace), stale);
+		const fresh = await this.#session(token, workspace, ide);
+		const streamKey = sessionKey(this.url, ide, workspace);
+		if (this.#streams.has(streamKey)) {
+			this.#sendSubscribe(token, workspace, ide, fresh);
+		}
+		return fresh;
+	}
+
+	#sendSubscribe(token: string, workspace: string, ide: string, session: E2eSession): void {
+		const ws = this.#ws;
+		if (!ws || ws.readyState !== WebSocket.OPEN) {
+			return;
+		}
+		this.#streamSessions.set(session.sid, session);
+		ws.send(JSON.stringify({ type: 'subscribe', token, workspace, ide, params: { sid: session.sid } }));
+	}
+
+	/** Pin an IDE from a pairing link (ADR 0087). Needs a relay token
+	 * already (`pair` first when the phone is new to this relay). */
+	async pairIde(token: string, link: PairLink, label: string): Promise<IdePin> {
+		return pairWithIde((m, p) => this.#plainCall(token, link.workspace, m, p, link.ide), link, label);
+	}
+
+	/** Subscribe to a workspace's coder event stream. Events arrive via
+	 * the `onEvent` handler, decrypted; this send has no direct reply.
+	 * `ide` selects the carrier (empty = local, present = remote IDE). */
+	subscribe(token: string, workspace: string, ide = ''): void {
+		this.#streams.set(sessionKey(this.url, ide, workspace), { token, workspace, ide });
+		this.#session(token, workspace, ide).then(
+			(session) => this.#sendSubscribe(token, workspace, ide, session),
+			() => {
+				// Surfaced by the next call on this workspace, which
+				// fails the same way with a message the UI shows.
+			},
+		);
+	}
+
+	/** Invoke a relayed method on `workspace`, end-to-end sealed for
+	 * the IDE (ADR 0087). `ide` selects the carrier (empty = local,
+	 * present = remote IDE). */
+	async call<T = unknown>(
+		token: string,
+		workspace: string,
+		method: string,
+		params: unknown = {},
+		ide = '',
+	): Promise<T> {
+		if (PLAINTEXT_METHODS.has(method)) {
+			// Untyped JSON boundary — the caller declares the shape it expects.
+			// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+			return (await this.#plainCall(token, workspace, method, params, ide)) as T;
+		}
+		let pending = this.#session(token, workspace, ide);
+		for (let attempt = 0; ; attempt++) {
+			const session = await pending;
+			const id = this.#nextRequestId++;
+			let reply: unknown;
+			try {
+				reply = await this.#plainCall(token, workspace, 'e2e_call', session.sealCall(id, method, params), ide);
+			} catch (e) {
+				if (attempt === 0 && e instanceof BridgeError && e.message.includes(UNKNOWN_SESSION)) {
+					pending = this.#renew(token, workspace, ide, pending);
+					continue;
+				}
+				throw e;
+			}
+			try {
+				// Untyped JSON boundary — the caller declares the shape it expects.
+				// eslint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+				return session.openResult(reply, id) as T;
+			} catch (e) {
+				throw e instanceof E2eError ? new BridgeError(e.message) : e;
+			}
+		}
 	}
 }

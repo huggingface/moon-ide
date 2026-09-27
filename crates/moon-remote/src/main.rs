@@ -136,6 +136,25 @@ enum Command {
 		#[arg(long)]
 		disable: Option<String>,
 	},
+	/// Mint a phone pairing link for a running `serve` (ADR 0087):
+	/// prints the link to copy-paste into the companion plus a
+	/// terminal QR. The link carries this host's public key and a
+	/// single-use secret; the relay only routes.
+	Pair {
+		/// Workspace slug whose `serve` should answer the pairing.
+		#[arg(long)]
+		workspace: String,
+		/// Print the link only, no terminal QR.
+		#[arg(long)]
+		no_qr: bool,
+	},
+	/// List the phones allowed to drive this host end-to-end, or
+	/// revoke one. Live sessions of a revoked phone end within 30 s.
+	Devices {
+		/// Device id to revoke (see the listing).
+		#[arg(long)]
+		revoke: Option<String>,
+	},
 	/// Show or set the model picks (`state.json`, same store the
 	/// desktop picker writes). Prints the current picks when no flag
 	/// is given. A running `serve` reads the picks at boot — restart
@@ -188,6 +207,8 @@ fn main() -> anyhow::Result<()> {
 			Command::WorkspaceAdd { name, folder, slug } => workspace_add(name, folder, slug).await,
 			Command::WorkspaceRemoveFolder { workspace, folder } => workspace_remove_folder(workspace, folder).await,
 			Command::Serve { workspace } => serve(workspace).await,
+			Command::Pair { workspace, no_qr } => pair(workspace, no_qr).await,
+			Command::Devices { revoke } => devices(revoke),
 			Command::Container {
 				workspace,
 				up,
@@ -550,7 +571,8 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 	// The listener is held for liveness probes (`connect` succeeding
 	// = live owner); R/S frames from a *local* moon-bridge are not
 	// served headless — the relay is the supported path.
-	let _instance = instance_bind(&workspaces_dir, &slug).await?;
+	let pair_ctx: Arc<tokio::sync::OnceCell<PairCtx>> = Arc::new(tokio::sync::OnceCell::new());
+	let _instance = instance_bind(&workspaces_dir, &slug, Arc::clone(&pair_ctx)).await?;
 
 	// Bump last-active + load the catalog & coder defaults.
 	let slug_for_bump = slug.clone();
@@ -693,7 +715,7 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		});
 	}
 
-	let rpc: Arc<dyn moon_remote::rpc::BridgeRpcHandler> = Arc::new(BridgeRpc::new(
+	let plain_rpc: Arc<dyn moon_remote::rpc::BridgeRpcHandler> = Arc::new(BridgeRpc::new(
 		coder.clone(),
 		registry.clone(),
 		SettingsContext {
@@ -703,6 +725,14 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		},
 		Some(Arc::new(HeadlessLauncher)),
 	));
+	// Relay path is strict (ADR 0087): only end-to-end sealed calls
+	// from phones this host paired itself reach the dispatcher.
+	let e2e = Arc::new(moon_remote::e2e::E2eEndpoint::keyring(
+		slug.clone(),
+		moon_remote::e2e::host_label(),
+	));
+	let rpc: Arc<dyn moon_remote::rpc::BridgeRpcHandler> =
+		Arc::new(moon_remote::e2e::E2eRpc::new(plain_rpc, Arc::clone(&e2e), true));
 
 	// Register the full catalog with this workspace marked live —
 	// same shape the desktop sends — so the phone's switcher shows
@@ -718,14 +748,19 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		})
 		.collect();
 
-	let handle = relay::spawn(
+	let handle = Arc::new(relay::spawn(
 		cred.bridge_url.clone(),
 		String::new(),
 		cred.ide_id.clone(),
 		cred.ide_id.clone(),
 		workspaces,
 		rpc,
-	);
+	));
+	let _ = pair_ctx.set(PairCtx {
+		handle: Arc::clone(&handle),
+		e2e,
+		ide_id: cred.ide_id.clone(),
+	});
 	tracing::info!(workspace = %slug, bridge = %cred.bridge_url, ide_id = %cred.ide_id, "moon-remote serving");
 
 	// Log status transitions until we're told to stop.
@@ -814,12 +849,42 @@ async fn model(
 	Ok(())
 }
 
+/// What a running `serve` needs to answer `moon-remote pair`.
+struct PairCtx {
+	handle: Arc<relay::RemoteBridgeHandle>,
+	e2e: Arc<moon_remote::e2e::E2eEndpoint>,
+	ide_id: String,
+}
+
+impl PairCtx {
+	async fn link(&self) -> anyhow::Result<String> {
+		let qr = self.handle.request_pair_code().await?;
+		self.e2e.pair_link_for(&qr.url, &qr.code, &self.ide_id)
+	}
+}
+
+/// The one request `instance.sock` answers headless: `{"op":"pair"}`.
+#[derive(serde::Deserialize)]
+struct InstanceRequest {
+	op: String,
+}
+
+fn instance_socket_path(workspaces_dir: &Utf8Path, slug: &str) -> Utf8PathBuf {
+	workspaces_dir.join(slug).join("run").join("instance.sock")
+}
+
 /// Bind the per-workspace single-instance socket (same path +
 /// stale-recovery semantics as the desktop's `focus_socket::try_bind`)
-/// and hold it, accepting-and-dropping connections so sibling
-/// liveness probes see a live owner.
-async fn instance_bind(workspaces_dir: &Utf8Path, slug: &str) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-	let path = workspaces_dir.join(slug).join("run").join("instance.sock");
+/// and hold it. Liveness probes connect and drop; the only request
+/// served is a local `pair` (same user — the socket lives in the
+/// user's data dir). R/S frames from a local moon-bridge are not
+/// served headless: the relay is the supported path.
+async fn instance_bind(
+	workspaces_dir: &Utf8Path,
+	slug: &str,
+	pair_ctx: Arc<tokio::sync::OnceCell<PairCtx>>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+	let path = instance_socket_path(workspaces_dir, slug);
 	tokio::fs::create_dir_all(path.parent().expect("socket path has a parent")).await?;
 	let listener = match tokio::net::UnixListener::bind(path.as_std_path()) {
 		Ok(l) => l,
@@ -840,9 +905,94 @@ async fn instance_bind(workspaces_dir: &Utf8Path, slug: &str) -> anyhow::Result<
 		Err(err) => return Err(err.into()),
 	};
 	Ok(tokio::spawn(async move {
-		// Accept + drop: liveness probes succeed, everything else
-		// (focus/edit/RPC frames from a local bridge) is refused by
-		// the close. Headless serves through the relay only.
-		while let Ok((_stream, _)) = listener.accept().await {}
+		while let Ok((stream, _)) = listener.accept().await {
+			let pair_ctx = Arc::clone(&pair_ctx);
+			tokio::spawn(async move {
+				use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+				let (read, mut write) = stream.into_split();
+				let mut line = String::new();
+				let mut reader = tokio::io::BufReader::new(read.take(4096));
+				let read = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_line(&mut line)).await;
+				if !matches!(read, Ok(Ok(n)) if n > 0) {
+					return;
+				}
+				let Ok(req) = serde_json::from_str::<InstanceRequest>(line.trim()) else {
+					return;
+				};
+				let reply = match (req.op.as_str(), pair_ctx.get()) {
+					("pair", Some(ctx)) => match ctx.link().await {
+						Ok(link) => serde_json::json!({ "link": link }),
+						Err(err) => serde_json::json!({ "error": err.to_string() }),
+					},
+					("pair", None) => serde_json::json!({ "error": "serve is still starting — retry in a moment" }),
+					_ => return,
+				};
+				let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+			});
+		}
 	}))
+}
+
+/// `moon-remote pair`: ask the workspace's running `serve` for a
+/// pairing link and print it (plus a terminal QR for the ssh case).
+async fn pair(slug: String, no_qr: bool) -> anyhow::Result<()> {
+	use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+	moon_protocol::workspace::validate_workspace_id(&slug)?;
+	let (_, workspaces_dir) = data_dirs()?;
+	let path = instance_socket_path(&workspaces_dir, &slug);
+	let stream = tokio::net::UnixStream::connect(path.as_std_path())
+		.await
+		.map_err(|err| anyhow::anyhow!("no running `moon-remote serve --workspace {slug}` ({err})"))?;
+	let (read, mut write) = stream.into_split();
+	write.write_all(b"{\"op\":\"pair\"}\n").await?;
+	let mut line = String::new();
+	tokio::time::timeout(
+		std::time::Duration::from_secs(20),
+		tokio::io::BufReader::new(read).read_line(&mut line),
+	)
+	.await
+	.map_err(|_| anyhow::anyhow!("serve did not answer the pairing request in time"))??;
+	let reply: serde_json::Value = serde_json::from_str(line.trim())
+		.map_err(|_| anyhow::anyhow!("unexpected reply from serve (is it an older build?)"))?;
+	if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
+		anyhow::bail!("{err}");
+	}
+	let link = reply
+		.get("link")
+		.and_then(|v| v.as_str())
+		.ok_or_else(|| anyhow::anyhow!("serve replied without a link"))?;
+	if !no_qr {
+		let code = qrcode::QrCode::new(link.as_bytes())?;
+		let art = code
+			.render::<qrcode::render::unicode::Dense1x2>()
+			.dark_color(qrcode::render::unicode::Dense1x2::Light)
+			.light_color(qrcode::render::unicode::Dense1x2::Dark)
+			.quiet_zone(true)
+			.build();
+		println!("{art}");
+	}
+	println!("Open this link on the phone (or scan the QR). Single use, valid 15 minutes:\n\n{link}\n");
+	println!("It carries this host's key and a one-time secret — share it only with the phone you're pairing.");
+	Ok(())
+}
+
+/// `moon-remote devices`: list or revoke end-to-end paired phones.
+fn devices(revoke: Option<String>) -> anyhow::Result<()> {
+	let e2e = moon_remote::e2e::E2eEndpoint::keyring(String::new(), moon_remote::e2e::host_label());
+	if let Some(id) = revoke {
+		if e2e.revoke(&id)? {
+			println!("revoked {id} (its live sessions end within 30 s)");
+		} else {
+			anyhow::bail!("no paired phone with id `{id}`");
+		}
+		return Ok(());
+	}
+	let list = e2e.devices()?;
+	if list.is_empty() {
+		println!("no phones paired — run `moon-remote pair --workspace <slug>`");
+	}
+	for d in list {
+		println!("{}  {}  (paired {})", d.id, d.label, d.paired_at_ms);
+	}
+	Ok(())
 }

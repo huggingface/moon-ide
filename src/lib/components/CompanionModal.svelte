@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
 	import { renderSVG } from 'uqr';
-	import { ipc, type PairingQr } from '../ipc';
+	import { ipc, type AuthorizedPhone, type PairingQr } from '../ipc';
 	import { formatError } from '../protocol';
 	import { companion } from '../companion.svelte';
 
@@ -15,8 +16,42 @@
 	// Defaults to local; auto-switches to remote if already connected.
 	let tab = $state<'local' | 'remote'>('local');
 
+	// Phones this host authorized end-to-end (ADR 0087) — host-wide,
+	// so both tabs show the same list.
+	let phones = $state<AuthorizedPhone[]>([]);
+	let phonesError = $state<string | null>(null);
+
+	async function refreshPhones(): Promise<void> {
+		try {
+			phones = await ipc.companion.e2eDevices();
+			phonesError = null;
+		} catch (err) {
+			phonesError = formatError(err);
+		}
+	}
+
+	async function revokePhone(id: string): Promise<void> {
+		await ipc.companion.e2eRevoke(id);
+		await refreshPhones();
+	}
+
+	let copied = $state(false);
+
+	async function copyLink(link: string): Promise<void> {
+		// The Tauri plugin first: WebKitGTK rejects navigator.clipboard
+		// from an unfocused button (same fallback as editorContextMenu).
+		try {
+			await clipboardWriteText(link);
+		} catch {
+			await navigator.clipboard.writeText(link);
+		}
+		copied = true;
+		setTimeout(() => (copied = false), 1500);
+	}
+
 	onMount(() => {
 		companion.startPolling();
+		void refreshPhones();
 		void companion.refresh();
 		void companion.refreshRemote().then(() => {
 			if (companion.remoteStatus?.connected) {
@@ -30,9 +65,8 @@
 	});
 
 	// Local-bridge pairing is on-demand (Phase 14.5): the button mints
-	// a fresh single-use code over the control socket. The QR encodes
-	// the full payload (url + fingerprint + code) that the PWA's pair
-	// screen parses from a paste/scan.
+	// a fresh single-use pairing link (ADR 0087). The QR and the copy
+	// button carry the same link — no short typed code exists.
 	let localPair = $state<PairingQr | null>(null);
 	let localPairError = $state<string | null>(null);
 	const qrSvg = $derived(localPair ? renderSVG(localPair.payload, { border: 2 }) : null);
@@ -118,6 +152,40 @@
 	}
 </script>
 
+{#snippet pairLink(pair: PairingQr, svg: string | null)}
+	{#if svg}
+		<!-- eslint-disable-next-line svelte/no-at-html-tags -->
+		<div class="qr">{@html svg}</div>
+	{/if}
+	<div class="link-row">
+		<code class="link">{pair.payload}</code>
+		<button type="button" class="copy" onclick={() => copyLink(pair.payload)}>{copied ? 'Copied' : 'Copy link'}</button>
+	</div>
+	<p class="hint">
+		Scan it, or paste the link into the companion. Single use, valid 15 minutes. It carries this IDE's key and a
+		one-time secret, so the relay can't pair itself or read the session — share it only with the phone you're pairing.
+	</p>
+{/snippet}
+
+{#snippet allowedPhones()}
+	<h3>Phones allowed to control this IDE</h3>
+	{#if phonesError}
+		<p class="hint" style="color: var(--danger, #f85149)">{phonesError}</p>
+	{:else if phones.length === 0}
+		<p class="hint">None yet. Pair one with a QR above.</p>
+	{:else}
+		<ul class="devices">
+			{#each phones as p (p.id)}
+				<li>
+					<span class="label">{p.label}</span>
+					<span class="meta">{relativeTime(p.paired_at_ms)}</span>
+					<button type="button" class="revoke" onclick={() => revokePhone(p.id)}>Revoke</button>
+				</li>
+			{/each}
+		</ul>
+	{/if}
+{/snippet}
+
 <div class="overlay" role="dialog" aria-modal="true" aria-label="Companion">
 	<div class="card">
 		<header>
@@ -160,32 +228,17 @@
 					<code>moon-bridge serve --web-root companion/dist</code> in a terminal, then reopen this dialog.
 				</p>
 			{:else}
-				<p class="lede">
-					On your phone (same network/VPN), open the companion and scan a pairing QR, or type the address + code.
-				</p>
+				<p class="lede">On your phone (same network/VPN), scan a pairing QR or paste its link into the companion.</p>
 
 				{#if localPair}
-					{#if qrSvg}
-						<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-						<div class="qr">{@html qrSvg}</div>
-					{/if}
-					<div class="details">
-						{#if status.mdns_url}
-							<div class="row"><span class="k">Address</span><code>{status.mdns_url}</code></div>
-							<div class="row"><span class="k">or</span><code>{localPair.url}</code></div>
-						{:else}
-							<div class="row"><span class="k">Address</span><code>{localPair.url}</code></div>
-						{/if}
-						<div class="row"><span class="k">Code</span><code class="code">{localPair.code}</code></div>
-					</div>
-					<p class="hint">Single-use, valid ~2 minutes. Generate a new one per phone.</p>
+					{@render pairLink(localPair, qrSvg)}
 				{:else}
 					<div class="details">
 						<div class="row"><span class="k">Address</span><code>{status.mdns_url ?? status.url}</code></div>
 					</div>
 				{/if}
 				<button type="button" onclick={() => requestLocalPairCode()}>
-					{localPair ? 'New pairing code' : 'Show pairing QR'}
+					{localPair ? 'New pairing link' : 'Show pairing QR'}
 				</button>
 				{#if localPairError}
 					<p class="hint" style="color: var(--danger, #f85149)">{localPairError}</p>
@@ -196,7 +249,9 @@
 					<code class="fingerprint">{status.fingerprint}</code>
 				</p>
 
-				<h3>Paired devices</h3>
+				{@render allowedPhones()}
+
+				<h3>Relay routing tokens</h3>
 				{#if status.devices.length === 0}
 					<p class="hint">None yet.</p>
 				{:else}
@@ -234,30 +289,24 @@
 					<p class="hint" style="color: var(--danger, #f85149)">{companion.remoteStatus.error}</p>
 				{/if}
 				<p class="hint">
-					This IDE is enrolled as <code>{companion.remoteStatus.ide_id}</code>. Phones paired to the remote bridge can
-					see this IDE's workspaces.
+					This IDE is enrolled as <code>{companion.remoteStatus.ide_id}</code>. The relay only routes: calls are
+					end-to-end encrypted, and only phones this IDE paired itself can drive it.
 				</p>
 
 				<h3>Pair a phone</h3>
 				{#if remotePair}
-					{#if remotePairQrSvg}
-						<!-- eslint-disable-next-line svelte/no-at-html-tags -->
-						<div class="qr">{@html remotePairQrSvg}</div>
-					{/if}
-					<div class="details">
-						<div class="row"><span class="k">Address</span><code>{remotePair.url}</code></div>
-						<div class="row"><span class="k">Code</span><code class="code">{remotePair.code}</code></div>
-					</div>
-					<p class="hint">Single-use, valid ~2 minutes. Generate a new one per phone.</p>
+					{@render pairLink(remotePair, remotePairQrSvg)}
 				{:else}
-					<p class="hint">Mint a fresh single-use pairing code on the relay and show it as a QR.</p>
+					<p class="hint">Mint a single-use pairing link and show it as a QR.</p>
 				{/if}
 				<button type="button" onclick={() => requestRemotePairCode()}>
-					{remotePair ? 'New pairing code' : 'Show pairing QR'}
+					{remotePair ? 'New pairing link' : 'Show pairing QR'}
 				</button>
 				{#if remotePairError}
 					<p class="hint" style="color: var(--danger, #f85149)">{remotePairError}</p>
 				{/if}
+
+				{@render allowedPhones()}
 
 				<button type="button" class="revoke" onclick={() => disconnectRemote()}>Disconnect</button>
 			{:else}
@@ -359,9 +408,27 @@
 		font-family: var(--mono, ui-monospace, monospace);
 		word-break: break-all;
 	}
-	.code {
-		font-size: 1.1rem;
-		letter-spacing: 0.05em;
+	.link-row {
+		display: flex;
+		gap: 0.5rem;
+		align-items: flex-start;
+	}
+	.link {
+		flex: 1;
+		font-size: 0.7rem;
+		color: var(--fg-muted, #8b949e);
+		max-height: 3.2rem;
+		overflow: hidden;
+	}
+	.copy {
+		background: var(--accent, #388bfd);
+		border: none;
+		border-radius: 6px;
+		color: white;
+		cursor: pointer;
+		padding: 0.3rem 0.7rem;
+		font-size: 0.8rem;
+		white-space: nowrap;
 	}
 	.fingerprint {
 		font-size: 0.7rem;

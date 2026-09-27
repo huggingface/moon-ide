@@ -110,78 +110,48 @@ notifications over the WS, routed to the phone by the same
 
 ## Pairing
 
-TOFU cert pin + revocable device tokens, mirroring the vocabulary
-of the coder's [HF device flow](coder.md#flow) and the keyring
-secret storage already in use.
+Two layers since [ADR 0087](decisions/0087-companion-end-to-end-encryption.md):
+the relay's routing tokens, and the IDE's own end-to-end pairing,
+which is what actually grants command authority.
 
-1. Bridge generates its TLS keypair + self-signed cert on first run.
-2. Desktop surfaces a **pairing QR** (a "Companion" affordance,
-   home is the status bar or a small settings modal). The QR encodes a
-   **link to the PWA itself** with the code in the fragment
-   (`https://<bridge-host>/#pair=<code>`), so a camera scan opens the
-   PWA and it pairs itself — the phone derives the WS URL from the
-   page origin (the PWA is served by the same listener), and the
-   fragment never reaches server logs. Type-in fallback: the URL +
-   code shown alongside the QR.
+1. **One pairing link, minted by the IDE on demand.** The Companion
+   modal's "Show pairing QR" (or `moon-remote pair --workspace <slug>`
+   headless, which also prints a terminal QR) asks the bridge for a
+   relay routing code and bundles it with this host's X25519 public key
+   and a fresh single-use 256-bit secret:
+   `https://<relay>/#pair=<code>&ide=<id>&ws=<slug>&k=<key>&s=<secret>`.
+   Valid 15 minutes. The QR and "Copy link" carry the same string —
+   there is no short typed code, so copy-paste over ssh is as strong as
+   a scan.
+2. The phone opens the link (camera scan lands on the PWA; a paste
+   works on the pair screen or, once paired, under "Pair another IDE"),
+   gets a relay device token with the routing code, then runs a Noise
+   `IKpsk2` handshake against the link's IDE key with the secret as PSK.
+   The IDE pins the phone's key in its keyring
+   (`companion-e2e-devices`); the phone pins the IDE's key.
+3. Every workspace call then rides a per-(IDE, workspace) Noise `IK`
+   session: `call{method:"e2e_call"}` carries the sealed inner call,
+   `subscribe{params:{sid}}` yields sealed events. The relay sees
+   routing envelopes only.
 
-   Codes are minted **on demand** (a "Show pairing QR" button — the
-   local panel asks over the control socket, a remote-enrolled IDE
-   over its WS; roadmap 14.5). There is no startup pairing window:
-   one live single-use session at a time, a fresh mint replaces it.
+The desktop **Companion** modal (command palette → "Companion: Pair a
+phone…") shows the QR + link, "Phones allowed to control this IDE"
+(the end-to-end list, with revoke), and the relay's routing tokens.
+Headless: `moon-remote devices [--revoke <id>]`. The local bridge
+still self-signs its TLS cert (fingerprint shown in the modal; iOS
+installs it once via a `.mobileconfig`), advertises
+`moon-bridge.local` over mDNS, and is driven by the IDE over its
+control socket (`status`, `revoke`, `paircode`, `shutdown`).
 
-3. Phone scans → connects → **pins the fingerprint (TOFU)** →
-   installs the bridge cert once (iOS: a `.mobileconfig` the bridge
-   serves; Android: a user cert) → presents the pairing token.
-4. Bridge issues a long-lived **device token** bound to that
-   device, stored in the host keyring at
-   `service=moon-ide, account=companion-device:<id>`.
-5. **Paired devices** list with per-device revoke is the management
-   surface.
-
-The one-time cert-trust install is what removes the browser's
-self-signed interstitial; after it the PWA loads cleanly. It's a
-per-device ritual the team performs once, alongside pairing.
-
-The desktop surfaces all this in a **Companion** modal (command
-palette → "Companion: Pair a phone…"): a QR of the pairing payload,
-the address + code, the fingerprint, and a paired-devices list with
-revoke. The bridge advertises `moon-bridge.local` over **mDNS**
-(`mdns-sd`) so the phone reaches it by name regardless of the host's
-IP; the raw IP rides in the payload as the fallback for networks
-that block multicast.
-
-Because the bridge is a separate process, the IDE talks to it over a
-local **control socket** (`<bridge_dir>/control.sock`, newline-framed
-JSON): `status` returns the pairing payload + device list, `revoke`
-drops a paired device, `shutdown` asks it to exit. The
-`companion_status` / `companion_revoke_device` commands are the IDE's
-client. Liveness is intrinsic — a refused connect means the bridge
-isn't running, so the status-bar pip can't be lit by a stale file
-(an earlier file-based channel had exactly that bug). The bridge
-stays the sole keyring writer; the IDE only _asks_ it to revoke.
-
-Pairing is the **whole** security boundary: a paired device can
-drive the coder, which can run anything via its `bash` tool, so
-there's no point fencing the relay's method surface (same threat
-model as the desktop — `coder.md` § Permissions). What the relay
-exposes is a scope decision, not a safety one.
-
-Two deliberate limits of the current shape, both tracked in README
-§ "Before wider release" and not built until someone shares a relay:
-
-- The scope is the **relay**, not the IDE — phone and IDE tokens are
-  relay-wide, so any paired phone can drive every enrolled IDE. A
-  shared relay needs phone tokens scoped to an allowed-IDE set
-  (default: the IDE that minted the pairing QR), enforced on every
-  routed frame.
-- The relay is **trusted**: it terminates TLS, sees plaintext
-  JSON-RPC, and nothing stops it originating commands to an enrolled
-  IDE. The release shape makes it a blind pipe: pairing mints a
-  device keypair, the phone signs every frame (nonce/counter against
-  replay), the IDE verifies against the pinned device key before
-  dispatching, and ideally the payloads are end-to-end encrypted
-  phone↔IDE — the relay's own tokens then only gate routing and
-  denial-of-service, not command authority.
+Threat model: on the relay path the IDE refuses every plaintext method
+but `workspace_launch`, so a compromised relay can route, delay or drop
+traffic, but not read it, forge calls, or pair itself (it never sees the
+secret, and a MITM handshake fails without the IDE's private key). The
+local instance.sock stays lenient — the local bridge is the same host
+and user. Residual risk, accepted for now: the relay also **serves the
+PWA**, so a malicious relay could ship JS that steals the phone's key;
+the fix is serving the PWA from a separate origin (README § "Before
+wider release").
 
 ## App form
 
@@ -523,8 +493,9 @@ security model, not two:
 enrollment handshake (`enroll` → `enrolled`) mirrors `pair` → `paired`.
 **No per-method ACL** behind enrollment — same threat model as pairing:
 an enrolled IDE can drive the coder, which runs anything via `bash`.
-Enrollment is the boundary; what the relay exposes is a scope decision,
-not a safety one. mTLS (client certs for IDEs) is a documented future,
+Enrollment is the IDE↔relay boundary; since ADR 0087 a phone's
+command authority comes from the IDE's own end-to-end pairing, so the
+relay itself is no longer trusted with it. mTLS (client certs for IDEs) is a documented future,
 not v1 — bearer tokens match the existing posture and are simpler to
 rotate/revoke.
 
@@ -561,8 +532,12 @@ fingerprint }` — an enrolled IDE asks the bridge to mint a fresh
   panel. An enrolled IDE is already fully trusted (it is what a paired
   phone would drive), so this adds no capability — it moves _when_ a
   pairing window opens from "bridge startup only" to "on demand from
-  the IDE". Codes keep the usual TTL + single-use semantics; one live
-  pairing session at a time (a new request replaces the old code).
+  the IDE". Codes keep single-use semantics (15 min TTL); one live
+  pairing session at a time (a new request replaces the old code). The
+  IDE wraps the code into its end-to-end pairing link (ADR 0087), so
+  the code alone only buys relay routing.
+- `Subscribe` / `ForwardSubscribe` carry the phone's `params` verbatim
+  (`{ sid }` names the end-to-end session the events are sealed for).
 
 Liveness: every WS connection (phone and IDE, both directions)
 carries a 30 s ping / 95 s read-idle deadline. Without it a

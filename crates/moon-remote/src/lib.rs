@@ -19,6 +19,7 @@
 //! see the headless ADR. The RemoteHost (SSH/Codespaces WorkspaceHost
 //! server) story remains future work and would live here too.
 
+pub mod e2e;
 pub mod relay;
 pub mod rpc;
 pub mod settings;

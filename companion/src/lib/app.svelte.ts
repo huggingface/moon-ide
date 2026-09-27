@@ -6,6 +6,7 @@
 // the full event stream (thinking, tool calls with args, diffs, token
 // usage, sub-agents, compaction, session metadata).
 
+import { forgetAll, ideFor, parsePairLink, type PairLink } from './e2e';
 import { BridgeSocket, clearConnection, loadConnection, type Connection } from './transport';
 
 // Wire shapes mirror the bridge's read-only method results, which in
@@ -760,6 +761,13 @@ class CompanionState {
 			this.phase = 'error';
 			return;
 		}
+		// A pairing QR scanned by an already-paired phone opens the
+		// app with the link in the fragment: pair that IDE too.
+		if (initialRouteHash.startsWith('#pair=')) {
+			history.replaceState(null, '', window.location.pathname);
+			await this.pairLink(initialRouteHash);
+			return;
+		}
 		await this.#restoreRoute();
 	}
 
@@ -851,13 +859,16 @@ class CompanionState {
 		}
 	}
 
-	/** Pair using the QR/typed payload. `url` is `wss://host:port`. */
-	async pair(url: string, code: string, label: string): Promise<void> {
+	/** First pairing from a scanned / pasted link (ADR 0087): get a
+	 * relay routing token, then pair end-to-end with the IDE that
+	 * minted the link. */
+	async pair(link: PairLink, label: string): Promise<void> {
 		this.error = null;
 		try {
-			const socket = new BridgeSocket(url);
+			const socket = new BridgeSocket(link.bridgeUrl);
 			await socket.open();
-			const conn = await socket.pair(code, label);
+			const conn = await socket.pair(link.relayCode, label);
+			await socket.pairIde(conn.token, link, label);
 			this.#socket = socket;
 			this.connection = conn;
 			this.phase = 'ready';
@@ -866,9 +877,40 @@ class CompanionState {
 		}
 	}
 
+	/** Pair one more IDE from a link while already connected. A link
+	 * for a different relay re-pairs this phone to that relay. */
+	async pairLink(text: string): Promise<boolean> {
+		const link = parsePairLink(text, window.location.origin);
+		if (!link) {
+			this.error = 'Not a moon-ide pairing link (it should contain #pair=…&k=…&s=…).';
+			return false;
+		}
+		const label = `${navigator.platform || 'phone'} companion`;
+		if (!this.#socket || !this.connection || this.connection.url !== link.bridgeUrl) {
+			await this.pair(link, label);
+			return this.error === null;
+		}
+		this.error = null;
+		try {
+			await this.#socket.pairIde(this.connection.token, link, label);
+			await this.loadWorkspaces();
+			return true;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			return false;
+		}
+	}
+
+	/** Whether this phone holds an end-to-end pin for `ide` on the
+	 * current relay (unpinned IDEs are listed but locked). */
+	isIdePaired(ide: string): boolean {
+		return this.connection ? ideFor(this.connection.url, ide) !== null : false;
+	}
+
 	/** Forget this device's pairing and return to the pair screen. */
 	unpair(): void {
 		clearConnection();
+		forgetAll();
 		this.#socket?.close();
 		this.#socket = null;
 		this.connection = null;

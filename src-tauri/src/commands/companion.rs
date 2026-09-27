@@ -168,23 +168,44 @@ pub async fn companion_revoke_ide(ide_id: String) -> Result<(), MoonError> {
 	}
 }
 
-/// Mint a fresh phone-pairing code from the local bridge (Phase 14.5).
-/// The panel renders the returned payload as a QR. Pairing is
-/// on-demand everywhere — there is no startup pairing window.
+/// Swap the relay's bare pairing payload for the end-to-end pairing
+/// link (ADR 0087): relay routing code + this host's key + a single-use
+/// secret. The panel renders `payload` as the QR and offers it for
+/// copy-paste.
+fn with_e2e_link(
+	mut qr: crate::remote_bridge::PairingQr,
+	e2e: &moon_remote::e2e::E2eEndpoint,
+	ide_id: &str,
+) -> Result<crate::remote_bridge::PairingQr, MoonError> {
+	qr.payload = e2e
+		.pair_link_for(&qr.url, &qr.code, ide_id)
+		.map_err(|e| MoonError::internal(format!("could not mint pairing link: {e}")))?;
+	Ok(qr)
+}
+
+/// Mint a fresh phone-pairing link via the local bridge (Phase 14.5,
+/// ADR 0087). Pairing is on-demand everywhere — there is no startup
+/// pairing window.
 #[tauri::command]
-pub async fn companion_pair_code() -> Result<crate::remote_bridge::PairingQr, MoonError> {
+pub async fn companion_pair_code(
+	e2e: tauri::State<'_, std::sync::Arc<moon_remote::e2e::E2eEndpoint>>,
+) -> Result<crate::remote_bridge::PairingQr, MoonError> {
 	match control_request(&ControlRequest::PairCode).await {
 		Ok(ControlResponse::PairCode {
 			payload,
 			url,
 			code,
 			fingerprint,
-		}) => Ok(crate::remote_bridge::PairingQr {
-			payload,
-			url,
-			code,
-			fingerprint,
-		}),
+		}) => with_e2e_link(
+			crate::remote_bridge::PairingQr {
+				payload,
+				url,
+				code,
+				fingerprint,
+			},
+			&e2e,
+			"",
+		),
 		Ok(ControlResponse::Error { message }) => Err(MoonError::internal(message)),
 		Ok(_) => Err(MoonError::internal("unexpected bridge reply")),
 		Err(err) => Err(MoonError::internal(format!("bridge not reachable: {err}"))),
@@ -277,15 +298,41 @@ pub async fn companion_remote_status(
 #[tauri::command]
 pub async fn companion_remote_pair_code(
 	state: tauri::State<'_, crate::state::AppState>,
+	e2e: tauri::State<'_, std::sync::Arc<moon_remote::e2e::E2eEndpoint>>,
 ) -> Result<crate::remote_bridge::PairingQr, MoonError> {
 	let guard = state.remote_bridge.lock().await;
 	let handle = guard
 		.as_ref()
 		.ok_or_else(|| MoonError::internal("not connected to a remote bridge"))?;
-	handle
+	let qr = handle
 		.request_pair_code()
 		.await
-		.map_err(|e| MoonError::internal(e.to_string()))
+		.map_err(|e| MoonError::internal(e.to_string()))?;
+	let ide_id = crate::remote_bridge::load_credential()
+		.ok()
+		.flatten()
+		.map(|c| c.ide_id)
+		.ok_or_else(|| MoonError::internal("no stored remote-bridge credential"))?;
+	with_e2e_link(qr, &e2e, &ide_id)
+}
+
+/// Phones this host authorized end-to-end (ADR 0087) — the list that
+/// actually gates command authority, as opposed to the relay's routing
+/// tokens.
+#[tauri::command]
+pub async fn companion_e2e_devices(
+	e2e: tauri::State<'_, std::sync::Arc<moon_remote::e2e::E2eEndpoint>>,
+) -> Result<Vec<moon_remote::e2e::AuthorizedDevice>, MoonError> {
+	e2e.devices().map_err(|e| MoonError::internal(e.to_string()))
+}
+
+#[tauri::command]
+pub async fn companion_e2e_revoke(
+	device_id: String,
+	e2e: tauri::State<'_, std::sync::Arc<moon_remote::e2e::E2eEndpoint>>,
+) -> Result<(), MoonError> {
+	e2e.revoke(&device_id).map_err(|e| MoonError::internal(e.to_string()))?;
+	Ok(())
 }
 
 /// Disconnect from the remote bridge and forget the stored credential

@@ -27,10 +27,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// How long an issued pairing code stays valid. Device-flow-style
-/// short window — long enough to scan a QR and tap "pair", short
-/// enough that a leaked code is useless by the time anyone finds it.
-pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(120);
+/// How long an issued pairing code stays valid. Long enough to copy a
+/// pairing link out of an ssh session by hand. Since ADR 0087 this code
+/// only buys relay routing — command authority comes from the IDE's own
+/// end-to-end pairing — so a longer window costs nothing.
+pub const PAIRING_CODE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Keyring coordinates for the device registry. One JSON blob holds
 /// every paired device, mirroring how `moon-coder` stores its OAuth
@@ -60,9 +61,9 @@ impl PairingSession {
 	/// Issue a fresh pairing code valid for [`PAIRING_CODE_TTL`].
 	///
 	/// The code is the first 8 hex chars of a v4 UUID, upper-cased
-	/// and split into two 4-char groups (`A1B2-C3D4`) — enough
-	/// entropy that guessing one inside a 120 s window is hopeless,
-	/// short enough to type if QR scanning fails.
+	/// and split into two 4-char groups (`A1B2-C3D4`). It only grants
+	/// relay routing (ADR 0087) and rides inside the pairing link, so
+	/// it doesn't need the end-to-end secret's entropy.
 	pub fn issue() -> Self {
 		Self::issue_with_ttl(PAIRING_CODE_TTL)
 	}

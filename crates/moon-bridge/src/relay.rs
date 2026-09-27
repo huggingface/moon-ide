@@ -88,7 +88,12 @@ pub async fn call(socket_path: &Utf8Path, method: &str, params: serde_json::Valu
 /// event line the workspace pushes until the connection closes or
 /// `on_event` returns `false` (the caller wants to stop — e.g. the
 /// phone disconnected). Used to relay `coder_events` to the phone.
-pub async fn subscribe<F>(socket_path: &Utf8Path, method: &str, mut on_event: F) -> Result<(), RelayError>
+pub async fn subscribe<F>(
+	socket_path: &Utf8Path,
+	method: &str,
+	params: serde_json::Value,
+	mut on_event: F,
+) -> Result<(), RelayError>
 where
 	F: FnMut(serde_json::Value) -> bool,
 {
@@ -105,7 +110,7 @@ where
 
 	let rpc = RpcRequest {
 		method: method.to_owned(),
-		params: serde_json::Value::Null,
+		params,
 	};
 	let json = serde_json::to_string(&rpc).map_err(|_| RelayError::BadReply)?;
 	let bytes = encode_request(&Request::Subscribe { json }).map_err(std::io::Error::from)?;

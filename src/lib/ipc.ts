@@ -493,11 +493,24 @@ export const ipc = {
 		remoteStatus: () => invoke<RemoteBridgeStatus>('companion_remote_status'),
 		remoteDisconnect: () => invoke<void>('companion_remote_disconnect'),
 		remotePairCode: () => invoke<PairingQr>('companion_remote_pair_code'),
+		e2eDevices: () => invoke<AuthorizedPhone[]>('companion_e2e_devices'),
+		e2eRevoke: (deviceId: string) => invoke<void>('companion_e2e_revoke', { deviceId }),
 	},
 } as const;
 
-/** A phone-pairing payload minted by the remote bridge on this IDE's
- * request (Phase 14.5). `payload` is the JSON the QR encodes. */
+/** A phone this host authorized end-to-end (ADR 0087). This list, not
+ * the relay's routing tokens, decides who can drive the IDE. */
+export type AuthorizedPhone = {
+	id: string;
+	label: string;
+	public_key: string;
+	paired_at_ms: number;
+};
+
+/** A phone-pairing link minted on this IDE's request (ADR 0087).
+ * `payload` is the end-to-end pairing link the QR encodes and the
+ * panel offers for copy-paste; `code` is the relay routing code it
+ * embeds. */
 export type PairingQr = {
 	payload: string;
 	url: string;

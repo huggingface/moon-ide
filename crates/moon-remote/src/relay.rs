@@ -159,7 +159,14 @@ enum BridgeToIde {
 	},
 	/// Forward a phone's `subscribe` to this IDE. The IDE pushes
 	/// `ForwardEvent` frames until the stream ends, then `ForwardEnd`.
-	ForwardSubscribe { id: u64, workspace: String, method: String },
+	ForwardSubscribe {
+		id: u64,
+		workspace: String,
+		method: String,
+		/// The phone's subscribe params, verbatim (ADR 0087 `{ sid }`).
+		#[serde(default)]
+		params: serde_json::Value,
+	},
 	/// A fresh phone-pairing payload (reply to `PairCode`, Phase
 	/// 14.5). The IDE renders `payload` as a QR in its Companion
 	/// panel; `url` / `code` / `fingerprint` are the type-in fallback.
@@ -596,11 +603,12 @@ async fn connect_and_serve(
 				id,
 				workspace: _,
 				method,
+				params,
 			} => {
 				let rpc = Arc::clone(rpc);
 				let sink = Arc::clone(&sink);
 				tokio::spawn(async move {
-					let mut rx = match rpc.subscribe(&method, serde_json::Value::Null).await {
+					let mut rx = match rpc.subscribe(&method, params).await {
 						Ok(rx) => rx,
 						Err(message) => {
 							let reply = IdeToBridge::ForwardError { id, message };

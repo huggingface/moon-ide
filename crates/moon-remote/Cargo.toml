@@ -23,17 +23,26 @@ moon-terminal = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 camino = { workspace = true }
+chacha20poly1305 = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 dirs = { workspace = true }
 futures-util = { workspace = true }
+getrandom = "0.4"
 hostname = { workspace = true }
 keyring = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
+snow = { version = "0.10", features = ["risky-raw-split"] }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+x25519-dalek = "3"

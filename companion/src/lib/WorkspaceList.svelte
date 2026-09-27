@@ -7,6 +7,19 @@
 		void app.loadWorkspaces();
 	});
 
+	// Pair another IDE on this relay (ADR 0087): paste the link its
+	// Companion panel or `moon-remote pair` printed.
+	let pairText = $state('');
+	let pairing = $state(false);
+
+	async function pairAnother(): Promise<void> {
+		pairing = true;
+		if (await app.pairLink(pairText)) {
+			pairText = '';
+		}
+		pairing = false;
+	}
+
 	/** Group workspaces by their owning IDE's id (Phase 14, ADR 0031).
 	 * Local-carrier workspaces (empty `ide`) appear under "This
 	 * machine"; remote-carrier workspaces appear under their IDE's
@@ -49,15 +62,22 @@
 	{:else}
 		{@const groups = groupByIde(app.workspaces)}
 		{#each groups as [ideLabel, wss]}
+			{@const paired = app.isIdePaired(ideLabel)}
 			{#if ideLabel}
-				<h2 class="group-header">{ideLabel}</h2>
+				<h2 class="group-header">{ideLabel}{paired ? '' : ' · not paired'}</h2>
 			{:else}
-				<h2 class="group-header">This machine</h2>
+				<h2 class="group-header">This machine{paired ? '' : ' · not paired'}</h2>
 			{/if}
-			<div class="list">
+			{#if !paired}
+				<p class="muted locked">
+					This phone can't drive this IDE yet. Scan its pairing QR (Companion panel, or <code>moon-remote pair</code>)
+					or paste the link below.
+				</p>
+			{/if}
+			<div class="list" class:locked-list={!paired}>
 				{#each wss as ws ((ws.ide ?? '') + '/' + ws.id)}
 					<div class="card list-item ws-row">
-						<button class="ws-main" onclick={() => app.openWorkspace(ws.id, ws.ide ?? '', ws.name)}>
+						<button class="ws-main" disabled={!paired} onclick={() => app.openWorkspace(ws.id, ws.ide ?? '', ws.name)}>
 							<div class="row">
 								<span class="pip" class:live={ws.live}></span>
 								<strong>{ws.name}</strong>
@@ -70,7 +90,7 @@
 								class="ghost launch-btn"
 								class:starting
 								title={starting ? 'Starting…' : 'Start this workspace'}
-								disabled={starting}
+								disabled={starting || !paired}
 								onclick={() => app.launchWorkspace(ws.id, ws.ide ?? '')}>{starting ? 'Starting…' : 'Start'}</button
 							>
 						{/if}
@@ -80,10 +100,28 @@
 		{/each}
 	{/if}
 
+	<div class="card list pair-another">
+		<label for="pair-link">Pair another IDE</label>
+		<input id="pair-link" bind:value={pairText} placeholder={'https://…/#pair=…&k=…&s=…'} autocomplete="off" />
+		<button class="ghost" disabled={!pairText.trim() || pairing} onclick={pairAnother}>
+			{pairing ? 'Pairing…' : 'Pair'}
+		</button>
+	</div>
+
 	<button class="ghost" onclick={() => app.unpair()}>Unpair this device</button>
 </div>
 
 <style>
+	.locked {
+		margin: 0 0 0.4rem;
+		font-size: 0.85rem;
+	}
+	.locked-list {
+		opacity: 0.55;
+	}
+	.pair-another {
+		margin-top: 1rem;
+	}
 	.ws-row {
 		flex-direction: row;
 		align-items: center;
