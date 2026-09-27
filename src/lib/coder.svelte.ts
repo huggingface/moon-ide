@@ -2186,6 +2186,9 @@ export class CoderPanelState {
 			case 'target_is_coordinator':
 				return 'Coordinators cannot be attached as workers.';
 		}
+		// The switch is exhaustive over today's wire union; a newer IDE
+		// core could still send an outcome this build doesn't know.
+		return 'Unexpected attach outcome.';
 	}
 
 	/** Render an error inline in the active session's transcript —
