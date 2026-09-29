@@ -58,6 +58,19 @@ export default defineConfig(async ({ command }) => ({
 		alias: {
 			$lib: fileURLToPath(new URL('./src/lib', import.meta.url)),
 		},
+		// CodeMirror keys syntax trees, facets and highlight tags on
+		// module-level identity. A second copy of any of these (e.g. a
+		// node_modules left half-pnpm, half-bun, or a grammar package
+		// resolving its own nested copy) silently yields an empty syntax
+		// tree and no highlighting, so force one instance from the root.
+		dedupe: [
+			'@codemirror/language',
+			'@codemirror/state',
+			'@codemirror/view',
+			'@lezer/common',
+			'@lezer/highlight',
+			'@lezer/lr',
+		],
 	},
 
 	// Vite expects strict ports / specific host for Tauri's window.
