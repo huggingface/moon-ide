@@ -37,6 +37,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::browser_tabs::BrowserTabRegistry;
 use crate::error::CoderError;
 use crate::inference::ToolDefinition;
 use crate::mcp::{McpManager, McpMount, McpRoot, McpSpawnKind, McpSpawnTarget};
@@ -967,6 +968,9 @@ pub struct ToolRegistry {
 	/// `list_terminals` / `read_terminal` see exactly what the user
 	/// sees (ADR 0048).
 	terminals: Arc<TerminalRegistry>,
+	/// The IDE's browser tabs (ADR 0088). Owned here; the Tauri layer
+	/// reaches it through `CoderHandle::browser_tabs`.
+	browser_tabs: Arc<BrowserTabRegistry>,
 	/// Live model picks + catalog-derived capability caches. Tools
 	/// consult this at dispatch time (not turn start) so a mid-turn
 	/// model swap changes what the *next* image-producing tool call
@@ -988,8 +992,13 @@ impl ToolRegistry {
 			web,
 			mcp: Arc::new(McpManager::default()),
 			terminals,
+			browser_tabs: Arc::new(BrowserTabRegistry::new()),
 			models,
 		}
+	}
+
+	pub fn browser_tabs(&self) -> &Arc<BrowserTabRegistry> {
+		&self.browser_tabs
 	}
 
 	/// Whether the active standard model accepts image input —
@@ -1402,6 +1411,71 @@ impl ToolRegistry {
 						}
 					},
 					"required": ["url"]
+				}),
+			),
+			ToolDefinition::function(
+				"open_browser",
+				"Open a URL in a browser tab inside the IDE so the user can see it — typically a dev server you just started (\"check out the preview here\"). Loopback URLs (`localhost`, `127.0.0.1`, `0.0.0.0`) and compose service names resolve on the same side `bash` runs on: when `bash` runs in the workspace container, the IDE tunnels to the container's port itself, so no port forward is needed and a server bound to the container's `127.0.0.1` is reachable. Only `http`/`https`. If a tab already shows the same URL it is focused and reloaded instead of duplicated. Returns the `tab_id` to use with `browser_tab`. This only shows the page to the user; it does not return page content (use `web_fetch` or `bash` + `curl` for that). Mention the URL in your reply as well.",
+				json!({
+					"type": "object",
+					"properties": {
+						"url": {
+							"type": "string",
+							"description": "Absolute http or https URL, e.g. `http://localhost:5173/`."
+						}
+					},
+					"required": ["url"]
+				}),
+			),
+			ToolDefinition::function(
+				"list_browser_tabs",
+				"List the IDE's open browser tabs (opened by you, another session, or the user): `tab_id`, `url`, and `target` (`host` / `container`). `url` is the last URL requested for the tab — links the user clicked inside the page aren't tracked.",
+				json!({ "type": "object", "properties": {} }),
+			),
+			ToolDefinition::function(
+				"browser_tab",
+				"Act on one IDE browser tab by `tab_id` (from `open_browser` / `list_browser_tabs`): `navigate` to a new `url` (resolved on your `bash` side, like `open_browser`), `reload` it (e.g. after a fix), `focus` it (bring it to front), or `close` it.",
+				json!({
+					"type": "object",
+					"properties": {
+						"tab_id": {
+							"type": "integer",
+							"description": "Tab to act on."
+						},
+						"action": {
+							"type": "string",
+							"enum": ["navigate", "reload", "focus", "close"]
+						},
+						"url": {
+							"type": "string",
+							"description": "Absolute http or https URL. Required for `navigate`, ignored otherwise."
+						}
+					},
+					"required": ["tab_id", "action"]
+				}),
+			),
+			ToolDefinition::function(
+				"browser_page",
+				"Read and drive the page inside an IDE browser tab (`tab_id` from `open_browser` / `list_browser_tabs`) — for checking your UI work the way the user sees it. Actions:\n- `snapshot`: page URL, title, and a text outline of what's visible; interactive elements carry refs like `[e12]`.\n- `click` (`ref` or CSS `selector`), `type` (`ref`/`selector`, `text`, optional `submit: true` to submit the form, `clear: false` to append), `select` (`ref`/`selector`, option `value` or label), `press` (`key`, e.g. `Enter`, dispatched to the focused element). These return a fresh snapshot, so you rarely need a separate one; refs from older snapshots go stale.\n- `eval`: run a JS `expression` in the page (awaited if it returns a promise); returns the JSON-serialised result.\n- `console`: the page's recent console output and uncaught errors (`clear: true` to reset).\n- `wait_for`: wait until a `selector` or `text` appears (`timeout_ms`, max 15000).\nEvents are synthetic (`isTrusted` false): fine for app logic, but native behaviours like a real key's default action don't happen. Only works on http pages loaded through the IDE; the tab is brought to front if needed (which reloads it if it wasn't visible).",
+				json!({
+					"type": "object",
+					"properties": {
+						"tab_id": { "type": "integer" },
+						"action": {
+							"type": "string",
+							"enum": ["snapshot", "click", "type", "select", "press", "eval", "console", "wait_for"]
+						},
+						"ref": { "type": "string", "description": "Element ref from the latest snapshot, e.g. `e12`." },
+						"selector": { "type": "string", "description": "CSS selector, alternative to `ref`." },
+						"text": { "type": "string", "description": "Text for `type`, or text to wait for with `wait_for`." },
+						"value": { "type": "string", "description": "Option value or label for `select`." },
+						"key": { "type": "string", "description": "Key name for `press`." },
+						"expression": { "type": "string", "description": "JavaScript for `eval`." },
+						"submit": { "type": "boolean" },
+						"clear": { "type": "boolean" },
+						"timeout_ms": { "type": "integer" }
+					},
+					"required": ["tab_id", "action"]
 				}),
 			),
 			ToolDefinition::function(
@@ -1855,6 +1929,13 @@ impl ToolRegistry {
 			// the kind of read-only inspection the mode exists for.
 			"web_search" => self.web_search(args, cancel).await,
 			"web_fetch" => self.web_fetch(args, cancel).await,
+			// Only shows a page to the user; not a mutation.
+			"open_browser" => self.open_browser(args, cx).await,
+			"list_browser_tabs" => Ok(self.list_browser_tabs()),
+			"browser_tab" => self.browser_tab(args, cx).await,
+			// Reading the page is inspection; acting on it is gated like
+			// a write inside `browser_page`.
+			"browser_page" => self.browser_page(args, cx, cancel).await,
 			// MCP meta-tools are, like `bash`, not mode-gated: a
 			// Research sub-agent driving a read-heavy MCP server
 			// is legitimate, and "don't mutate" stays prompt-
@@ -2158,6 +2239,150 @@ impl ToolRegistry {
 			"truncated": fetched.truncated,
 			"bytes": fetched.markdown.len(),
 		}))
+	}
+
+	async fn open_browser(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct OpenBrowserArgs {
+			url: String,
+		}
+		let parsed: OpenBrowserArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("open_browser", err.to_string()))?;
+		let url = parse_browser_url("open_browser", &parsed.url)?;
+		let in_container = self.browser_in_container(cx).await;
+		let (tab, reused) = self.browser_tabs.open(&url, in_container, true);
+		Ok(json!({
+			"tab_id": tab.id,
+			"url": tab.url,
+			"target": browser_target(tab.in_container),
+			"reused": reused,
+		}))
+	}
+
+	fn list_browser_tabs(&self) -> Value {
+		let tabs: Vec<Value> = self
+			.browser_tabs
+			.list()
+			.into_iter()
+			.map(|tab| {
+				json!({
+					"tab_id": tab.id,
+					"url": tab.url,
+					"target": browser_target(tab.in_container),
+				})
+			})
+			.collect();
+		json!({ "count": tabs.len(), "tabs": tabs })
+	}
+
+	async fn browser_tab(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		#[serde(rename_all = "snake_case")]
+		enum Action {
+			Navigate,
+			Reload,
+			Focus,
+			Close,
+		}
+		#[derive(Deserialize)]
+		struct BrowserTabArgs {
+			tab_id: u32,
+			action: Action,
+			#[serde(default)]
+			url: Option<String>,
+		}
+		let parsed: BrowserTabArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("browser_tab", err.to_string()))?;
+		let id = parsed.tab_id;
+		let (tab, action) = match parsed.action {
+			Action::Navigate => {
+				let Some(raw) = parsed.url else {
+					return Err(CoderError::invalid_args("browser_tab", "`navigate` needs a `url`"));
+				};
+				let url = parse_browser_url("browser_tab", &raw)?;
+				let in_container = self.browser_in_container(cx).await;
+				(self.browser_tabs.navigate(id, &url, Some(in_container)), "navigate")
+			}
+			Action::Reload => (self.browser_tabs.reload(id), "reload"),
+			Action::Focus => (self.browser_tabs.focus(id), "focus"),
+			Action::Close => (self.browser_tabs.close(id), "close"),
+		};
+		let Some(tab) = tab else {
+			return Err(CoderError::invalid_args(
+				"browser_tab",
+				format!("no browser tab {id}; call `list_browser_tabs` for the open ones"),
+			));
+		};
+		Ok(json!({
+			"tab_id": tab.id,
+			"action": action,
+			"url": tab.url,
+			"target": browser_target(tab.in_container),
+		}))
+	}
+
+	async fn browser_page(
+		&self,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct BrowserPageArgs {
+			tab_id: u32,
+			action: String,
+			#[serde(default)]
+			timeout_ms: Option<u64>,
+		}
+		let parsed: BrowserPageArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("browser_page", err.to_string()))?;
+		let action = parsed.action.as_str();
+		let acts = matches!(action, "click" | "type" | "select" | "press" | "eval");
+		if !matches!(action, "snapshot" | "console" | "wait_for") && !acts {
+			return Err(CoderError::invalid_args(
+				"browser_page",
+				format!("unknown action `{action}`"),
+			));
+		}
+		if acts && !cx.mode.allows_writes() {
+			return Err(CoderError::read_only_mode("browser_page"));
+		}
+		// The bridge reads the same field names the tool advertises.
+		let mut bridge_args = args.clone();
+		if let Some(obj) = bridge_args.as_object_mut() {
+			obj.remove("tab_id");
+			obj.remove("action");
+		}
+		let wait = parsed.timeout_ms.unwrap_or(5_000).min(15_000);
+		let timeout = Duration::from_millis(if action == "wait_for" { wait + 10_000 } else { 20_000 });
+		let request = self
+			.browser_tabs
+			.page_request(parsed.tab_id, action, bridge_args, timeout);
+		let value = tokio::select! {
+			result = request => result.map_err(|msg| CoderError::tool_failed("browser_page", msg))?,
+			() = cancel.cancelled() => return Err(CoderError::Aborted),
+		};
+		if !matches!(action, "click" | "type" | "select" | "press") {
+			return Ok(value);
+		}
+		// Let the app react (re-render, client-side route) before
+		// describing the result; a full navigation just reloads the
+		// bridge, which the frontend waits for.
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		let snapshot = self
+			.browser_tabs
+			.page_request(parsed.tab_id, "snapshot", json!({}), Duration::from_secs(20))
+			.await;
+		Ok(match snapshot {
+			Ok(snapshot) => json!({ "action": action, "done": true, "page": snapshot }),
+			Err(err) => json!({ "action": action, "done": true, "snapshot_error": err }),
+		})
+	}
+
+	/// Browser URLs resolve on the same side `bash` would run.
+	async fn browser_in_container(&self, cx: &ToolContext) -> bool {
+		resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash(), &cx.folder).await
+			== BASH_TARGET_CONTAINER
 	}
 
 	async fn bash(
@@ -2923,6 +3148,28 @@ pub(crate) async fn running_container_applied_folders(
 /// verbatim from the tool result (and from `CoderStatus`) so the
 /// strings are part of the protocol — don't rename without
 /// updating `src/lib/protocol.ts` in lockstep.
+fn browser_target(in_container: bool) -> &'static str {
+	if in_container {
+		BASH_TARGET_CONTAINER
+	} else {
+		BASH_TARGET_HOST
+	}
+}
+
+fn parse_browser_url(tool: &'static str, raw: &str) -> Result<String, CoderError> {
+	let url = url::Url::parse(raw.trim()).map_err(|err| CoderError::invalid_args(tool, format!("invalid url: {err}")))?;
+	if !matches!(url.scheme(), "http" | "https") {
+		return Err(CoderError::invalid_args(
+			tool,
+			format!("only http/https URLs are supported, got `{}`", url.scheme()),
+		));
+	}
+	if url.host_str().is_none() {
+		return Err(CoderError::invalid_args(tool, "url has no host"));
+	}
+	Ok(url.into())
+}
+
 pub(crate) const BASH_TARGET_HOST: &str = "host";
 pub(crate) const BASH_TARGET_CONTAINER: &str = "container";
 

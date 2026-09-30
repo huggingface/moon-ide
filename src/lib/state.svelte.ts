@@ -18,6 +18,7 @@ import {
 	type BranchSwitchTarget,
 	type CommitEntry,
 	type EditorConfig,
+	type BrowserTabsChanged,
 	type EditRequest,
 	type FolderSession,
 	type GitBranchInfo,
@@ -67,6 +68,8 @@ import { fileKindFor, isPreviewKind, type FileKind, type PreviewKind } from './u
 import { isMarkdownPath } from './util/markdown';
 import { isReviewPath, REVIEW_PATH } from './util/reviewPath';
 import { commitPath, isCommitPath, shaFromCommitPath } from './util/commitPath';
+import { browserIdFromPath, browserPath, browserTabName, isBrowserPath } from './util/browserPath';
+import { wireBrowserBridge } from './browserBridge';
 
 export type MarkdownView = 'source' | 'preview';
 
@@ -187,6 +190,12 @@ export type OpenFile = {
  * Tab paths are folder-relative — same as in Phase 0–2's single-folder
  * world; multi-folder just gives each folder its own copy.
  */
+/** Frontend mirror of one backend browser tab (ADR 0088). `url` is
+ *  what the user/agent asked for — shown in the URL bar — not the
+ *  tunnel URL the iframe loads. `reloadToken` bumps force a fresh
+ *  load. */
+export type BrowserTabView = { id: number; url: string; inContainer: boolean; reloadToken: number };
+
 class FolderState {
 	paths = $state<string[]>([]);
 
@@ -366,6 +375,12 @@ class WorkspaceState {
 	// nudge. Cheap (one integer) and the editor view is not a hot
 	// enough recompute for it to matter.
 	editorViewTick = $state(0);
+
+	/** Mirror of the backend browser-tab registry, keyed by
+	 *  `browser://<id>` (ADR 0088). The registry is the truth — the
+	 *  coder lists and drives it — so user actions go through IPC and
+	 *  land back here via `browser:tabs`. */
+	browserTabs = $state<Record<string, BrowserTabView>>({});
 
 	loadingPaths = $state(false);
 	toast = $state<string | null>(null);
@@ -1889,6 +1904,7 @@ class WorkspaceState {
 		// in-container terminals so `git commit --amend` etc.
 		// open a buffer in moon-ide. See ADR 0021.
 		void this.wireEditorForward();
+		void this.wireBrowserTabs();
 		void this.refreshNextEditServerStatusThenMaybeAutostart();
 		// Terminal output rides on its own event channel —
 		// see `terminal.svelte.ts`. Wired once at startup so
@@ -2211,6 +2227,25 @@ class WorkspaceState {
 	 * Idempotent — safe to call from `App.svelte`'s onMount even
 	 * with HMR, same convention as the other `wire*` helpers.
 	 */
+	private browserTabsWired = false;
+	private async wireBrowserTabs(): Promise<void> {
+		if (this.browserTabsWired) {
+			return;
+		}
+		this.browserTabsWired = true;
+		try {
+			await listen<BrowserTabsChanged>('browser:tabs', ({ payload }) => {
+				this.applyBrowserTabs(payload);
+			});
+			await wireBrowserBridge();
+			// Tabs opened before this webview (re)loaded.
+			const tabs = await ipc.browser.list();
+			this.applyBrowserTabs({ tabs, focus: null, reload: null });
+		} catch (err) {
+			frontendLog('runtime', 'warn', `browser tabs: wiring failed: ${String(err)}`);
+		}
+	}
+
 	private editorForwardWired = false;
 	private async wireEditorForward(): Promise<void> {
 		if (this.editorForwardWired) {
@@ -4659,6 +4694,129 @@ class WorkspaceState {
 		this.setActive(path, side);
 	}
 
+	/** Reconcile the tab strips with the backend registry: attach
+	 *  tabs that aren't in any folder yet, drop ones the registry
+	 *  closed, and apply focus / reload. A focused tab parked in
+	 *  another folder moves to the active one so it's actually
+	 *  visible. */
+	applyBrowserTabs(change: BrowserTabsChanged) {
+		const previous = this.browserTabs;
+		const next: Record<string, BrowserTabView> = {};
+		for (const tab of change.tabs) {
+			const path = browserPath(tab.id);
+			const prior = previous[path];
+			// Only explicit reloads (which `navigate` implies) reload:
+			// a URL change alone may just be the page reporting its
+			// own in-page navigation.
+			const bump = change.reload === tab.id ? 1 : 0;
+			next[path] = {
+				id: tab.id,
+				url: tab.url,
+				inContainer: tab.in_container,
+				reloadToken: (prior?.reloadToken ?? 0) + bump,
+			};
+		}
+		this.browserTabs = next;
+		for (const path of Object.keys(previous)) {
+			if (!(path in next)) {
+				this.#detachBrowserBuffer(path);
+			}
+		}
+		for (const [path, tab] of Object.entries(next)) {
+			const focused = change.focus === tab.id;
+			const owner = this.#browserTabOwner(path);
+			if (owner === null) {
+				this.#attachBrowserBuffer(path, this.focusedSide, focused);
+				continue;
+			}
+			if (owner !== this.activeFolderPath) {
+				if (focused) {
+					this.#detachBrowserBuffer(path);
+					this.#attachBrowserBuffer(path, this.focusedSide, true);
+				}
+				continue;
+			}
+			this.openFiles = this.openFiles.map((f) =>
+				f.path === path && f.name !== browserTabName(tab.url) ? { ...f, name: browserTabName(tab.url) } : f,
+			);
+			if (focused) {
+				this.setActive(path, this.leftTabs.includes(path) ? 'left' : 'right');
+			}
+		}
+	}
+
+	/** Folder whose tab strip holds `path`, or null. */
+	#browserTabOwner(path: string): string | null {
+		for (const [folder, state] of this.folderStates) {
+			if (state.leftTabs.includes(path) || state.rightTabs.includes(path)) {
+				return folder;
+			}
+		}
+		return null;
+	}
+
+	/** Remove a browser tab from whichever folder holds it, without
+	 *  telling the backend (the registry already dropped it, or it's
+	 *  being moved). */
+	#detachBrowserBuffer(path: string) {
+		for (const state of this.folderStates.values()) {
+			for (const side of ['left', 'right'] as const) {
+				const tabs = side === 'left' ? state.leftTabs : state.rightTabs;
+				const idx = tabs.indexOf(path);
+				if (idx < 0) {
+					continue;
+				}
+				const remaining = tabs.filter((p) => p !== path);
+				const fallback = remaining[Math.max(0, idx - 1)] ?? null;
+				if (side === 'left') {
+					state.leftTabs = remaining;
+					if (state.leftActive === path) {
+						state.leftActive = fallback;
+					}
+				} else {
+					state.rightTabs = remaining;
+					if (state.rightActive === path) {
+						state.rightActive = fallback;
+					}
+				}
+			}
+			state.openFiles = state.openFiles.filter((f) => f.path !== path);
+		}
+		this.editorViewTick++;
+	}
+
+	#attachBrowserBuffer(path: string, side: SplitSide, activate: boolean) {
+		const tab = this.browserTabs[path];
+		if (!tab) {
+			return;
+		}
+		if (!this.openFiles.some((f) => f.path === path)) {
+			const file: OpenFile = {
+				path,
+				name: browserTabName(tab.url),
+				kind: 'text',
+				isUntitled: false,
+				text: '',
+				previewUrl: '',
+				loadedFingerprint: fingerprint(''),
+				loadedMtimeMs: null,
+				isDirty: false,
+				isDeleted: false,
+				isExternal: false,
+				pendingEdit: null,
+				previewToken: 0,
+			};
+			this.openFiles = [...this.openFiles, file];
+		}
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(path)) {
+			this.setTabsFor(side, [...tabs, path]);
+		}
+		if (activate) {
+			this.setActive(path, side);
+		}
+	}
+
 	/**
 	 * Lazily attach a backing `OpenFile` for a path that the user is
 	 * editing from inside a review section, without touching tab
@@ -4758,6 +4916,12 @@ class WorkspaceState {
 		// stub buffer on demand.
 		if (isReviewPath(path)) {
 			this.openReviewTab(side);
+			return;
+		}
+		if (isBrowserPath(path)) {
+			// Nav-history replay: only a tab the registry still has
+			// can come back (a closed one is gone for good).
+			this.#attachBrowserBuffer(path, side, true);
 			return;
 		}
 		if (isCommitPath(path)) {
@@ -5753,6 +5917,10 @@ class WorkspaceState {
 			// active folder, so its `FolderState` is the right target.
 			if (isReviewPath(path)) {
 				this.setReviewRestoreFor(this.activeFolderPath, null);
+			}
+			const browserId = browserIdFromPath(path);
+			if (browserId !== null) {
+				void ipc.browser.close(browserId);
 			}
 			// External buffers were never opened with the LSP / git
 			// machinery, so capture the flag before the filter and
@@ -7191,13 +7359,13 @@ function isGitStatePath(path: string): boolean {
 
 /** True for any synthetic path that doesn't back onto a real
  *  on-disk file under a bound folder — `untitled:N` unsaved
- *  buffers, the `review://` pseudo-tab, and `commit://<sha>` per-
- *  commit diff tabs. Used by every gate that would otherwise route
+ *  buffers, the `review://` pseudo-tab, `commit://<sha>` per-
+ *  commit diff tabs, and `browser://<n>` browser tabs. Used by every gate that would otherwise route
  *  to the host's filesystem (LSP, blame, HEAD fetch, persistence,
  *  format-on-save, …) so we don't fire IPCs that are guaranteed to
  *  fail or, worse, silently match the wrong file. */
 export function isSyntheticBufferPath(path: string): boolean {
-	return isUntitledPath(path) || isReviewPath(path) || isCommitPath(path);
+	return isUntitledPath(path) || isReviewPath(path) || isCommitPath(path) || isBrowserPath(path);
 }
 
 /**

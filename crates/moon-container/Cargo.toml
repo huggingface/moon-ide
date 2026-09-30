@@ -9,7 +9,11 @@ publish = false
 [dependencies]
 moon-protocol = { workspace = true }
 
+bytes = { workspace = true }
 camino = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

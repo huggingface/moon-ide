@@ -8,12 +8,14 @@
 	import MarkdownView from './MarkdownView.svelte';
 	import ReviewView from './ReviewView.svelte';
 	import CommitView from './CommitView.svelte';
+	import BrowserView from './BrowserView.svelte';
 	import Welcome from './Welcome.svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
 	import { isReviewPath } from '../util/reviewPath';
 	import { isCommitPath } from '../util/commitPath';
+	import { isBrowserPath } from '../util/browserPath';
 	import { frontendLog } from '../logs.svelte';
 
 	type Props = { side: SplitSide };
@@ -66,6 +68,9 @@
 		}
 		if (file.kind === 'video') {
 			return { path, file, kind: 'video' as const };
+		}
+		if (isBrowserPath(file.path)) {
+			return { path, file, kind: 'browser' as const };
 		}
 		// Commit diff view: synthetic `commit://<sha>` buffer. Each
 		// commit gets its own tab; the view fetches the file list
@@ -225,6 +230,10 @@
 			{:else if view.file && view.kind === 'video'}
 				{#key view.file.path}
 					<VideoView file={view.file} />
+				{/key}
+			{:else if view.file && view.kind === 'browser'}
+				{#key view.file.path}
+					<BrowserView path={view.file.path} />
 				{/key}
 			{:else if view.file && view.kind === 'commit'}
 				{#key view.file.path}

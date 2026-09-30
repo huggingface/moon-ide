@@ -21,6 +21,7 @@
 	import ToolBodyReadFile from './ToolBodyReadFile.svelte';
 	import ToolBodyTodoWrite from './ToolBodyTodoWrite.svelte';
 	import ToolBodyWebFetch from './ToolBodyWebFetch.svelte';
+	import ToolBodyOpenBrowser from './ToolBodyOpenBrowser.svelte';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
 	import ToolImages from './ToolImages.svelte';
@@ -1854,8 +1855,22 @@
 			case 'web_search': {
 				return typeof o.query === 'string' ? firstLine(o.query) : null;
 			}
-			case 'web_fetch': {
+			case 'web_fetch':
+			case 'open_browser': {
 				return typeof o.url === 'string' ? o.url : null;
+			}
+			case 'browser_page': {
+				const action = typeof o.action === 'string' ? o.action : '?';
+				const tab = typeof o.tab_id === 'number' ? `#${o.tab_id}` : '';
+				const detail = [o.ref, o.selector, o.text, o.key, o.expression].find(
+					(v): v is string => typeof v === 'string' && v.length > 0,
+				);
+				return detail === undefined ? `${action} ${tab}` : `${action} ${tab} ${firstLine(detail)}`;
+			}
+			case 'browser_tab': {
+				const action = typeof o.action === 'string' ? o.action : '?';
+				const tab = typeof o.tab_id === 'number' ? `#${o.tab_id}` : '';
+				return typeof o.url === 'string' ? `${action} ${tab} ${o.url}` : `${action} ${tab}`;
 			}
 			case 'todo_write': {
 				return todoWriteHint(o);
@@ -4012,6 +4027,8 @@
 						 the header when the body was lopped at the
 						 200 kB cap. -->
 						<ToolBodyWebFetch args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'open_browser'}
+						<ToolBodyOpenBrowser args={row.args} result={row.result} hasResult={row.hasResult} />
 					{:else if row.name === 'todo_write'}
 						<!-- Plan view: status glyph per item, in-
 						 progress accented, completed / cancelled

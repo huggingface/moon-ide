@@ -2231,6 +2231,30 @@ export type ForwardedPort = {
 	label: string;
 };
 
+/** Mirrors `moon_protocol::browser::BrowserTab` (ADR 0088). */
+export type BrowserTab = {
+	id: number;
+	url: string;
+	in_container: boolean;
+};
+
+/** Mirrors `moon_protocol::browser::BrowserTabsChanged` — payload of
+ *  the `browser:tabs` event. */
+export type BrowserTabsChanged = {
+	tabs: BrowserTab[];
+	focus: number | null;
+	reload: number | null;
+};
+
+/** Mirrors `moon_protocol::browser::BrowserPageRequest` — payload of
+ *  the `browser:page_request` event. */
+export type BrowserPageRequest = {
+	request_id: number;
+	tab_id: number;
+	op: string;
+	args: unknown;
+};
+
 /** Mirrors `moon_protocol::ports::ForwardedPortHealth`. */
 export type ForwardedPortHealth = 'live' | 'host_port_busy' | 'proxy_down';
 

@@ -1,5 +1,6 @@
 pub mod app_info;
 pub mod app_state;
+pub mod browser;
 pub mod coder;
 pub mod companion;
 pub mod compose_logs;

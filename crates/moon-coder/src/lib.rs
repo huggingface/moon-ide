@@ -17,6 +17,7 @@
 
 pub mod anthropic;
 pub mod auth;
+pub mod browser_tabs;
 pub mod compaction;
 pub mod coordinator;
 pub mod defaults;
@@ -38,6 +39,7 @@ pub mod tools;
 pub mod web;
 
 pub use auth::{Authenticator, DeviceCode, HfIdentity, HfOrg, TokenStore};
+pub use browser_tabs::BrowserTabRegistry;
 pub use defaults::{DEFAULT_CHEAP_MODEL, DEFAULT_STANDARD_MODEL, HF_OAUTH_CLIENT_ID, HF_OAUTH_SCOPES};
 pub use error::CoderError;
 pub use event::{CoderEvent, CoderEventEnvelope, CoderStatus};

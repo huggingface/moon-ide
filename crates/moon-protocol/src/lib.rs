@@ -5,6 +5,7 @@
 
 pub mod app_info;
 pub mod app_state;
+pub mod browser;
 pub mod coder_hub;
 pub mod coder_mcp;
 pub mod coder_models;

@@ -78,6 +78,14 @@ ts-rs = { version = "12.0", features = ["serde-compat", "serde-json-impl"] }
 lsp-types = "0.97"
 which = "8.0"
 url = "2.5"
+# Browser-tab preview proxy (ADR 0088): HTTP/1 server + client with
+# upgrade support, so the proxy can inject the page bridge into HTML
+# and still pass WebSockets (HMR) through. Already in the tree via
+# reqwest.
+hyper = { version = "1.9", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1.11"
 
 [profile.release]
 lto = "thin"

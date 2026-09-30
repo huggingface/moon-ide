@@ -1,10 +1,8 @@
 <script lang="ts">
 	import { mount as mountComponent, unmount } from 'svelte';
-	import { workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
+	import { isSyntheticBufferPath, workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
 	import { ipc } from '../ipc';
 	import { isMarkdownPath } from '../util/markdown';
-	import { isReviewPath } from '../util/reviewPath';
-	import { isCommitPath } from '../util/commitPath';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import RevertIcon from './icons/RevertIcon.svelte';
@@ -312,7 +310,7 @@
 	}
 
 	function absolutePathFor(file: OpenFile): string | null {
-		if (file.isUntitled || isReviewPath(file.path) || isCommitPath(file.path)) {
+		if (file.isUntitled || isSyntheticBufferPath(file.path)) {
 			return null;
 		}
 		if (file.isExternal) {
@@ -334,7 +332,7 @@
 	let renameDraft = $state('');
 
 	function canRenameFile(file: OpenFile): boolean {
-		return !file.isUntitled && !file.isExternal && !isReviewPath(file.path) && !isCommitPath(file.path);
+		return !file.isUntitled && !file.isExternal && !isSyntheticBufferPath(file.path);
 	}
 
 	function startTabRename(file: OpenFile) {
@@ -483,7 +481,7 @@
 		// external buffers `file.path` already *is* the absolute host
 		// path, so the relative entry would be a duplicate of "Copy
 		// path"; for untitled buffers there's no path at all.
-		if (!file.isExternal && !file.isUntitled && !isReviewPath(file.path) && !isCommitPath(file.path)) {
+		if (!file.isExternal && !file.isUntitled && !isSyntheticBufferPath(file.path)) {
 			items.push({
 				id: 'copy-relative-path',
 				label: 'Copy relative path',
@@ -589,7 +587,7 @@
 				class:dragging={draggingPath === file.path}
 				class:drop-before={dropBeforePath === file.path}
 				aria-selected={activePath === file.path}
-				title={file.isUntitled || isReviewPath(file.path) || isCommitPath(file.path) ? file.name : file.path}
+				title={file.isUntitled || isSyntheticBufferPath(file.path) ? file.name : file.path}
 				tabindex="0"
 				draggable="true"
 				onclick={() => workspace.setActive(file.path, side)}

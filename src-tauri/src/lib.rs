@@ -208,6 +208,15 @@ pub fn run() {
 			commands::project_compose::project_compose_service_stop,
 			commands::project_compose::project_compose_service_restart,
 			commands::project_compose::project_compose_service_recreate,
+			commands::browser::browser_resolve_url,
+			commands::browser::browser_tabs_list,
+			commands::browser::browser_tab_open,
+			commands::browser::browser_tab_navigate,
+			commands::browser::browser_tab_reload,
+			commands::browser::browser_tab_focus,
+			commands::browser::browser_tab_close,
+			commands::browser::browser_tab_location,
+			commands::browser::browser_page_respond,
 			commands::ports::ports_list,
 			commands::ports::ports_set,
 			commands::ports::ports_status,
@@ -549,6 +558,7 @@ pub fn run() {
 			)
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
+			commands::browser::spawn_tabs_pump(app.handle().clone(), &coder);
 			// OS-level agent-activity indicator (per-workspace
 			// tray icon + window-icon status dot + taskbar
 			// flash).

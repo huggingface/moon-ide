@@ -86,6 +86,10 @@ pub struct AppState {
 	/// (local mode). Held so the `companion_remote_status` /
 	/// `companion_remote_disconnect` commands can reach it.
 	pub remote_bridge: Mutex<Option<crate::remote_bridge::RemoteBridgeHandle>>,
+	/// Loopback tunnels into the workspace shell backing the IDE's
+	/// browser tabs (ADR 0088). Process-lifetime: dropped with the
+	/// process, never persisted.
+	pub preview_tunnels: moon_container::PreviewTunnels,
 }
 
 /// What this process is doing. Picked once at startup based on
@@ -160,6 +164,7 @@ impl AppState {
 			logs,
 			focus_listener: Mutex::new(None),
 			remote_bridge: Mutex::new(None),
+			preview_tunnels: moon_container::PreviewTunnels::new(),
 		}
 	}
 

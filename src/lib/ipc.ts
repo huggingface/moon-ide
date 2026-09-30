@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
 	AppInfo,
 	AppState,
+	BrowserTab,
 	CoderHubBucket,
 	CoderModelSettings,
 	CoderProviderConfig,
@@ -271,6 +272,25 @@ export const ipc = {
 			invoke<ProjectComposeStatus>('project_compose_service_restart', { folderPath, service }),
 		serviceRecreate: (folderPath: string, service: string) =>
 			invoke<ProjectComposeStatus>('project_compose_service_recreate', { folderPath, service }),
+	},
+	browser: {
+		/** Turn a URL into one the webview can load: unchanged for
+		 *  `inContainer = false`, otherwise rewritten onto a host
+		 *  loopback tunnel that dials from inside the workspace
+		 *  shell (ADR 0088). */
+		resolveUrl: (url: string, inContainer: boolean) => invoke<string>('browser_resolve_url', { url, inContainer }),
+		// Tab registry (ADR 0088). Mutations answer via `browser:tabs`.
+		list: () => invoke<BrowserTab[]>('browser_tabs_list'),
+		open: (url: string, inContainer: boolean, reuse: boolean) =>
+			invoke<BrowserTab>('browser_tab_open', { url, inContainer, reuse }),
+		navigate: (id: number, url: string) => invoke<BrowserTab>('browser_tab_navigate', { id, url }),
+		reload: (id: number) => invoke<void>('browser_tab_reload', { id }),
+		focus: (id: number) => invoke<void>('browser_tab_focus', { id }),
+		close: (id: number) => invoke<void>('browser_tab_close', { id }),
+		location: (id: number, url: string) => invoke<void>('browser_tab_location', { id, url }),
+		/** Answer a `browser:page_request` (`error` non-null = failed). */
+		respond: (requestId: number, value: unknown, error: string | null) =>
+			invoke<void>('browser_page_respond', { requestId, value, error }),
 	},
 	ports: {
 		list: () => invoke<ForwardedPort[]>('ports_list'),

@@ -1294,6 +1294,12 @@ impl CoderHandle {
 		self.state.hub_sync.upload_all_sessions(&workspace_id, &folders).await
 	}
 
+	/// The IDE's browser tab registry (ADR 0088), shared with the
+	/// Tauri layer for the user's own tab actions and the UI mirror.
+	pub fn browser_tabs(&self) -> Arc<crate::BrowserTabRegistry> {
+		self.state.tools.browser_tabs().clone()
+	}
+
 	/// True iff a Tavily API key is currently stored in the
 	/// keyring. The panel reads this on the model-settings popover
 	/// to flip the web-search section between "set a key" and

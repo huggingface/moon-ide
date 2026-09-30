@@ -555,6 +555,16 @@ A "Ports" tab in the bottom panel plus a status-bar entry: one row
 per forward with a status dot (green live, amber proxy down, red
 host port busy) and a clickable `http://localhost:<port>` link.
 
+### Browser-tab preview proxies (not forwards)
+
+The IDE's browser tab reaches container URLs without a forward:
+an ephemeral host-loopback HTTP proxy per target whose upstream
+connections `docker exec` `ncat` inside `dev`, so container-loopback
+servers and service names work. It also injects the page bridge the
+coder drives. Process-lifetime, never persisted, not shown in the
+Ports panel. The dev image needs `ncat` (`moon-base` ships it). See
+[ADR 0088](decisions/0088-in-ide-browser-tab.md).
+
 ## SSH agent forwarding
 
 In-container `git fetch` / `git push` / `gh` need the host's keys
