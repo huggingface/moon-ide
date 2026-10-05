@@ -295,10 +295,14 @@ pin falls back to HF with a `tracing::warn!`.
 Three contract points the native adapter must honour (details in
 `anthropic.rs`):
 
-1. **Request thinking** on the modern adaptive models
+1. **Request thinking** on every adaptive Claude model
    (`type: "adaptive"`, `display: "summarized"`, no `budget_tokens`)
-   so reasoning actually streams back; send no `thinking` object to
-   any other model (Haiku in its cheap role wants none).
+   so reasoning actually streams back. The newer models default to
+   `display: "omitted"`, which returns empty blocks. Classification is
+   default-on: every Claude model except Claude 3, Haiku and Opus/Sonnet
+   4.0-4.5, so models released later don't silently lose
+   their reasoning. Send no `thinking` object to any other model (Haiku
+   in its cheap role wants none).
 2. **Round-trip signed thinking blocks.** The API requires the
    unmodified signed block to be echoed back ahead of `tool_use`
    blocks on tool turns, or the next round-trip 400s. The blocks are

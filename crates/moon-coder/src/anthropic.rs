@@ -88,28 +88,55 @@ fn is_small_output_model(model: &str) -> bool {
 	m.contains("haiku") || m.contains("claude-3")
 }
 
-/// True for the modern Claude models that use **adaptive** thinking:
-/// Fable 5, Mythos 5 / Preview, and Opus 4.6/4.7/4.8. These are the
-/// only models we enable thinking on — see [`thinking_config_for`].
-/// Matches on the stable family token in the slug so a new dated
-/// revision (`claude-opus-4-8-20260101`) still classifies correctly.
+/// True for the Claude models that use **adaptive** thinking — the
+/// only models we send a `thinking` object to (see
+/// [`thinking_config_for`]). **Default-on**, same lesson as
+/// [`max_tokens_for`]: this used to be an allowlist (Fable 5, Mythos,
+/// Opus 4.6-4.8) and every model released after it (Opus 5.5, Sonnet
+/// 5.5, ...) silently fell back to the API's `display: "omitted"`
+/// default — thinking ran and was billed, but every block came back
+/// empty. Now anything Claude-shaped is adaptive except the
+/// pre-adaptive generations: Claude 3, every Haiku, and Opus / Sonnet
+/// 4.0-4.5 (which 400 on `type: "adaptive"`). Slugs that don't look
+/// like Claude at all (a custom Anthropic-compatible endpoint serving
+/// something else) get nothing.
 fn is_adaptive_thinking_model(model: &str) -> bool {
 	let m = model.to_ascii_lowercase();
-	m.contains("fable-5")
-		|| m.contains("mythos")
-		|| m.contains("opus-4-6")
-		|| m.contains("opus-4.6")
-		|| m.contains("opus-4-7")
-		|| m.contains("opus-4.7")
-		|| m.contains("opus-4-8")
-		|| m.contains("opus-4.8")
+	let claude_like = m.contains("claude") || m.contains("fable") || m.contains("mythos");
+	if !claude_like || m.contains("haiku") || m.contains("claude-3") {
+		return false;
+	}
+	!["opus-4", "sonnet-4"].iter().any(|family| is_pre_4_6(&m, family))
+}
+
+/// `family` (`"opus-4"`) appears in `m` with a minor version below 6,
+/// or none at all (`claude-sonnet-4-20250514` is 4.0; the 8-digit
+/// date is not a minor).
+fn is_pre_4_6(m: &str, family: &str) -> bool {
+	let Some(idx) = m.find(family) else {
+		return false;
+	};
+	let rest = &m[idx + family.len()..];
+	let mut chars = rest.chars();
+	let Some(sep) = chars.next() else {
+		return true;
+	};
+	if sep != '-' && sep != '.' {
+		return true;
+	}
+	let digits: String = chars.take_while(char::is_ascii_digit).collect();
+	if digits.len() != 1 {
+		return true;
+	}
+	digits.parse::<u32>().is_ok_and(|minor| minor < 6)
 }
 
 /// Build the `thinking` request object, or `None` for models we
 /// don't enable thinking on. Only the adaptive thinking models get a
 /// `thinking` object: `type: "adaptive"` (these 400 on a manual
 /// `budget_tokens`) with `display: "summarized"` so reasoning is
-/// actually returned (they omit it by default). Every other model —
+/// actually returned (most of them omit it by default; the summary
+/// is free — billing is identical either way). Every other model —
 /// notably Haiku in its cheap-summarisation / auto-rename role, where
 /// reasoning is pure latency and cost — sends no `thinking` at all.
 /// We deliberately don't support the older manual `enabled` shape:
@@ -2037,15 +2064,22 @@ mod tests {
 
 	#[test]
 	fn thinking_config_adaptive_for_modern_models() {
-		// Fable 5 / Mythos 5 / Opus 4.6-4.8 get adaptive thinking
-		// (no budget_tokens — a manual budget 400s on these models)
-		// with display=summarized so reasoning is actually returned.
+		// Adaptive thinking (no budget_tokens — a manual budget 400s
+		// on these models) with display=summarized so reasoning is
+		// actually returned. Includes models newer than any list:
+		// Opus 5.5 used to come back with every block empty.
 		for model in [
 			"claude-fable-5",
 			"claude-opus-4-8",
 			"claude-mythos-5",
 			"claude-opus-4-7",
 			"claude-opus-4-6",
+			"claude-opus-4.6",
+			"claude-sonnet-4-6",
+			"claude-opus-5",
+			"claude-opus-5-5",
+			"claude-sonnet-5-5",
+			"claude-fable-5-1-20260901",
 		] {
 			let cfg = thinking_config_for(model).unwrap_or_else(|| panic!("{model} should enable thinking"));
 			assert_eq!(cfg.kind, "adaptive", "{model} should be adaptive");
@@ -2055,13 +2089,17 @@ mod tests {
 
 	#[test]
 	fn no_thinking_for_cheap_and_unknown_models() {
-		// Haiku (the cheap summarisation / auto-rename model) and any
-		// model we don't recognise send NO `thinking` object — we only
-		// enable thinking on the modern adaptive models.
+		// Haiku (the cheap summarisation / auto-rename model), the
+		// pre-adaptive Claude 3 / 4.0-4.5 generations, and non-Claude
+		// slugs send NO `thinking` object.
 		for model in [
 			"claude-haiku-4-5-20251001",
 			"claude-3-5-haiku-20241022",
 			"claude-sonnet-4-5-20250929",
+			"claude-sonnet-4-20250514",
+			"claude-opus-4-1-20250805",
+			"claude-opus-4-5",
+			"claude-opus-4",
 			"some-unknown-model",
 		] {
 			assert!(
