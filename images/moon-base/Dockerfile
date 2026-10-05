@@ -267,11 +267,10 @@ RUN curl -fsSL https://bun.sh/install | bash
 # nvm and saner inside non-interactive `docker exec`. The image
 # ships the current LTS as the default Node.
 #
-# Corepack (bundled with Node 16+) is enabled here, with `pnpm`
-# pre-staged via `corepack prepare`. Each project's actual
-# pnpm/yarn version resolves on demand from its `packageManager`
-# field in package.json, so we don't bake a pnpm version that'll
-# drift.
+# Corepack (bundled with Node 16+) is enabled here. Each project's
+# actual pnpm/yarn version resolves on demand from its
+# `packageManager` field in package.json, so we don't bake a pnpm
+# version that'll drift.
 ENV FNM_DIR=/home/${USERNAME}/.fnm \
     PATH=/home/${USERNAME}/.fnm/aliases/default/bin:/home/${USERNAME}/.fnm:${PATH}
 
@@ -286,6 +285,17 @@ RUN curl -fsSL https://fnm.vercel.app/install \
 # resolved for every subsequent `docker exec`. Enable corepack so the
 # `pnpm` / `yarn` shims are on PATH; the actual pnpm/yarn version
 # downloads on first use from each project's `packageManager` field.
+#
+# `COREPACK_ENABLE_DOWNLOAD_PROMPT=0`: corepack's cache
+# (`~/.cache/node/corepack`) is container-private, so every
+# Recreate makes the first `pnpm` re-download the pinned version —
+# and by default corepack asks `Do you want to continue? [Y/n]`
+# first. That prompt blocks every non-interactive caller (the
+# coder's `bash` tool, scripts under `docker exec`); the download
+# itself is the expected behaviour, so skip the question. Lives in
+# the image rather than the generated compose because corepack is
+# an image concern and `FROM moon-base` extensions inherit it.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable \
  && node --version \
  && npm --version \

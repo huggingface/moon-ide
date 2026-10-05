@@ -48,7 +48,7 @@ pub async fn stop_all(state: &AppState) {
 		let mut registry = state.terminal_streams.lock().await;
 		let count = registry.len();
 		for (_, handle) in registry.drain() {
-			handle.abort.abort();
+			handle.task.abort();
 		}
 		if count > 0 {
 			tracing::info!(count, "stop_all: aborted terminal supervisors");

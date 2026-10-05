@@ -117,10 +117,13 @@ pub const PREBOOT_WORKSPACE_ID: &str = "__preboot__";
 /// Owning handle the terminal commands keep per stream. The
 /// `tx` channel is read by the supervisor task; sending fails
 /// once the supervisor exits (process dead) so write commands
-/// translate that to a no-op.
+/// translate that to a no-op. `task` is the supervisor itself:
+/// aborting it drops the PTY (killing the child), and an in-place
+/// restart awaits it so the old supervisor's exit bookkeeping can't
+/// land on the new shell.
 pub struct TerminalStreamHandle {
 	pub tx: tokio::sync::mpsc::Sender<TerminalCommand>,
-	pub abort: AbortHandle,
+	pub task: tauri::async_runtime::JoinHandle<()>,
 }
 
 /// Inputs the terminal supervisor accepts on its mpsc channel.

@@ -3631,6 +3631,7 @@ dependencies = [
 name = "moon-terminal"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "camino",
  "moon-protocol",
  "portable-pty",

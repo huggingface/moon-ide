@@ -22,6 +22,7 @@
 	import ToolBodyTodoWrite from './ToolBodyTodoWrite.svelte';
 	import ToolBodyWebFetch from './ToolBodyWebFetch.svelte';
 	import ToolBodyOpenBrowser from './ToolBodyOpenBrowser.svelte';
+	import ToolBodyOpenTerminal from './ToolBodyOpenTerminal.svelte';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
 	import ToolImages from './ToolImages.svelte';
@@ -1866,6 +1867,13 @@
 					(v): v is string => typeof v === 'string' && v.length > 0,
 				);
 				return detail === undefined ? `${action} ${tab}` : `${action} ${tab} ${firstLine(detail)}`;
+			}
+			case 'open_terminal': {
+				return typeof o.command === 'string' ? firstLine(o.command) : null;
+			}
+			case 'terminal_tab': {
+				const action = typeof o.action === 'string' ? o.action : '?';
+				return typeof o.id === 'string' ? `${action} ${o.id.slice(0, 8)}` : action;
 			}
 			case 'browser_tab': {
 				const action = typeof o.action === 'string' ? o.action : '?';
@@ -4029,6 +4037,8 @@
 						<ToolBodyWebFetch args={row.args} result={row.result} hasResult={row.hasResult} />
 					{:else if row.name === 'open_browser'}
 						<ToolBodyOpenBrowser args={row.args} result={row.result} hasResult={row.hasResult} />
+					{:else if row.name === 'open_terminal'}
+						<ToolBodyOpenTerminal args={row.args} result={row.result} hasResult={row.hasResult} />
 					{:else if row.name === 'todo_write'}
 						<!-- Plan view: status glyph per item, in-
 						 progress accented, completed / cancelled

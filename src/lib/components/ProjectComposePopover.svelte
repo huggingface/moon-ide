@@ -217,7 +217,7 @@
 					type="button"
 					class="action"
 					disabled={busy || !canRecreate}
-					title="Recreate services (docker compose up -d --build --force-recreate). Pulls fresh images and recreates containers."
+					title="Recreate services (docker compose up -d --force-recreate --pull always). Pulls fresh images and recreates containers."
 					onclick={() => projectCompose.rebuild(folderPath)}
 				>
 					Recreate

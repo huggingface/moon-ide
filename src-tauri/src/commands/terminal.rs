@@ -24,14 +24,15 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use camino::Utf8PathBuf;
 use moon_protocol::terminal::{
-	TerminalCloseReason, TerminalClosed, TerminalOpenRequest, TerminalOutput, TerminalTarget as ProtocolTarget,
+	TerminalAgentOpened, TerminalCloseReason, TerminalClosed, TerminalOpenRequest, TerminalOutput, TerminalRemoved,
+	TerminalRespawned, TerminalTarget as ProtocolTarget,
 };
 use moon_protocol::MoonError;
 use moon_terminal::{
-	container_name_for_workspace, container_running, editor_forward_env_for_workspace, spawn, TerminalKind,
-	TerminalRegistration, TerminalRegistry, TerminalTarget,
+	container_name_for_workspace, container_running, editor_forward_env_for_workspace, spawn, AgentTerminalRequest,
+	StartupCommand, TerminalKind, TerminalRegistration, TerminalRegistry, TerminalSpawner, TerminalTarget,
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -43,6 +44,22 @@ pub const TERMINAL_OUTPUT_EVENT: &str = "terminal:output";
 /// Emitted once when the underlying child exits. Payload is
 /// [`TerminalClosed`].
 pub const TERMINAL_CLOSED_EVENT: &str = "terminal:closed";
+
+/// An agent opened a terminal. Payload is [`TerminalAgentOpened`].
+pub const TERMINAL_AGENT_OPENED_EVENT: &str = "terminal:agent_opened";
+
+/// A terminal's shell was replaced in place. Payload is
+/// [`TerminalRespawned`].
+pub const TERMINAL_RESPAWNED_EVENT: &str = "terminal:respawned";
+
+/// The backend closed a terminal. Payload is [`TerminalRemoved`].
+pub const TERMINAL_REMOVED_EVENT: &str = "terminal:removed";
+
+/// Initial PTY size for agent-opened terminals, before the tab's
+/// xterm fits and resizes it. Wider than the 80x24 default so a
+/// dev server's banner doesn't wrap in an early `read_terminal`.
+const AGENT_TERMINAL_COLS: u16 = 120;
+const AGENT_TERMINAL_ROWS: u16 = 30;
 
 /// Channel depth for inbound write/resize commands. Writes are
 /// already small (xterm sends a few bytes per keystroke); 256
@@ -56,6 +73,27 @@ pub async fn terminal_open(
 	state: State<'_, AppState>,
 	request: TerminalOpenRequest,
 ) -> Result<String, MoonError> {
+	let stream_id = Uuid::new_v4().to_string();
+	// A `command` in the request is prefilled at the fresh shell's
+	// prompt, not executed (restart / session replay) — see
+	// `moon_terminal::spawn`.
+	let startup = request.command.as_deref().map(StartupCommand::Prefill);
+	start_stream(&app, &state, &stream_id, &request, startup, true).await?;
+	Ok(stream_id)
+}
+
+/// Spawn a PTY for `request` and supervise it under `stream_id`.
+/// `fresh` registers a new terminal; otherwise the registry entry
+/// already exists (an in-place restart) and only has its output
+/// reset.
+async fn start_stream(
+	app: &AppHandle,
+	state: &AppState,
+	stream_id: &str,
+	request: &TerminalOpenRequest,
+	startup: Option<StartupCommand<'_>>,
+	fresh: bool,
+) -> Result<(), MoonError> {
 	// For Container targets we also gather the bound-folder list,
 	// which the editor-forward env vars (`MOON_EDIT_PATH_MAP`)
 	// need. The snapshot read is async so we do it up here and
@@ -72,24 +110,22 @@ pub async fn terminal_open(
 	} else {
 		Vec::new()
 	};
-	let registration = registration_for(&request);
-	let target = into_internal_target(request.target, &state, &bound_folders)?;
+	let target = into_internal_target(request.target.clone(), state, &bound_folders)?;
 
-	let stream_id = Uuid::new_v4().to_string();
 	let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(COMMAND_CHANNEL_DEPTH);
 
 	// Spawn the PTY synchronously so an immediate failure (bad
 	// shell path, missing container) surfaces as the open
-	// command's error rather than a silent close event later. A
-	// `command` in the request is prefilled at the fresh shell's
-	// prompt (not executed — restart / session replay) — see
-	// `moon_terminal::spawn`.
-	let session = spawn(&target, request.cols, request.rows, request.command.as_deref())
-		.map_err(|e| MoonError::internal(e.to_string()))?;
+	// command's error rather than a silent close event later.
+	let session = spawn(&target, request.cols, request.rows, startup).map_err(|e| MoonError::internal(e.to_string()))?;
 
 	// Register before the supervisor starts so no output chunk can
 	// race ahead of the entry it belongs in.
-	state.terminals.register(&stream_id, registration).await;
+	if fresh {
+		state.terminals.register(stream_id, registration_for(request)).await;
+	} else {
+		state.terminals.reset(stream_id).await;
+	}
 
 	// What the supervisor needs to classify the close at the end:
 	// host shells always classify `ShellExited`; container
@@ -101,24 +137,21 @@ pub async fn terminal_open(
 	};
 
 	let registry = state.terminal_streams.clone();
-	let supervisor = tauri::async_runtime::spawn(supervise(
-		app,
+	let task = tauri::async_runtime::spawn(supervise(
+		app.clone(),
 		registry.clone(),
 		state.terminals.clone(),
-		stream_id.clone(),
+		stream_id.to_owned(),
 		session,
 		cmd_rx,
 		container_name,
 	));
 
-	registry.lock().await.insert(
-		stream_id.clone(),
-		TerminalStreamHandle {
-			tx: cmd_tx,
-			abort: supervisor.inner().abort_handle(),
-		},
-	);
-	Ok(stream_id)
+	registry
+		.lock()
+		.await
+		.insert(stream_id.to_owned(), TerminalStreamHandle { tx: cmd_tx, task });
+	Ok(())
 }
 
 #[tauri::command]
@@ -159,17 +192,124 @@ pub async fn terminal_resize(
 
 #[tauri::command]
 pub async fn terminal_close(state: State<'_, AppState>, stream_id: String) -> Result<(), MoonError> {
-	let handle = state.terminal_streams.lock().await.remove(&stream_id);
+	close_stream(&state, &stream_id).await;
+	Ok(())
+}
+
+async fn close_stream(state: &AppState, stream_id: &str) {
+	let handle = state.terminal_streams.lock().await.remove(stream_id);
 	if let Some(handle) = handle {
-		handle.abort.abort();
+		handle.task.abort();
 	}
 	// The tab is gone, so its scrollback is no longer something the
 	// user can see either — drop it rather than leaving output the
 	// coder could still read. Aborting the supervisor skips its own
 	// cleanup tail, so this is the only place a user-closed terminal
 	// gets forgotten.
-	state.terminals.forget(&stream_id).await;
-	Ok(())
+	state.terminals.forget(stream_id).await;
+}
+
+/// The coder's way to open, restart and close terminals (ADR 0090).
+/// Installed on the shared [`TerminalRegistry`] once `AppState` is
+/// managed; resolves it from the app handle per call.
+pub struct AgentTerminalSpawner {
+	pub app: AppHandle,
+}
+
+#[async_trait::async_trait]
+impl TerminalSpawner for AgentTerminalSpawner {
+	async fn open(&self, request: AgentTerminalRequest) -> Result<String, String> {
+		let state = self.app.state::<AppState>();
+		let stream_id = Uuid::new_v4().to_string();
+		let folder = request.folder.to_string();
+		let open = TerminalOpenRequest {
+			target: request.target.clone(),
+			cols: AGENT_TERMINAL_COLS,
+			rows: AGENT_TERMINAL_ROWS,
+			command: Some(request.agent.command.clone()),
+			folder: Some(folder.clone()),
+			agent: Some(request.agent.clone()),
+		};
+		let startup = Some(StartupCommand::Run(&request.agent.command));
+		start_stream(&self.app, &state, &stream_id, &open, startup, true)
+			.await
+			.map_err(|err| err.to_string())?;
+		// Output that beats this event to the frontend is queued
+		// there by stream id until the tab mounts.
+		let _ = self.app.emit(
+			TERMINAL_AGENT_OPENED_EVENT,
+			&TerminalAgentOpened {
+				stream_id: stream_id.clone(),
+				target: request.target,
+				folder: Some(folder),
+				agent: request.agent,
+			},
+		);
+		Ok(stream_id)
+	}
+
+	async fn restart(&self, id: &str) -> Result<(), String> {
+		let state = self.app.state::<AppState>();
+		let info = state
+			.terminals
+			.info(id)
+			.await
+			.ok_or_else(|| format!("no terminal `{id}`"))?;
+		let agent = info
+			.agent
+			.clone()
+			.ok_or_else(|| format!("terminal `{id}` wasn't opened by an agent"))?;
+		let target = match info.kind {
+			TerminalKind::Host => ProtocolTarget::Host {
+				cwd: (info.cwd != "~").then(|| info.cwd.clone()),
+			},
+			TerminalKind::Container => ProtocolTarget::Container { cwd: info.cwd.clone() },
+		};
+		let old = state.terminal_streams.lock().await.remove(id);
+		if let Some(old) = old {
+			old.task.abort();
+			let _ = old.task.await;
+		}
+		// Keep the old run's scrollback on screen, visibly fenced off.
+		let _ = self.app.emit(
+			TERMINAL_OUTPUT_EVENT,
+			&TerminalOutput {
+				stream_id: id.to_owned(),
+				data: BASE64.encode(b"\r\n\x1b[2m--- restarted by agent ---\x1b[0m\r\n"),
+			},
+		);
+		let open = TerminalOpenRequest {
+			target,
+			cols: info.cols,
+			rows: info.rows,
+			command: Some(agent.command.clone()),
+			folder: info.folder.as_ref().map(ToString::to_string),
+			agent: Some(agent.clone()),
+		};
+		let startup = Some(StartupCommand::Run(&agent.command));
+		start_stream(&self.app, &state, id, &open, startup, false)
+			.await
+			.map_err(|err| err.to_string())?;
+		let _ = self.app.emit(
+			TERMINAL_RESPAWNED_EVENT,
+			&TerminalRespawned {
+				stream_id: id.to_owned(),
+			},
+		);
+		Ok(())
+	}
+
+	async fn close(&self, id: &str) -> Result<(), String> {
+		let state = self.app.state::<AppState>();
+		close_stream(&state, id).await;
+		let _ = self.app.emit(
+			TERMINAL_REMOVED_EVENT,
+			&TerminalRemoved {
+				stream_id: id.to_owned(),
+			},
+		);
+		Ok(())
+	}
 }
 
 /// Metadata the registry keeps for a terminal, taken off the open
@@ -188,6 +328,7 @@ fn registration_for(request: &TerminalOpenRequest) -> TerminalRegistration {
 		folder: request.folder.as_deref().map(Utf8PathBuf::from),
 		cols: request.cols,
 		rows: request.rows,
+		agent: request.agent.clone(),
 	}
 }
 

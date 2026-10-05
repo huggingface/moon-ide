@@ -178,6 +178,10 @@
 		}
 		const where = tab.target.kind === 'host' ? 'host' : 'container';
 		const cwd = tab.target.kind === 'host' ? (tab.target.cwd ?? '~') : tab.target.cwd;
+		const agent = terminal.sessionFor(tab.id)?.agent;
+		if (agent) {
+			return `Opened by an agent to run: ${agent.command}\n${where}: ${cwd}`;
+		}
 		return `${where}: ${cwd}`;
 	}
 
@@ -227,6 +231,9 @@
 							>
 								<TerminalTargetIcon kind={chip} size={12} />
 							</span>
+						{/if}
+						{#if tab.kind === 'terminal' && terminal.sessionFor(tab.id)?.agent}
+							<span class="tab-agent" aria-label="opened by an agent">agent</span>
 						{/if}
 						<span class="tab-title">{tab.title}</span>
 						{#if exitSuffix}
@@ -352,6 +359,15 @@
 	.tab-row.active .tab-select,
 	.tab-row:hover .tab-select {
 		color: var(--m-fg);
+	}
+	.tab-agent {
+		flex: 0 0 auto;
+		padding: 0 4px;
+		border-radius: 3px;
+		font-size: 10px;
+		line-height: 14px;
+		color: var(--m-accent);
+		border: 1px solid color-mix(in srgb, var(--m-accent) 45%, transparent);
 	}
 	.tab-title {
 		flex: 0 1 auto;

@@ -113,6 +113,51 @@ pub struct TerminalOpenRequest {
 	/// match a folder-scoped listing.
 	#[serde(default)]
 	pub folder: Option<String>,
+	/// Set when the terminal is (a restart or restore of) one an
+	/// agent opened — carried through so the respawned shell keeps
+	/// its title, badge, and the agent's right to restart / close
+	/// it (ADR 0090). `command` above stays a prefill either way.
+	#[serde(default)]
+	pub agent: Option<AgentTerminal>,
+}
+
+/// What marks a terminal as agent-opened (ADR 0090): the label the
+/// agent gave it and the command it launched it to run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AgentTerminal {
+	pub title: String,
+	pub command: String,
+}
+
+/// An agent opened a terminal (`open_terminal`). The PTY is already
+/// running under `stream_id`; the frontend adopts it as a tab.
+/// Emitted on `terminal:agent_opened`, before any of its output.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalAgentOpened {
+	pub stream_id: String,
+	pub target: TerminalTarget,
+	pub folder: Option<String>,
+	pub agent: AgentTerminal,
+}
+
+/// The backend replaced a terminal's shell in place (agent
+/// `restart`): same `stream_id`, fresh process. Emitted on
+/// `terminal:respawned` so a tab showing an exit banner goes live
+/// again.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalRespawned {
+	pub stream_id: String,
+}
+
+/// The backend closed a terminal (agent `close`); the tab goes
+/// away. Emitted on `terminal:removed`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TerminalRemoved {
+	pub stream_id: String,
 }
 
 /// One chunk of terminal output. `data` is base64-encoded

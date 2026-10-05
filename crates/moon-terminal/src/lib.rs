@@ -22,10 +22,10 @@ mod pty;
 mod registry;
 mod target;
 
-pub use pty::{spawn, PtyError, PtySession};
+pub use pty::{spawn, PtyError, PtySession, StartupCommand};
 pub use registry::{
-	TerminalInfo, TerminalKind, TerminalRead, TerminalRegistration, TerminalRegistry, DEFAULT_READ_LINES, MAX_READ_LINES,
-	SCROLLBACK_BYTES,
+	AgentTerminalRequest, TerminalInfo, TerminalKind, TerminalRead, TerminalRegistration, TerminalRegistry,
+	TerminalSpawner, DEFAULT_READ_LINES, MAX_READ_LINES, SCROLLBACK_BYTES,
 };
 pub use target::{
 	container_name_for_workspace, container_running, editor_forward_env_for_workspace,

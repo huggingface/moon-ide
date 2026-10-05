@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 moon-protocol = { workspace = true }
 
+async-trait = { workspace = true }
 camino = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

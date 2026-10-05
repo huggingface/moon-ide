@@ -81,7 +81,7 @@
 				type="button"
 				class="action"
 				disabled={busy || !canRecreate}
-				title="Recreate the workspace shell (docker compose up -d --force-recreate --pull always). Pulls a fresh moon-base image and recreates from current bound folders."
+				title="Recreate the workspace shell (docker compose up -d --force-recreate). Pulls a fresh moon-base image when it comes from a registry (the locally built moon-base:dev is never pulled) and recreates from current bound folders."
 				onclick={() => container.rebuild()}
 			>
 				Recreate

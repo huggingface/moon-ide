@@ -465,11 +465,12 @@ impl Workspace {
 		Ok(())
 	}
 
-	/// Force-recreate every container, pulling fresh images
-	/// first. The hammer: use this when the moon-base reference
-	/// changed, when an included compose changed in a way `up`
-	/// didn't pick up, or when the user just wants to start
-	/// over.
+	/// Force-recreate every container, pulling a fresh dev image
+	/// first when it comes from a registry (see
+	/// [`rebuild_pull_policy`]). The hammer: use this when the
+	/// moon-base reference changed, when an included compose
+	/// changed in a way `up` didn't pick up, or when the user just
+	/// wants to start over.
 	///
 	/// Force-recreate replaces the dev container, so any prior
 	/// project-network attachments are lost; we reconcile them
@@ -481,7 +482,14 @@ impl Workspace {
 		// generation's mounts.
 		self.write_state(dev_image).await?;
 		self
-			.docker_compose(["up", "-d", "--force-recreate", "--pull", "always", "--wait"])
+			.docker_compose([
+				"up",
+				"-d",
+				"--force-recreate",
+				"--pull",
+				rebuild_pull_policy(dev_image),
+				"--wait",
+			])
 			.await?;
 		self.invalidate_status_cache().await;
 		self.reattach_running_projects().await;
@@ -598,6 +606,20 @@ impl Workspace {
 	}
 }
 
+/// `--pull` policy for [`Workspace::rebuild`].
+///
+/// [`DEFAULT_DEV_IMAGE`] is a locally built tag that exists on no
+/// registry: compose resolves it to `docker.io/library/moon-base`,
+/// the pull is denied, and the whole `up` aborts before recreating
+/// anything. `--pull` on the CLI overrides any per-service
+/// `pull_policy`, so the decision has to live here.
+fn rebuild_pull_policy(dev_image: &str) -> &'static str {
+	if dev_image == DEFAULT_DEV_IMAGE {
+		return "missing";
+	}
+	"always"
+}
+
 pub(crate) struct DockerOutput {
 	pub(crate) stdout: Vec<u8>,
 }
@@ -673,10 +695,12 @@ where
 		if stderr.contains("Cannot connect to the Docker daemon") {
 			return Err(LifecycleError::DaemonUnreachable(stderr));
 		}
-		return Err(LifecycleError::ComposeFailed {
-			code: output.status.code().unwrap_or(-1),
-			stderr,
-		});
+		let code = output.status.code().unwrap_or(-1);
+		// Args and stderr only: the compose environment carries
+		// secrets (GH_TOKEN), so never log env or file contents.
+		let args: Vec<_> = cmd.as_std().get_args().map(OsStr::to_string_lossy).collect();
+		tracing::warn!(%project, code, ?args, %stderr, "docker compose failed");
+		return Err(LifecycleError::ComposeFailed { code, stderr });
 	}
 
 	Ok(DockerOutput { stdout: output.stdout })
@@ -1393,6 +1417,13 @@ mod tests {
 			bound_folders: folders,
 		})
 		.expect("default is a valid id")
+	}
+
+	#[test]
+	fn rebuild_never_force_pulls_the_local_default_image() {
+		assert_eq!(rebuild_pull_policy(DEFAULT_DEV_IMAGE), "missing");
+		assert_eq!(rebuild_pull_policy("huggingface/moon-base:0.1"), "always");
+		assert_eq!(rebuild_pull_policy("ghcr.io/huggingface/moon-base:0.1"), "always");
 	}
 
 	#[test]

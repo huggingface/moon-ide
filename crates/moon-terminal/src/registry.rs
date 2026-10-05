@@ -33,8 +33,10 @@
 //! agent) and is dropped only when the tab closes.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, OnceLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
+use moon_protocol::terminal::{AgentTerminal, TerminalTarget as ProtocolTarget};
 use tokio::sync::Mutex;
 
 /// Raw PTY bytes retained per terminal. 256 kB is a few thousand
@@ -95,6 +97,8 @@ pub struct TerminalRegistration {
 	pub folder: Option<Utf8PathBuf>,
 	pub cols: u16,
 	pub rows: u16,
+	/// Set for terminals an agent opened (ADR 0090).
+	pub agent: Option<AgentTerminal>,
 }
 
 /// Snapshot of one registered terminal. Cloned out of the registry
@@ -115,6 +119,9 @@ pub struct TerminalInfo {
 	/// Bytes currently retained in the ring — a rough "how much is
 	/// there to read" hint, capped by [`SCROLLBACK_BYTES`].
 	pub buffered_bytes: usize,
+	/// Set for terminals an agent opened (ADR 0090) — the only
+	/// ones agents may restart or close.
+	pub agent: Option<AgentTerminal>,
 }
 
 /// Rendered read of one terminal: its metadata plus the tail of
@@ -139,14 +146,56 @@ struct Entry {
 	dropped: bool,
 }
 
+/// What an agent asks for when it opens a terminal (ADR 0090).
+#[derive(Debug, Clone)]
+pub struct AgentTerminalRequest {
+	/// Wire-level target (host cwd / container cwd); the spawner
+	/// resolves the container name and env itself.
+	pub target: ProtocolTarget,
+	/// Bound folder (host path) the terminal belongs to — the
+	/// session's own project, so its `list_terminals` sees it.
+	pub folder: Utf8PathBuf,
+	pub agent: AgentTerminal,
+}
+
+/// The side that can actually spawn and kill terminals — the Tauri
+/// layer, which owns the PTY supervisors and the event bus. Installed
+/// once on the registry so the coder, which only holds the registry,
+/// can open terminals the user sees as ordinary tabs. Errors are
+/// messages for the model.
+#[async_trait::async_trait]
+pub trait TerminalSpawner: Send + Sync {
+	/// Spawn a shell, run `request.agent.command` in it, and show it
+	/// as a tab. Returns the terminal id.
+	async fn open(&self, request: AgentTerminalRequest) -> Result<String, String>;
+	/// Replace terminal `id`'s shell with a fresh one running its
+	/// agent command again, keeping the id and the tab.
+	async fn restart(&self, id: &str) -> Result<(), String>;
+	/// Kill terminal `id` and close its tab.
+	async fn close(&self, id: &str) -> Result<(), String>;
+}
+
 /// Shared map of open terminals. Cheap to clone (`Arc` it once at
 /// startup); every method takes the lock briefly and gets out.
 #[derive(Default)]
 pub struct TerminalRegistry {
 	entries: Mutex<HashMap<String, Entry>>,
+	spawner: OnceLock<Arc<dyn TerminalSpawner>>,
 }
 
 impl TerminalRegistry {
+	/// Install the spawner. First install wins; there is one per
+	/// process.
+	pub fn set_spawner(&self, spawner: Arc<dyn TerminalSpawner>) {
+		let _ = self.spawner.set(spawner);
+	}
+
+	/// The installed spawner, if any (none in tests or before the
+	/// Tauri layer is up).
+	pub fn spawner(&self) -> Option<Arc<dyn TerminalSpawner>> {
+		self.spawner.get().cloned()
+	}
+
 	/// Record a newly-opened terminal. Called by `terminal_open`
 	/// right after the PTY spawns.
 	pub async fn register(&self, id: &str, registration: TerminalRegistration) {
@@ -156,6 +205,7 @@ impl TerminalRegistry {
 			folder,
 			cols,
 			rows,
+			agent,
 		} = registration;
 		let entry = Entry {
 			info: TerminalInfo {
@@ -168,6 +218,7 @@ impl TerminalRegistry {
 				running: true,
 				exit_code: None,
 				buffered_bytes: 0,
+				agent,
 			},
 			ring: VecDeque::new(),
 			dropped: false,
@@ -208,6 +259,20 @@ impl TerminalRegistry {
 		if let Some(entry) = entries.get_mut(id) {
 			entry.info.running = false;
 			entry.info.exit_code = exit_code;
+		}
+	}
+
+	/// A fresh shell replaced this terminal's old one under the same
+	/// id: live again, and its retained output starts over so a read
+	/// (or a `wait_for`) only sees the new run.
+	pub async fn reset(&self, id: &str) {
+		let mut entries = self.entries.lock().await;
+		if let Some(entry) = entries.get_mut(id) {
+			entry.ring.clear();
+			entry.dropped = false;
+			entry.info.buffered_bytes = 0;
+			entry.info.running = true;
+			entry.info.exit_code = None;
 		}
 	}
 
@@ -392,6 +457,7 @@ mod tests {
 			folder: Some(Utf8PathBuf::from("/home/dev/code/moon-ide")),
 			cols: 80,
 			rows: 24,
+			agent: None,
 		}
 	}
 
@@ -512,6 +578,19 @@ mod tests {
 		assert_eq!(read.lines.last().map(String::as_str), Some("ok"));
 		registry.forget("t1").await;
 		assert!(registry.read("t1", None).await.is_none());
+	}
+
+	#[tokio::test]
+	async fn reset_clears_output_and_revives() {
+		let registry = TerminalRegistry::default();
+		registry.register("t1", registration()).await;
+		registry.record_output("t1", b"Local: http://localhost:5173\r\n").await;
+		registry.mark_exited("t1", Some(1)).await;
+		registry.reset("t1").await;
+		let read = registry.read("t1", None).await.expect("still registered");
+		assert!(read.info.running);
+		assert_eq!(read.info.exit_code, None);
+		assert!(read.lines.is_empty());
 	}
 
 	#[tokio::test]

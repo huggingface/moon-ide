@@ -267,6 +267,13 @@ What it ships:
   framing means the per-command shell starts inside the project
   and lands on the project's Node. No `.nvmrc` up-tree → silently
   stays on the `default` alias.
+- **Non-interactive Corepack**: `COREPACK_ENABLE_DOWNLOAD_PROMPT=0`
+  (image `ENV`). The corepack cache is container-private, so after
+  a Recreate the first `pnpm` / `yarn` re-downloads the project's
+  pinned version; without the variable that download blocks on a
+  `[Y/n]` prompt no `docker exec … bash -c` caller can answer. Set
+  in the image, not the generated compose, because corepack is an
+  image concern and `FROM moon-base` extensions inherit it.
 - **Cluster tooling**: `helm` (user-mode, pinned) for the
   Helm-chart-heavy infra / workloads repos. No Kubernetes daemon
   or `kubectl` baked in — add those in a `FROM moon-base`
@@ -343,15 +350,15 @@ free. Devcontainer.json **interop** is deferred to Phase 2.3
 
 ## Lifecycle
 
-| Event                          | What moon-ide does                                                                                                     |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| First workspace open           | Pull image if absent → compose create + start.                                                                         |
-| Subsequent opens               | Auto-`up -d --wait` if `stopped`; no-op if running; leave alone if `failed` / `absent`.                                |
-| App quit / window close        | Hide window, `compose stop` the shell and every bound-folder project, snapshot what was running for resume, then exit. |
-| "Recreate"                     | `up -d --force-recreate --pull always --wait`. Drops in-container state.                                               |
-| Compose file edited externally | Detected via mtime on next open; prompt "Rebuild now?".                                                                |
-| Container deleted out-of-band  | Detected via `docker inspect` failure; recreate transparently.                                                         |
-| Image tag changed              | Treated as "Rebuild".                                                                                                  |
+| Event                          | What moon-ide does                                                                                                        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| First workspace open           | Pull image if absent → compose create + start.                                                                            |
+| Subsequent opens               | Auto-`up -d --wait` if `stopped`; no-op if running; leave alone if `failed` / `absent`.                                   |
+| App quit / window close        | Hide window, `compose stop` the shell and every bound-folder project, snapshot what was running for resume, then exit.    |
+| "Recreate"                     | `up -d --force-recreate --pull always --wait` (`--pull missing` for the local `moon-base:dev`). Drops in-container state. |
+| Compose file edited externally | Detected via mtime on next open; prompt "Rebuild now?".                                                                   |
+| Container deleted out-of-band  | Detected via `docker inspect` failure; recreate transparently.                                                            |
+| Image tag changed              | Treated as "Rebuild".                                                                                                     |
 
 ### Stop semantics, and how to keep in-memory state
 
@@ -875,9 +882,11 @@ avoids surprise recreates of a deliberately-stopped shell.
 #### Caches across `dev` recreation
 
 Recreating `dev` on every folder change would nuke `~/.cargo`,
-`~/.bun`, `~/.cache`. Named volumes for those paths make the bytes
-survive recreation; they land when there's cache state worth
-preserving.
+`~/.bun`, `~/.cache` (including the corepack cache, so the first
+`pnpm` after a Recreate re-downloads its pinned version — without
+prompting, see the `moon-base` image above). Named volumes for those
+paths make the bytes survive recreation; they land when there's cache
+state worth preserving.
 
 #### Inventory + GC
 

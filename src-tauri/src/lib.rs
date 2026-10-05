@@ -667,6 +667,13 @@ pub fn run() {
 				tauri::async_runtime::block_on(restore_session(&state, &workspace_id, &poller, &loaded_state));
 			}
 
+			// Agents open terminals through the registry they share
+			// with the terminal commands (ADR 0090).
+			state
+				.terminals
+				.set_spawner(std::sync::Arc::new(commands::terminal::AgentTerminalSpawner {
+					app: app.handle().clone(),
+				}));
 			app.manage(state);
 
 			// Reconnect to a remote relay bridge when this IDE holds a

@@ -67,7 +67,11 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
   the `pnpm` / `yarn` shims are on PATH; the actual version
   resolves from each project's `packageManager` field on
   first use, so nothing in this image drifts vs. what teams
-  pin in their repos.
+  pin in their repos. `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` is
+  set (image `ENV`) so that first-use download doesn't stop at
+  a `[Y/n]` prompt — the corepack cache doesn't survive a
+  container Recreate, and non-interactive callers (the coder's
+  `bash` tool, `docker exec` scripts) can't answer it.
 - **`uv`** (pinned to a specific version for reproducibility),
   managing Python toolchains and tool installs.
 - **`hf`** (Hugging Face Hub CLI), installed via `uv tool` so

@@ -935,6 +935,22 @@ fn read_tail(path: &Path, max_bytes: usize) -> String {
 	String::from_utf8_lossy(&buf[..cut]).into_owned()
 }
 
+/// In-container working directory for `folder` — what `bash` and
+/// agent-opened terminals start in. Worktree-backed sessions (ADR
+/// 0029) live inside the parent repo at `<parent>/.worktrees/…`, so
+/// their cwd is the parent's `/workspace/<name>` mount plus the
+/// relative tail. Everything else falls back to `/workspace` if the
+/// host path has no basename — same fallback `moon-terminal` uses
+/// for pathological inputs (`/`).
+fn container_cwd_for(folder: &WorkspaceFolderEntry) -> Utf8PathBuf {
+	let folder_path = Utf8Path::new(&folder.folder.path);
+	if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &folder.folder.origin {
+		return moon_core::worktree::worktree_container_path(Utf8Path::new(parent_path), folder_path)
+			.unwrap_or_else(|| Utf8PathBuf::from("/workspace"));
+	}
+	TerminalTarget::container_cwd_for_folder(folder_path).unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
+}
+
 /// Shared JSON shape for one terminal, used by both
 /// `list_terminals` rows and the `read_terminal` result so the
 /// model sees the same field names either way.
@@ -948,7 +964,31 @@ fn terminal_info_json(info: &moon_terminal::TerminalInfo) -> Value {
 		"running": info.running,
 		"exit_code": info.exit_code,
 		"buffered_bytes": info.buffered_bytes,
+		"opened_by_agent": info.agent.is_some(),
+		"title": info.agent.as_ref().map(|agent| agent.title.as_str()),
+		"command": info.agent.as_ref().map(|agent| agent.command.as_str()),
 	})
+}
+
+/// Default and cap for a terminal `wait_for`.
+const TERMINAL_WAIT_DEFAULT: Duration = Duration::from_secs(30);
+const TERMINAL_WAIT_MAX: Duration = Duration::from_secs(120);
+const TERMINAL_WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// Lines of output an `open_terminal` / `terminal_tab` result carries
+/// after a `wait_for` — enough for a dev server's banner.
+const TERMINAL_WAIT_TAIL_LINES: usize = 40;
+
+/// Tab label for an agent terminal when the model gives none: the
+/// command's first line, clipped.
+fn default_terminal_title(command: &str) -> String {
+	let first = command.lines().next().unwrap_or("").trim();
+	if first.chars().count() <= 32 {
+		return first.to_owned();
+	}
+	let mut clipped: String = first.chars().take(31).collect();
+	clipped.push('…');
+	clipped
 }
 
 /// Tools are dispatched by name. The registry holds the JSON-schema
@@ -1628,26 +1668,46 @@ impl ToolRegistry {
 	pub async fn terminal_definitions(&self, cx: &ToolContext) -> Vec<ToolDefinition> {
 		let folder = Utf8Path::new(cx.folder.folder.path.as_str());
 		let open = self.terminals.list_for_folder(folder).await;
-		if open.is_empty() {
+		// Write modes can open terminals (ADR 0090), and need the read
+		// pair in the same turn to watch what they started — the tool
+		// list is fixed for the turn, so it can't wait for one to exist.
+		let can_open = cx.mode.allows_writes() && self.terminals.spawner().is_some();
+		if open.is_empty() && !can_open {
 			return Vec::new();
 		}
-		let inventory = open
-			.iter()
-			.map(|t| {
-				let state = match (t.running, t.exit_code) {
-					(true, _) => "running".to_owned(),
-					(false, Some(code)) => format!("exited {code}"),
-					(false, None) => "exited".to_owned(),
-				};
-				format!("- `{}` — {} shell in `{}` ({state})", t.id, t.kind.as_str(), t.cwd)
-			})
-			.collect::<Vec<_>>()
-			.join("\n");
-		vec![
+		let inventory = if open.is_empty() {
+			"(none)".to_owned()
+		} else {
+			open
+				.iter()
+				.map(|t| {
+					let state = match (t.running, t.exit_code) {
+						(true, _) => "running".to_owned(),
+						(false, Some(code)) => format!("exited {code}"),
+						(false, None) => "exited".to_owned(),
+					};
+					let owner = match &t.agent {
+						Some(agent) => format!(
+							" — opened by an agent as \"{}\" to run `{}`",
+							agent.title, agent.command
+						),
+						None => String::new(),
+					};
+					format!(
+						"- `{}` — {} shell in `{}` ({state}){owner}",
+						t.id,
+						t.kind.as_str(),
+						t.cwd
+					)
+				})
+				.collect::<Vec<_>>()
+				.join("\n")
+		};
+		let mut defs = vec![
 			ToolDefinition::function(
 				"list_terminals",
 				format!(
-					"List the terminals the user has open for this project, with each one's shell target, working directory, and whether its shell is still running. Use this to find the id to pass to `read_terminal`.\n\nCurrently open:\n{inventory}"
+					"List this project's terminals — the user's own and the ones agents opened with `open_terminal` — with each one's shell target, working directory, and whether its shell is still running. Use this to find the id to pass to `read_terminal`.\n\nCurrently open:\n{inventory}"
 				),
 				json!({
 					"type": "object",
@@ -1657,7 +1717,7 @@ impl ToolRegistry {
 			ToolDefinition::function(
 				"read_terminal",
 				format!(
-					"Read the recent output of one of the user's open terminals — what is actually on their screen, with escape sequences applied and `\\r`-redrawn progress lines collapsed. Use it to see how a dev server, watcher, or test run the user started is doing instead of starting a competing one with `bash`. When the user pastes terminal output into their message, the `<terminal_output>` block's `terminal_id` attribute is a valid id here — use it to read the live terminal instead of treating the paste as everything there is. Read-only: this cannot type into a terminal or run anything. Terminals may contain output the user did not mean to share (tokens, secrets, unrelated projects) — read what you need for the task at hand and don't quote more of it back than necessary.\n\nCurrently open:\n{inventory}"
+					"Read the recent output of one of this project's terminals — what is actually on screen, with escape sequences applied and `\\r`-redrawn progress lines collapsed. Use it to see how a dev server, watcher, or test run is doing instead of starting a competing one with `bash`. When the user pastes terminal output into their message, the `<terminal_output>` block's `terminal_id` attribute is a valid id here — use it to read the live terminal instead of treating the paste as everything there is. Pass `wait_for` to block until some text shows up (e.g. a dev server's \"ready\" line). Read-only: this cannot type into a terminal. Terminals may contain output the user did not mean to share (tokens, secrets, unrelated projects) — read what you need for the task at hand and don't quote more of it back than necessary.\n\nCurrently open:\n{inventory}"
 				),
 				json!({
 					"type": "object",
@@ -1669,12 +1729,76 @@ impl ToolRegistry {
 						"lines": {
 							"type": "integer",
 							"description": format!("How many lines from the end of the terminal to return. Defaults to {DEFAULT_READ_LINES}, capped at {MAX_READ_LINES}.")
+						},
+						"wait_for": {
+							"type": "string",
+							"description": "Optional. Plain text (not a regex) to wait for in the terminal's recent output before returning; returns at once if it's already there. The result's `matched` says whether it appeared."
+						},
+						"timeout_ms": {
+							"type": "integer",
+							"description": "How long `wait_for` waits. Defaults to 30000, capped at 120000."
 						}
 					},
 					"required": ["id"]
 				}),
 			),
-		]
+		];
+		if !can_open {
+			return defs;
+		}
+		defs.push(ToolDefinition::function(
+			"open_terminal",
+			"Run a long-lived command — a dev server, a watcher, `docker compose logs -f` — in a new IDE terminal tab the user can see, type into, and keep after this session ends. It runs in an interactive shell on the same side `bash` runs on, starting in this project's folder; the command lands in that shell's history, and the tab is restored (not re-run) when the IDE restarts. Use it instead of `bash` with `detach` when the process is something the user should watch or keep running; use detached `bash` for builds and tests whose result you only need yourself. If an agent terminal in this project already runs the same command, it is reused instead of starting a duplicate. Pass `wait_for` to wait for a readiness line (e.g. `Local:` or `ready in`) and get the output so far; otherwise follow up with `read_terminal`. Mention the terminal in your reply.",
+			json!({
+				"type": "object",
+				"properties": {
+					"command": {
+						"type": "string",
+						"description": "Shell command to run, e.g. `pnpm dev`."
+					},
+					"title": {
+						"type": "string",
+						"description": "Short tab label, e.g. `web dev server`. Defaults to the command."
+					},
+					"wait_for": {
+						"type": "string",
+						"description": "Optional plain text to wait for in the output before returning — something the command prints, not part of the command itself (the typed command is echoed on screen too)."
+					},
+					"timeout_ms": {
+						"type": "integer",
+						"description": "How long `wait_for` waits. Defaults to 30000, capped at 120000."
+					}
+				},
+				"required": ["command"]
+			}),
+		));
+		defs.push(ToolDefinition::function(
+			"terminal_tab",
+			"Act on a terminal an agent opened with `open_terminal` (any session's, in this project): `restart` kills its shell and runs its command again in a fresh one (same id; e.g. after changing config the server doesn't hot-reload), or `close` kills it and closes the tab. Terminals the user opened can't be controlled — ask the user instead.",
+			json!({
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string",
+						"description": "Terminal id from `open_terminal` / `list_terminals`."
+					},
+					"action": {
+						"type": "string",
+						"enum": ["restart", "close"]
+					},
+					"wait_for": {
+						"type": "string",
+						"description": "`restart` only: optional plain text to wait for in the new run's output before returning."
+					},
+					"timeout_ms": {
+						"type": "integer",
+						"description": "How long `wait_for` waits. Defaults to 30000, capped at 120000."
+					}
+				},
+				"required": ["id", "action"]
+			}),
+		));
+		defs
 	}
 
 	/// Every terminal open for the session's folder.
@@ -1696,33 +1820,75 @@ impl ToolRegistry {
 	/// project's terminals so the model can self-correct. Leaking
 	/// "that id exists but is another project's" would be a worse
 	/// answer than the recovery hint.
-	async fn read_terminal(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
+	async fn read_terminal(
+		&self,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct ReadTerminalArgs {
 			id: String,
 			#[serde(default)]
 			lines: Option<usize>,
+			#[serde(default)]
+			wait_for: Option<String>,
+			#[serde(default)]
+			timeout_ms: Option<u64>,
 		}
 		let parsed: ReadTerminalArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("read_terminal", err.to_string()))?;
+		self.scoped_terminal("read_terminal", &parsed.id, cx).await?;
+		let wait = match parsed.wait_for.as_deref() {
+			Some(needle) => Some(
+				self
+					.wait_for_terminal(&parsed.id, needle, parsed.timeout_ms, cancel)
+					.await?,
+			),
+			None => None,
+		};
+		let mut out = self.render_terminal("read_terminal", &parsed.id, parsed.lines).await?;
+		if let (Some(matched), Value::Object(map)) = (wait, &mut out) {
+			map.insert("matched".into(), json!(matched));
+		}
+		Ok(out)
+	}
+
+	/// Info for terminal `id` if it belongs to the session's folder.
+	///
+	/// A terminal belonging to another folder is refused as if it
+	/// didn't exist — same shape as an unknown id, listing this
+	/// project's terminals so the model can self-correct. Leaking
+	/// "that id exists but is another project's" would be a worse
+	/// answer than the recovery hint.
+	async fn scoped_terminal(
+		&self,
+		tool: &str,
+		id: &str,
+		cx: &ToolContext,
+	) -> Result<moon_terminal::TerminalInfo, CoderError> {
 		let folder = Utf8Path::new(cx.folder.folder.path.as_str());
 		let scoped = self.terminals.list_for_folder(folder).await;
-		if !scoped.iter().any(|t| t.id == parsed.id) {
-			let known: Vec<&str> = scoped.iter().map(|t| t.id.as_str()).collect();
-			return Err(CoderError::invalid_args(
-				"read_terminal",
-				format!(
-					"no terminal `{}` open for this project; open terminals: [{}]",
-					parsed.id,
-					known.join(", ")
-				),
-			));
+		if let Some(info) = scoped.iter().find(|t| t.id == id) {
+			return Ok(info.clone());
 		}
+		let known: Vec<&str> = scoped.iter().map(|t| t.id.as_str()).collect();
+		Err(CoderError::invalid_args(
+			tool,
+			format!(
+				"no terminal `{id}` open for this project; open terminals: [{}]",
+				known.join(", ")
+			),
+		))
+	}
+
+	/// Metadata plus the rendered tail of terminal `id`.
+	async fn render_terminal(&self, tool: &str, id: &str, lines: Option<usize>) -> Result<Value, CoderError> {
 		let read = self
 			.terminals
-			.read(&parsed.id, parsed.lines)
+			.read(id, lines)
 			.await
-			.ok_or_else(|| CoderError::tool_failed("read_terminal", "terminal closed while being read"))?;
+			.ok_or_else(|| CoderError::tool_failed(tool, "terminal closed while being read"))?;
 		let mut out = terminal_info_json(&read.info);
 		let text = read.lines.join("\n");
 		if let Value::Object(map) = &mut out {
@@ -1731,6 +1897,240 @@ impl ToolRegistry {
 			map.insert("output".into(), json!(text));
 		}
 		Ok(out)
+	}
+
+	/// Poll terminal `id` until `needle` shows up in its recent
+	/// output, the shell exits, or the timeout passes. Returns
+	/// whether it matched; the caller reads the output itself.
+	async fn wait_for_terminal(
+		&self,
+		id: &str,
+		needle: &str,
+		timeout_ms: Option<u64>,
+		cancel: &CancellationToken,
+	) -> Result<bool, CoderError> {
+		let timeout = timeout_ms
+			.map(Duration::from_millis)
+			.unwrap_or(TERMINAL_WAIT_DEFAULT)
+			.min(TERMINAL_WAIT_MAX);
+		let deadline = tokio::time::Instant::now() + timeout;
+		loop {
+			let Some(read) = self.terminals.read(id, None).await else {
+				return Ok(false);
+			};
+			if read.lines.iter().any(|line| line.contains(needle)) {
+				return Ok(true);
+			}
+			if !read.info.running || tokio::time::Instant::now() >= deadline {
+				return Ok(false);
+			}
+			tokio::select! {
+				() = cancel.cancelled() => return Err(CoderError::Aborted),
+				() = tokio::time::sleep(TERMINAL_WAIT_POLL) => {}
+			}
+		}
+	}
+
+	/// `open_terminal` (ADR 0090): run a command in a new terminal
+	/// tab, on the same side `bash` would run it.
+	async fn open_terminal(
+		&self,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		struct OpenTerminalArgs {
+			#[serde(alias = "cmd")]
+			command: String,
+			#[serde(default)]
+			title: Option<String>,
+			#[serde(default)]
+			wait_for: Option<String>,
+			#[serde(default)]
+			timeout_ms: Option<u64>,
+		}
+		let parsed: OpenTerminalArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("open_terminal", err.to_string()))?;
+		let command = parsed.command.trim().to_owned();
+		if command.is_empty() {
+			return Err(CoderError::invalid_args("open_terminal", "`command` is empty"));
+		}
+		let Some(spawner) = self.terminals.spawner() else {
+			return Err(CoderError::tool_failed(
+				"open_terminal",
+				"no IDE terminals in this context",
+			));
+		};
+		let folder = Utf8Path::new(cx.folder.folder.path.as_str());
+		let existing = self
+			.terminals
+			.list_for_folder(folder)
+			.await
+			.into_iter()
+			.find(|t| t.agent.as_ref().is_some_and(|agent| agent.command == command));
+		let (id, reused) = match existing {
+			Some(info) if info.running => (info.id, true),
+			Some(info) => {
+				spawner
+					.restart(&info.id)
+					.await
+					.map_err(|err| CoderError::tool_failed("open_terminal", err))?;
+				(info.id, false)
+			}
+			None => {
+				let in_container =
+					resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash(), &cx.folder).await
+						== BASH_TARGET_CONTAINER;
+				let target = if in_container {
+					moon_protocol::terminal::TerminalTarget::Container {
+						cwd: container_cwd_for(&cx.folder).into_string(),
+					}
+				} else {
+					moon_protocol::terminal::TerminalTarget::Host {
+						cwd: Some(folder.to_string()),
+					}
+				};
+				let title = parsed
+					.title
+					.as_deref()
+					.map(str::trim)
+					.filter(|title| !title.is_empty())
+					.map_or_else(|| default_terminal_title(&command), ToOwned::to_owned);
+				let request = moon_terminal::AgentTerminalRequest {
+					target,
+					folder: folder.to_path_buf(),
+					agent: moon_protocol::terminal::AgentTerminal {
+						title,
+						command: command.clone(),
+					},
+				};
+				let id = spawner
+					.open(request)
+					.await
+					.map_err(|err| CoderError::tool_failed("open_terminal", err))?;
+				(id, false)
+			}
+		};
+		self
+			.terminal_result(
+				"open_terminal",
+				&id,
+				parsed.wait_for.as_deref(),
+				parsed.timeout_ms,
+				reused,
+				cancel,
+			)
+			.await
+	}
+
+	/// Shared tail of `open_terminal` / `terminal_tab restart`: the
+	/// terminal's info, plus the output so far when the model asked
+	/// to wait for something.
+	async fn terminal_result(
+		&self,
+		tool: &str,
+		id: &str,
+		wait_for: Option<&str>,
+		timeout_ms: Option<u64>,
+		reused: bool,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
+		let mut out = match wait_for {
+			Some(needle) => {
+				let matched = self.wait_for_terminal(id, needle, timeout_ms, cancel).await?;
+				let mut out = self.render_terminal(tool, id, Some(TERMINAL_WAIT_TAIL_LINES)).await?;
+				if let Value::Object(map) = &mut out {
+					map.insert("matched".into(), json!(matched));
+				}
+				out
+			}
+			None => {
+				let info = self
+					.terminals
+					.info(id)
+					.await
+					.ok_or_else(|| CoderError::tool_failed(tool, "terminal closed right after opening"))?;
+				terminal_info_json(&info)
+			}
+		};
+		if let Value::Object(map) = &mut out {
+			map.insert("reused".into(), json!(reused));
+		}
+		Ok(out)
+	}
+
+	/// `terminal_tab` (ADR 0090): restart or close an agent-opened
+	/// terminal in this project.
+	async fn terminal_tab(
+		&self,
+		args: &Value,
+		cx: &ToolContext,
+		cancel: &CancellationToken,
+	) -> Result<Value, CoderError> {
+		#[derive(Deserialize)]
+		#[serde(rename_all = "snake_case")]
+		enum Action {
+			Restart,
+			Close,
+		}
+		#[derive(Deserialize)]
+		struct TerminalTabArgs {
+			id: String,
+			action: Action,
+			#[serde(default)]
+			wait_for: Option<String>,
+			#[serde(default)]
+			timeout_ms: Option<u64>,
+		}
+		let parsed: TerminalTabArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("terminal_tab", err.to_string()))?;
+		let info = self.scoped_terminal("terminal_tab", &parsed.id, cx).await?;
+		if info.agent.is_none() {
+			return Err(CoderError::invalid_args(
+				"terminal_tab",
+				format!(
+					"terminal `{}` is the user's own; only terminals opened with `open_terminal` can be restarted or closed",
+					parsed.id
+				),
+			));
+		}
+		let Some(spawner) = self.terminals.spawner() else {
+			return Err(CoderError::tool_failed(
+				"terminal_tab",
+				"no IDE terminals in this context",
+			));
+		};
+		match parsed.action {
+			Action::Restart => {
+				spawner
+					.restart(&parsed.id)
+					.await
+					.map_err(|err| CoderError::tool_failed("terminal_tab", err))?;
+				let mut out = self
+					.terminal_result(
+						"terminal_tab",
+						&parsed.id,
+						parsed.wait_for.as_deref(),
+						parsed.timeout_ms,
+						false,
+						cancel,
+					)
+					.await?;
+				if let Value::Object(map) = &mut out {
+					map.remove("reused");
+					map.insert("action".into(), json!("restart"));
+				}
+				Ok(out)
+			}
+			Action::Close => {
+				spawner
+					.close(&parsed.id)
+					.await
+					.map_err(|err| CoderError::tool_failed("terminal_tab", err))?;
+				Ok(json!({ "id": parsed.id, "action": "close" }))
+			}
+		}
 	}
 
 	/// The workspace's persisted MCP config. Load failures degrade
@@ -1911,7 +2311,21 @@ impl ToolRegistry {
 			// screen, so it isn't mode-gated — a Research sub-agent
 			// checking why the dev server is unhappy is the point.
 			"list_terminals" => self.list_terminals(cx).await,
-			"read_terminal" => self.read_terminal(args, cx).await,
+			"read_terminal" => self.read_terminal(args, cx, cancel).await,
+			// Starting / killing processes the user keeps is a
+			// mutation, unlike `bash` (ADR 0090).
+			"open_terminal" => {
+				if !cx.mode.allows_writes() {
+					return Err(CoderError::read_only_mode("open_terminal"));
+				}
+				self.open_terminal(args, cx, cancel).await
+			}
+			"terminal_tab" => {
+				if !cx.mode.allows_writes() {
+					return Err(CoderError::read_only_mode("terminal_tab"));
+				}
+				self.terminal_tab(args, cx, cancel).await
+			}
 			"write_file" => {
 				if !cx.mode.allows_writes() {
 					return Err(CoderError::read_only_mode("write_file"));
@@ -2628,20 +3042,7 @@ impl ToolRegistry {
 		if target == BASH_TARGET_CONTAINER {
 			let workspace_id = self.workspaces.workspace_id().await;
 			let container_name = container_name_for_workspace(&workspace_id);
-			// Worktree-backed sessions (ADR 0029) live inside the parent
-			// repo at `<parent>/.worktrees/…`, so their `bash` cwd is the
-			// parent's `/workspace/<name>` mount plus the relative tail.
-			// Everything else falls back to `/workspace` if the host
-			// path has no basename — same fallback `moon-terminal` uses
-			// for pathological inputs (`/`).
-			let folder_path = Utf8Path::new(&folder.folder.path);
-			let container_cwd =
-				if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &folder.folder.origin {
-					moon_core::worktree::worktree_container_path(Utf8Path::new(parent_path), folder_path)
-						.unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
-				} else {
-					TerminalTarget::container_cwd_for_folder(folder_path).unwrap_or_else(|| Utf8PathBuf::from("/workspace"))
-				};
+			let container_cwd = container_cwd_for(folder);
 			// `docker exec` (no `-it`): we want captured
 			// stdout/stderr, not a TTY. Terminals get `-it`; the
 			// bash tool doesn't.
@@ -4745,9 +5146,11 @@ mod tests {
 		use super::super::{CoderMode, ToolContext, ToolRegistry};
 		use camino::{Utf8Path, Utf8PathBuf};
 		use moon_core::WorkspaceRegistry;
-		use moon_terminal::{TerminalKind, TerminalRegistration, TerminalRegistry};
+		use moon_terminal::{AgentTerminalRequest, TerminalKind, TerminalRegistration, TerminalRegistry, TerminalSpawner};
+		use std::sync::atomic::{AtomicUsize, Ordering};
 		use std::sync::Arc;
 		use tempfile::TempDir;
+		use tokio_util::sync::CancellationToken;
 
 		async fn harness(folder_count: usize) -> (Vec<Utf8PathBuf>, Vec<TempDir>, Arc<TerminalRegistry>, ToolRegistry) {
 			let dirs: Vec<TempDir> = (0..folder_count).map(|_| TempDir::new().unwrap()).collect();
@@ -4783,6 +5186,7 @@ mod tests {
 				folder: Some(folder.to_path_buf()),
 				cols: 80,
 				rows: 24,
+				agent: None,
 			}
 		}
 
@@ -4833,7 +5237,7 @@ mod tests {
 				.await;
 			let cx = cx_for(&tools, 0).await;
 			let out = tools
-				.read_terminal(&serde_json::json!({ "id": "t1" }), &cx)
+				.read_terminal(&serde_json::json!({ "id": "t1" }), &cx, &CancellationToken::new())
 				.await
 				.expect("read succeeds");
 			assert_eq!(out["output"], "$ bun run dev\nready in 312ms");
@@ -4851,12 +5255,162 @@ mod tests {
 			terminals.register("theirs", registration(&paths[1])).await;
 			let cx = cx_for(&tools, 0).await;
 			let err = tools
-				.read_terminal(&serde_json::json!({ "id": "theirs" }), &cx)
+				.read_terminal(&serde_json::json!({ "id": "theirs" }), &cx, &CancellationToken::new())
 				.await
 				.expect_err("cross-project read is refused");
 			let message = err.to_string();
 			assert!(message.contains("no terminal `theirs`"), "{message}");
 			assert!(message.contains("mine"), "{message}");
+		}
+
+		/// Stands in for the Tauri layer: "spawning" registers the
+		/// terminal and prints a readiness line into it.
+		#[derive(Default)]
+		struct FakeSpawner {
+			terminals: std::sync::OnceLock<Arc<TerminalRegistry>>,
+			opened: AtomicUsize,
+			restarted: AtomicUsize,
+		}
+
+		#[async_trait::async_trait]
+		impl TerminalSpawner for FakeSpawner {
+			async fn open(&self, request: AgentTerminalRequest) -> Result<String, String> {
+				let n = self.opened.fetch_add(1, Ordering::SeqCst);
+				let id = format!("agent-{n}");
+				let terminals = self.terminals.get().expect("wired");
+				terminals
+					.register(
+						&id,
+						TerminalRegistration {
+							kind: TerminalKind::Host,
+							cwd: request.folder.to_string(),
+							folder: Some(request.folder),
+							cols: 80,
+							rows: 24,
+							agent: Some(request.agent),
+						},
+					)
+					.await;
+				terminals
+					.record_output(&id, b"$ pnpm dev\r\nLocal: http://localhost:5173\r\n")
+					.await;
+				Ok(id)
+			}
+			async fn restart(&self, id: &str) -> Result<(), String> {
+				self.restarted.fetch_add(1, Ordering::SeqCst);
+				self.terminals.get().expect("wired").reset(id).await;
+				Ok(())
+			}
+			async fn close(&self, id: &str) -> Result<(), String> {
+				self.terminals.get().expect("wired").forget(id).await;
+				Ok(())
+			}
+		}
+
+		async fn with_spawner() -> (
+			Vec<Utf8PathBuf>,
+			Vec<TempDir>,
+			Arc<TerminalRegistry>,
+			ToolRegistry,
+			Arc<FakeSpawner>,
+		) {
+			let (paths, dirs, terminals, tools) = harness(1).await;
+			let spawner = Arc::new(FakeSpawner::default());
+			let _ = spawner.terminals.set(terminals.clone());
+			terminals.set_spawner(spawner.clone());
+			(paths, dirs, terminals, tools, spawner)
+		}
+
+		/// With a spawner, write modes see the whole set up front — a
+		/// terminal opened mid-turn must be readable in that turn.
+		#[tokio::test]
+		async fn agent_mode_gets_open_and_read_tools_without_any_terminal() {
+			let (_paths, _dirs, _terminals, tools, _spawner) = with_spawner().await;
+			let cx = cx_for(&tools, 0).await;
+			let names: Vec<String> = tools
+				.terminal_definitions(&cx)
+				.await
+				.into_iter()
+				.map(|def| def.function.name)
+				.collect();
+			assert_eq!(
+				names,
+				vec!["list_terminals", "read_terminal", "open_terminal", "terminal_tab"]
+			);
+			let folders = tools.workspaces.folders().await;
+			let research = ToolContext::new(folders[0].clone(), CoderMode::Research);
+			assert!(tools.terminal_definitions(&research).await.is_empty());
+		}
+
+		#[tokio::test]
+		async fn open_terminal_waits_and_reuses_the_same_command() {
+			let (_paths, _dirs, _terminals, tools, spawner) = with_spawner().await;
+			let cx = cx_for(&tools, 0).await;
+			let cancel = CancellationToken::new();
+			let args = serde_json::json!({ "command": "pnpm dev", "title": "web", "wait_for": "Local:" });
+			let out = tools.open_terminal(&args, &cx, &cancel).await.expect("opens");
+			assert_eq!(out["id"], "agent-0");
+			assert_eq!(out["matched"], true);
+			assert_eq!(out["reused"], false);
+			assert_eq!(out["title"], "web");
+			assert!(out["output"].as_str().unwrap().contains("localhost:5173"));
+
+			let again = tools
+				.open_terminal(&serde_json::json!({ "command": "pnpm dev" }), &cx, &cancel)
+				.await
+				.expect("reuses");
+			assert_eq!(again["id"], "agent-0");
+			assert_eq!(again["reused"], true);
+			assert_eq!(spawner.opened.load(Ordering::SeqCst), 1);
+		}
+
+		#[tokio::test]
+		async fn terminal_tab_only_controls_agent_terminals() {
+			let (paths, _dirs, terminals, tools, spawner) = with_spawner().await;
+			terminals.register("user", registration(&paths[0])).await;
+			let cx = cx_for(&tools, 0).await;
+			let cancel = CancellationToken::new();
+			let err = tools
+				.terminal_tab(&serde_json::json!({ "id": "user", "action": "close" }), &cx, &cancel)
+				.await
+				.expect_err("user terminals are off limits");
+			assert!(err.to_string().contains("user's own"), "{err}");
+
+			tools
+				.open_terminal(&serde_json::json!({ "command": "pnpm dev" }), &cx, &cancel)
+				.await
+				.expect("opens");
+			let out = tools
+				.terminal_tab(
+					&serde_json::json!({ "id": "agent-0", "action": "restart" }),
+					&cx,
+					&cancel,
+				)
+				.await
+				.expect("restarts");
+			assert_eq!(out["action"], "restart");
+			assert_eq!(spawner.restarted.load(Ordering::SeqCst), 1);
+			tools
+				.terminal_tab(&serde_json::json!({ "id": "agent-0", "action": "close" }), &cx, &cancel)
+				.await
+				.expect("closes");
+			assert!(terminals.info("agent-0").await.is_none());
+		}
+
+		#[tokio::test]
+		async fn wait_for_times_out_unmatched() {
+			let (paths, _dirs, terminals, tools) = harness(1).await;
+			terminals.register("t1", registration(&paths[0])).await;
+			let cx = cx_for(&tools, 0).await;
+			let out = tools
+				.read_terminal(
+					&serde_json::json!({ "id": "t1", "wait_for": "never", "timeout_ms": 300 }),
+					&cx,
+					&CancellationToken::new(),
+				)
+				.await
+				.expect("read succeeds");
+			assert_eq!(out["matched"], false);
 		}
 	}
 

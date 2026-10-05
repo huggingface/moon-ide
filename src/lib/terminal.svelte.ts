@@ -56,17 +56,24 @@ import { container } from './container.svelte';
 import { ipc } from './ipc';
 import {
 	formatError,
+	type AgentTerminal,
 	type ContainerStateChange,
 	type PersistedTerminal,
 	type TerminalCloseReason,
 	type TerminalClosed,
+	type TerminalAgentOpened,
 	type TerminalOpenRequest,
 	type TerminalOutput,
+	type TerminalRemoved,
+	type TerminalRespawned,
 	type TerminalTarget,
 } from './protocol';
 
 const OUTPUT_EVENT = 'terminal:output';
 const CLOSED_EVENT = 'terminal:closed';
+const AGENT_OPENED_EVENT = 'terminal:agent_opened';
+const RESPAWNED_EVENT = 'terminal:respawned';
+const REMOVED_EVENT = 'terminal:removed';
 const CONTAINER_STATE_EVENT = 'container:state';
 
 /** Per-tab session state surfaced reactively to the body. */
@@ -85,6 +92,9 @@ export type TerminalSession = {
 	/** Error returned by `terminal_open` itself. The tab still
 	 * mounts so the message is visible. */
 	openError: string | null;
+	/** Set for a terminal an agent opened (ADR 0090): its label
+	 * and launch command. Survives restart and relaunch. */
+	agent: AgentTerminal | null;
 };
 
 type OutputWriter = (bytes: Uint8Array) => void;
@@ -160,7 +170,16 @@ class TerminalStore {
 			const onContainerState = await listen<ContainerStateChange>(CONTAINER_STATE_EVENT, (event) => {
 				this.#reconcileContainerState(event.payload.status.state);
 			});
-			this.#unlisten.push(onOutput, onClosed, onContainerState);
+			const onAgentOpened = await listen<TerminalAgentOpened>(AGENT_OPENED_EVENT, (event) => {
+				this.#adoptAgentTerminal(event.payload);
+			});
+			const onRespawned = await listen<TerminalRespawned>(RESPAWNED_EVENT, (event) => {
+				this.#handleRespawned(event.payload.stream_id);
+			});
+			const onRemoved = await listen<TerminalRemoved>(REMOVED_EVENT, (event) => {
+				this.#forgetLocal(event.payload.stream_id);
+			});
+			this.#unlisten.push(onOutput, onClosed, onContainerState, onAgentOpened, onRespawned, onRemoved);
 		} catch {
 			// Event-bus bind failed. Without it terminals can
 			// only show their open error; better than a silent
@@ -205,6 +224,7 @@ class TerminalStore {
 				target: tab.target,
 				folder: session?.folder ?? null,
 				command: this.#commands.get(tab.id) ?? null,
+				agent: session?.agent ?? null,
 			});
 		}
 		return out;
@@ -272,7 +292,7 @@ class TerminalStore {
 				// rather than seed an error tab.
 				continue;
 			}
-			await this.open(entry.target, 80, 24, entry.folder, entry.command);
+			await this.open(entry.target, 80, 24, entry.folder, entry.command, entry.agent ?? null);
 		}
 		return true;
 	}
@@ -291,6 +311,9 @@ class TerminalStore {
 	 * `command` (restart / session replay) is prefilled at the
 	 * fresh shell's prompt by the backend (not executed) and
 	 * seeded into the tab's recorded history line.
+	 *
+	 * `agent` restores an agent-opened terminal (ADR 0090) — the
+	 * command is still only prefilled.
 	 */
 	async open(
 		target: TerminalTarget,
@@ -298,10 +321,11 @@ class TerminalStore {
 		rows: number,
 		folder: string | null,
 		command: string | null = null,
+		agent: AgentTerminal | null = null,
 	): Promise<string> {
 		bottomPanel.show();
 
-		const request: TerminalOpenRequest = { target, cols, rows, folder, command };
+		const request: TerminalOpenRequest = { target, cols, rows, folder, command, agent };
 		let streamId: string;
 		try {
 			streamId = await ipc.terminal.open(request);
@@ -316,11 +340,12 @@ class TerminalStore {
 				folder,
 				closedReason: null,
 				openError: formatError(err),
+				agent,
 			});
 			if (command !== null) {
 				this.#commands.set(streamId, command);
 			}
-			bottomPanel.addTab(this.#tabFor(streamId, target));
+			bottomPanel.addTab(this.#tabFor(streamId, target, agent));
 			this.#notify();
 			return streamId;
 		}
@@ -331,13 +356,51 @@ class TerminalStore {
 			folder,
 			closedReason: null,
 			openError: null,
+			agent,
 		});
 		if (command !== null) {
 			this.#commands.set(streamId, command);
 		}
-		bottomPanel.addTab(this.#tabFor(streamId, target));
+		bottomPanel.addTab(this.#tabFor(streamId, target, agent));
 		this.#notify();
 		return streamId;
+	}
+
+	/** Take in a terminal an agent opened (`terminal:agent_opened`,
+	 * ADR 0090). The PTY already runs; this only makes the tab.
+	 * The panel is revealed, but the new tab only comes to the
+	 * front when the user isn't working in the panel — focus
+	 * inside it means they're typing into another terminal, and
+	 * switching tabs under them would eat their keystrokes. */
+	#adoptAgentTerminal(payload: TerminalAgentOpened): void {
+		if (this.#sessions.has(payload.stream_id)) {
+			return;
+		}
+		const focused = document.activeElement;
+		const userInPanel =
+			bottomPanel.visible && focused !== null && focused.closest('[data-region="bottom-panel"]') !== null;
+		bottomPanel.show();
+		this.#sessions.set(payload.stream_id, {
+			streamId: payload.stream_id,
+			target: payload.target,
+			folder: payload.folder,
+			closedReason: null,
+			openError: null,
+			agent: payload.agent,
+		});
+		this.#commands.set(payload.stream_id, payload.agent.command);
+		bottomPanel.addTab(this.#tabFor(payload.stream_id, payload.target, payload.agent), !userInPanel);
+		this.#notify();
+	}
+
+	/** The backend swapped the shell under an existing id (agent
+	 * restart): a tab showing an exit banner goes live again. */
+	#handleRespawned(streamId: string): void {
+		const session = this.#sessions.get(streamId);
+		if (!session) {
+			return;
+		}
+		this.#sessions.set(streamId, { ...session, closedReason: null, openError: null });
 	}
 
 	async close(streamId: string): Promise<void> {
@@ -355,6 +418,12 @@ class TerminalStore {
 			// Backend close failed (window torn down). Local
 			// cleanup proceeds regardless.
 		}
+		this.#forgetLocal(streamId);
+	}
+
+	/** Drop every trace of `streamId` on this side, for a terminal
+	 * whose backend half is already gone. */
+	#forgetLocal(streamId: string): void {
 		this.#sessions.delete(streamId);
 		this.#writers.delete(streamId);
 		this.#pending.delete(streamId);
@@ -415,6 +484,7 @@ class TerminalStore {
 				rows: 24,
 				folder: session.folder,
 				command,
+				agent: session.agent,
 			});
 		} catch (err) {
 			this.#sessions.set(oldStreamId, { ...session, openError: formatError(err) });
@@ -429,6 +499,7 @@ class TerminalStore {
 			folder: session.folder,
 			closedReason: null,
 			openError: null,
+			agent: session.agent,
 		});
 		if (command !== null) {
 			this.#commands.delete(oldStreamId);
@@ -568,10 +639,10 @@ class TerminalStore {
 		}
 	}
 
-	#tabFor(streamId: string, target: TerminalTarget): TerminalTab {
+	#tabFor(streamId: string, target: TerminalTarget, agent: AgentTerminal | null): TerminalTab {
 		return {
 			id: streamId,
-			title: terminalCwdBasename(target),
+			title: agent?.title ?? terminalCwdBasename(target),
 			kind: 'terminal',
 			target,
 		};

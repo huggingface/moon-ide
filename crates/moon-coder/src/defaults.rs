@@ -272,7 +272,7 @@ For genuinely complex tasks — multi-step investigations, large refactors where
 
 ## Asking the user
 
-Don't use `ask_user` for things you could resolve by reading files, and don't use it as a "should I proceed?" confirmation — when you can reasonably infer the answer, just proceed. A brief lead-in message before the call is fine (the user reads it); don't dump a long analysis, and don't repeat the lead-in inside the question.
+Don't use `ask_user` for things you could resolve by reading files, and don't use it as a "should I proceed?" confirmation — when you can reasonably infer the answer, just proceed.
 
 Be concise. Do not narrate what each tool call is for; the UI already shows the call to the user.
 "#;

@@ -16,7 +16,7 @@ use crate::coder_models::CoderProviderLock;
 use crate::git::{CompareBaseline, PrListScope};
 use crate::ports::ForwardedPort;
 use crate::review::{ReviewComment, ReviewedFile};
-use crate::terminal::TerminalTarget;
+use crate::terminal::{AgentTerminal, TerminalTarget};
 use crate::workspace::FolderOrigin;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -247,4 +247,9 @@ pub struct PersistedTerminal {
 	/// the restored shell's prompt (not executed). `None` when
 	/// nothing was ever run.
 	pub command: Option<String>,
+	/// Set for a terminal an agent opened (ADR 0090), so the
+	/// restored tab keeps its title and badge and agents can still
+	/// restart it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub agent: Option<AgentTerminal>,
 }

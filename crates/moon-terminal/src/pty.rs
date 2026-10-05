@@ -97,23 +97,39 @@ impl Drop for PtySession {
 	}
 }
 
+/// A command typed into a freshly spawned shell — see [`spawn`].
+#[derive(Debug, Clone, Copy)]
+pub enum StartupCommand<'a> {
+	/// Typed at the prompt, not executed.
+	Prefill(&'a str),
+	/// Typed and executed.
+	Run(&'a str),
+}
+
 /// Allocate a PTY, spawn the target's command in it, and start
 /// the read / wait pump threads. Returns a `PtySession` whose
 /// `next_output` channel begins yielding bytes as soon as the
 /// child writes anything.
 ///
-/// `command` (when `Some`) is prefilled at the fresh shell's
-/// prompt as if the user had typed it — but NOT executed: no
-/// trailing newline is sent, so the user reviews the command and
-/// presses Enter themselves. Used for restart of an exited tab
-/// and session replay after an IDE relaunch. Delivery is a raw
+/// `startup` (when `Some`) is typed at the fresh shell's prompt as
+/// if the user had typed it. [`StartupCommand::Prefill`] leaves it
+/// there unexecuted — no trailing newline, so the user reviews the
+/// command and presses Enter themselves (restart of an exited tab,
+/// session replay after an IDE relaunch). [`StartupCommand::Run`]
+/// presses Enter for them (a terminal an agent opened to run a dev
+/// server — ADR 0090). Delivery is a raw
 /// write after a short delay (the shell needs a moment to
 /// initialise readline before keystrokes land correctly), wrapped
 /// in bracketed-paste markers so a multi-line command pastes
 /// literally instead of running at its first newline. Once the
 /// user runs it, the line lands in the shell's *own* history —
 /// something a `bash -c` spawn could never do.
-pub fn spawn(target: &TerminalTarget, cols: u16, rows: u16, command: Option<&str>) -> Result<PtySession, PtyError> {
+pub fn spawn(
+	target: &TerminalTarget,
+	cols: u16,
+	rows: u16,
+	startup: Option<StartupCommand<'_>>,
+) -> Result<PtySession, PtyError> {
 	let pty_system = native_pty_system();
 	let pair = pty_system
 		.openpty(PtySize {
@@ -153,15 +169,23 @@ pub fn spawn(target: &TerminalTarget, cols: u16, rows: u16, command: Option<&str
 	// Prefill a restart / restore command into the fresh shell.
 	// The write task needs its own handle on the master — the
 	// session's `writer` Arc moves into `PtySession` below.
-	if let Some(command) = command {
+	if let Some(startup) = startup {
 		// Bracketed paste: `\x1b[200~ … \x1b[201~` tells
 		// readline to insert the bytes literally, so a
 		// multi-line command doesn't execute at its first
-		// newline. No `\n` is appended — the command sits at
-		// the prompt until the user presses Enter.
+		// newline. A prefill stops there — the command sits at
+		// the prompt until the user presses Enter; a run sends
+		// the Enter itself, after the paste closes.
+		let (command, run) = match startup {
+			StartupCommand::Prefill(command) => (command, false),
+			StartupCommand::Run(command) => (command, true),
+		};
 		let mut bytes = b"\x1b[200~".to_vec();
 		bytes.extend_from_slice(command.as_bytes());
 		bytes.extend_from_slice(b"\x1b[201~");
+		if run {
+			bytes.push(b'\r');
+		}
 		let writer = writer.clone();
 		tokio::spawn(async move {
 			// Shell readline init isn't instant; writing too

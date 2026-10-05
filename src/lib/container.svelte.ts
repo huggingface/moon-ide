@@ -36,7 +36,9 @@ class ContainerPanelState {
 	/** Currently in-flight mutating command, if any. */
 	inFlight = $state<ContainerInFlight>(null);
 
-	/** Most recent error from a lifecycle command. Cleared on success. */
+	/** Most recent error. An action's error sticks until the next
+	 *  action starts; a refresh's error clears on the next good
+	 *  refresh. */
 	lastError = $state<string | null>(null);
 
 	/** Cached compose preview from `container_render_compose`. Lazily
@@ -52,6 +54,10 @@ class ContainerPanelState {
 	 *  this so they don't race the startup refresh and silently fall
 	 *  back to host. `null` between refreshes. */
 	#inFlightRefresh: Promise<void> | null = null;
+	/** Set while `lastError` came from a user action, so the
+	 *  post-failure (and focus-triggered) refresh doesn't wipe it
+	 *  before the user can read it. */
+	#actionFailed = false;
 
 	/** True iff the IDE has a workspace open AND status has been loaded
 	 * at least once. The status-bar pip is hidden until then to avoid
@@ -205,9 +211,13 @@ class ContainerPanelState {
 		const run = (async () => {
 			try {
 				this.status = await ipc.container.status();
-				this.lastError = null;
+				if (!this.#actionFailed) {
+					this.lastError = null;
+				}
 			} catch (err) {
-				this.lastError = formatError(err);
+				if (!this.#actionFailed) {
+					this.lastError = formatError(err);
+				}
 			} finally {
 				this.#inFlightRefresh = null;
 			}
@@ -282,11 +292,13 @@ class ContainerPanelState {
 		}
 		this.inFlight = label;
 		this.lastError = null;
+		this.#actionFailed = false;
 		try {
 			const next = await op();
 			this.status = next;
 		} catch (err) {
 			this.lastError = formatError(err);
+			this.#actionFailed = true;
 			// Still refresh — the command may have partially
 			// applied (e.g. `up -d --wait` failed at the wait step
 			// but containers exist), and the user wants to see

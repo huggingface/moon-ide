@@ -205,18 +205,24 @@ class BottomPanelStore {
 		}
 	}
 
-	/** Append `tab` to the strip and make it active. Caller is
-	 * responsible for picking a unique id (typically a stream
-	 * UUID for log tabs). Existing tabs with the same id are
-	 * left alone — use [`findLogTab`] before opening to avoid
-	 * duplicates. */
-	addTab(tab: BottomPanelTab): void {
+	/** Append `tab` to the strip and make it active (or, with
+	 * `activate: false`, leave the current tab in front — an
+	 * agent's terminal shouldn't yank the one the user is typing
+	 * in; an empty strip still gets it). Caller is responsible
+	 * for picking a unique id (typically a stream UUID for log
+	 * tabs). Existing tabs with the same id are left alone — use
+	 * [`findLogTab`] before opening to avoid duplicates. */
+	addTab(tab: BottomPanelTab, activate = true): void {
 		if (this.#tabs.some((t) => t.id === tab.id)) {
-			this.#activeId = tab.id;
+			if (activate) {
+				this.#activeId = tab.id;
+			}
 			return;
 		}
 		this.#tabs = [...this.#tabs, tab];
-		this.#activeId = tab.id;
+		if (activate || this.#activeId === null) {
+			this.#activeId = tab.id;
+		}
 	}
 
 	/** Find an existing log tab for `(folderPath, service)`, or

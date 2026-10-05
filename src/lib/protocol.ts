@@ -977,6 +977,9 @@ export type PersistedTerminal = {
 	/** Shell-history line prefilled at the restored shell's
 	 * prompt (not executed). `null` when nothing was run. */
 	command: string | null;
+	/** Set for a terminal an agent opened (ADR 0090). Omitted on
+	 * the wire for the user's own terminals. */
+	agent?: AgentTerminal | null;
 };
 
 /**
@@ -1187,6 +1190,39 @@ export type TerminalOpenRequest = {
 	 * `list_terminals` / `read_terminal` tools to one project
 	 * (ADR 0048). `null` when no folder is active. */
 	folder: string | null;
+	/** Set when (re)opening a terminal an agent opened, so the
+	 * respawned shell keeps its title, badge, and agent control
+	 * (ADR 0090). */
+	agent?: AgentTerminal | null;
+};
+
+/** What marks a terminal as agent-opened (ADR 0090). Mirrors
+ * `moon_protocol::terminal::AgentTerminal`. */
+export type AgentTerminal = {
+	title: string;
+	command: string;
+};
+
+/** `terminal:agent_opened` — an agent's `open_terminal` spawned a
+ * PTY the frontend adopts as a tab. Mirrors
+ * `moon_protocol::terminal::TerminalAgentOpened`. */
+export type TerminalAgentOpened = {
+	stream_id: string;
+	target: TerminalTarget;
+	folder: string | null;
+	agent: AgentTerminal;
+};
+
+/** `terminal:respawned` — the backend replaced the shell in place
+ * (agent restart). Mirrors `moon_protocol::terminal::TerminalRespawned`. */
+export type TerminalRespawned = {
+	stream_id: string;
+};
+
+/** `terminal:removed` — the backend closed the terminal (agent
+ * close). Mirrors `moon_protocol::terminal::TerminalRemoved`. */
+export type TerminalRemoved = {
+	stream_id: string;
 };
 
 /** One chunk of terminal output. Bytes are base64-encoded —

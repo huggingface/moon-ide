@@ -84,8 +84,15 @@ class ProjectComposeStateStore {
 	/** Per-folder in-flight tracker — at most one mutation per folder. */
 	#inFlight = new SvelteMap<string, ProjectComposeInFlight>();
 
-	/** Per-folder last-error string. Cleared on successful mutation. */
+	/** Per-folder last-error string. An action's error sticks until
+	 * the folder's next action; a refresh's error clears on the
+	 * next good refresh. */
 	#errors = new SvelteMap<string, string>();
+
+	/** Folders whose current error came from a user action, so the
+	 * post-failure refresh and the pollers don't wipe it before the
+	 * user can read it. */
+	#actionFailed = new Set<string>();
 
 	/** Per-folder popover open flag — folder bars share the panel
 	 * implementation but each tracks its own visibility. */
@@ -202,6 +209,7 @@ class ProjectComposeStateStore {
 		this.#snapshots.delete(folderPath);
 		this.#inFlight.delete(folderPath);
 		this.#errors.delete(folderPath);
+		this.#actionFailed.delete(folderPath);
 		this.#openPanel.delete(folderPath);
 		this.#stopPolling(folderPath);
 	}
@@ -234,9 +242,13 @@ class ProjectComposeStateStore {
 		try {
 			const snap = await ipc.projectCompose.status(folderPath);
 			this.#snapshots.set(folderPath, snap);
-			this.#errors.delete(folderPath);
+			if (!this.#actionFailed.has(folderPath)) {
+				this.#errors.delete(folderPath);
+			}
 		} catch (err) {
-			this.#errors.set(folderPath, formatError(err));
+			if (!this.#actionFailed.has(folderPath)) {
+				this.#errors.set(folderPath, formatError(err));
+			}
 		}
 	}
 
@@ -312,11 +324,13 @@ class ProjectComposeStateStore {
 		}
 		this.#inFlight.set(folderPath, label);
 		this.#errors.delete(folderPath);
+		this.#actionFailed.delete(folderPath);
 		try {
 			const next = await op();
 			this.#snapshots.set(folderPath, next);
 		} catch (err) {
 			this.#errors.set(folderPath, formatError(err));
+			this.#actionFailed.add(folderPath);
 			// Mirror the workspace shell store: even on failure,
 			// re-poll so partial-apply outcomes (e.g. some
 			// services up, others failed) reach the UI.
