@@ -61,6 +61,29 @@ use tokio::sync::Semaphore;
 /// avoids back-pressure stalls when the UI is slow to consume.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// A user-facing (top-level, non-worker) session's turn settled.
+/// Published on [`CoderHandle::subscribe_turn_settled`] for the
+/// Tauri layer's desktop notification (ADR 0089). Aborts are not
+/// published: the user pressed stop, they already know.
+#[derive(Debug, Clone)]
+pub struct TurnSettled {
+	pub session_id: String,
+	pub title: String,
+	pub outcome: TurnOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub enum TurnOutcome {
+	/// Last assistant text of the session (empty when the turn
+	/// ended on a tool call with no prose).
+	Complete {
+		last_assistant: String,
+	},
+	Error {
+		message: String,
+	},
+}
+
 /// Public, cheap-to-clone handle the Tauri layer holds on to. Wraps
 /// the inner shared state in `Arc`s so the same coder can be addressed
 /// from every command + the event-pump task.
@@ -96,6 +119,8 @@ struct CoderState {
 	/// not counted — they're fire-and-forget helpers the parent
 	/// collects later, not something the user is waiting on.
 	running_turns: watch::Sender<usize>,
+	/// See [`TurnSettled`].
+	turn_settled: broadcast::Sender<TurnSettled>,
 	/// Per-folder session + turn state. Lazy-created on the first
 	/// command that targets a given folder; survives across
 	/// folder switches so background turns aren't interrupted.
@@ -1217,6 +1242,7 @@ impl CoderHandle {
 		);
 		let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 		let (running_turns, _) = watch::channel(0usize);
+		let (turn_settled, _) = broadcast::channel(16);
 		let folder_summaries = Arc::new(FolderSummaryService::new(folder_summaries_dir));
 		let hub_sync = crate::hub_sync::HubSync::new(
 			auth.clone(),
@@ -1231,6 +1257,7 @@ impl CoderHandle {
 				tools,
 				events,
 				running_turns,
+				turn_settled,
 				sessions_by_folder: Arc::new(RwLock::new(HashMap::new())),
 				workspaces,
 				workspaces_dir,
@@ -4810,6 +4837,12 @@ impl CoderHandle {
 		self.state.running_turns.subscribe()
 	}
 
+	/// Subscribe to turn settlements of user-facing sessions; see
+	/// [`TurnSettled`].
+	pub fn subscribe_turn_settled(&self) -> broadcast::Receiver<TurnSettled> {
+		self.state.turn_settled.subscribe()
+	}
+
 	// ── Orchestrator-facing client surface (ADR 0030) ───────────
 	//
 	// By-id variants of the panel-driven methods. An orchestrator
@@ -6323,6 +6356,7 @@ fn spawn_turn_loop(
 					drop(turn);
 					cancel_outer = fresh;
 				};
+				publish_turn_settled(&state, &rt_for_turn, &result).await;
 				match &result {
 					Ok(()) => {
 						sink_for_turn.send(CoderEvent::TurnComplete);
@@ -6401,6 +6435,40 @@ fn spawn_turn_loop(
 			}),
 		),
 	));
+}
+
+async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &Result<(), CoderError>) {
+	// No subscriber (headless / tests): skip the transcript walk.
+	if state.turn_settled.receiver_count() == 0 {
+		return;
+	}
+	let session = rt.session.lock().await;
+	let header = &session.header;
+	if header.parent_session_id.is_some() || header.orchestrator_session_id.is_some() {
+		return;
+	}
+	let outcome = match result {
+		Ok(()) => TurnOutcome::Complete {
+			last_assistant: session
+				.messages
+				.iter()
+				.rev()
+				.find_map(|m| match m {
+					ChatMessage::Assistant { content: Some(t), .. } if !t.trim().is_empty() => Some(t.clone()),
+					_ => None,
+				})
+				.unwrap_or_default(),
+		},
+		Err(CoderError::Aborted) => return,
+		Err(err) => TurnOutcome::Error {
+			message: err.to_string(),
+		},
+	};
+	let _ = state.turn_settled.send(TurnSettled {
+		session_id: header.id.clone(),
+		title: header.title.clone(),
+		outcome,
+	});
 }
 
 /// How long a session's MCP server instances survive after its

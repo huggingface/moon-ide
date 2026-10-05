@@ -56,7 +56,8 @@ collects later, not something the user waits on.
   fighting the WM.
 - **Desktop notifications**: heavier interruption than the state
   being conveyed; a finished agent is a status, not an event that
-  deserves a popup. Revisitable if the team asks.
+  deserves a popup. Revisitable if the team asks. (The team asked:
+  superseded by [ADR 0089](0089-turn-finished-notification.md).)
 
 ## Consequences
 

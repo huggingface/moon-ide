@@ -20,7 +20,9 @@
 //! the "finished" state entirely — the user is watching the panel.
 //! When it settles unfocused we additionally raise the WM urgency
 //! hint (`request_user_attention`) so grouped taskbars that hide
-//! per-window icons still flash.
+//! per-window icons still flash. Each user-facing session's turn
+//! settling unfocused also posts a desktop notification with a
+//! sound (`turn_notification`, ADR 0089).
 //!
 //! Linux tray caveat: appindicator-style trays deliver no
 //! left-click events, only menu activation, so the menu carries
@@ -99,6 +101,17 @@ impl AgentIndicator {
 				for_task.on_running_count(count);
 			}
 		});
+		let mut settled_rx = coder.subscribe_turn_settled();
+		let for_task = Arc::clone(&indicator);
+		tauri::async_runtime::spawn(async move {
+			loop {
+				match settled_rx.recv().await {
+					Ok(event) => for_task.on_turn_settled(&event),
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+				}
+			}
+		});
 		// The tray icon is permanent: show it right away in its
 		// idle (plain badge) state.
 		indicator.render();
@@ -129,6 +142,15 @@ impl AgentIndicator {
 	pub fn set_color(&self, color: Option<String>) {
 		*self.color.lock().expect("agent indicator color poisoned") = color;
 		self.render();
+	}
+
+	/// A user-facing session's turn settled. Watching the panel
+	/// already tells a focused user; only interrupt when away.
+	fn on_turn_settled(&self, event: &moon_coder::TurnSettled) {
+		if self.focused.load(Ordering::Relaxed) {
+			return;
+		}
+		crate::turn_notification::notify(&self.app, &self.workspace_id, event);
 	}
 
 	fn on_running_count(&self, count: usize) {

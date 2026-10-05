@@ -25,6 +25,7 @@ mod shutdown;
 mod slack_poller;
 mod state;
 mod system_theme_watcher;
+mod turn_notification;
 mod window_icon;
 
 use std::sync::{Arc, Mutex};
