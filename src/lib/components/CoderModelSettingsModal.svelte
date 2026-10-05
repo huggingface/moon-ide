@@ -1936,7 +1936,7 @@
 		background: var(--m-accent);
 		border: 1px solid var(--m-accent);
 		border-radius: 4px;
-		color: var(--m-on-accent, #fff);
+		color: var(--m-bg);
 		font-size: 10px;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
@@ -2269,7 +2269,7 @@
 	.pick.picked {
 		background: var(--m-accent);
 		border-color: var(--m-accent);
-		color: var(--m-on-accent, #fff);
+		color: var(--m-bg);
 	}
 	.pick[disabled] {
 		opacity: 0.45;
@@ -2296,7 +2296,7 @@
 	.primary {
 		background: var(--m-accent);
 		border: 1px solid var(--m-accent);
-		color: var(--m-on-accent, #fff);
+		color: var(--m-bg);
 	}
 	.primary[disabled] {
 		opacity: 0.6;
@@ -2455,7 +2455,7 @@
 	.provider-tab.active {
 		background: var(--m-accent);
 		border-color: var(--m-accent);
-		color: var(--m-on-accent, #fff);
+		color: var(--m-bg);
 	}
 	.provider-tab.add {
 		border-style: dashed;
@@ -2491,7 +2491,7 @@
 		color: var(--m-fg-muted);
 	}
 	.provider-tab.active .provider-tab-flag {
-		color: var(--m-on-accent, #fff);
+		color: var(--m-bg);
 	}
 	.provider-edit {
 		background: transparent;

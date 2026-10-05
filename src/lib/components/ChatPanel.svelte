@@ -705,7 +705,7 @@
 		font: inherit;
 		background: var(--m-accent);
 		border: 1px solid var(--m-accent);
-		color: #fff;
+		color: var(--m-bg);
 		padding: 6px 14px;
 		border-radius: 4px;
 		cursor: pointer;

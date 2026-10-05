@@ -300,7 +300,7 @@
 	.actions .primary {
 		background: var(--m-accent);
 		border: 1px solid var(--m-accent);
-		color: #fff;
+		color: var(--m-bg);
 	}
 	.actions .primary:disabled,
 	.actions .ghost:disabled {

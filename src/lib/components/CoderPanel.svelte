@@ -4779,7 +4779,7 @@
 	.primary {
 		font: inherit;
 		background: var(--m-accent);
-		color: #fff;
+		color: var(--m-bg);
 		border: 0;
 		border-radius: 4px;
 		padding: 8px 14px;

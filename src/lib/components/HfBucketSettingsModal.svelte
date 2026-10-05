@@ -328,7 +328,7 @@
 	}
 	.primary {
 		background: var(--m-accent);
-		color: #fff;
+		color: var(--m-bg);
 	}
 	.primary:hover:not(:disabled) {
 		filter: brightness(1.1);
