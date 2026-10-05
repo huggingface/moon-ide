@@ -670,8 +670,18 @@ credentials. The token lands in plaintext in the generated
 per-workspace re-login; `gh auth logout` skips it. A non-zero
 `gh auth token` simply omits the line.
 
+`gh` is looked up on `$PATH`, then at
+`/home/linuxbrew/.linuxbrew/bin/gh`, `~/.linuxbrew/bin/gh`,
+`/opt/homebrew/bin/gh`, `/usr/local/bin/gh` — a GUI-launched IDE
+inherits the desktop session's `PATH`, which often lacks brew's bin
+dir. When the config dir is mounted but no token comes back (no
+`gh` found, non-zero exit, empty output) moon-ide logs a warning:
+on keyring-backed hosts the in-container `gh` will otherwise just
+report "The token in default is invalid" with no clue why.
+
 The IDE's own `gh pr list` / `checkout` (branch-switcher palette)
-runs against the host's `gh`; the forward exists so a container
+and review publishing (`gh pr view` / `gh api`) run against the
+host's `gh`, located the same way; the forward exists so a container
 terminal feels the same.
 
 ## `fj` (Forgejo) credential forwarding

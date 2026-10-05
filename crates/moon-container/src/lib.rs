@@ -38,7 +38,9 @@ pub use discovery::{
 	discover_compose_files, discover_compose_files_for_folders, discover_root_compose, ComposeDiscovery,
 	DiscoveredCompose,
 };
-pub use lifecycle::{LifecycleError, Workspace, WorkspaceConfig, BOUND_FOLDERS_FILE, COMPOSE_FILE, DEFAULT_DEV_IMAGE};
+pub use lifecycle::{
+	resolve_host_gh, LifecycleError, Workspace, WorkspaceConfig, BOUND_FOLDERS_FILE, COMPOSE_FILE, DEFAULT_DEV_IMAGE,
+};
 pub use network::{
 	connect_container_to_network, dev_container_name, disconnect_container_from_network, project_default_network,
 };

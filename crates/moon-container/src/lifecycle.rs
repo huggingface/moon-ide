@@ -300,7 +300,7 @@ impl Workspace {
 		let ssh_known_hosts = detect_host_ssh_known_hosts();
 		let identity = detect_host_git_identity();
 		let gh_config = detect_host_gh_config();
-		let gh_token = detect_host_gh_token();
+		let gh_token = detect_host_gh_token(gh_config.as_ref());
 		let fj_data = detect_host_fj_data_dir();
 		// The IDE's per-workspace focus socket lives in the
 		// `run/` subdir of `state_dir`. moon-ide creates that
@@ -937,12 +937,16 @@ pub(crate) fn detect_host_gh_config() -> Option<GhConfigMount> {
 ///
 /// Returns `None` when:
 ///
-/// - The `gh` binary isn't on the host's `$PATH`. The user may
-///   not have installed it, or may have logged in via a custom
-///   mechanism. Either way, no token, no env var.
+/// - The `gh` binary can't be found (see [`resolve_host_gh`]).
 /// - `gh auth token` exits non-zero (the typical signal for
 ///   "you're not logged in").
 /// - Stdout is empty or non-UTF-8.
+///
+/// When `gh_config` is `Some` (the config dir is about to be
+/// mounted) each of those is logged at warn level: the mount
+/// without a token leaves keyring-backed hosts with an
+/// in-container `gh` that reports "The token in default is
+/// invalid", and the log is the only breadcrumb pointing back here.
 ///
 /// Re-evaluated every time we render or write `compose.yaml`, so
 /// a host-side `gh auth refresh` or `gh auth login` is picked up
@@ -950,20 +954,88 @@ pub(crate) fn detect_host_gh_config() -> Option<GhConfigMount> {
 /// plaintext in the generated `compose.yaml` under the
 /// per-workspace state dir — that's a deliberate trade-off (see
 /// [`HostGhToken`] for the rationale).
-pub(crate) fn detect_host_gh_token() -> Option<HostGhToken> {
-	let output = std::process::Command::new("gh").args(["auth", "token"]).output().ok()?;
+pub(crate) fn detect_host_gh_token(gh_config: Option<&GhConfigMount>) -> Option<HostGhToken> {
+	let mounted = gh_config.is_some();
+	let Some(gh) = resolve_host_gh() else {
+		if mounted {
+			tracing::warn!(
+				"gh config dir found but no gh binary on PATH or in well-known locations; \
+				 in-container gh will be unauthenticated if the host uses the system keyring",
+			);
+		}
+		return None;
+	};
+	let output = match std::process::Command::new(&gh).args(["auth", "token"]).output() {
+		Ok(output) => output,
+		Err(e) => {
+			if mounted {
+				tracing::warn!(gh = %gh.display(), error = %e, "failed to run gh auth token; skipping GH_TOKEN forward");
+			}
+			return None;
+		}
+	};
 	if !output.status.success() {
-		tracing::debug!(
-			status = ?output.status,
-			"gh auth token returned non-zero; skipping GH_TOKEN forward",
-		);
+		if mounted {
+			tracing::warn!(
+				gh = %gh.display(),
+				status = ?output.status,
+				stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+				"gh auth token returned non-zero; skipping GH_TOKEN forward",
+			);
+		}
 		return None;
 	}
-	let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+	let value = String::from_utf8(output.stdout)
+		.ok()
+		.map(|s| s.trim().to_owned())
+		.unwrap_or_default();
 	if value.is_empty() {
+		if mounted {
+			tracing::warn!(gh = %gh.display(), "gh auth token printed no token; skipping GH_TOKEN forward");
+		}
 		return None;
 	}
 	Some(HostGhToken { token: value })
+}
+
+/// Locate the host's `gh`: `$PATH` first, then the usual
+/// Homebrew / Linuxbrew prefixes. GUI-launched IDEs inherit the
+/// desktop session's stripped-down `PATH`, which often lacks
+/// brew's bin dir (typically only added by `~/.bashrc`).
+///
+/// Shared with moon-core's host-side `gh` calls (PR list, review
+/// publish, branch switch) so both fail or succeed together.
+pub fn resolve_host_gh() -> Option<std::path::PathBuf> {
+	if let Ok(path) = which::which("gh") {
+		return Some(path);
+	}
+	let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+	first_executable(gh_fallback_candidates(home.as_deref().map(std::path::Path::new)))
+}
+
+fn gh_fallback_candidates(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+	let mut candidates = vec![std::path::PathBuf::from("/home/linuxbrew/.linuxbrew/bin/gh")];
+	if let Some(home) = home {
+		candidates.push(home.join(".linuxbrew/bin/gh"));
+	}
+	candidates.push("/opt/homebrew/bin/gh".into());
+	candidates.push("/usr/local/bin/gh".into());
+	candidates
+}
+
+fn first_executable(candidates: impl IntoIterator<Item = std::path::PathBuf>) -> Option<std::path::PathBuf> {
+	candidates.into_iter().find(|p| is_executable_file(p))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+	use std::os::unix::fs::PermissionsExt;
+	std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+	path.is_file()
 }
 
 /// Resolve the host's `fj` (forgejo-cli) data directory so its
@@ -1703,5 +1775,41 @@ mod tests {
 
 		ws.teardown().await.expect("teardown");
 		assert_eq!(ws.status().await.unwrap().state, ContainerState::Absent);
+	}
+
+	#[test]
+	fn gh_fallback_candidates_include_user_linuxbrew_when_home_known() {
+		let home = std::path::Path::new("/home/someone");
+		let with_home = gh_fallback_candidates(Some(home));
+		assert_eq!(
+			with_home,
+			vec![
+				std::path::PathBuf::from("/home/linuxbrew/.linuxbrew/bin/gh"),
+				home.join(".linuxbrew/bin/gh"),
+				std::path::PathBuf::from("/opt/homebrew/bin/gh"),
+				std::path::PathBuf::from("/usr/local/bin/gh"),
+			],
+		);
+		assert_eq!(gh_fallback_candidates(None).len(), 3);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn first_executable_skips_missing_dirs_and_non_executables() {
+		use std::os::unix::fs::PermissionsExt;
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let missing = tmp.path().join("missing/gh");
+		let dir = tmp.path().join("dir");
+		std::fs::create_dir(&dir).unwrap();
+		let not_exec = tmp.path().join("not-exec");
+		std::fs::write(&not_exec, "").unwrap();
+		std::fs::set_permissions(&not_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+		let exec = tmp.path().join("exec");
+		std::fs::write(&exec, "").unwrap();
+		std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+		let found = first_executable([missing.clone(), dir.clone(), not_exec.clone(), exec.clone()]);
+		assert_eq!(found, Some(exec));
+		assert_eq!(first_executable([missing, dir, not_exec]), None);
 	}
 }

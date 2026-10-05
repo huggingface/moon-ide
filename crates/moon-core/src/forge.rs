@@ -502,8 +502,8 @@ fn parse_forgejo_pr_list(value: &serde_json::Value) -> Vec<ForgejoPr> {
 			is_draft: item.get("draft").and_then(|d| d.as_bool()).unwrap_or(false),
 			updated_at: item.get("updated_at").and_then(|u| u.as_str()).unwrap_or("").to_owned(),
 			html_url: item.get("html_url").and_then(|u| u.as_str()).unwrap_or("").to_owned(),
-			assignees: item.get("assignees").map(&logins).unwrap_or_default(),
-			requested_reviewers: item.get("requested_reviewers").map(&logins).unwrap_or_default(),
+			assignees: item.get("assignees").map(logins).unwrap_or_default(),
+			requested_reviewers: item.get("requested_reviewers").map(logins).unwrap_or_default(),
 		});
 	}
 	rows

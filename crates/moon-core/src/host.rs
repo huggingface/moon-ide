@@ -4730,12 +4730,19 @@ fn resolve_anchor_in(lines: &[&str], start_line: u32, end_line: u32, fingerprint
 /// list — a GitHub review POST is a single API call.
 const GH_PUBLISH_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
+/// Host `gh` path, found the same way as the container `GH_TOKEN`
+/// forward. Bare `gh` when unresolved keeps the spawn's NotFound
+/// error (and each call site's handling of it) unchanged.
+fn host_gh() -> std::path::PathBuf {
+	moon_container::resolve_host_gh().unwrap_or_else(|| "gh".into())
+}
+
 /// Resolve the open PR for the current branch via
 /// `gh pr view --json number,headRefOid,headRefName`. Returns
 /// `Ok(None)` when there's no PR (gh exits non-zero / empty), which
 /// the caller surfaces as [`PublishReviewResult::NoPr`].
 async fn gh_pr_head(root: &Utf8Path) -> MoonResult<Option<(u64, String)>> {
-	let mut cmd = tokio::process::Command::new("gh");
+	let mut cmd = tokio::process::Command::new(host_gh());
 	cmd
 		.current_dir(root.as_std_path())
 		.args(["pr", "view", "--json", "number,headRefOid,state"])
@@ -4944,7 +4951,7 @@ async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -
 async fn gh_api_post_review(root: &Utf8Path, endpoint: &str, body_json: &str) -> MoonResult<String> {
 	use tokio::io::AsyncWriteExt;
 
-	let mut cmd = tokio::process::Command::new("gh");
+	let mut cmd = tokio::process::Command::new(host_gh());
 	cmd
 		.current_dir(root.as_std_path())
 		.args([
@@ -5294,7 +5301,7 @@ async fn run_gh_pr_list_query(
 	root: &Utf8Path,
 	search: Option<&str>,
 ) -> (Vec<(BranchListEntry, Option<i64>)>, PrListStatus) {
-	let mut cmd = tokio::process::Command::new("gh");
+	let mut cmd = tokio::process::Command::new(host_gh());
 	cmd.current_dir(root.as_std_path()).args([
 		"pr",
 		"list",
@@ -5462,7 +5469,7 @@ async fn run_git_existing_pr_url(root: &Utf8Path) -> Option<String> {
 			.filter(|url| !url.is_empty());
 	}
 
-	let mut cmd = tokio::process::Command::new("gh");
+	let mut cmd = tokio::process::Command::new(host_gh());
 	cmd
 		.current_dir(root.as_std_path())
 		.args([
@@ -5655,7 +5662,11 @@ fn run_branch_switch(root: &Utf8Path, target: &BranchSwitchTarget) -> MoonResult
 			_ => "gh",
 		},
 	};
-	let mut cmd = Command::new(pr_cli);
+	let mut cmd = if pr_cli == "gh" {
+		Command::new(host_gh())
+	} else {
+		Command::new(pr_cli)
+	};
 	let label = match target {
 		BranchSwitchTarget::Local { name } => {
 			let trimmed = name.trim();
