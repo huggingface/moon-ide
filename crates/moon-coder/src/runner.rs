@@ -6309,9 +6309,9 @@ fn spawn_turn_loop(
 						background.set_event_sink(Arc::new(move |event| sink.send(event)));
 					}
 					// Capture the baseline SHA at turn start for per-turn
-					// diff attribution (ADR 0030). `git stash create`
-					// snapshots the working tree without touching it; HEAD
-					// is the fallback when the tree is clean. Best-effort —
+					// diff attribution (ADR 0030) — a snapshot of the
+					// working tree that takes no git lock (ADR 0092), with
+					// HEAD as the fallback. Best-effort —
 					// `None` means no git repo / git unavailable, in which
 					// case we skip the diff computation at turn end.
 					let baseline_sha = capture_baseline(&state, &folder_for_turn).await;

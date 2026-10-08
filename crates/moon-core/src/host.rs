@@ -714,19 +714,18 @@ pub trait WorkspaceHost: Send + Sync {
 	async fn git_fetch(&self) -> MoonResult<()>;
 
 	/// Capture a baseline commit SHA for per-turn diff attribution
-	/// (ADR 0030). Runs `git stash create` — which returns a
-	/// dangling commit object capturing the current working-tree +
-	/// index state **without touching the working tree, index, or
-	/// HEAD** — and falls back to `git rev-parse HEAD` when the tree
-	/// is clean (stash create returns empty). The returned SHA is
-	/// the comparison point for `git_diff_against` at turn end, so
-	/// the diff shows only what changed *during this turn*,
-	/// regardless of pre-existing uncommitted changes, mid-turn
-	/// commits by the agent or the user, or concurrent sessions.
+	/// (ADR 0030): a tree object of the tracked files' current
+	/// working-tree content, built in a throwaway copy of the index so
+	/// it never takes `.git/index.lock` (ADR 0092); `HEAD` when that
+	/// fails. The returned SHA is the comparison point for
+	/// `git_diff_against` at turn end, so the diff shows only what
+	/// changed *during this turn*, regardless of pre-existing
+	/// uncommitted changes, mid-turn commits by the agent or the user,
+	/// or concurrent sessions.
 	///
-	/// Read-only from git's perspective (creates an object, modifies
-	/// nothing), so concurrent turns can each snapshot independently.
-	/// Returns `Ok(None)` when not a repo or git is unavailable.
+	/// Only writes objects, so concurrent turns can each snapshot
+	/// independently. Returns `Ok(None)` when not a repo or git is
+	/// unavailable.
 	async fn git_snapshot_baseline(&self) -> MoonResult<Option<String>>;
 
 	/// Web base URL of the folder's `origin`/`upstream` remote
@@ -816,7 +815,16 @@ pub struct LocalHost {
 	/// mid-write. Holding this mutex around every git subprocess
 	/// closes the window. FIFO so background ops can't starve the
 	/// user. See [ADR 0015](../../specs/decisions/0015-git-serialisation.md).
+	///
+	/// Network operations that never touch the index or working tree
+	/// (fetch, push, `gh` lookups) stay off it — a 30 s fetch used to
+	/// stall every status refresh and agent turn queued behind it —
+	/// and serialise on `remote_mutex` instead (ADR 0092).
 	git_mutex: Arc<tokio::sync::Mutex<()>>,
+	/// One remote operation (fetch / push / publish) at a time, so
+	/// overlapping auto-fetches don't fight over `FETCH_HEAD` and ref
+	/// locks. Independent of `git_mutex`.
+	remote_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LocalHost {
@@ -828,6 +836,7 @@ impl LocalHost {
 			shell_resolver: None,
 			log_sink: None,
 			git_mutex: Arc::new(tokio::sync::Mutex::new(())),
+			remote_mutex: Arc::new(tokio::sync::Mutex::new(())),
 		}
 	}
 
@@ -2207,7 +2216,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_push(&self) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.remote_mutex.clone().lock_owned().await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2218,7 +2227,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_publish_branch(&self) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.remote_mutex.clone().lock_owned().await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2323,30 +2332,23 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_fetch(&self) -> MoonResult<()> {
-		// `run_git_fetch_quiet` is async (uses tokio's
-		// `Command` for the timeout), so the guard just needs to
-		// outlive the await.
-		let _guard = self.git_lock().await;
+		// Remote refs + `FETCH_HEAD` only — no index, no working
+		// tree — so not under `git_mutex` (ADR 0092).
+		let _guard = self.remote_mutex.lock().await;
 		run_git_fetch_quiet(&self.root).await
 	}
 
 	async fn branch_list(&self, pr_scope: PrListScope) -> MoonResult<BranchList> {
-		// `run_branch_list` shells out to `git for-each-ref` and
-		// `gh pr list`; both can compete with concurrent index
-		// writes. `gh` is the slow bit (network), so the worst
-		// case is a commit waiting a few seconds for an in-flight
-		// PR list — acceptable.
-		let _guard = self.git_lock().await;
+		// `git for-each-ref` + `gh pr list`: read-only, and `gh` is a
+		// network call, so no git lock — holding it made every commit,
+		// status refresh, and agent turn wait on GitHub (ADR 0092).
 		run_branch_list(&self.root, pr_scope).await
 	}
 
 	async fn git_existing_pr_url(&self) -> MoonResult<Option<String>> {
-		// Same git lock as `branch_list` — gh's `pr list` resolves
-		// the active repo via the .git directory and we don't want
-		// to race a concurrent commit / switch. Best-effort: every
-		// failure collapses to `Ok(None)` so the SCM panel just
-		// falls back to its create-PR URL.
-		let _guard = self.git_lock().await;
+		// A `gh` network lookup; no git lock, same as `branch_list`.
+		// Best-effort: every failure collapses to `Ok(None)` so the
+		// SCM panel just falls back to its create-PR URL.
 		Ok(run_git_existing_pr_url(&self.root).await)
 	}
 
@@ -2408,14 +2410,14 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_snapshot_baseline(&self) -> MoonResult<Option<String>> {
-		let guard = self.git_lock().await;
+		// Snapshots through a private copy of the index, so it never
+		// touches `.git/index` / `index.lock` and needs no git lock —
+		// it runs at every agent turn start and used to queue behind
+		// whatever held the lock (ADR 0092).
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			run_git_snapshot_baseline(&root)
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_snapshot_baseline join error: {e}")))
+		tokio::task::spawn_blocking(move || run_git_snapshot_baseline(&root))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_snapshot_baseline join error: {e}")))
 	}
 
 	async fn git_remote_web_url(&self) -> MoonResult<Option<String>> {
@@ -2445,36 +2447,37 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_base_check(&self) -> MoonResult<Option<GitBaseCheck>> {
-		// The fetch is async (tokio `Command` + timeout), so take the
-		// lock across the whole probe: no concurrent commit can slide
-		// HEAD between the behind-count and the numstat, keeping the
-		// snapshot internally consistent.
-		let guard = self.git_lock().await;
 		let root = self.root.clone();
 		// Best-effort currency of origin/main. A failed fetch (offline,
 		// no remote, auth) downgrades to the local ref rather than
 		// failing the check — the drift signal is still useful, just
-		// measured against a possibly-stale ref.
-		let _ = run_git_fetch_quiet(&root).await;
-		let _guard = guard;
-		tokio::task::spawn_blocking(move || Ok(run_git_base_check(&root)))
-			.await
-			.map_err(|e| MoonError::Internal(format!("git_base_check join error: {e}")))?
+		// measured against a possibly-stale ref. Outside `git_mutex`
+		// (ADR 0092): a network call must not hold up local git work.
+		{
+			let _remote = self.remote_mutex.lock().await;
+			let _ = run_git_fetch_quiet(&root).await;
+		}
+		// The probe itself runs under the lock so no concurrent commit
+		// slides HEAD between the behind-count and the numstat.
+		let guard = self.git_lock().await;
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			Ok(run_git_base_check(&root))
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_base_check join error: {e}")))?
 	}
 
 	async fn git_clone(&self, url: &str, dest: &Utf8Path) -> MoonResult<()> {
 		// Clone runs on the host — the destination isn't bound yet,
 		// so there's no container path to translate to. Same
-		// rationale as worktree ops (ADR 0028).
-		let guard = self.git_lock().await;
+		// rationale as worktree ops (ADR 0028). It writes a different
+		// repo, so this folder's git lock isn't involved.
 		let url = url.to_owned();
 		let dest = dest.to_owned();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			run_git_clone(&url, &dest)
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_clone join error: {e}")))?
+		tokio::task::spawn_blocking(move || run_git_clone(&url, &dest))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_clone join error: {e}")))?
 	}
 
 	async fn git_init(&self, path: &Utf8Path) -> MoonResult<()> {
@@ -2813,6 +2816,7 @@ fn run_git_base_numstat(root: &Utf8Path, remote_ref: &str) -> Vec<GitBaseCheckFi
 	let out = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
 		.args(["diff", "--numstat", &format!("{remote_ref}...HEAD")])
 		.output()
 		.ok()
@@ -2931,6 +2935,14 @@ fn encode_branch_segment(branch: &str) -> String {
 /// (path translation fails) we fall back to host execution rather
 /// than spawning git against a path the in-container process
 /// can't see.
+/// Global git flag for read-only commands. `status` and `diff`
+/// otherwise opportunistically rewrite the index to refresh its stat
+/// cache, taking `.git/index.lock` — and the IDE runs them often
+/// enough that agents' and hooks' own git writes (`git add`,
+/// `git commit`, lint-staged's stash dance) fail with "index.lock
+/// exists". Goes before the subcommand.
+const NO_OPTIONAL_LOCKS: &str = "--no-optional-locks";
+
 fn git_command(target: &ShellTarget, root: &Utf8Path) -> std::process::Command {
 	use std::process::Command;
 
@@ -3477,6 +3489,7 @@ fn run_git_worktree_add_moving(
 		// worktree is a fresh checkout at the branch tip), so block on
 		// both rather than silently lose work.
 		let status = git_command(target, root)
+			.arg(NO_OPTIONAL_LOCKS)
 			.args(["status", "--porcelain"])
 			.output()
 			.map_err(|e| MoonError::IoError(format!("git status failed to launch: {e}")))?;
@@ -3715,6 +3728,7 @@ fn run_git_diff_summary_tracked(root: &Utf8Path) -> String {
 	let output = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
 		.args(["diff", "HEAD", "--stat=200,80", "-M", "-C", "--no-color"])
 		.output();
 	let Ok(output) = output else {
@@ -4313,6 +4327,7 @@ fn run_git_commit_diff(root: &Utf8Path, sha: &str) -> Option<CommitDiff> {
 	let diff = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
 		.args(["diff", "--name-status", "-z", "--no-renames", &diff_arg])
 		.output()
 		.ok()?;
@@ -4369,6 +4384,7 @@ fn run_git_diff_head(root: &Utf8Path) -> String {
 	let output = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
 		.args(["diff", "HEAD", "--no-color"])
 		.output();
 	let Ok(output) = output else {
@@ -4494,47 +4510,50 @@ fn cap_patch_at_newline(combined: String, cap: usize) -> String {
 	out
 }
 
-/// `git stash create` + `git rev-parse HEAD` fallback. Returns a
-/// baseline commit SHA for per-turn diff attribution (ADR 0030):
-/// - Dirty working tree → `git stash create` returns a dangling
-///   commit object capturing the current state (without touching the
-///   working tree, index, or HEAD). That SHA is the baseline.
-/// - Clean working tree → `git stash create` returns empty; fall
-///   back to HEAD.
-/// - Not a repo / no commits / git unavailable → `None`.
-///
-/// Read-only from git's perspective (creates an object, modifies
-/// nothing), so concurrent turns can each snapshot independently.
+/// Baseline tree for per-turn diff attribution (ADR 0030): the
+/// tracked files' current working-tree content, written as a tree
+/// object. Same snapshot `git stash create` takes, but built in a
+/// throwaway copy of the index (`GIT_INDEX_FILE`), so it never takes
+/// `.git/index.lock` and can run concurrently with anything else
+/// (ADR 0092). Falls back to `HEAD` when the index can't be copied
+/// or the snapshot fails; `None` when not a repo / no commits / git
+/// unavailable. Only writes objects.
 fn run_git_snapshot_baseline(root: &Utf8Path) -> Option<String> {
 	use std::process::Command;
-	// `git stash create` — returns a commit SHA on stdout when there
-	// are uncommitted changes, empty stdout when the tree is clean.
-	// Never modifies the working tree, index, or HEAD.
-	let stash = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
-		.args(["stash", "create"])
-		.output()
-		.ok()
-		.filter(|o| o.status.success())
-		.and_then(|o| String::from_utf8(o.stdout).ok())
-		.map(|s| s.trim().to_owned());
-	if let Some(sha) = stash {
-		if !sha.is_empty() {
-			return Some(sha);
+	use std::sync::atomic::{AtomicU64, Ordering};
+
+	static NEXT: AtomicU64 = AtomicU64::new(0);
+
+	let git_stdout = |args: &[&str], index: Option<&std::path::Path>| -> Option<String> {
+		let mut cmd = Command::new("git");
+		cmd.arg("-C").arg(root.as_std_path()).args(args);
+		if let Some(index) = index {
+			cmd.env("GIT_INDEX_FILE", index);
 		}
-	}
-	// Clean tree or `stash create` failed — fall back to HEAD.
-	let head = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
-		.args(["rev-parse", "HEAD"])
-		.output()
+		let output = cmd.output().ok().filter(|o| o.status.success())?;
+		let text = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+		Some(text)
+	};
+	let head = git_stdout(&["rev-parse", "HEAD"], None).filter(|s| !s.is_empty());
+	let Some(index_rel) = git_stdout(&["rev-parse", "--git-path", "index"], None) else {
+		return head;
+	};
+	let index_path = root.as_std_path().join(index_rel);
+	let scratch = std::env::temp_dir().join(format!(
+		"moon-baseline-{}-{}.index",
+		std::process::id(),
+		NEXT.fetch_add(1, Ordering::Relaxed)
+	));
+	// Copying keeps the stat cache, so `add -u` only hashes files
+	// that actually changed. Git replaces the index by rename, so the
+	// copy sees one consistent version.
+	let tree = std::fs::copy(&index_path, &scratch)
 		.ok()
-		.filter(|o| o.status.success())
-		.and_then(|o| String::from_utf8(o.stdout).ok())
-		.map(|s| s.trim().to_owned());
-	head.filter(|s| !s.is_empty())
+		.and_then(|_| git_stdout(&["add", "-u"], Some(&scratch)))
+		.and_then(|_| git_stdout(&["write-tree"], Some(&scratch)))
+		.filter(|s| !s.is_empty());
+	let _ = std::fs::remove_file(&scratch);
+	tree.or(head)
 }
 
 /// `git diff <commit_sha> --no-color -- <files…>`, byte-capped at
@@ -4547,7 +4566,7 @@ fn run_git_diff_against(root: &Utf8Path, commit_sha: &str, files: &[String]) -> 
 		return String::new();
 	}
 	let mut cmd = Command::new("git");
-	cmd.arg("-C").arg(root.as_std_path());
+	cmd.arg("-C").arg(root.as_std_path()).arg(NO_OPTIONAL_LOCKS);
 	cmd.args(["diff", commit_sha, "--no-color", "--"]);
 	for f in files {
 		cmd.arg(f);
@@ -6018,6 +6037,7 @@ fn run_git_default_branch_diff(root: &Utf8Path) -> Option<BranchDiffStatus> {
 	let diff = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
 		.args(["diff", "--name-status", "-z", "--no-renames", &merge_base])
 		.output()
 		.ok()?;
@@ -6516,6 +6536,7 @@ fn collapsed_ignored_dirs(root: &Utf8Path) -> std::collections::BTreeSet<String>
 	let Ok(output) = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
 		.args(["status", "--porcelain=v1", "-z", "--ignored=matching"])
 		.output()
 	else {
@@ -6627,6 +6648,7 @@ fn classify_git_status(target: &ShellTarget, root: &Utf8Path, paths: &[String]) 
 /// and triggers the walker fallback. Stderr is swallowed on purpose.
 fn classify_via_git_status(target: &ShellTarget, root: &Utf8Path) -> Option<Vec<GitStatusEntry>> {
 	let output = git_command(target, root)
+		.arg(NO_OPTIONAL_LOCKS)
 		.args([
 			"status",
 			"--porcelain=v1",
@@ -11051,5 +11073,43 @@ mod tests {
 		let mtime_after = std::fs::metadata(dir.path().join("a.txt")).unwrap().modified().unwrap();
 		assert_eq!(mtime_before, mtime_after, "no-op format_file should not have written");
 		assert_eq!(result.bytes_written, 6);
+	}
+
+	/// The turn baseline (ADR 0092) captures uncommitted work and
+	/// leaves the real index untouched, so the turn diff shows only
+	/// what changed after it — without ever taking `index.lock`.
+	#[tokio::test]
+	async fn snapshot_baseline_captures_dirty_tree_without_touching_the_index() {
+		let Some(git) = crate::test_util::which_git() else {
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		crate::test_util::init_committed_repo(&git, dir.path());
+		let h = host(&dir);
+		std::fs::write(dir.path().join("README.md"), "before the turn\n").unwrap();
+		let index = dir.path().join(".git/index");
+		let index_before = std::fs::read(&index).unwrap();
+
+		let baseline = h.git_snapshot_baseline().await.unwrap().expect("a baseline");
+		assert_eq!(std::fs::read(&index).unwrap(), index_before, "real index unchanged");
+
+		std::fs::write(dir.path().join("README.md"), "during the turn\n").unwrap();
+		let diff = h.git_diff_against(&baseline, &["README.md".to_owned()]).await.unwrap();
+		assert!(diff.contains("-before the turn"), "{diff}");
+		assert!(diff.contains("+during the turn"), "{diff}");
+		assert!(!diff.contains("-hi"), "pre-turn edits are in the baseline: {diff}");
+	}
+
+	#[tokio::test]
+	async fn snapshot_baseline_of_a_clean_tree_matches_head() {
+		let Some(git) = crate::test_util::which_git() else {
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		crate::test_util::init_committed_repo(&git, dir.path());
+		let h = host(&dir);
+		let baseline = h.git_snapshot_baseline().await.unwrap().expect("a baseline");
+		let diff = h.git_diff_against(&baseline, &["README.md".to_owned()]).await.unwrap();
+		assert!(diff.is_empty(), "{diff}");
 	}
 }

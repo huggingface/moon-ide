@@ -1,7 +1,7 @@
 # ADR 0015 — Per-folder git serialisation + commit safety snapshot
 
 Date: 2026-05-16
-Status: accepted
+Status: accepted; lock scope narrowed by [ADR 0092](0092-git-lock-scope.md) (network calls, read refreshes, turn baselines)
 
 ## Context
 
