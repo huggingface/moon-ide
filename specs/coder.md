@@ -2185,7 +2185,10 @@ valid, and rewriting a link we can't place would corrupt it.
   **default** branch (or detached) it forks a fresh `moon/agent-<id>`.
   The switch-then-add runs atomically under the git lock and **refuses
   a dirty tree** (commit or stash first) rather than risk carrying
-  uncommitted work to the wrong branch. The button disables once the
+  uncommitted work to the wrong branch. A **blank** session (nothing
+  sent yet) has nothing to carry, so it gets the sessions-list
+  behaviour instead: a fresh branch off the default branch under the
+  project's `.worktrees/`, no reset, no clean-tree requirement. The button disables once the
   session is already in a worktree. So "I want a new isolated session
   while in one" is `+` (new blank session) then the worktree button.
 

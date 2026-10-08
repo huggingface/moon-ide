@@ -2648,6 +2648,20 @@ impl CoderHandle {
 		Ok(!already)
 	}
 
+	/// Whether the visible session is blank — nothing sent, nothing
+	/// on disk yet. `false` when no session is visible.
+	pub async fn visible_session_is_blank(&self) -> Result<bool, CoderError> {
+		let (fs, _) = self.state.active_folder_session().await?;
+		let Some(id) = fs.visible_session_id().await else {
+			return Ok(false);
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return Ok(false);
+		};
+		let session = rt.session.lock().await;
+		Ok(session.persisted_records == 0 && session.session_dir.is_none())
+	}
+
 	/// The visible session's associated branch — `committed_branch`
 	/// (set by the last commit made with this session open), or
 	/// `worktree_branch` if the session already runs in a worktree.

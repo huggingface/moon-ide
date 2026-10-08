@@ -781,17 +781,18 @@ pub async fn coder_merge_and_remove_worktree(
 /// - **no associated branch** + on the **default** branch (or detached
 ///   / no known default): a fresh `moon/agent-<id>` branch off `HEAD`;
 ///   the main tree is left as-is.
+///
+/// A **blank** session (nothing sent yet) has no work to carry, so it
+/// gets exactly what the sessions-list button gives a new session
+/// (ADR 0093): a fresh branch off the default branch, under the
+/// project's `.worktrees/`, whichever checkout is active — no main-tree
+/// reset, no clean-tree requirement.
 #[tauri::command]
 pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Result<NewWorktreeSession, MoonError> {
 	use moon_core::host::WorktreeBranch;
 
-	let parent = state.workspaces.require_active_folder().await?;
-	if matches!(
-		parent.folder.origin,
-		moon_protocol::workspace::FolderOrigin::Worktree { .. }
-	) {
-		return Err(MoonError::invalid("the active folder is already an isolated worktree"));
-	}
+	use moon_protocol::workspace::FolderOrigin;
+
 	// Bail before touching git if there's nothing movable, so we never
 	// strand an orphaned worktree.
 	if !state.coder.can_move_visible_session().await.map_err(MoonError::from)? {
@@ -799,6 +800,19 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 			"no movable session (none is open, or it already runs in a worktree)",
 		));
 	}
+	let active = state.workspaces.require_active_folder().await?;
+	let blank = state.coder.visible_session_is_blank().await.map_err(MoonError::from)?;
+	let parent = match (&active.folder.origin, blank) {
+		(FolderOrigin::Worktree { parent_path, .. }, true) => state
+			.workspaces
+			.folder_for_path(parent_path)
+			.await
+			.unwrap_or_else(|| active.clone()),
+		(FolderOrigin::Worktree { .. }, false) => {
+			return Err(MoonError::invalid("the active folder is already an isolated worktree"));
+		}
+		(FolderOrigin::UserPicked, _) => active.clone(),
+	};
 	let parent_path = parent.folder.path.clone();
 
 	// Decide the branch + whether the main tree resets. Prefer the
@@ -812,7 +826,15 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 		.default_branch_remote_ref
 		.as_deref()
 		.and_then(|r| r.rsplit_once('/').map(|(_, b)| b.to_string()));
-	let (spec, reset_to) = if let Some(b) = &session_branch {
+	let (spec, reset_to) = if blank {
+		(
+			WorktreeBranch::NewFrom {
+				name: fresh_agent_branch(),
+				start: None,
+			},
+			None,
+		)
+	} else if let Some(b) = &session_branch {
 		// The session has an associated branch. Check it out in the
 		// worktree. Only reset the main tree if it's currently on that
 		// same branch (the main tree is being "freed" from it); if the
@@ -830,16 +852,7 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 			(Some(b), Some(d)) if b != d => (WorktreeBranch::Existing(b.clone()), Some(d.clone())),
 			// No session branch, on the default branch / detached / no
 			// known default: fork fresh off HEAD.
-			_ => {
-				let now_ms = std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.map(|d| d.as_millis())
-					.unwrap_or(0) as u64;
-				(
-					WorktreeBranch::New(format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)),
-					None,
-				)
-			}
+			_ => (WorktreeBranch::New(fresh_agent_branch()), None),
 		}
 	};
 	let branch = spec.name().to_string();
@@ -875,6 +888,16 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 
 	let workspace = state.workspaces.snapshot().await;
 	Ok(NewWorktreeSession { workspace, session })
+}
+
+/// `moon/agent-<id>` from the clock — the default name for a fresh
+/// isolated-session branch.
+fn fresh_agent_branch() -> String {
+	let now_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_millis())
+		.unwrap_or(0) as u64;
+	format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)
 }
 
 /// Tie the active folder's visible coder session to the branch its

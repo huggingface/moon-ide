@@ -2275,6 +2275,11 @@
 		if (visibleSessionInWorktree) {
 			return 'This session already runs in its own worktree';
 		}
+		if (coder.rows.length === 0) {
+			// Nothing to carry over: same as the sessions-list button
+			// (ADR 0093).
+			return `Move this session into its own git worktree, on a new branch off ${workspace.gitBranch.defaultBranchRemoteRef ?? 'the default branch'}`;
+		}
 		const branch = workspace.gitBranch.name;
 		const defaultRef = workspace.gitBranch.defaultBranchRemoteRef;
 		const defaultName = defaultRef !== null ? defaultRef.split('/').slice(1).join('/') || defaultRef : null;

@@ -20,6 +20,8 @@ under the project — opening the session showed an empty panel.
   (`origin/main` via `origin/HEAD`, else `HEAD`), not whatever the
   current checkout is on. The branch is created `--no-track`, so a
   branch started from `origin/main` doesn't track main.
+- **"Move session into a worktree" on a blank session** does the same
+  as the sessions-list button — there's no work to keep on its branch.
 - **An agent-driven spawn from a worktree keeps that worktree's branch
   as its start point** (a follow-up on a worker's work), just placed
   under the project. A spawn from a project folder still branches off
