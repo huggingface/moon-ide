@@ -70,6 +70,7 @@ import { isReviewPath, REVIEW_PATH } from './util/reviewPath';
 import { commitPath, isCommitPath, shaFromCommitPath } from './util/commitPath';
 import { browserIdFromPath, browserPath, browserTabName, isBrowserPath } from './util/browserPath';
 import { wireBrowserBridge } from './browserBridge';
+import { worktreeRootPath } from './worktreeRoot';
 
 export type MarkdownView = 'source' | 'preview';
 
@@ -1642,8 +1643,7 @@ class WorkspaceState {
 		// the latest non-worktree session when the user switches back
 		// to the parent.
 		const active = snapshot.active_folder ?? null;
-		const activeEntry = active !== null ? (snapshot.folders.find((f) => f.path === active) ?? null) : null;
-		const coderRoot = activeEntry?.origin.kind === 'worktree' ? activeEntry.origin.parentPath : active;
+		const coderRoot = active !== null ? worktreeRootPath(active, snapshot.folders) : null;
 		coder.setActiveFolder(coderRoot ?? null, active);
 		const tAdoptCoder = performance.now();
 		// Drop FolderStates whose folders aren't bound anymore. Two-pass

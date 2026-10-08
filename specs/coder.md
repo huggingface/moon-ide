@@ -2026,7 +2026,7 @@ folder, so the file tree, SCM panel, per-folder git-change badges,
 diff view, review comments, terminal, and LSP all light up for it
 unchanged — it's just another repo root with its own `WorkspaceHost`
 and git mutex. A folder `origin` discriminator marks it as a
-session-worktree: it renders **nested under its parent** in the
+session-worktree: it renders **nested under its project** in the
 folder bar with a branch glyph, its lifecycle is tied to its owning
 session, and it is pruned (not merely unbound) when discarded.
 
@@ -2079,7 +2079,8 @@ force-host coordinator mints force-host workers, each keeping its own
 independent toggle from there on.
 
 An isolated session can either start a **fresh** `moon/agent-<id>`
-branch off the parent's current `HEAD` (the default), or be based on
+branch (off the default branch, `origin/main`, when started from the
+sessions list — see below), or be based on
 an **existing** branch — local, or a remote one DWIM-created locally
 the way `git switch` does. The latter is how you set an agent working
 on a colleague's branch: it's checked out only in the worktree, so the
@@ -2168,7 +2169,12 @@ valid, and rewriting a link we can't place would corrupt it.
 #### The worktree button is context-aware
 
 - **On the sessions list** it starts a fresh isolated session in a new
-  worktree (a new `moon/agent-<id>` branch off `HEAD`).
+  worktree: a new `moon/agent-<id>` branch off the default branch
+  (`origin/main`, falling back to `HEAD`), created `--no-track` so it
+  doesn't push to or pull from main. Whatever checkout the user is in —
+  the project or one of its worktrees — the new worktree goes under the
+  **project's** `.worktrees/`: worktrees never nest
+  ([ADR 0093](decisions/0093-no-nested-worktrees.md)).
 - **Inside a session** it _moves that session_ into a worktree,
   conversation and all (`coder_move_session_to_worktree`): the header
   gains `worktree_root`, so from the next turn its tools run in the

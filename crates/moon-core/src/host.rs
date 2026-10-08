@@ -35,6 +35,14 @@ pub enum WorktreeBranch {
 	/// (`git worktree add -b <name> <path>`). The default
 	/// isolated-session behaviour.
 	New(String),
+	/// Create a fresh branch off `start` instead of `HEAD`
+	/// (`git worktree add --no-track -b <name> <path> <start>`), so the
+	/// worktree doesn't inherit whatever the parent checkout is on.
+	/// `start: None` means the repo's default branch on `origin`
+	/// (`origin/main`), falling back to `HEAD` when there is none.
+	/// `--no-track`: a branch started from `origin/main` must not
+	/// track it, or a plain `git push` / `git pull` would aim at main.
+	NewFrom { name: String, start: Option<String> },
 	/// Check out an **existing** branch (`git worktree add <path>
 	/// <name>`), DWIM-creating a local tracking branch from a remote
 	/// of the same name when no local branch exists — the same
@@ -51,7 +59,7 @@ impl WorktreeBranch {
 	/// worktree's display label, on-disk dir slug, and session header.
 	pub fn name(&self) -> &str {
 		match self {
-			WorktreeBranch::New(name) | WorktreeBranch::Existing(name) => name,
+			WorktreeBranch::New(name) | WorktreeBranch::NewFrom { name, .. } | WorktreeBranch::Existing(name) => name,
 		}
 	}
 }
@@ -3314,7 +3322,7 @@ fn run_git_worktree_add(
 	// existing branch is git's to validate when it resolves it —
 	// `check-ref-format` would also reject a remote-qualified DWIM
 	// target the user is allowed to pass.
-	if let WorktreeBranch::New(name) = branch {
+	if let WorktreeBranch::New(name) | WorktreeBranch::NewFrom { name, .. } = branch {
 		let check = git_command(target, root)
 			.args(["check-ref-format", "--branch", name])
 			.output()
@@ -3339,6 +3347,7 @@ fn run_git_worktree_add(
 
 	let path_arg = worktree_path_arg(target, path);
 	// `New(name)`  -> `git worktree add --relative-paths -b <name> <path>`  (fresh branch off HEAD)
+	// `NewFrom`    -> `… --no-track -b <name> <path> <start>`                  (fresh branch off start)
 	// `Existing(n)` -> `git worktree add --relative-paths <path> <n>`        (check out existing;
 	//                  DWIM-creates a local tracking branch from a remote of
 	//                  the same name when no local branch exists, like `git switch`)
@@ -3347,6 +3356,13 @@ fn run_git_worktree_add(
 	match branch {
 		WorktreeBranch::New(name) => {
 			cmd.args(["-b", name, &path_arg]);
+		}
+		WorktreeBranch::NewFrom { name, start } => {
+			cmd.args(["--no-track", "-b", name, &path_arg]);
+			let start = start.clone().or_else(|| resolve_default_remote_ref(root));
+			if let Some(start) = start {
+				cmd.arg(start);
+			}
 		}
 		WorktreeBranch::Existing(name) => {
 			cmd.arg(&path_arg).arg(name);
@@ -7930,6 +7946,49 @@ mod tests {
 			.unwrap();
 		assert!(head_branch.status.success());
 		assert_eq!(String::from_utf8_lossy(&head_branch.stdout).trim(), "feature/wip");
+	}
+
+	/// `NewFrom` starts the branch from the given ref, not from the
+	/// parent checkout's `HEAD`, and without an upstream (ADR 0093).
+	#[tokio::test]
+	async fn git_worktree_add_new_from_branches_off_the_start_point() {
+		let Some(git) = which_git() else {
+			return;
+		};
+		if !relative_worktrees_supported() {
+			return;
+		}
+		let dir = TempDir::new().unwrap();
+		crate::test_util::init_committed_repo(&git, dir.path());
+		run_git(&git, dir.path(), &["switch", "-q", "-c", "feature"]);
+		std::fs::write(dir.path().join("feature.txt"), "wip\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "feature work"]);
+
+		let wt_path = Utf8PathBuf::from_path_buf(dir.path().join(".worktrees").join("fresh")).unwrap();
+		let created = host(&dir)
+			.git_worktree_add(
+				&wt_path,
+				WorktreeBranch::NewFrom {
+					name: "moon/fresh".into(),
+					start: Some("main".into()),
+				},
+			)
+			.await
+			.unwrap();
+		assert_eq!(created.branch.as_deref(), Some("moon/fresh"));
+		assert!(wt_path.join("README.md").exists());
+		assert!(
+			!wt_path.join("feature.txt").exists(),
+			"started from main, not the parent's feature HEAD"
+		);
+		let upstream = std::process::Command::new(&git)
+			.arg("-C")
+			.arg(wt_path.as_std_path())
+			.args(["rev-parse", "--abbrev-ref", "@{upstream}"])
+			.output()
+			.unwrap();
+		assert!(!upstream.status.success(), "no upstream on the fresh branch");
 	}
 
 	#[tokio::test]

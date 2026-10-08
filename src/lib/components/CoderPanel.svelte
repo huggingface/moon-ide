@@ -2220,7 +2220,7 @@
 	const worktreeButtonTitle = $derived(
 		creatingWorktree
 			? 'Creating isolated worktree…'
-			: `New isolated session — forks a new branch off ${workspace.gitBranch.name ?? 'the current commit'}, in its own git worktree`,
+			: `New isolated session — a new branch off ${workspace.gitBranch.defaultBranchRemoteRef ?? 'the default branch'}, in its own git worktree under the project`,
 	);
 
 	async function onNewWorktreeSession(): Promise<void> {

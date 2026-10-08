@@ -1026,12 +1026,21 @@ impl CoderState {
 	/// orphaned worktree whose parent isn't bound (shouldn't happen
 	/// post-W.3).
 	async fn coder_root_of(&self, folder: Arc<WorkspaceFolderEntry>) -> Arc<WorkspaceFolderEntry> {
-		if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &folder.folder.origin {
-			if let Some(parent) = self.workspaces.folder_for_path(parent_path).await {
-				return parent;
-			}
+		// Walks the whole chain: worktrees no longer nest (ADR 0093),
+		// but older worktree-of-worktree checkouts still exist, and
+		// stopping one hop short filed their sessions under the middle
+		// worktree — where nothing ever looks.
+		let mut current = folder;
+		for _ in 0..8 {
+			let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &current.folder.origin else {
+				break;
+			};
+			let Some(parent) = self.workspaces.folder_for_path(parent_path).await else {
+				break;
+			};
+			current = parent;
 		}
-		folder
+		current
 	}
 
 	/// Resolve to `(coder-root folder's FolderSession, folder path)`.
@@ -2322,12 +2331,19 @@ impl CoderHandle {
 	/// agent can mint workers via `spawn_worker` without going through
 	/// the Tauri command layer.
 	///
-	/// Steps: resolve the active (parent) folder, compute the branch
-	/// spec (fresh `moon/<name>` or `moon/agent-<id>` off HEAD, or
-	/// check out an existing `base_branch`), derive the worktree path
-	/// under `<parent>/.worktrees/<branch-slug>`, `git worktree add`,
-	/// bind it as a nested folder, and mint a session (filed under the
-	/// parent) whose tools route to the worktree.
+	/// Steps: resolve the requesting folder and its **project root**
+	/// (worktrees never nest, ADR 0093 — a request from inside a
+	/// worktree still lands under the project's `.worktrees/`), compute
+	/// the branch spec, derive the worktree path under
+	/// `<root>/.worktrees/<branch-slug>`, `git worktree add`, bind it as
+	/// a nested folder, and mint a session (filed under the root) whose
+	/// tools route to the worktree.
+	///
+	/// The fresh branch's start point: the default branch
+	/// (`origin/main`) for the UI button, whatever checkout the user
+	/// happens to be in; for an agent-driven spawn, the requesting
+	/// worktree's branch when it came from one (a follow-up on a
+	/// worker's work), else the project's `HEAD`.
 	///
 	/// `branch_name` names the fresh branch (ADR 0042): a coordinator
 	/// passes the worker's `name` so the branch / worktree / session
@@ -2363,7 +2379,7 @@ impl CoderHandle {
 	) -> Result<(SessionSummary, moon_protocol::workspace::Workspace), CoderError> {
 		use moon_core::host::WorktreeBranch;
 		let ui_driven = parent_folder.is_none();
-		let parent = match parent_folder {
+		let requested = match parent_folder {
 			Some(path) => self
 				.state
 				.workspaces
@@ -2372,20 +2388,35 @@ impl CoderHandle {
 				.ok_or_else(|| CoderError::Internal(format!("no bound folder at `{path}`")))?,
 			None => self.state.workspaces.require_active_folder().await?,
 		};
+		let requested_worktree_branch = match &requested.folder.origin {
+			moon_protocol::workspace::FolderOrigin::Worktree { branch, .. } => Some(branch.clone()),
+			moon_protocol::workspace::FolderOrigin::UserPicked => None,
+		};
+		let parent = self.state.coder_root_of(requested).await;
 		let parent_path = parent.folder.path.clone();
 		let name_slug = branch_name.as_deref().and_then(worker_branch_slug);
 		let spec = match base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
 			Some(existing) => WorktreeBranch::Existing(existing.to_string()),
-			None => WorktreeBranch::New(match &name_slug {
-				Some(slug) => free_worker_branch(&parent, &parent_path, slug).await,
-				None => {
-					let now_ms = std::time::SystemTime::now()
-						.duration_since(std::time::UNIX_EPOCH)
-						.map(|d| d.as_millis())
-						.unwrap_or(0) as u64;
-					format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)
+			None => {
+				let name = match &name_slug {
+					Some(slug) => free_worker_branch(&parent, &parent_path, slug).await,
+					None => {
+						let now_ms = std::time::SystemTime::now()
+							.duration_since(std::time::UNIX_EPOCH)
+							.map(|d| d.as_millis())
+							.unwrap_or(0) as u64;
+						format!("moon/agent-{:08x}", now_ms & 0xffff_ffff)
+					}
+				};
+				match (ui_driven, requested_worktree_branch) {
+					(true, _) => WorktreeBranch::NewFrom { name, start: None },
+					(false, Some(branch)) => WorktreeBranch::NewFrom {
+						name,
+						start: Some(branch),
+					},
+					(false, None) => WorktreeBranch::New(name),
 				}
-			}),
+			}
 		};
 		let branch = spec.name().to_string();
 		let branch_slug = branch.replace('/', "-");
