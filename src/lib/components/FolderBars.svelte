@@ -3,7 +3,6 @@
 	import type { WorkspaceFolder } from '../protocol';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
-	import { worktreeRootPath } from '../worktreeRoot';
 	import BranchIcon from './icons/BranchIcon.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
@@ -88,40 +87,35 @@
 
 	const orderedFolders = $derived.by((): FolderRow[] => {
 		const all = folders;
-		// Worktrees group under their project root, not their direct
-		// parent: older worktree-of-worktree checkouts (worktrees no
-		// longer nest, ADR 0093) would otherwise have no row at all.
-		const childrenByRoot = new Map<string, WorkspaceFolder[]>();
+		const childrenByParent = new Map<string, WorkspaceFolder[]>();
 		for (const f of all) {
-			if (f.origin.kind !== 'worktree') {
-				continue;
+			if (f.origin.kind === 'worktree') {
+				const list = childrenByParent.get(f.origin.parentPath) ?? [];
+				list.push(f);
+				childrenByParent.set(f.origin.parentPath, list);
 			}
-			const root = worktreeRootPath(f.path, all);
-			if (root === f.path) {
-				continue;
-			}
-			const list = childrenByRoot.get(root) ?? [];
-			list.push(f);
-			childrenByRoot.set(root, list);
 		}
 		const rows: FolderRow[] = [];
 		for (const f of all) {
 			if (f.origin.kind === 'worktree') {
-				// Emitted under its root below — or here at top level
-				// when its parent isn't bound (shouldn't happen, but a
-				// stale snapshot could), so it's never lost off-screen.
-				if (worktreeRootPath(f.path, all) === f.path) {
-					rows.push({ folder: f, branch: f.origin.branch, depth: 0 });
-				}
-				continue;
+				continue; // emitted under its parent below
 			}
 			rows.push({ folder: f, branch: null, depth: 0 });
-			for (const child of childrenByRoot.get(f.path) ?? []) {
+			for (const child of childrenByParent.get(f.path) ?? []) {
 				rows.push({
 					folder: child,
 					branch: child.origin.kind === 'worktree' ? child.origin.branch : null,
 					depth: 1,
 				});
+			}
+		}
+		// Orphan worktrees (parent not bound — shouldn't happen, but a
+		// stale snapshot could) surface at top level so they're never
+		// lost off-screen.
+		for (const f of all) {
+			const origin = f.origin;
+			if (origin.kind === 'worktree' && !all.some((p) => p.path === origin.parentPath)) {
+				rows.push({ folder: f, branch: origin.branch, depth: 0 });
 			}
 		}
 		return rows;
@@ -157,7 +151,7 @@
 		{@const modified = summary?.modified ?? 0}
 		{@const deleted = summary?.deleted ?? 0}
 		{@const hasChanges = added + modified + deleted > 0}
-		{@const coderRoot = isWorktree ? worktreeRootPath(folder.path, folders) : folder.path}
+		{@const coderRoot = isWorktree && folder.origin.kind === 'worktree' ? folder.origin.parentPath : folder.path}
 		{@const agentAwaitingInput = isWorktree
 			? coder.awaitingInputForWorktree(coderRoot, folder.path)
 			: coder.awaitingInputForFolder(folder.path)}

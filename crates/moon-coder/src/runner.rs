@@ -1026,21 +1026,12 @@ impl CoderState {
 	/// orphaned worktree whose parent isn't bound (shouldn't happen
 	/// post-W.3).
 	async fn coder_root_of(&self, folder: Arc<WorkspaceFolderEntry>) -> Arc<WorkspaceFolderEntry> {
-		// Walks the whole chain: worktrees no longer nest (ADR 0093),
-		// but older worktree-of-worktree checkouts still exist, and
-		// stopping one hop short filed their sessions under the middle
-		// worktree — where nothing ever looks.
-		let mut current = folder;
-		for _ in 0..8 {
-			let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &current.folder.origin else {
-				break;
-			};
-			let Some(parent) = self.workspaces.folder_for_path(parent_path).await else {
-				break;
-			};
-			current = parent;
+		if let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = &folder.folder.origin {
+			if let Some(parent) = self.workspaces.folder_for_path(parent_path).await {
+				return parent;
+			}
 		}
-		current
+		folder
 	}
 
 	/// Resolve to `(coder-root folder's FolderSession, folder path)`.

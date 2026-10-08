@@ -24,11 +24,9 @@ under the project — opening the session showed an empty panel.
   as its start point** (a follow-up on a worker's work), just placed
   under the project. A spawn from a project folder still branches off
   its `HEAD`.
-- **Project-root resolution walks the whole chain** (backend
-  `coder_root_of`, frontend `worktreeRootPath`), and the folder bar
-  groups worktrees under their project root, so worktree-of-worktree
-  checkouts created before this change still show up and find their
-  sessions. No migration moves them.
+- **No compatibility handling for existing nested worktrees.** One
+  root hop is enough when worktrees never nest; the one nested checkout
+  that existed was removed by hand.
 
 ## Rejected alternatives
 
@@ -37,5 +35,6 @@ under the project — opening the session showed an empty panel.
 - **Branch off the current checkout's `HEAD`** (the old behaviour). A
   new session from the sessions list is new work; inheriting a
   colleague agent's half-done branch by accident was the surprise.
-- **Migrate existing nested worktrees.** Moving a live checkout under a
-  running agent is riskier than tolerating the old path.
+- **Resolve roots through the whole parent chain** so legacy nested
+  worktrees keep working. Compatibility code for a state that no longer
+  gets created (AGENTS.md: no premature migrations).
