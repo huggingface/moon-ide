@@ -23,6 +23,7 @@
 	import ToolBodyWebFetch from './ToolBodyWebFetch.svelte';
 	import ToolBodyOpenBrowser from './ToolBodyOpenBrowser.svelte';
 	import ToolBodyOpenTerminal from './ToolBodyOpenTerminal.svelte';
+	import { parseSubagentReport } from '../subagentReport';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
 	import ToolImages from './ToolImages.svelte';
@@ -3365,12 +3366,6 @@
 				<span class="subagent-mode" class:research={transcript.mode === 'research'} title="Sub-agent mode">
 					{transcript.mode}
 				</span>
-				{#if subagentSummary?.detached}
-					<span
-						class="subagent-detached"
-						title="Detached — running in the background; the parent collects the result via task_collect">detached</span
-					>
-				{/if}
 				{#if subId !== null}
 					<button
 						type="button"
@@ -3544,7 +3539,25 @@
 {/snippet}
 
 {#snippet rowMarkup(row: CoderRow, inParentTranscript: boolean)}
-	{#if row.kind === 'user'}
+	{@const subagentReport = row.kind === 'user' ? parseSubagentReport(row.text) : null}
+	{#if subagentReport !== null}
+		<!-- A background sub-agent's completion callback (ADR 0091):
+			 sent as a user-role message, but it's the sub-agent
+			 speaking, so it gets its own collapsed card. -->
+		<div class="row subagent-report">
+			<details>
+				<summary>
+					<span class="subagent-report-tag" class:error={subagentReport.status === 'error'}
+						>{subagentReport.status === 'error' ? 'sub-agent failed' : 'sub-agent report'}</span
+					>
+					<span class="subagent-report-id">{subagentReport.subagentId}</span>
+				</summary>
+				<div class="bubble user-md">
+					<CoderMarkdown text={subagentReport.body} />
+				</div>
+			</details>
+		</div>
+	{:else if row.kind === 'user'}
 		{@const parsed = parseUserPrompt(row.text)}
 		<div class="row user" class:queued={row.queued} class:from-coordinator={row.fromCoordinator}>
 			<div class="row-label">
@@ -4092,17 +4105,6 @@
 						<span class="subagent-mode" class:research={subagent.mode === 'research'}>
 							{subagent.mode}
 						</span>
-						{#if subagent.detached}
-							<!-- ADR 0053 — a detached `task` runs in the
-							     background and the parent collects it via
-							     `task_collect`; badge it so a background run
-							     reads differently from a blocking one. -->
-							<span
-								class="subagent-detached"
-								title="Detached — running in the background; the parent collects the result via task_collect"
-								>detached</span
-							>
-						{/if}
 						<span class="subagent-folder" title={subagent.targetFolder}>
 							{baseName(subagent.targetFolder)}
 						</span>
@@ -5120,6 +5122,34 @@
 		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
 		color: var(--m-accent);
 	}
+	.row.subagent-report summary {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		cursor: pointer;
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.subagent-report-tag {
+		padding: 1px 6px;
+		border-radius: 999px;
+		font-size: 9px;
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
+		color: var(--m-accent);
+	}
+	.subagent-report-tag.error {
+		background: color-mix(in srgb, var(--m-danger) 22%, transparent);
+		color: var(--m-danger);
+	}
+	.subagent-report-id {
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		color: var(--m-fg-subtle);
+	}
+	.row.subagent-report .bubble {
+		margin-top: 4px;
+	}
 	.row.user.from-coordinator .bubble {
 		background: color-mix(in srgb, var(--m-accent) 6%, transparent);
 		border-left: 2px solid color-mix(in srgb, var(--m-accent) 45%, var(--m-border));
@@ -5531,22 +5561,6 @@
 	.subagent-mode.research {
 		background: var(--m-bg-3, var(--m-bg-2));
 		color: var(--m-fg-muted);
-	}
-	/* Detached pill (ADR 0053): outlines rather than fills so it
-	   reads as a modifier next to the filled mode pill, not a
-	   second mode. */
-	.subagent-detached {
-		display: inline-flex;
-		align-items: center;
-		padding: 1px 6px;
-		border-radius: 999px;
-		border: 1px solid var(--m-border);
-		color: var(--m-fg-muted);
-		font-size: 10px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		flex-shrink: 0;
 	}
 	.subagent-preview {
 		font-size: 12px;

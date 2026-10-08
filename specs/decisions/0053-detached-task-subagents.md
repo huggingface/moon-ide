@@ -1,7 +1,7 @@
 # ADR 0053 — Detached `task` sub-agents: async delegation for regular agents
 
 Date: 2026-08-03
-Status: accepted; implemented.
+Status: accepted; implemented. Revised by [ADR 0091](0091-background-only-subagents.md) (always detached, report in the wake, no wake for aborted runs).
 
 ## Context
 

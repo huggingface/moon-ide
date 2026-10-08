@@ -54,7 +54,6 @@ use crate::subagent::{build_subagent_spec, run_subagent, task_tool_definition};
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
 use moon_core::WorkspaceFolderEntry;
 use serde_json::json;
-use tokio::sync::Semaphore;
 
 /// Capacity for the broadcast channel the Tauri layer subscribes to.
 /// Each turn produces O(few hundred) events at most; oversizing
@@ -356,11 +355,15 @@ enum DetachedFinish {
 
 /// One in-flight (or settled, cached) detached sub-agent run.
 /// `notify` fires exactly once when the run settles; `task_collect`'s
-/// `wait_ms` blocks on it instead of busy-polling.
+/// `wait_ms` blocks on it instead of busy-polling. `collectors`
+/// counts parent `task_collect` calls parked on it: a run that
+/// settles while one is waiting hands its report to that call and
+/// skips the completion callback (ADR 0091).
 struct DetachedEntry {
 	cancel: CancellationToken,
 	notify: Arc<tokio::sync::Notify>,
 	finish: Mutex<Option<DetachedFinish>>,
+	collectors: std::sync::atomic::AtomicUsize,
 }
 
 /// In-memory parent → detached-sub-agent registry ([ADR 0053]).
@@ -390,6 +393,7 @@ impl DetachedTaskRegistry {
 			cancel,
 			notify: Arc::new(tokio::sync::Notify::new()),
 			finish: Mutex::new(None),
+			collectors: std::sync::atomic::AtomicUsize::new(0),
 		});
 		self
 			.by_parent
@@ -425,16 +429,25 @@ impl DetachedTaskRegistry {
 		entry.notify.notify_waiters();
 	}
 
-	/// All live cancel tokens for `parent_session_id`'s detached
-	/// runs — the user-level abort cascade cancels each. A run whose
-	/// token is already cancelled is harmlessly re-cancelled.
-	fn live_tokens_of(&self, parent_session_id: &str) -> Vec<CancellationToken> {
+	/// Every run entry of `parent_session_id`, live or settled.
+	fn entries_of(&self, parent_session_id: &str) -> Vec<Arc<DetachedEntry>> {
 		self
 			.by_parent
 			.get(parent_session_id)
 			.into_iter()
 			.flatten()
-			.filter_map(|id| self.entries.get(id))
+			.filter_map(|id| self.entries.get(id).cloned())
+			.collect()
+	}
+
+	/// All live cancel tokens for `parent_session_id`'s detached
+	/// runs — the user-level abort (and `abort_worker`) cancels each.
+	/// A run whose token is already cancelled is harmlessly
+	/// re-cancelled.
+	fn live_tokens_of(&self, parent_session_id: &str) -> Vec<CancellationToken> {
+		self
+			.entries_of(parent_session_id)
+			.into_iter()
 			.map(|entry| entry.cancel.clone())
 			.collect()
 	}
@@ -445,9 +458,8 @@ impl DetachedTaskRegistry {
 	/// parent is gone, and this bound (entries live as long as
 	/// their parent session) is what keeps a long-lived process
 	/// from accumulating one map entry per detached run forever.
-	/// Settled entries must NOT be pruned any earlier: the finish
-	/// wake is a pointer, not the report, and the parent may only
-	/// get around to `task_collect` several turns later.
+	/// Settled entries must NOT be pruned any earlier: the parent
+	/// may still `task_collect` a report several turns later.
 	fn prune_parent(&mut self, parent_session_id: &str) {
 		let Some(ids) = self.by_parent.remove(parent_session_id) else {
 			return;
@@ -4472,10 +4484,9 @@ impl CoderHandle {
 		let Some(rt) = fs.runtime(&id).await else {
 			return;
 		};
-		// Cascade to the session's detached sub-agents ([ADR 0053]):
-		// they run on their own root tokens precisely so a *turn*
-		// end doesn't kill them, but the user hitting "stop" means
-		// "stop everything", so we cancel each run's token here.
+		// Stop means stop everything: the session's background
+		// sub-agents go too (ADR 0091). Aborted runs send no report,
+		// so this doesn't wake the session straight back up.
 		for token in self.state.detached_tasks.read().await.live_tokens_of(&id) {
 			token.cancel();
 		}
@@ -5182,7 +5193,7 @@ impl CoderHandle {
 		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
 			return;
 		};
-		// Same detached cascade as `abort` ([ADR 0053]).
+		// Same cascade as `abort` (ADR 0091).
 		for token in self.state.detached_tasks.read().await.live_tokens_of(session_id) {
 			token.cancel();
 		}
@@ -6260,6 +6271,10 @@ fn spawn_turn_loop(
 ) {
 	let session_hint = sink_for_turn.session_id.clone();
 	let sink_for_backoff = sink_for_turn.clone();
+	// Acquired before the spawn so a background sub-agent handing
+	// over to the turn its report starts (ADR 0091) never lets the
+	// count dip to zero in between.
+	let running_guard = RunningTurnGuard::acquire(&state.running_turns);
 	tokio::spawn(crate::inference::SESSION_HINT.scope(
 		session_hint,
 		crate::inference::TURN_STICKY_MODEL.scope(
@@ -6268,7 +6283,7 @@ fn spawn_turn_loop(
 				// Scope-tied so every exit path (success, abort, error,
 				// steer-drain re-loop) decrements exactly once, even on
 				// panic.
-				let _running_guard = RunningTurnGuard::acquire(&state.running_turns);
+				let _running_guard = running_guard;
 				// Loop wrapper closes the race between `run_turn` returning
 				// `Ok(())` and the spawn task clearing `turn.cancel`: a steer
 				// queued in that window lands in `pending_steers` but would
@@ -6446,6 +6461,15 @@ async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &
 	let header = &session.header;
 	if header.parent_session_id.is_some() || header.orchestrator_session_id.is_some() {
 		return;
+	}
+	// Still waiting on background sub-agents (ADR 0091): the agent
+	// isn't done — their reports will start another turn, and that
+	// one notifies.
+	let entries = state.detached_tasks.read().await.entries_of(&header.id);
+	for entry in entries {
+		if entry.finish.lock().await.is_none() {
+			return;
+		}
 	}
 	let outcome = match result {
 		Ok(()) => TurnOutcome::Complete {
@@ -7315,28 +7339,12 @@ done, what's still unfinished, and any uncertainty. If the user needs to take a 
 	Ok(())
 }
 
-/// Limit on concurrent sub-agents per parent batch. A
-/// `Semaphore`-bound; only meaningful when the model emits a
-/// homogeneous `task` batch larger than this. Excess sub-agents
-/// queue against the semaphore. Hardcoded for now per AGENTS.md
-/// "hardcode first, configure later" — bumps land when a real
-/// workload outgrows it.
-const SUBAGENT_PARALLELISM_CAP: usize = 4;
-
-/// Run every `tool_call` in `calls`, emitting the `ToolCall` /
-/// `ToolResult` event pair for each and pushing the result onto
-/// the session's messages. Branches:
-///
-/// - **Homogeneous `task` batch (N ≥ 2)**: spawn each sub-agent
-///   concurrently, bounded by [`SUBAGENT_PARALLELISM_CAP`].
-///   Tool-call events fire upfront so the UI inserts every
-///   collapsed card before any sub-agent finishes; results land
-///   in completion order but are pushed onto `messages` in the
-///   model's original tool-call order so context stays
-///   deterministic across replays.
-/// - **Anything else** (mixed batch, single call, or zero `task`
-///   calls): sequential dispatch. Sub-agent intercept still kicks
-///   in for individual `task` calls in mixed batches.
+/// Run every `tool_call` in `calls` in order, emitting the
+/// `ToolCall` / `ToolResult` event pair for each and pushing the
+/// result onto the session's messages. `task` calls return their
+/// handle immediately (sub-agents always run in the background,
+/// ADR 0091), so sequential dispatch still runs a batch of them
+/// concurrently.
 async fn dispatch_tool_calls(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
@@ -7346,255 +7354,104 @@ async fn dispatch_tool_calls(
 	calls: &[crate::inference::ToolCall],
 	hit_output_cap: bool,
 ) -> Result<(), CoderError> {
-	// A batch with a truncated call in it falls through to the
-	// sequential path, which refuses that one call and runs the
-	// rest. Losing parallelism on a broken batch is a fine price
-	// for keeping the refusal in exactly one place.
-	//
-	// A batch containing a `detach: true` call also falls through:
-	// detached runs return their handle immediately, so the
-	// batch's `join_all`-then-report shape doesn't apply to them —
-	// routing them through the sequential dispatch (where
-	// `handle_task` branches to the detached spawn) keeps exactly
-	// one detached path.
-	let homogeneous_subagent = calls.len() >= 2
-		&& calls.iter().all(|c| c.function.name == "task")
-		&& calls
-			.iter()
-			.all(|c| tool_args_or_refusal(&c.function, hit_output_cap).is_ok())
-		&& !calls.iter().any(|c| {
-			parse_tool_args(&c.function)
-				.get("detach")
-				.and_then(Value::as_bool)
-				.unwrap_or(false)
-		});
-	if homogeneous_subagent {
-		dispatch_subagent_batch(state, rt, sink, cx, cancel, calls).await
-	} else {
-		for call in calls {
-			if cancel.is_cancelled() {
-				return Err(CoderError::Aborted);
-			}
-			let args = match tool_args_or_refusal(&call.function, hit_output_cap) {
-				Ok(args) => args,
-				Err(err) => {
-					// The row still has to appear (and the API
-					// still needs a `tool_result` for every
-					// `tool_use` block) — it just carries the
-					// refusal instead of a result.
-					sink.send(CoderEvent::ToolCall {
-						id: call.id.clone(),
-						name: call.function.name.clone(),
-						args: Value::Object(Default::default()),
-						started_at_ms: Some(current_time_ms()),
-					});
-					finish_tool_call(rt, sink, &call.id, &call.function.name, Err(err), None).await?;
-					continue;
-				}
-			};
-			sink.send(CoderEvent::ToolCall {
-				id: call.id.clone(),
-				name: call.function.name.clone(),
-				args: args.clone(),
-				started_at_ms: Some(current_time_ms()),
-			});
-			let dispatched_at = std::time::Instant::now();
-			let outcome = if call.function.name == "task" {
-				handle_task(state, rt, sink, cx, cancel, &call.id, &args).await
-			} else if call.function.name == "task_collect" {
-				// Detached-sub-agent report fetch ([ADR 0053]).
-				handle_task_collect(state, rt, &args).await
-			} else if call.function.name == "task_steer" {
-				handle_task_steer(state, rt, &args).await
-			} else if call.function.name == "task_abort" {
-				handle_task_abort(state, rt, &args).await
-			} else if call.function.name == "ask_user" {
-				// Bidirectional: parks a oneshot on the session's
-				// prompt registry and blocks the turn until the user
-				// answers the card, sends a normal composer message
-				// (skip), or aborts. The `tool_call` event already
-				// fired above, so the panel rendered the prompt.
-				handle_ask_user(rt, cancel, &call.id, &args).await
-			} else if call.function.name == "todo_write" {
-				// `todo_write` mutates per-session state owned by
-				// the runner (`Session.todos`), so it doesn't fit
-				// the stateless-tool shape `ToolRegistry::dispatch`
-				// expects. Short-circuit here, alongside
-				// `task`, before falling through to the
-				// generic registry dispatch.
-				handle_todo_write(rt, &args).await
-			} else if call.function.name == "spawn_worker" {
-				// Coordinator-only (ADR 0030). Mints a peer
-				// top-level session in a worktree + seeds it with
-				// the task. Returns a handle (session id), not a
-				// blocking result — the worker runs detached.
-				handle_spawn_worker(state, sink, &call.id, &args).await
-			} else if call.function.name == "observe_worker" {
-				handle_observe_worker(state, &args).await
-			} else if call.function.name == "list_workers" {
-				handle_list_workers(state, sink, &args).await
-			} else if call.function.name == "steer_worker" {
-				handle_steer_worker(state, &args).await
-			} else if call.function.name == "abort_worker" {
-				handle_abort_worker(state, &args).await
-			} else if call.function.name == "respond_to_worker_prompt" {
-				handle_respond_to_worker_prompt(state, &args).await
-			} else if call.function.name == "review_worker_changes" {
-				handle_review_worker_changes(state, &args).await
-			} else if call.function.name == "workspace_scm_status" {
-				handle_workspace_scm_status(state, sink, &args).await
-			} else if call.function.name == "commit_worker_changes" {
-				handle_commit_worker_changes(state, &args).await
-			} else if call.function.name == "merge_worker_changes" {
-				handle_merge_worker_changes(state, &args).await
-			} else if call.function.name == "check_worker_base" {
-				handle_check_worker_base(state, &args).await
-			} else if call.function.name == "discard_worker_worktree" {
-				handle_discard_worker_worktree(state, sink, &args).await
-			} else if call.function.name == "retire_worker" {
-				handle_retire_worker(state, sink, &args).await
-			} else if call.function.name == "clone_repo" {
-				handle_clone_repo(state, sink, &args).await
-			} else if call.function.name == "init_repo" {
-				handle_init_repo(state, sink, &args).await
-			} else if call.function.name == "add_folder" {
-				handle_add_folder(state, sink, &args).await
-			} else {
-				state
-					.tools
-					.dispatch_with_call_id(&call.function.name, &args, cx, cancel, &call.id)
-					.await
-			};
-			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
-			finish_tool_call(rt, sink, &call.id, &call.function.name, outcome, duration_ms).await?;
+	for call in calls {
+		if cancel.is_cancelled() {
+			return Err(CoderError::Aborted);
 		}
-		Ok(())
-	}
-}
-
-/// Run N parallel sub-agents under a `Semaphore`, then drain
-/// results in the order the model issued them so the conversation
-/// history stays deterministic. Cancellation cascades automatically
-/// via `cancel.child_token()` (the parent's token is the child's
-/// parent).
-///
-/// Each sub-agent's `ToolResult` **event** fires the moment that
-/// sub-agent finishes — not when its earlier siblings do — so the
-/// panel can stop that row's elapsed timer even while the rest of
-/// the batch is still running. (An earlier implementation awaited
-/// the spawn handles in call order, which stranded later rows in
-/// the live "running…" state until the longest-running sibling
-/// settled.) The `messages` push, by contrast, is reassembled in
-/// the model's original call order once the whole batch resolves,
-/// so the conversation history the next LLM round-trip sees — and
-/// anything persisted from it — is deterministic across replays.
-async fn dispatch_subagent_batch(
-	state: &Arc<CoderState>,
-	rt: &Arc<SessionRuntime>,
-	sink: &FolderEventSink,
-	cx: &ToolContext,
-	cancel: &CancellationToken,
-	calls: &[crate::inference::ToolCall],
-) -> Result<(), CoderError> {
-	// Emit `ToolCall` events upfront so every collapsed card is
-	// present in the parent's transcript before any sub-agent
-	// starts streaming events of its own.
-	let parsed_args: Vec<Value> = calls.iter().map(|c| parse_tool_args(&c.function)).collect();
-	let batch_started_at_ms = current_time_ms();
-	for (call, args) in calls.iter().zip(parsed_args.iter()) {
+		let args = match tool_args_or_refusal(&call.function, hit_output_cap) {
+			Ok(args) => args,
+			Err(err) => {
+				// The row still has to appear (and the API
+				// still needs a `tool_result` for every
+				// `tool_use` block) — it just carries the
+				// refusal instead of a result.
+				sink.send(CoderEvent::ToolCall {
+					id: call.id.clone(),
+					name: call.function.name.clone(),
+					args: Value::Object(Default::default()),
+					started_at_ms: Some(current_time_ms()),
+				});
+				finish_tool_call(rt, sink, &call.id, &call.function.name, Err(err), None).await?;
+				continue;
+			}
+		};
 		sink.send(CoderEvent::ToolCall {
 			id: call.id.clone(),
 			name: call.function.name.clone(),
 			args: args.clone(),
-			started_at_ms: Some(batch_started_at_ms),
+			started_at_ms: Some(current_time_ms()),
 		});
+		let dispatched_at = std::time::Instant::now();
+		let outcome = if call.function.name == "task" {
+			handle_task(state, rt, sink, cx, &call.id, &args).await
+		} else if call.function.name == "task_collect" {
+			// Detached-sub-agent report fetch ([ADR 0053]).
+			handle_task_collect(state, rt, &args, cancel).await
+		} else if call.function.name == "task_steer" {
+			handle_task_steer(state, rt, &args).await
+		} else if call.function.name == "task_abort" {
+			handle_task_abort(state, rt, &args).await
+		} else if call.function.name == "ask_user" {
+			// Bidirectional: parks a oneshot on the session's
+			// prompt registry and blocks the turn until the user
+			// answers the card, sends a normal composer message
+			// (skip), or aborts. The `tool_call` event already
+			// fired above, so the panel rendered the prompt.
+			handle_ask_user(rt, cancel, &call.id, &args).await
+		} else if call.function.name == "todo_write" {
+			// `todo_write` mutates per-session state owned by
+			// the runner (`Session.todos`), so it doesn't fit
+			// the stateless-tool shape `ToolRegistry::dispatch`
+			// expects. Short-circuit here, alongside
+			// `task`, before falling through to the
+			// generic registry dispatch.
+			handle_todo_write(rt, &args).await
+		} else if call.function.name == "spawn_worker" {
+			// Coordinator-only (ADR 0030). Mints a peer
+			// top-level session in a worktree + seeds it with
+			// the task. Returns a handle (session id), not a
+			// blocking result — the worker runs detached.
+			handle_spawn_worker(state, sink, &call.id, &args).await
+		} else if call.function.name == "observe_worker" {
+			handle_observe_worker(state, &args).await
+		} else if call.function.name == "list_workers" {
+			handle_list_workers(state, sink, &args).await
+		} else if call.function.name == "steer_worker" {
+			handle_steer_worker(state, &args).await
+		} else if call.function.name == "abort_worker" {
+			handle_abort_worker(state, &args).await
+		} else if call.function.name == "respond_to_worker_prompt" {
+			handle_respond_to_worker_prompt(state, &args).await
+		} else if call.function.name == "review_worker_changes" {
+			handle_review_worker_changes(state, &args).await
+		} else if call.function.name == "workspace_scm_status" {
+			handle_workspace_scm_status(state, sink, &args).await
+		} else if call.function.name == "commit_worker_changes" {
+			handle_commit_worker_changes(state, &args).await
+		} else if call.function.name == "merge_worker_changes" {
+			handle_merge_worker_changes(state, &args).await
+		} else if call.function.name == "check_worker_base" {
+			handle_check_worker_base(state, &args).await
+		} else if call.function.name == "discard_worker_worktree" {
+			handle_discard_worker_worktree(state, sink, &args).await
+		} else if call.function.name == "retire_worker" {
+			handle_retire_worker(state, sink, &args).await
+		} else if call.function.name == "clone_repo" {
+			handle_clone_repo(state, sink, &args).await
+		} else if call.function.name == "init_repo" {
+			handle_init_repo(state, sink, &args).await
+		} else if call.function.name == "add_folder" {
+			handle_add_folder(state, sink, &args).await
+		} else {
+			state
+				.tools
+				.dispatch_with_call_id(&call.function.name, &args, cx, cancel, &call.id)
+				.await
+		};
+		let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
+		finish_tool_call(rt, sink, &call.id, &call.function.name, outcome, duration_ms).await?;
 	}
-
-	let sem = Arc::new(Semaphore::new(SUBAGENT_PARALLELISM_CAP));
-	let mut tasks = Vec::with_capacity(calls.len());
-	for (call, args) in calls.iter().cloned().zip(parsed_args) {
-		let state_for_task = state.clone();
-		let rt_for_task = rt.clone();
-		let sink_for_task = sink.clone();
-		let cx_for_task = cx.clone();
-		let cancel_for_task = cancel.clone();
-		let sem_for_task = sem.clone();
-		let call_id = call.id.clone();
-		let call_name = call.function.name.clone();
-		let task = tokio::spawn(async move {
-			let _permit = sem_for_task.acquire().await.expect("semaphore not closed");
-			// Timed from permit acquisition, not batch spawn, so a
-			// sub-agent queued behind the parallelism cap doesn't
-			// book its wait time as execution time.
-			let dispatched_at = std::time::Instant::now();
-			let outcome = handle_task(
-				&state_for_task,
-				&rt_for_task,
-				&sink_for_task,
-				&cx_for_task,
-				&cancel_for_task,
-				&call_id,
-				&args,
-			)
-			.await;
-			let duration_ms = u64::try_from(dispatched_at.elapsed().as_millis()).ok();
-			// Emit + persist immediately on completion so this row's
-			// timer stops in the UI; the `ChatMessage::Tool` for the
-			// conversation history rides back to the caller, which
-			// reassembles the batch in call order before pushing.
-			let message =
-				match emit_tool_result(&rt_for_task, &sink_for_task, &call_id, &call_name, outcome, duration_ms).await {
-					Ok(message) => message,
-					Err(err) => return Err(err),
-				};
-			Ok(message)
-		});
-		tasks.push(task);
-	}
-	// Await every handle, collecting the per-call tool message (or
-	// first error) so the `messages` push below lands in the model's
-	// original tool-call order regardless of completion order. A
-	// `join_all` (not an early-return `?` loop) guarantees a slow
-	// sibling never blocks an already-finished sub-agent's message
-	// from being recorded, and a panicking task can't strand the
-	// rest of the batch's results.
-	let joined = futures_util::future::join_all(tasks).await;
-	let mut messages = Vec::with_capacity(joined.len());
-	let mut first_err: Option<CoderError> = None;
-	for (call, result) in calls.iter().zip(joined) {
-		match result {
-			// Sub-agent ran to completion and its `ToolResult` already
-			// went out over the sink inside the spawned task.
-			Ok(Ok(message)) => messages.push(message),
-			// The sub-agent's emit was aborted — propagate the
-			// short-circuit so the turn loop bails the same way the
-			// sequential path does. Sibling messages already collected
-			// stay in `messages` and are pushed below before we return.
-			Ok(Err(err)) => {
-				first_err.get_or_insert(err);
-			}
-			// Join error (panic / cancellation): surface a synthetic
-			// errored tool message so the next LLM round-trip still
-			// sees a `tool_result` for every `tool_use` — Anthropic
-			// 400s the request otherwise.
-			Err(join_err) => {
-				first_err.get_or_insert_with(|| {
-					CoderError::Internal(format!("sub-agent task join error for {}: {join_err}", call.id))
-				});
-				messages.push(ChatMessage::Tool {
-					tool_call_id: call.id.clone(),
-					tool_name: Some(call.function.name.clone()),
-					content: json!({ "error": "sub-agent task failed" }).to_string(),
-					images: Vec::new(),
-				});
-			}
-		}
-	}
-	rt.session.lock().await.messages.extend(messages);
-	match first_err {
-		Some(err) => Err(err),
-		None => Ok(()),
-	}
+	Ok(())
 }
 
 /// Build + run a `Subagent` from the JSON args. Validation
@@ -7606,7 +7463,6 @@ async fn handle_task(
 	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
 	cx: &ToolContext,
-	cancel: &CancellationToken,
 	tool_call_id: &str,
 	args: &Value,
 ) -> Result<Value, CoderError> {
@@ -7617,7 +7473,7 @@ async fn handle_task(
 	// tools operate against (parent's project owns its sub-agents).
 	let parent_folder = Utf8PathBuf::from(sink.folder());
 	let bound = state.workspaces.folders().await;
-	let spec = build_subagent_spec(
+	let mut spec = build_subagent_spec(
 		parent_session_id,
 		tool_call_id.to_string(),
 		parent_folder,
@@ -7628,78 +7484,11 @@ async fn handle_task(
 		// sub-agents run their bash where the parent's runs.
 		rt.force_host_bash.clone(),
 	)?;
-	// Detached spawn ([ADR 0053]): register, spawn, return a
-	// handle. The sub-agent runs on its own root token; its finish
-	// wakes the parent via the feeder and its report is collected
-	// via `task_collect`. The synchronous path below is unchanged.
-	if spec.detach {
-		return handle_task_detached(state, sink, tool_call_id, spec).await;
-	}
-	// Persist the spawn into the **parent**'s JSONL right away
-	// (before the sub-agent runs) so a crash / kill mid-sub-agent
-	// still leaves a record the parent can replay. The on-disk
-	// record mirrors `CoderEvent::SubagentSpawned` byte-for-byte
-	// so replay needs no shape conversion. Best-effort: a write
-	// failure logs at warn but doesn't fail the spawn.
-	persist_parent_record(
-		rt,
-		SessionRecord::SubagentSpawned {
-			tool_call_id: tool_call_id.to_string(),
-			subagent_id: spec.id.clone(),
-			target_folder: spec.folder.folder.path.clone(),
-			mode: spec.mode.as_wire().to_string(),
-			worktree_root: None,
-			worker: false,
-			detached: false,
-		},
-	)
-	.await;
-	let subagent_id_for_record = spec.id.clone();
-	let sub_cancel = cancel.child_token();
-	// Sub-agents share their parent's `FolderEventSink` — events
-	// arrive in the parent's folder bucket on the frontend, which
-	// is exactly the multi-session contract: sub-agents belong to
-	// whichever project originated them.
-	let outcome = run_subagent(
-		&state.tools,
-		&state.inference,
-		sink,
-		&state.coder_sessions_dir,
-		&state.models,
-		spec,
-		sub_cancel,
-	)
-	.await;
-	// Persist the finish (success or error) into the parent's
-	// JSONL. We piggy-back on the live `CoderEvent::SubagentFinished`
-	// shape and add a `result_preview` so a reloaded parent can
-	// render the collapsed card without lazy-loading the
-	// sub-agent's own JSONL. For errors we record `was_error: true`
-	// and a `None` preview — the parent's tool_result row already
-	// surfaces the error JSON, no need to duplicate it.
-	let finished_record = match &outcome {
-		Ok(report) => SessionRecord::SubagentFinished {
-			subagent_id: subagent_id_for_record.clone(),
-			tokens_used_estimate: report.tokens_used_estimate,
-			was_error: false,
-			result_preview: result_preview_from(&report.result),
-		},
-		Err(_) => SessionRecord::SubagentFinished {
-			subagent_id: subagent_id_for_record,
-			tokens_used_estimate: 0,
-			was_error: true,
-			result_preview: None,
-		},
-	};
-	persist_parent_record(rt, finished_record).await;
-	let report = outcome?;
-	Ok(json!({
-		"result": report.result,
-		"sub_session_id": report.sub_session_id,
-		"tokens_used_estimate": report.tokens_used_estimate,
-		"mode": report.mode.as_wire(),
-		"iterations_used": report.iterations_used,
-	}))
+	// Every parent `task` runs in the background (ADR 0091): register,
+	// spawn, return a handle. The report reaches the parent through
+	// the completion callback or `task_collect`.
+	spec.detach = true;
+	handle_task_detached(state, sink, tool_call_id, spec).await
 }
 
 /// First non-empty trimmed line of `result`, capped at 512 chars,
@@ -7832,11 +7621,13 @@ async fn persist_worker_detached(
 	.await;
 }
 
-/// `task` with `detach: true` ([ADR 0053]). Registers the run,
-/// spawns it on a fresh root token, and returns a handle
-/// immediately — the parent keeps working. The finish feeder
-/// wakes the parent when the run settles; `task_collect` fetches
-/// the report; `task_abort` / the user-level abort cancel it.
+/// `task` ([ADR 0053]; every parent call since ADR 0091). Registers
+/// the run, spawns it on a fresh root token, and returns a handle
+/// immediately — the parent keeps working. When the run settles its
+/// report goes to the parent as a message (the completion callback)
+/// unless a parked `task_collect` takes it; `task_abort`, the
+/// pop-out's stop button, Esc, or a coordinator's `abort_worker`
+/// cancel it.
 async fn handle_task_detached(
 	state: &Arc<CoderState>,
 	sink: &FolderEventSink,
@@ -7873,14 +7664,17 @@ async fn handle_task_detached(
 		)
 		.await;
 	}
-	// First detached run for this parent spawns its finish feeder.
-	spawn_detached_finish_feeder(state.clone(), parent_session_id.clone());
-
 	let state_for_run = state.clone();
 	let sink_for_run = sink.clone();
 	let parent_session_id_for_run = parent_session_id.clone();
 	let subagent_id_for_run = subagent_id.clone();
+	// Background sub-agents count as agent activity (ADR 0091): the
+	// OS indicator stays "running" and doesn't flash "done" while the
+	// parent is idle waiting on them. Held across the callback so the
+	// turn it starts takes over without a gap.
+	let running_guard = RunningTurnGuard::acquire(&state.running_turns);
 	tokio::spawn(async move {
+		let _running_guard = running_guard;
 		let outcome = run_subagent(
 			&state_for_run.tools,
 			&state_for_run.inference,
@@ -7896,7 +7690,22 @@ async fn handle_task_detached(
 			Err(CoderError::Aborted) => DetachedFinish::Aborted,
 			Err(err) => DetachedFinish::Failed(err.to_string()),
 		};
-		DetachedTaskRegistry::settle(&entry, finish).await;
+		DetachedTaskRegistry::settle(&entry, finish.clone()).await;
+		// The completion callback (ADR 0091): hand the report to the
+		// parent as a message — queued into its running turn, or
+		// waking it. Skipped when a parked `task_collect` already
+		// takes it (`settle` stored the finish before this read, and
+		// a collector registers before re-checking the finish, so at
+		// least one of the two sees the other), and for aborts —
+		// somebody stopped the run on purpose.
+		let collected = entry.collectors.load(std::sync::atomic::Ordering::SeqCst) > 0;
+		if let (false, Some(text)) = (collected, subagent_report_message(&subagent_id_for_run, &finish)) {
+			let handle = CoderHandle {
+				state: state_for_run.clone(),
+			};
+			// Best-effort: the parent session may have been deleted.
+			let _ = handle.send_to(&parent_session_id_for_run, text, Vec::new()).await;
+		}
 		// Persist the finish into the parent's JSONL, mirroring the
 		// synchronous path so a reloaded parent settles the card
 		// without lazy-loading the sub-agent's JSONL.
@@ -7922,12 +7731,22 @@ async fn handle_task_detached(
 		"detached": true,
 		"subagent_id": subagent_id,
 		"status": "running",
-		// Nudge against busy-polling: the finish feeder wakes the
-		// parent (even across turns), so the model can park the
-		// handle and end its turn instead of spinning on
-		// `task_collect`.
-		"hint": "you will be notified when this run finishes — keep working or end your turn; only call task_collect(wait_ms) if you need the result before continuing",
+		"hint": "its report will be delivered to you as a <subagent_report> message when it finishes — keep working, or call task_collect(subagent_id, wait_ms) if you need it before you can continue",
 	}))
+}
+
+/// The completion callback's text for a settled run, or `None` for
+/// an aborted one. Tagged so the model can tell it from something
+/// the user typed, and the panel can render it as a report card.
+fn subagent_report_message(subagent_id: &str, finish: &DetachedFinish) -> Option<String> {
+	let (status, body) = match finish {
+		DetachedFinish::Done(report) => ("done", report.result.trim().to_owned()),
+		DetachedFinish::Failed(error) => ("error", error.clone()),
+		DetachedFinish::Aborted => return None,
+	};
+	Some(format!(
+		"<subagent_report subagent_id=\"{subagent_id}\" status=\"{status}\">\n{body}\n</subagent_report>"
+	))
 }
 
 /// Resolve `subagent_id` to one of the calling session's detached
@@ -7952,7 +7771,7 @@ async fn own_detached_entry(
 	Err(CoderError::invalid_args(
 		tool,
 		format!(
-			"no detached sub-agent `{subagent_id}` for this session — either the id is not one this session's `task({{ detach: true }})` calls returned (a synchronous `task` has no handle), or the in-memory handle was lost to an IDE restart; a finished run's transcript is on disk under the parent session's sub-agent directory"
+			"no sub-agent `{subagent_id}` for this session — either the id is not one this session's `task` calls returned, or the in-memory handle was lost to an IDE restart; a finished run's transcript is on disk under the parent session's sub-agent directory"
 		),
 	))
 }
@@ -7964,6 +7783,7 @@ async fn handle_task_collect(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
 	args: &Value,
+	cancel: &CancellationToken,
 ) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct CollectArgs {
@@ -7979,21 +7799,44 @@ async fn handle_task_collect(
 		return Ok(value);
 	}
 	// Still running. Either report `running` now, or park on the
-	// notify until it settles / the wait cap elapses.
-	let wait_ms = parsed.wait_ms.unwrap_or(0).min(60_000);
-	if wait_ms > 0 {
-		let notified = entry.notify.notified();
-		tokio::pin!(notified);
-		// Enable the notification *before* the timeout race so a
-		// settle between the check above and here isn't lost.
-		notified.as_mut().enable();
-		let _ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), notified).await;
-		if let Some(value) = detached_collect_value(&entry).await {
-			return Ok(value);
+	// notify until it settles / the wait cap elapses / the user
+	// stops the turn.
+	let wait_ms = parsed.wait_ms.unwrap_or(0).min(TASK_COLLECT_MAX_WAIT_MS);
+	if wait_ms == 0 {
+		return Ok(json!({ "status": "running" }));
+	}
+	let notified = entry.notify.notified();
+	tokio::pin!(notified);
+	// Enable the notification *before* the re-check so a settle in
+	// between isn't lost.
+	notified.as_mut().enable();
+	// Registered before the re-check: the run's settle either sees
+	// this collector (and skips its callback) or set the finish
+	// before the re-check below reads it.
+	entry.collectors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+	let settled = match detached_collect_value(&entry).await {
+		Some(value) => Some(value),
+		None => {
+			tokio::select! {
+				() = cancel.cancelled() => {}
+				_ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), notified) => {}
+			}
+			detached_collect_value(&entry).await
 		}
+	};
+	entry.collectors.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+	if let Some(value) = settled {
+		return Ok(value);
+	}
+	if cancel.is_cancelled() {
+		return Err(CoderError::Aborted);
 	}
 	Ok(json!({ "status": "running" }))
 }
+
+/// Cap on `task_collect`'s `wait_ms` — same 10 minutes as a blocking
+/// `bash` call.
+const TASK_COLLECT_MAX_WAIT_MS: u64 = 600_000;
 
 /// Map a settled [`DetachedEntry`] to the `task_collect` result
 /// payload, or `None` while it's still running.
@@ -8066,65 +7909,6 @@ async fn handle_task_abort(
 	}
 	entry.cancel.cancel();
 	Ok(json!({ "status": "aborted" }))
-}
-
-/// Per-parent background task that watches the event broadcast for
-/// `SubagentFinished` from this parent's detached sub-agents and
-/// injects a wake message into the parent's session ([ADR 0053]).
-/// The wake is a pointer, not the report — the parent calls
-/// `task_collect` for the content, preserving `task`'s
-/// context-preservation property. Exits when the broadcast closes.
-fn spawn_detached_finish_feeder(state: Arc<CoderState>, parent_session_id: String) {
-	// Spawn the feeder once per parent. A first detached spawn for
-	// a parent flips this flag; later spawns reuse the running
-	// feeder. Reuse the coordinator-workers pattern of "one
-	// feeder per orchestrator" rather than a feeder per run.
-	static FEEDERS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
-	let feeders = FEEDERS.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
-	if !feeders
-		.lock()
-		.expect("detached feeder registry poisoned")
-		.insert(parent_session_id.clone())
-	{
-		return;
-	}
-	let handle = CoderHandle { state: state.clone() };
-	let mut rx = handle.subscribe();
-	tokio::spawn(async move {
-		loop {
-			let recv = rx.recv().await;
-			let Ok(envelope) = recv else { continue };
-			// Only detached runs of *this* parent wake it.
-			let CoderEvent::SubagentFinished {
-				subagent_id, was_error, ..
-			} = &envelope.event
-			else {
-				continue;
-			};
-			let is_ours = state
-				.detached_tasks
-				.read()
-				.await
-				.is_detached_of(&parent_session_id, subagent_id);
-			if !is_ours {
-				continue;
-			}
-			// The report is cached under the same registry entry;
-			// `task_collect` returns it (or the error) verbatim.
-			let status = if *was_error { "error" } else { "done" };
-			let text = format!(
-				"Detached sub-agent {subagent_id} finished (status: {status}). Call `task_collect(\"{subagent_id}\")` to fetch its report, or ignore it if you no longer need the result."
-			);
-			// Best-effort: the parent may be gone (its session
-			// deleted). The wake is a pointer, not the report —
-			// the cached entry must survive it, because the parent
-			// is typically mid-turn here and only reaches its
-			// `task_collect` one or more LLM round-trips later.
-			// Entries are pruned when the parent session is
-			// deleted, not before.
-			let _ = handle.send_to(&parent_session_id, text, Vec::new()).await;
-		}
-	});
 }
 
 /// Apply a `todo_write` payload to the current session's todo
@@ -12084,6 +11868,24 @@ pub(crate) fn new_message_id() -> String {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn subagent_report_message_carries_the_report_and_skips_aborts() {
+		let report = crate::subagent::SubagentReport {
+			result: "  Found 3 callsites.\n".into(),
+			tokens_used_estimate: 10,
+			sub_session_id: "sub-1".into(),
+			mode: CoderMode::Research,
+			iterations_used: 2,
+		};
+		assert_eq!(
+			super::subagent_report_message("sub-1", &super::DetachedFinish::Done(report)).as_deref(),
+			Some("<subagent_report subagent_id=\"sub-1\" status=\"done\">\nFound 3 callsites.\n</subagent_report>")
+		);
+		let failed = super::subagent_report_message("sub-2", &super::DetachedFinish::Failed("boom".into()));
+		assert!(failed.is_some_and(|text| text.contains("status=\"error\"") && text.contains("boom")));
+		assert!(super::subagent_report_message("sub-3", &super::DetachedFinish::Aborted).is_none());
+	}
+
 	use super::*;
 
 	#[test]

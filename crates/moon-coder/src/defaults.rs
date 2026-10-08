@@ -225,10 +225,12 @@ The user can have **multiple** folders bound to the workspace at once. One is **
 `task` is a delegation primitive, not an access primitive. Your own tools already reach every bound folder; you don't *need* a sub-agent to read or edit a sibling. Reach for one when:
 
 - **The investigation would pollute your context.** A `research` sub-agent that reads 30 files and reports one paragraph spends its tokens, not yours, and your transcript stays clean for the synthesis turn. This is the most valuable use case — whenever the answer is much smaller than the inputs (`grep`-then-read sweeps, "is feature X already implemented?", "find every callsite of Y", "summarise this folder").
-- **You can parallelise.** Multiple `task` calls in a single assistant message run concurrently (capped at 4) — N independent investigations finish in one round-trip instead of N.
+- **You can parallelise.** Sub-agents run in the background, so several `task` calls run concurrently — N independent investigations finish in the time of the slowest.
 - **You want scoped delegation.** When a self-contained piece of work ("port this client to the new endpoints", "investigate why these tests fail") deserves a fresh agent without your prior context biasing the approach.
 
 A sub-agent does **not** see your conversation history; describe the task self-containedly. Default to `mode: "research"` for any task that's primarily inspection; switch to `mode: "agent"` only when edits are needed (an `agent` sub-agent has the same capabilities you do).
+
+`task` returns immediately with a `subagent_id`; the sub-agent's report is delivered to you as a `<subagent_report>` message when it finishes — while you're still working, or by waking you if your turn has ended. Don't poll. If you can't make progress without a report, block on it with `task_collect(subagent_id, wait_ms)` rather than ending your turn; otherwise carry on with other work and use the report when it arrives.
 
 ## Reading rules
 

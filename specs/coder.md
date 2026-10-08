@@ -406,10 +406,10 @@ implementations are typed Rust:
 | `read_terminal`     | `(id, lines?, wait_for?, timeout_ms?) -> { id, target, cwd, running, …, output, matched? }`                                 | Rendered tail of one terminal's output. Read-only; same gating as `list_terminals`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `open_terminal`     | `(command, title?, wait_for?, timeout_ms?) -> { id, …, reused, output?, matched? }`                                         | Runs a long-lived command in a new IDE terminal tab on the `bash` side; reuses an agent terminal already running the same command. Write modes only. See [§ Agent-opened terminals](#agent-opened-terminals).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `terminal_tab`      | `(id, action: restart\|close, wait_for?, timeout_ms?) -> { id, action, … }`                                                 | Restart (fresh shell, same id, command re-run) or close an **agent-opened** terminal in this project. The user's terminals are refused.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `task`              | `(task, folder?, mode?, system_prompt?, detach?) -> { result, … } \| { detached, subagent_id, status }`                     | Delegates to a sub-agent — see [§ Sub-agents](#sub-agents). Parent-only; up to 4 run in parallel. `detach: true` returns a handle immediately and runs in the background ([ADR 0053](decisions/0053-detached-task-subagents.md)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `task_collect`      | `(subagent_id, wait_ms?) -> { status, result? }`                                                                            | Fetch a detached sub-agent's report; `wait_ms` blocks until it settles (capped 60 s). See [ADR 0053](decisions/0053-detached-task-subagents.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `task_steer`        | `(subagent_id, text) -> { status }`                                                                                         | Queue a steering message into a running detached sub-agent; delivered at its next iteration top, same as a user steer ([ADR 0071](decisions/0071-steer-detached-subagents.md)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `task_abort`        | `(subagent_id) -> { status }`                                                                                               | Cancel a running detached sub-agent (scoped to that run only). See [ADR 0053](decisions/0053-detached-task-subagents.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `task`              | `(task, folder?, mode?, system_prompt?) -> { detached, subagent_id, status }`                                               | Delegates to a sub-agent — see [§ Sub-agents](#sub-agents). Parent-only. Always runs in the background; the report arrives as a `<subagent_report>` message ([ADR 0091](decisions/0091-background-only-subagents.md)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `task_collect`      | `(subagent_id, wait_ms?) -> { status, result? }`                                                                            | Block on a sub-agent's report (`wait_ms`, capped 10 min); a report collected this way skips the callback. See [ADR 0091](decisions/0091-background-only-subagents.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `task_steer`        | `(subagent_id, text) -> { status }`                                                                                         | Queue a steering message into a running sub-agent; delivered at its next iteration top, same as a user steer ([ADR 0071](decisions/0071-steer-detached-subagents.md)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `task_abort`        | `(subagent_id) -> { status }`                                                                                               | Cancel a running sub-agent (scoped to that run only; no report is sent). See [ADR 0053](decisions/0053-detached-task-subagents.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `web_search`        | `(query, max_results?) -> { query, results, count }`                                                                        | Tavily SERP. Only advertised when a key is configured. See [§ Web search](#web-search).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `web_fetch`         | `(url) -> { url, markdown, truncated, bytes }`                                                                              | Jina Reader markdown extraction; `http`/`https` only, 200 kB cap. Always available.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `open_browser`      | `(url) -> { tab_id, url, target, reused }`                                                                                  | Opens (or focuses + reloads, same URL) an IDE browser tab. Loopback / service-name URLs resolve on the `bash` side; container targets go through a tunnel, no port forward. See [ADR 0088](decisions/0088-in-ide-browser-tab.md).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -1721,39 +1721,20 @@ from.
 ## Sub-agents
 
 The parent's loop exposes the `task` tool. One call dispatches one
-sub-agent; by default the parent's tool call **awaits the report**
-(synchronous). `detach: true` instead returns a handle immediately and
-runs the sub-agent in the background — see § Detached sub-agents below.
-Multiple synchronous `task` calls in one assistant message run
-concurrently (4-permit semaphore). The wire name is `task` (what every
-agent product calls this); Rust internals keep the `subagent` naming.
-
-For a concurrent batch, each call's `ToolResult` event fires the
-moment that sub-agent finishes — not when its earlier siblings do —
-so the panel can stop that row's elapsed timer while the rest of the
-batch is still running. The conversation-history push is the mirror
-image: results land on `messages` in the model's original tool-call
-order once the whole batch resolves, so the next round-trip and any
-persisted replay stay deterministic. (Firing events in call order
-instead left finished-but-later rows pinned in the live "running…"
-state until the longest sibling settled.)
+sub-agent, which always runs **in the background**
+([ADR 0091](decisions/0091-background-only-subagents.md)): the call
+returns a handle immediately and the report comes back through the
+completion callback (§ Background sub-agents below). Several calls run
+concurrently, with no cap. The wire name is `task` (what every agent
+product calls this); Rust internals keep the `subagent` naming.
 
 ```jsonschema
 task(
   task: string,                    // self-contained; sub-agent doesn't see the parent's transcript
   folder?: string,                 // basename of a bound folder, default = parent's active folder
   mode?: "research" | "agent",     // default = "agent"
-  system_prompt?: string,          // overrides the mode-default prompt
-  detach?: boolean                 // default false; true = run in background, return a handle
-) -> {
-  result: string,                  // synchronous: the only string the parent's model sees
-  sub_session_id: string,          // pop-out lookup key, stable across restarts
-  tokens_used_estimate: number,
-  mode: "research" | "agent",
-  iterations_used: number
-}
-// detach: true instead returns immediately:
-//   { detached: true, subagent_id: string, status: "running" }
+  system_prompt?: string           // overrides the mode-default prompt
+) -> { detached: true, subagent_id: string, status: "running", hint: string }
 ```
 
 There is deliberately no per-call model selector — sub-agents inherit
@@ -1766,7 +1747,7 @@ Sub-agents also inherit the parent session's **host-mode override**
 shared flag ([ADR 0082](decisions/0082-inherited-host-mode.md)): a
 force-host parent's delegated `bash` runs on the host too, and a
 mid-run toggle re-routes the sub-agent's next command (ADR 0041
-semantics, one level down). Nested and detached runs ride the same
+semantics, one level down). Nested and background runs ride the same
 handle; a user-resumed sub-agent re-resolves the flag from the
 parent's runtime, falling back to auto when the parent is unmounted.
 
@@ -1787,7 +1768,7 @@ Top-level sessions are always `agent`; mode is a sub-agent concept.
 ### Nested sub-agents ([ADR 0081](decisions/0081-nested-research-subagents.md))
 
 An `agent`-mode sub-agent gets a **trimmed `task`** of its own:
-research-only (no `mode`), synchronous-only (no `detach`), no
+research-only (no `mode`), blocking (no handle, no callback), no
 `system_prompt` override — just `task` + optional `folder`. This gives
 delegated refactors the same context-preservation lever the parent
 has for read-heavy legwork. Depth is capped at 2 by tool-list shape:
@@ -1832,56 +1813,46 @@ returned as a fragment — see § Truncated answers. There is no
 wall-clock timeout: a sub-agent is bounded by iterations and by
 cancellation, not by a clock.
 
-### Detached sub-agents ([ADR 0053](decisions/0053-detached-task-subagents.md))
+### Background sub-agents ([ADR 0053](decisions/0053-detached-task-subagents.md), [ADR 0091](decisions/0091-background-only-subagents.md))
 
-`task({ ..., detach: true })` runs the sub-agent in the **background**
-and returns a handle immediately — the parent keeps working instead of
-parking the turn behind a blocking call. It's the async counterpart to
-the synchronous default, for slow independent work (a long test suite,
-a background audit) whose report isn't needed before the parent's next
-step. Detached runs share everything else with synchronous ones: same
-modes, same folder targeting, same nested-delegation rules
-(§ Nested sub-agents — a detached `agent` run may spawn nested
-research sub-agents, which are themselves always synchronous), same
-JSONL + collapsed card + pop-out.
+Every parent `task` returns a handle immediately; the parent keeps
+working, or ends its turn. Nested research sub-agents (§ Nested
+sub-agents) are the exception: they block their `agent`-mode caller,
+which has nothing to wake it.
 
-The lifecycle surface:
-
-- **`task_collect(subagent_id, wait_ms?)`** fetches the report once
-  the run settles (`{ status: "done", result, … }` / `"error"` /
-  `"aborted"`), or returns `{ status: "running" }` while in flight.
-  `wait_ms` (capped 60 s) parks until it settles, so the model can
-  wait without busy-polling — the `read_process` shape (ADR 0034).
-- **The finish wakes the parent.** A per-parent feeder watches for the
-  run's `SubagentFinished` and injects a steer-style message pointing
-  at `task_collect` — the coordinator's events-as-messages pattern
-  (ADR 0030 §a) keyed to sub-agent ids. The wake is a pointer, not the
-  report, preserving `task`'s context-isolation property.
+- **Completion callback.** When a run settles, its report is sent to
+  the parent as a message:
+  `<subagent_report subagent_id="…" status="done|error">…</subagent_report>`
+  — queued into the running turn, or waking an idle parent. The panel
+  renders it as a collapsed "sub-agent report" card. Aborted runs
+  (`task_abort`, the pop-out's stop button, Esc) send nothing.
+- **`task_collect(subagent_id, wait_ms?)`** is for blocking on a report
+  the parent can't proceed without: `wait_ms` parks (capped 10 min,
+  aborted by Esc) until the run settles. A run that settles while a
+  collect is parked on it hands the report to that call and skips the
+  callback; otherwise collect returns the cached report (`"done"` /
+  `"error"` / `"aborted"`) or `{ status: "running" }`.
 - **`task_steer(subagent_id, text)`** queues a steering message into a
-  running detached run ([ADR 0071](decisions/0071-steer-detached-subagents.md))
-  — delivered at the top of the
-  sub-agent's next iteration, the same channel the pop-out composer
-  uses. The row is tagged `from_coordinator` in the sub-agent's
-  transcript so it reads as agent-sent, not user-sent. Settled runs
-  return `{ status: "not_running" }`; only the spawning session's own
-  detached ids are steerable (synchronous runs have no handle and the
-  parent is blocked on them anyway).
+  running run ([ADR 0071](decisions/0071-steer-detached-subagents.md))
+  — delivered at the top of the sub-agent's next iteration, the same
+  channel the pop-out composer uses, tagged `from_coordinator` so it
+  reads as agent-sent. Settled runs return `{ status: "not_running" }`.
 - **`task_abort(subagent_id)`** cancels the run's own token — scoped
-  to the one sub-agent, never the parent turn or its siblings. The
-  user-level abort (Esc) cascades to a session's live detached runs.
+  to the one sub-agent.
+- **Esc stops everything.** The user-level abort (and a
+  coordinator's `abort_worker`) cancels the session's running
+  sub-agents along with its turn; deleting the parent session does
+  too. Aborted runs send no report, so the stop sticks.
+- **Counts as agent activity.** A running sub-agent keeps the OS
+  activity indicator "running", and a parent turn that ends while its
+  sub-agents are still running doesn't fire the turn-finished
+  notification ([ADR 0089](decisions/0089-turn-finished-notification.md))
+  — the turn their reports start does.
 - **Handles are in-memory.** A restart loses live runs (their JSONLs
-  stay on disk); `task_collect` on a lost id says so rather than
-  hanging. A settled run's report stays collectable (repeatably) until
-  the parent session is deleted — the wake is only a pointer, and the
-  parent may not reach its `task_collect` until several turns later.
-  A detached run outlives its spawning turn, so it flushes
-  its own format-on-save queue when it settles (as a user-resumed
-  sub-agent already does).
-
-Detached spawns skip the homogeneous-batch parallel path (a detached
-call returns instantly, so the `join_all`-then-report shape doesn't
-apply) — the sequential dispatch routes them through the same detached
-spawn, keeping one code path.
+  stay on disk) and their callbacks; `task_collect` on a lost id says
+  so. A settled run's report stays collectable until the parent
+  session is deleted. A run outlives its spawning turn, so it flushes
+  its own format-on-save queue when it settles.
 
 ### Persistence
 

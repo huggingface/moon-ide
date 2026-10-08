@@ -323,11 +323,11 @@ pub struct Subagent {
 	pub task: String,
 	pub system_prompt_override: Option<String>,
 	pub mode: CoderMode,
-	/// Whether this run was spawned with `detach: true` ([ADR
-	/// 0053]): the parent's tool call returns a handle immediately
-	/// and the run settles in the background, surfaced via the
-	/// detached registry + `task_collect` instead of a blocking
-	/// tool result. `false` for every synchronous `task` call.
+	/// Whether this run is a background run of a top-level parent
+	/// (every parent `task` is, ADR 0091): the tool call returns a
+	/// handle immediately and the report arrives via the completion
+	/// callback or `task_collect`. `false` for nested (blocking)
+	/// runs and user-driven resumes.
 	pub detach: bool,
 	/// Folder the sub-agent's tools operate against. May differ
 	/// from `parent_folder` when the model passed an explicit
@@ -380,7 +380,9 @@ fn serialize_mode_wire<S: serde::Serializer>(mode: &CoderMode, s: S) -> Result<S
 pub fn task_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"task",
-		"Delegate a self-contained task to a sub-agent and get back a single summarised string. Sub-agents run in their own context — you spend tokens on the task description and the final summary, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
+		"Delegate a self-contained task to a sub-agent that runs in the background. Sub-agents run in their own context — you spend tokens on the task description and the final report, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
+\
+The call returns at once with a `subagent_id`. When the sub-agent finishes, its report is delivered to you automatically as a `<subagent_report>` message — mid-turn, or by waking you if your turn already ended — so never poll for it. If you need the report before you can do anything else, call `task_collect(subagent_id, wait_ms)` to block on it (it then isn't delivered a second time); otherwise keep working. Several `task` calls run concurrently. Use `task_steer` to redirect a running sub-agent and `task_abort` to stop one. \
 \
 The sub-agent has no access to your conversation history — describe the task self-containedly. An `agent`-mode sub-agent can itself delegate read-only investigations to nested `research` sub-agents; `research` sub-agents cannot delegate further.",
 		json!({
@@ -402,10 +404,6 @@ The sub-agent has no access to your conversation history — describe the task s
 				"system_prompt": {
 					"type": "string",
 					"description": "Optional override for the sub-agent's system prompt. Most callers should leave this empty and rely on the mode-default prompt."
-				},
-				"detach": {
-					"type": "boolean",
-					"description": "When true, the call returns immediately with a `subagent_id` handle instead of blocking on the report: the sub-agent runs in the background, its finish wakes you with a notice, and you fetch the report with `task_collect(subagent_id)` (steer it mid-run with `task_steer`, or stop it with `task_abort`). Default false (synchronous). Prefer detach for slow, independent work you don't need the answer to before continuing — long test suites, background audits."
 				}
 			},
 			"required": ["task"]
@@ -448,17 +446,17 @@ The sub-agent has no access to your conversation history — describe the task s
 pub fn task_collect_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 			"task_collect",
-			"Fetch the report of a detached sub-agent (one spawned with `task({ ..., detach: true })`). Returns `{ status: \"done\", result, tokens_used_estimate, iterations_used }` once it settles, `{ status: \"error\", error }` on failure, or `{ status: \"running\" }` while it's still going. Pass `wait_ms` to block until it settles (capped at 60 s) instead of busy-polling. Only ids your own session spawned with `detach: true` are collectable.",
+			"Block on a sub-agent's report when you need it before continuing (reports are otherwise delivered to you automatically when the run finishes). Returns `{ status: \"done\", result, tokens_used_estimate, iterations_used }` once it settles, `{ status: \"error\", error }` on failure, `{ status: \"aborted\" }`, or `{ status: \"running\" }` if `wait_ms` elapsed first. A report collected while you were waiting on it is not delivered again. Only ids your own session's `task` calls returned are collectable.",
 			json!({
 				"type": "object",
 				"properties": {
 					"subagent_id": {
 						"type": "string",
-						"description": "The `subagent_id` a detached `task` call returned."
+						"description": "The `subagent_id` a `task` call returned."
 					},
 					"wait_ms": {
 						"type": "integer",
-						"description": "Optional. Block up to this many milliseconds for the run to settle (capped at 60000). Omit to return immediately with the current status."
+						"description": "Block up to this many milliseconds for the run to settle (capped at 600000 = 10 minutes). Omit to return immediately with the current status."
 					}
 				},
 				"required": ["subagent_id"]
@@ -475,13 +473,13 @@ pub fn task_collect_tool_definition() -> ToolDefinition {
 pub fn task_steer_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 			"task_steer",
-			"Send a steering message to a running detached sub-agent (one spawned with `task({ ..., detach: true })`). The message is queued and delivered at the top of the sub-agent's next iteration — the same way a user steers a session. Use it to redirect a run that's drifting, narrow or extend its scope, or feed it something you just learned; don't use it to poll (use `task_collect` with `wait_ms` for that). Returns `{ status: \"steered\" }`, or `{ status: \"not_running\" }` when the run already settled (collect its report instead). Only ids your own session spawned with `detach: true` can be steered.",
+			"Send a steering message to a running sub-agent. The message is queued and delivered at the top of the sub-agent's next iteration — the same way a user steers a session. Use it to redirect a run that's drifting, narrow or extend its scope, or feed it something you just learned; don't use it to poll. Returns `{ status: \"steered\" }`, or `{ status: \"not_running\" }` when the run already settled (its report is or will be delivered to you). Only ids your own session's `task` calls returned can be steered.",
 			json!({
 				"type": "object",
 				"properties": {
 					"subagent_id": {
 						"type": "string",
-						"description": "The `subagent_id` a detached `task` call returned."
+						"description": "The `subagent_id` a `task` call returned."
 					},
 					"text": {
 						"type": "string",
@@ -499,13 +497,13 @@ pub fn task_steer_tool_definition() -> ToolDefinition {
 pub fn task_abort_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 			"task_abort",
-			"Cancel a running detached sub-agent. Its partial work is discarded (the turn's format-on-save flush still runs for whatever it already wrote). Returns `{ status: \"aborted\" }` when it was running, `{ status: \"not_running\" }` when it had already settled (its report is still available via `task_collect`). Never affects your own turn or other sub-agents.",
+			"Cancel a running sub-agent. Its partial work is discarded (files it already wrote stay), and no report is delivered for it. Returns `{ status: \"aborted\" }` when it was running, `{ status: \"not_running\" }` when it had already settled. Never affects your own turn or other sub-agents.",
 			json!({
 				"type": "object",
 				"properties": {
 					"subagent_id": {
 						"type": "string",
-						"description": "The `subagent_id` a detached `task` call returned."
+						"description": "The `subagent_id` a `task` call returned."
 					}
 				},
 				"required": ["subagent_id"]
@@ -1296,9 +1294,8 @@ async fn run_subagent_loop(
 		// Sub-agents dispatch their tools sequentially today —
 		// recursive parallelism (a sub-agent's own tools running
 		// concurrently) is out of scope for the current slice.
-		// Parallelism happens *one level up*: multiple sub-agents
-		// in the parent's batch run concurrently via the parent's
-		// `dispatch_subagent_batch`.
+		// Parallelism happens *one level up*: the parent's `task`
+		// calls all run in the background (ADR 0091).
 		for call in &response.tool_calls {
 			if cancel.is_cancelled() {
 				return Err(CoderError::Aborted);
@@ -1990,8 +1987,6 @@ pub fn build_subagent_spec(
 		.filter(|s| !s.is_empty())
 		.map(str::to_string);
 
-	let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
-
 	Ok(Subagent {
 		id: new_subagent_id(),
 		parent_session_id,
@@ -2000,7 +1995,8 @@ pub fn build_subagent_spec(
 		task,
 		system_prompt_override,
 		mode,
-		detach,
+		// The parent's `handle_task` flips this; nested runs block.
+		detach: false,
 		folder,
 		force_host_bash,
 	})
