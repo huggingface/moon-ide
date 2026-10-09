@@ -2249,6 +2249,12 @@ export class CoderPanelState {
 		}
 	}
 
+	/** Rename a session. The list and header pick the new title up
+	 *  from the backend's `session_title_updated` broadcast. */
+	async renameSession(id: string, title: string): Promise<void> {
+		await ipc.coder.renameSession(id, title);
+	}
+
 	/** Switch to the sessions-list view. Doesn't drop the
 	 *  in-memory session — the user can come back via a click. */
 	showSessionsList(): void {

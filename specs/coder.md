@@ -1342,6 +1342,11 @@ once per session, and **not at all** for a session that was already
 titled at creation — a coordinator-spawned worker keeps the name the
 coordinator gave it ([ADR 0042](decisions/0042-named-worker-branches.md)).
 
+The user can rename a session any time — pencil on a sessions-list row
+or next to the in-session title, or the companion's title edit — via
+`coder_rename_session` (same `TitleUpdate` + `session_title_updated`
+path). A user rename wins over an auto-rename still in flight.
+
 ### Sidebar UI
 
 Two views sharing the right-side slot (`rightPanel.kind === 'coder'`):

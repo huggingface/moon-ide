@@ -315,6 +315,7 @@ pub fn run() {
 			commands::coder::coder_set_bash_target_override,
 			commands::coder::coder_open_session,
 			commands::coder::coder_delete_session,
+			commands::coder::coder_rename_session,
 			commands::coder::coder_session_jsonl_path,
 			commands::coder::coder_get_model_settings,
 			commands::coder::coder_set_model_settings,

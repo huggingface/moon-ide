@@ -2416,6 +2416,49 @@
 		}
 	}
 
+	// Inline session rename — one at a time, from a list row's pencil
+	// or a double-click on the in-session title.
+	let renamingId = $state<string | null>(null);
+	let renameText = $state('');
+
+	function startRename(event: MouseEvent, id: string, title: string): void {
+		event.stopPropagation();
+		renamingId = id;
+		renameText = title;
+	}
+
+	async function commitRename(): Promise<void> {
+		const id = renamingId;
+		renamingId = null;
+		const title = renameText.trim();
+		if (id === null || title.length === 0) {
+			return;
+		}
+		try {
+			await coder.renameSession(id, title);
+		} catch (err) {
+			workspace.flash(`Could not rename session: ${formatError(err)}`);
+		}
+	}
+
+	function onRenameKeydown(event: KeyboardEvent): void {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			void commitRename();
+			return;
+		}
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			event.stopPropagation();
+			renamingId = null;
+		}
+	}
+
+	function focusAndSelect(node: HTMLInputElement): void {
+		node.focus();
+		node.select();
+	}
+
 	async function onDeleteSession(event: MouseEvent, id: string, title: string): Promise<void> {
 		// Stop the click from propagating into the row's "open"
 		// button — without this, deleting a session would also
@@ -2844,64 +2887,71 @@
 								class:running={isRunning}
 								class:finished={isFinished}
 							>
-								<button
-									type="button"
-									class="session-pick"
-									onclick={() => onPickSession(session.id)}
-									title={isAwaitingInput
-										? 'Agent needs your input — click to answer'
-										: isRunning
-											? 'Session is running — click to follow'
-											: isFailed
-												? 'Last turn failed — open to retry'
-												: isInterrupted
-													? 'Turn never finished (restart/stop) — open to relaunch'
-													: isFinished
-														? 'Finished while you were away — click to open'
-														: 'Open session'}
-								>
-									<div class="session-title">
-										{#if isAwaitingInput}
-											<span class="awaiting-dot" aria-hidden="true"></span>
-										{:else if isRunning}
-											<span class="running-dot" aria-hidden="true"></span>
-										{:else if isFailed}
-											<span class="failed-dot" aria-hidden="true">!</span>
-										{:else if isInterrupted}
-											<span class="interrupted-dot" aria-hidden="true">!</span>
-										{:else if isFinished}
-											<span class="finished-dot" aria-hidden="true"></span>
-										{/if}
-										<span class="session-title-text" title={session.title || '(untitled)'}
-											>{session.title || '(untitled)'}</span
-										>
-										{#if isCoordinatorSession(session)}
-											<span
-												class="session-mode-badge coordinator"
-												title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
+								{#if renamingId === session.id}
+									<div class="session-pick">
+										<div class="session-title">{@render renameInput()}</div>
+									</div>
+								{:else}
+									<button
+										type="button"
+										class="session-pick"
+										onclick={() => onPickSession(session.id)}
+										title={isAwaitingInput
+											? 'Agent needs your input — click to answer'
+											: isRunning
+												? 'Session is running — click to follow'
+												: isFailed
+													? 'Last turn failed — open to retry'
+													: isInterrupted
+														? 'Turn never finished (restart/stop) — open to relaunch'
+														: isFinished
+															? 'Finished while you were away — click to open'
+															: 'Open session'}
+									>
+										<div class="session-title">
+											{#if isAwaitingInput}
+												<span class="awaiting-dot" aria-hidden="true"></span>
+											{:else if isRunning}
+												<span class="running-dot" aria-hidden="true"></span>
+											{:else if isFailed}
+												<span class="failed-dot" aria-hidden="true">!</span>
+											{:else if isInterrupted}
+												<span class="interrupted-dot" aria-hidden="true">!</span>
+											{:else if isFinished}
+												<span class="finished-dot" aria-hidden="true"></span>
+											{/if}
+											<span class="session-title-text" title={session.title || '(untitled)'}
+												>{session.title || '(untitled)'}</span
 											>
-										{/if}
-									</div>
-									<div class="session-meta">
-										{#if isAwaitingInput}
-											<span class="awaiting-label">needs input</span>
-											<span class="session-meta-sep">·</span>
-										{:else if isRunning}
-											<span class="running-label">running…</span>
-											<span class="session-meta-sep">·</span>
-										{:else if isFailed}
-											<span class="failed-label">last turn failed</span>
-											<span class="session-meta-sep">·</span>
-										{:else if isInterrupted}
-											<span class="interrupted-label">interrupted</span>
-											<span class="session-meta-sep">·</span>
-										{:else if isFinished}
-											<span class="finished-label">finished</span>
-											<span class="session-meta-sep">·</span>
-										{/if}
-										{formatRelative(session.updated_at_ms)}
-									</div>
-								</button>
+
+											{#if isCoordinatorSession(session)}
+												<span
+													class="session-mode-badge coordinator"
+													title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
+												>
+											{/if}
+										</div>
+										<div class="session-meta">
+											{#if isAwaitingInput}
+												<span class="awaiting-label">needs input</span>
+												<span class="session-meta-sep">·</span>
+											{:else if isRunning}
+												<span class="running-label">running…</span>
+												<span class="session-meta-sep">·</span>
+											{:else if isFailed}
+												<span class="failed-label">last turn failed</span>
+												<span class="session-meta-sep">·</span>
+											{:else if isInterrupted}
+												<span class="interrupted-label">interrupted</span>
+												<span class="session-meta-sep">·</span>
+											{:else if isFinished}
+												<span class="finished-label">finished</span>
+												<span class="session-meta-sep">·</span>
+											{/if}
+											{formatRelative(session.updated_at_ms)}
+										</div>
+									</button>
+								{/if}
 								{#if sessionBranch(session)}
 									{@const branch = sessionBranch(session)}
 									{@const inWorktree = worktreeFolderForBranch(branch) !== null}
@@ -2956,6 +3006,15 @@
 								<button
 									type="button"
 									class="icon session-row-action"
+									title="Rename session"
+									aria-label="Rename session"
+									onclick={(event) => startRename(event, session.id, session.title)}
+								>
+									<EditIcon size={12} />
+								</button>
+								<button
+									type="button"
+									class="icon session-row-action"
 									title="Delete session"
 									aria-label="Delete session"
 									onclick={(event) => onDeleteSession(event, session.id, session.title)}
@@ -2984,15 +3043,34 @@
 			>
 				<ListIcon />
 			</button>
-			<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
-				{#if isCoordinatorSession(coder.activeSession)}
-					<span
-						class="session-mode-badge coordinator"
-						title="Coordinator — an orchestrator that spawns and manages worker agents">coordinator</span
+			{#if visibleSessionSummary && renamingId === visibleSessionSummary.id}
+				<span class="session-bar-title">{@render renameInput()}</span>
+			{:else}
+				<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
+					{#if isCoordinatorSession(coder.activeSession)}
+						<span
+							class="session-mode-badge coordinator"
+							title="Coordinator — an orchestrator that spawns and manages worker agents">coordinator</span
+						>
+					{/if}
+					{coder.activeSession?.title || 'New session'}
+				</span>
+				{#if visibleSessionSummary && coder.sessions?.some((s) => s.id === visibleSessionSummary.id)}
+					<!-- Only once the session is on disk: a blank session has
+					     nothing to rename yet (its title comes from the first
+					     prompt). -->
+					{@const summary = visibleSessionSummary}
+					<button
+						type="button"
+						class="icon"
+						title="Rename session"
+						aria-label="Rename session"
+						onclick={(event) => startRename(event, summary.id, summary.title)}
 					>
+						<EditIcon size={12} />
+					</button>
 				{/if}
-				{coder.activeSession?.title || 'New session'}
-			</span>
+			{/if}
 			{#if visibleSessionSummary}
 				{@const summary = visibleSessionSummary}
 				{@const branch = sessionBranch(summary)}
@@ -3541,6 +3619,19 @@
 			</details>
 		{/if}
 	</div>
+{/snippet}
+
+{#snippet renameInput()}
+	<input
+		class="session-rename"
+		type="text"
+		aria-label="Session title"
+		bind:value={renameText}
+		{@attach focusAndSelect}
+		onclick={(event) => event.stopPropagation()}
+		onkeydown={onRenameKeydown}
+		onblur={() => void commitRename()}
+	/>
 {/snippet}
 
 {#snippet rowMarkup(row: CoderRow, inParentTranscript: boolean)}
@@ -4697,6 +4788,16 @@
 	.interrupted-label {
 		color: var(--m-warning, #d4a017);
 		font-weight: 500;
+	}
+	.session-rename {
+		flex: 1 1 auto;
+		min-width: 0;
+		font: inherit;
+		color: var(--m-fg);
+		background: var(--m-bg);
+		border: 1px solid var(--m-accent);
+		border-radius: 3px;
+		padding: 0 4px;
 	}
 	.session-row-action {
 		opacity: 0;

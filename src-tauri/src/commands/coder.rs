@@ -972,6 +972,23 @@ pub async fn coder_session_jsonl_path(state: State<'_, AppState>, id: String) ->
 
 /// Delete a persisted session for the active workspace folder.
 /// Idempotent. Emits `session_list_changed` afterwards.
+/// Rename a session from the desktop panel — same path as the
+/// companion's title edit (`rename_session_in`): persisted as a
+/// `TitleUpdate` record and broadcast, so the list and header update
+/// from the event.
+#[tauri::command]
+pub async fn coder_rename_session(
+	state: State<'_, AppState>,
+	id: String,
+	title: String,
+) -> Result<SessionSummary, MoonError> {
+	state
+		.coder
+		.rename_session_in(None, id, title)
+		.await
+		.map_err(MoonError::from)
+}
+
 #[tauri::command]
 pub async fn coder_delete_session(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
 	state.coder.delete_session(id.clone()).await.map_err(MoonError::from)?;

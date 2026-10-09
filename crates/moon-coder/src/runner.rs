@@ -808,6 +808,9 @@ struct Session {
 	/// because the model failed). Avoids re-renaming on every
 	/// subsequent turn.
 	auto_rename_pending: bool,
+	/// The user renamed this session (desktop or companion). An
+	/// in-flight auto-rename must not overwrite their title.
+	title_set_by_user: bool,
 	/// Last provider-supplied (or estimated) token usage from
 	/// the previous LLM round-trip. Carries across user turns so
 	/// the next turn's first iteration can decide whether to
@@ -958,6 +961,7 @@ impl Session {
 			messages: vec![ChatMessage::System { content: system_prompt }],
 			persisted_records: 0,
 			auto_rename_pending: false,
+			title_set_by_user: false,
 			last_usage: None,
 			cache_stats: SessionCacheStats::default(),
 			todos: Vec::new(),
@@ -3547,6 +3551,7 @@ impl CoderHandle {
 				let mut session = rt.session.lock().await;
 				session.header.title = title.to_string();
 				session.header.updated_at_ms = current_time_ms();
+				session.title_set_by_user = true;
 				session.header.clone()
 			}
 			None => {
@@ -3929,6 +3934,7 @@ impl CoderHandle {
 				messages,
 				persisted_records: records.len() as u32,
 				auto_rename_pending: false,
+				title_set_by_user: false,
 				// Seed the in-memory `last_usage` with whatever
 				// we recovered from disk. Without this the auto-
 				// compaction trigger wouldn't have a number to
@@ -10714,7 +10720,7 @@ fn spawn_auto_rename(state: Arc<CoderState>, rt: Arc<SessionRuntime>, sink: Fold
 		// session while we were waiting on the model. Only apply
 		// when the active session is still the one we started.
 		let mut session = rt.session.lock().await;
-		if session.header.id != header_snapshot.id {
+		if session.header.id != header_snapshot.id || session.title_set_by_user {
 			return;
 		}
 		if session.header.title == new_title {
