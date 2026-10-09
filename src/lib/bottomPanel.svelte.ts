@@ -250,27 +250,6 @@ class BottomPanelStore {
 		return tab && tab.kind === 'ports' ? tab : null;
 	}
 
-	/** Re-point the tab with `oldId` at `newId`, keeping its
-	 * strip position, title, and active state. Terminal restart
-	 * uses this: the fresh PTY gets a new stream id, but the tab
-	 * the user is looking at shouldn't move. No-op when `oldId`
-	 * isn't in the strip. */
-	replaceTabId(oldId: string, newId: string): void {
-		const idx = this.#tabs.findIndex((t) => t.id === oldId);
-		const tab = idx === -1 ? undefined : this.#tabs[idx];
-		if (tab === undefined) {
-			return;
-		}
-		// Mutate the tab's id in place (preserving its concrete
-		// variant) rather than spreading — a union spread widens
-		// to a bare `{ id }` and needs an unsafe assertion.
-		tab.id = newId;
-		this.#tabs = this.#tabs.toSpliced(idx, 1, tab);
-		if (this.#activeId === oldId) {
-			this.#activeId = newId;
-		}
-	}
-
 	closeTab(id: string): void {
 		const idx = this.#tabs.findIndex((t) => t.id === id);
 		if (idx === -1) {

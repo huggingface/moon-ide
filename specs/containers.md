@@ -118,9 +118,8 @@ Without it the status pip keeps showing the last snapshot until
 a focus event or a click re-polls, which read as "pip green,
 then every container terminal dies at once." The pip's listener
 picks the event up like any IDE-initiated change, and the
-terminal store reconciles its open container tabs to the respawn
-banner off the same event (see
-[ADR 0050](decisions/0050-terminal-persistence-and-restart.md)).
+terminal store closes its open container tabs off the same event
+(see [ADR 0094](decisions/0094-close-terminals-on-exit.md)).
 Per-folder projects stay poll-driven; only the workspace shell,
 whose state everything downstream keys on, is worth the watcher.
 

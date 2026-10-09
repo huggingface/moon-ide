@@ -1233,24 +1233,11 @@ export type TerminalOutput = {
 	data: string;
 };
 
-/** Why a terminal session ended. Drives the frontend's
- * auto-close / auto-respawn policy: shell exits (the user's
- * own Ctrl+D / `exit`) close the tab; container losses keep
- * it and offer to respawn. Mirrors
- * `moon_protocol::terminal::TerminalCloseReason`. */
-export type TerminalCloseReason =
-	| 'shell_exited'
-	| 'container_shell_exited'
-	| 'container_stopped'
-	| 'container_not_running'
-	| 'unknown';
-
 /** Final event for a terminal session when its child exits.
  * Mirrors `moon_protocol::terminal::TerminalClosed`. */
 export type TerminalClosed = {
 	stream_id: string;
 	code: number | null;
-	reason: TerminalCloseReason;
 };
 
 /** Default llama-server listen port (IANA dynamic range; avoids 8080 and similar). */

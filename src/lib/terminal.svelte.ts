@@ -3,17 +3,9 @@
 //! One [`TerminalSession`] per open terminal tab. The Tauri side
 //! allocates the PTY and emits `terminal:output` chunks +
 //! `terminal:closed` once on exit; we forward output bytes to
-//! the matching xterm.js instance and react to the close per its
-//! [`TerminalCloseReason`]:
-//!
-//! - **Shell exits** (`shell_exited`, `container_shell_exited`) —
-//!   the user's own Ctrl+D / `exit`, or a command that finished.
-//!   The tab closes itself; a shell that ends is done.
-//! - **Container losses** (`container_stopped`, `container_not_running`)
-//!   — the environment went away (user Stop / Recreate, or a
-//!   `docker exec` refusal while the container was still booting
-//!   after an IDE relaunch). The tab stays with a banner offering
-//!   to respawn the shell once the container is back.
+//! the matching xterm.js instance. Whatever ended the shell — the
+//! user's Ctrl+D, the container stopping — the tab closes with it
+//! (ADR 0094).
 //!
 //! Persistence
 //! -----------
@@ -59,7 +51,6 @@ import {
 	type AgentTerminal,
 	type ContainerStateChange,
 	type PersistedTerminal,
-	type TerminalCloseReason,
 	type TerminalClosed,
 	type TerminalAgentOpened,
 	type TerminalOpenRequest,
@@ -84,11 +75,6 @@ export type TerminalSession = {
 	 * `null` for a folder-less `$HOME` shell. Kept for the
 	 * persistence snapshot. */
 	folder: string | null;
-	/** Set on `closed` for the container-loss reasons — the body
-	 * swaps xterm for a "respawn when the container is back"
-	 * banner. Shell-exit closes never reach this: the tab is
-	 * gone by then. `null` while the session is live. */
-	closedReason: TerminalCloseReason | null;
 	/** Error returned by `terminal_open` itself. The tab still
 	 * mounts so the message is visible. */
 	openError: string | null;
@@ -168,7 +154,7 @@ class TerminalStore {
 				void this.#handleClosed(event.payload);
 			});
 			const onContainerState = await listen<ContainerStateChange>(CONTAINER_STATE_EVENT, (event) => {
-				this.#reconcileContainerState(event.payload.status.state);
+				void this.#reconcileContainerState(event.payload.status.state);
 			});
 			const onAgentOpened = await listen<TerminalAgentOpened>(AGENT_OPENED_EVENT, (event) => {
 				this.#adoptAgentTerminal(event.payload);
@@ -338,7 +324,6 @@ class TerminalStore {
 				streamId,
 				target,
 				folder,
-				closedReason: null,
 				openError: formatError(err),
 				agent,
 			});
@@ -354,7 +339,6 @@ class TerminalStore {
 			streamId,
 			target,
 			folder,
-			closedReason: null,
 			openError: null,
 			agent,
 		});
@@ -384,7 +368,6 @@ class TerminalStore {
 			streamId: payload.stream_id,
 			target: payload.target,
 			folder: payload.folder,
-			closedReason: null,
 			openError: null,
 			agent: payload.agent,
 		});
@@ -394,13 +377,13 @@ class TerminalStore {
 	}
 
 	/** The backend swapped the shell under an existing id (agent
-	 * restart): a tab showing an exit banner goes live again. */
+	 * restart): clear a stale open error. */
 	#handleRespawned(streamId: string): void {
 		const session = this.#sessions.get(streamId);
 		if (!session) {
 			return;
 		}
-		this.#sessions.set(streamId, { ...session, closedReason: null, openError: null });
+		this.#sessions.set(streamId, { ...session, openError: null });
 	}
 
 	async close(streamId: string): Promise<void> {
@@ -411,7 +394,7 @@ class TerminalStore {
 			return;
 		}
 		try {
-			if (!session.closedReason && !session.openError) {
+			if (!session.openError) {
 				await ipc.terminal.close(streamId);
 			}
 		} catch {
@@ -442,74 +425,6 @@ class TerminalStore {
 		for (const id of ids) {
 			await this.close(id);
 		}
-	}
-
-	/** Re-spawn an exited terminal's shell in the same tab —
-	 * the "restart" affordance on the container-loss banner.
-	 * The old stream is closed (its registry entry frees), a
-	 * fresh PTY opens against the same target with the recorded
-	 * history line replayed, and the tab is re-pointed at the
-	 * new stream without losing its strip position. No-op for
-	 * live sessions. */
-	async restart(streamId: string): Promise<void> {
-		const session = this.#sessions.get(streamId);
-		if (!session || session.closedReason === null) {
-			return;
-		}
-		const tab = bottomPanel.tabs.find((t): t is TerminalTab => t.id === streamId && t.kind === 'terminal');
-		if (!tab) {
-			return;
-		}
-		const command = this.#commands.get(streamId) ?? null;
-		if (session.target.kind === 'container' && container.state !== 'running') {
-			// The banner's button gates on this too; a stale
-			// click just gets ignored.
-			return;
-		}
-		// Best-effort backend cleanup of the dead stream; the
-		// supervisor's already gone so this is just the registry
-		// forget. Local state is rebuilt from scratch below.
-		try {
-			await ipc.terminal.close(streamId);
-		} catch {
-			// Window mid-teardown — the new spawn's failure will
-			// surface on its own tab.
-		}
-		const oldStreamId = streamId;
-		let newStreamId: string;
-		try {
-			newStreamId = await ipc.terminal.open({
-				target: session.target,
-				cols: 80,
-				rows: 24,
-				folder: session.folder,
-				command,
-				agent: session.agent,
-			});
-		} catch (err) {
-			this.#sessions.set(oldStreamId, { ...session, openError: formatError(err) });
-			return;
-		}
-		this.#sessions.delete(oldStreamId);
-		this.#writers.delete(oldStreamId);
-		this.#pending.delete(oldStreamId);
-		this.#sessions.set(newStreamId, {
-			streamId: newStreamId,
-			target: session.target,
-			folder: session.folder,
-			closedReason: null,
-			openError: null,
-			agent: session.agent,
-		});
-		if (command !== null) {
-			this.#commands.delete(oldStreamId);
-			this.#commands.set(newStreamId, command);
-		}
-		if (this.activeSelection?.streamId === oldStreamId) {
-			this.activeSelection = null;
-		}
-		bottomPanel.replaceTabId(oldStreamId, newStreamId);
-		this.#notify();
 	}
 
 	/** Register the xterm.js writer for a stream. Drains any
@@ -571,71 +486,28 @@ class TerminalStore {
 		this.#pending.set(payload.stream_id, [bytes]);
 	}
 
-	/** React to the backend's `terminal:closed`. Only a
-	 * *definitive* shell exit — the user's own Ctrl+D / `exit`,
-	 * or a command that finished, where the container (if any)
-	 * is provably still up — auto-closes the tab: a shell that
-	 * ends on its own is done, and a dead tab strip was the old
-	 * UX's main complaint. Every ambiguous case keeps the tab
-	 * and shows the respawn banner instead, so a terminal never
-	 * just *vanishes* with its scrollback when the environment
-	 * might have been the cause:
-	 *
-	 *  - `container_stopped` / `container_not_running`: the
-	 *    container is (or was) gone — clearly environmental.
-	 *  - `unknown`: portable-pty lost the exit code (a signal it
-	 *    couldn't translate, e.g. the SIGKILL a `docker stop`
-	 *    sends the `docker exec` child). We can't tell a clean
-	 *    Ctrl+D from the environment dying, so we keep the tab:
-	 *    losing scrollback to a wrong auto-close is far worse
-	 *    than a tab the user closes by hand. */
+	/** The backend's `terminal:closed`: the shell is gone, so the
+	 * tab goes too — whether the user exited it or the container
+	 * stopped under it (ADR 0094). */
 	async #handleClosed(payload: TerminalClosed): Promise<void> {
-		const session = this.#sessions.get(payload.stream_id);
-		if (!session) {
+		if (!this.#sessions.has(payload.stream_id)) {
 			return;
 		}
-		switch (payload.reason) {
-			case 'shell_exited':
-			case 'container_shell_exited':
-				await this.close(payload.stream_id);
-				return;
-			case 'container_stopped':
-			case 'container_not_running':
-			case 'unknown':
-				// Ambiguous or environmental — keep the tab.
-				// `unknown` surfaces as a generic "exited"
-				// banner rather than a container-specific one.
-				this.#sessions.set(payload.stream_id, {
-					...session,
-					closedReason: payload.reason,
-				});
-				return;
-		}
+		await this.close(payload.stream_id);
 	}
 
-	/** Reconcile open terminal tabs against a container state
-	 * change. When the workspace container reports non-running
-	 * (a daemon-driven stop the events watcher just broadcast —
-	 * a previous session's `compose stop` landing, an external
-	 * `docker stop`), every container terminal's `docker exec`
-	 * is about to die with it. Mark those tabs lost *now* so
-	 * they flip to the respawn banner immediately, rather than
-	 * waiting for each close event to classify itself — or
-	 * worse, racing it into an ambiguous reason. When the
-	 * container comes back the close events have long since
-	 * fired, so there's nothing to undo here. */
-	#reconcileContainerState(state: ContainerStateChange['status']['state']): void {
+	/** Close every container terminal when the workspace container
+	 * reports non-running: their `docker exec`s are dying with it,
+	 * and closing now beats waiting on each one's close event. */
+	async #reconcileContainerState(state: ContainerStateChange['status']['state']): Promise<void> {
 		if (state === 'running') {
 			return;
 		}
-		for (const [streamId, session] of this.#sessions) {
-			if (session.target.kind !== 'container') {
-				continue;
-			}
-			if (session.closedReason !== null || session.openError !== null) {
-				continue;
-			}
-			this.#sessions.set(streamId, { ...session, closedReason: 'container_stopped' });
+		const ids = [...this.#sessions.values()]
+			.filter((session) => session.target.kind === 'container')
+			.map((session) => session.streamId);
+		for (const id of ids) {
+			await this.close(id);
 		}
 	}
 
@@ -671,27 +543,11 @@ export function terminalCwdBasename(target: TerminalTarget): string {
 }
 
 /** Marker suffix the tab strip shows for a terminal whose shell
- * is gone but which kept its tab (respawn banner) — empty string
- * while live, and definitive shell exits never show one because
- * the tab closes itself. Reads the store's reactive session map,
- * so callers in a Svelte template (e.g. `{@const}`) get a
- * re-render on close. */
+ * failed to open — empty string otherwise. Reads the store's
+ * reactive session map, so callers in a Svelte template (e.g.
+ * `{@const}`) re-render when it changes. */
 export function terminalExitSuffix(streamId: string): string {
-	const session = terminal.sessionFor(streamId);
-	if (!session) {
-		return '';
-	}
-	if (session.openError) {
-		return ' [failed]';
-	}
-	const reason = session.closedReason;
-	if (reason === null) {
-		return '';
-	}
-	if (reason === 'container_stopped' || reason === 'container_not_running') {
-		return ' [environment lost]';
-	}
-	return ' [exited]';
+	return terminal.sessionFor(streamId)?.openError ? ' [failed]' : '';
 }
 
 function base64Encode(bytes: Uint8Array): string {

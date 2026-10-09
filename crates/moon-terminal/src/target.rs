@@ -238,28 +238,6 @@ impl TerminalTarget {
 	}
 }
 
-/// Best-effort liveness probe for a container terminal's target
-/// container, used by the supervisor to classify a `docker exec`
-/// exit: if the container is gone, the terminal died because its
-/// environment did (user Stop / Recreate / crash); if it's still
-/// up, the exit came from the in-container shell itself. One
-/// `docker inspect` — cheap enough to run once per close.
-///
-/// `false` covers every negative case uniformly (container
-/// stopped, name unknown after a recreate-in-progress, docker
-/// CLI missing): the frontend treats them all as "respawn when
-/// the container comes back".
-pub async fn container_running(container_name: &str) -> bool {
-	let output = tokio::process::Command::new("docker")
-		.args(["inspect", "-f", "{{.State.Running}}", container_name])
-		.output()
-		.await;
-	match output {
-		Ok(out) => String::from_utf8_lossy(&out.stdout).trim() == "true",
-		Err(_) => false,
-	}
-}
-
 /// Set `PROMPT_COMMAND` on a host shell's env: our history hook
 /// plus any inherited value. bash ≥ 5.1 treats `PROMPT_COMMAND`
 /// as an array when declared with `-a`, but the common env-var

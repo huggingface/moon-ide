@@ -3,7 +3,6 @@
 /**
  * The backend replaced a terminal's shell in place (agent
  * `restart`): same `stream_id`, fresh process. Emitted on
- * `terminal:respawned` so a tab showing an exit banner goes live
- * again.
+ * `terminal:respawned`.
  */
 export type TerminalRespawned = { stream_id: string, };

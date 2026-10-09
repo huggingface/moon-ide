@@ -24,13 +24,13 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use camino::Utf8PathBuf;
 use moon_protocol::terminal::{
-	TerminalAgentOpened, TerminalCloseReason, TerminalClosed, TerminalOpenRequest, TerminalOutput, TerminalRemoved,
-	TerminalRespawned, TerminalTarget as ProtocolTarget,
+	TerminalAgentOpened, TerminalClosed, TerminalOpenRequest, TerminalOutput, TerminalRemoved, TerminalRespawned,
+	TerminalTarget as ProtocolTarget,
 };
 use moon_protocol::MoonError;
 use moon_terminal::{
-	container_name_for_workspace, container_running, editor_forward_env_for_workspace, spawn, AgentTerminalRequest,
-	StartupCommand, TerminalKind, TerminalRegistration, TerminalRegistry, TerminalSpawner, TerminalTarget,
+	container_name_for_workspace, editor_forward_env_for_workspace, spawn, AgentTerminalRequest, StartupCommand,
+	TerminalKind, TerminalRegistration, TerminalRegistry, TerminalSpawner, TerminalTarget,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
@@ -127,15 +127,6 @@ async fn start_stream(
 		state.terminals.reset(stream_id).await;
 	}
 
-	// What the supervisor needs to classify the close at the end:
-	// host shells always classify `ShellExited`; container
-	// terminals get their `docker exec` output probed and their
-	// container's liveness checked.
-	let container_name = match &target {
-		TerminalTarget::Host { .. } => None,
-		TerminalTarget::Container { container_name, .. } => Some(container_name.clone()),
-	};
-
 	let registry = state.terminal_streams.clone();
 	let task = tauri::async_runtime::spawn(supervise(
 		app.clone(),
@@ -144,7 +135,6 @@ async fn start_stream(
 		stream_id.to_owned(),
 		session,
 		cmd_rx,
-		container_name,
 	));
 
 	registry
@@ -368,10 +358,6 @@ fn into_internal_target(
 /// commands (write/resize/rerun) into the PTY. Exits when the child
 /// closes its master (EOF on `next_output`) or the registry
 /// channel is dropped (frontend close call).
-///
-/// `container_name` is `Some` for container terminals: the close
-/// classification needs it for the post-exit liveness probe, and the
-/// `docker exec` refusal detector only arms on container targets.
 async fn supervise(
 	app: AppHandle,
 	registry: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, TerminalStreamHandle>>>,
@@ -379,24 +365,13 @@ async fn supervise(
 	stream_id: String,
 	mut session: moon_terminal::PtySession,
 	mut cmd_rx: mpsc::Receiver<TerminalCommand>,
-	container_name: Option<String>,
 ) {
-	// Ring of recent output for the `docker exec` refusal detector.
-	// Bounded small — the refusal message lands within the first
-	// chunk or two; we only ever inspect the tail on close.
-	let mut output_sample: Vec<u8> = Vec::new();
 	loop {
 		tokio::select! {
 			chunk = session.next_output() => {
 				let Some(bytes) = chunk else {
 					break;
 				};
-				if container_name.is_some() {
-					output_sample.extend_from_slice(&bytes);
-					if output_sample.len() > OUTPUT_SAMPLE_BYTES {
-						output_sample.drain(..output_sample.len() - OUTPUT_SAMPLE_BYTES);
-					}
-				}
 				terminals.record_output(&stream_id, &bytes).await;
 				let payload = TerminalOutput {
 					stream_id: stream_id.clone(),
@@ -434,13 +409,11 @@ async fn supervise(
 	// may not have fully exited yet, but `PtySession::drop`
 	// will SIGKILL it shortly.
 	let code = session.next_exit().await;
-	let reason = classify_close(&container_name, code, &output_sample).await;
 	drop(session);
 
 	registry.lock().await.remove(&stream_id);
-	// Keep the registry entry: the tab is still there showing the
-	// output, so a coder read should still answer for it. The entry
-	// goes away with the tab, in `terminal_close`.
+	// The entry stays readable until the frontend reacts to the close
+	// event by closing the tab (`terminal_close` forgets it).
 	terminals.mark_exited(&stream_id, code).await;
 
 	let _ = app.emit(
@@ -448,59 +421,6 @@ async fn supervise(
 		&TerminalClosed {
 			stream_id: stream_id.clone(),
 			code,
-			reason,
 		},
 	);
-}
-
-/// Bound on the output tail kept for the refusal detector — 8 KiB
-/// is far past the one-line `docker exec` refusal and cheap to
-/// keep per terminal.
-const OUTPUT_SAMPLE_BYTES: usize = 8 * 1024;
-
-/// Work out *why* the terminal's child exited. The frontend's whole
-/// auto-close / auto-respawn policy hangs off this, so the order of
-/// the checks matters: a `docker exec` refusal (container still
-/// booting) is decided from the output alone and skips the daemon
-/// probe; every other container exit is decided by whether the
-/// container is still running afterwards.
-///
-/// `code: None` (a signal portable-pty couldn't translate, e.g.
-/// the SIGKILL a `docker stop` sends the `docker exec` child)
-/// yields `Unknown` — and the frontend deliberately does **not**
-/// auto-close on `Unknown`, because we can't distinguish a clean
-/// Ctrl+D from the environment dying. That ambiguity is exactly
-/// what hits on a quick IDE relaunch when the previous session's
-/// `compose stop` lands after the new process has already
-/// restored its terminals; auto-closing there made tabs vanish
-/// with their scrollback. Keeping the tab (respawn banner) is
-/// the safe default whenever the cause is in doubt.
-async fn classify_close(
-	container_name: &Option<String>,
-	code: Option<i32>,
-	output_sample: &[u8],
-) -> TerminalCloseReason {
-	let Some(container_name) = container_name else {
-		return TerminalCloseReason::ShellExited;
-	};
-	if looks_like_exec_refusal(output_sample) {
-		return TerminalCloseReason::ContainerNotRunning;
-	}
-	if code.is_none() {
-		return TerminalCloseReason::Unknown;
-	}
-	if container_running(container_name).await {
-		TerminalCloseReason::ContainerShellExited
-	} else {
-		TerminalCloseReason::ContainerStopped
-	}
-}
-
-/// `docker exec` refuses to run the remote process — container
-/// stopped/paused/being recreated or unknown — with a one-line
-/// message on its own output and exit code 125. Match loosely on
-/// the stable prefix rather than the full sentence so a docker CLI
-/// rewording doesn't silently flip the classification.
-fn looks_like_exec_refusal(output_sample: &[u8]) -> bool {
-	String::from_utf8_lossy(output_sample).contains("Error response from daemon")
 }

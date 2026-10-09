@@ -9,7 +9,6 @@
 	import '@xterm/xterm/css/xterm.css';
 
 	import type { TerminalTab } from '../bottomPanel.svelte';
-	import { container } from '../container.svelte';
 	import { terminal as terminalStore } from '../terminal.svelte';
 	import { workspace } from '../state.svelte';
 	import { scanHistoryChunk } from '../terminalHistory';
@@ -38,38 +37,8 @@
 
 	const session = $derived(terminalStore.sessionFor(tab.id));
 	const openError = $derived(session?.openError ?? null);
-	/** Container-loss close reasons keep the tab and swap xterm
-	 * for a respawn banner; shell exits close the tab outright in
-	 * the store, so they never reach this. */
-	const closedReason = $derived(session?.closedReason ?? null);
-	const containerRunning = $derived(container.state === 'running');
 	const encoder = new TextEncoder();
 	const decoder = new TextDecoder();
-
-	/** User opted to respawn as soon as the container is back. */
-	let waitingForContainer = $state(false);
-
-	function respawn(): void {
-		waitingForContainer = false;
-		void terminalStore.restart(tab.id);
-	}
-
-	async function waitAndRespawn(): Promise<void> {
-		waitingForContainer = true;
-		const started = await container.onceRunning(120_000);
-		waitingForContainer = false;
-		if (!started) {
-			return;
-		}
-		// The user may have closed the tab while we waited.
-		if (terminalStore.sessionFor(tab.id)?.closedReason) {
-			await terminalStore.restart(tab.id);
-		}
-	}
-
-	function closeThisTab(): void {
-		void terminalStore.close(tab.id);
-	}
 
 	// Read the clipboard and write it into the PTY. We prefer
 	// the Tauri clipboard plugin over `navigator.clipboard`:
@@ -358,11 +327,10 @@
 		// Forward keystrokes (and pasted text) to the supervisor.
 		// `onData` already decodes xterm's input modes correctly
 		// (e.g. arrow keys → CSI sequences); we just transport.
-		// A dead session (container lost, open failed) swallows
-		// input — the respawn banner owns the interaction then.
+		// A session whose open failed swallows input.
 		t.onData((data) => {
 			const s = terminalStore.sessionFor(tab.id);
-			if (s?.closedReason || s?.openError) {
+			if (s?.openError) {
 				return;
 			}
 			void terminalStore.writeInput(tab.id, encoder.encode(data));
@@ -528,38 +496,6 @@
 		<div class="error" role="alert">
 			Failed to open terminal: {openError}
 		</div>
-	{:else if closedReason !== null}
-		<!-- The shell is gone but the tab stays so the user can
-		     respawn it or close it deliberately — never vanish
-		     silently with the scrollback. The copy differs by
-		     whether we know the container was the cause. -->
-		{@const isContainerLoss = closedReason === 'container_stopped' || closedReason === 'container_not_running'}
-		{@const command = terminalStore.commandFor(tab.id)}
-		<div class="lost" role="status">
-			<div class="lost-title">{isContainerLoss ? "Workspace container isn't running" : 'Terminal exited'}</div>
-			<div class="lost-sub">
-				{#if isContainerLoss}
-					This terminal's shell exited with it. Respawn a fresh shell once the container is back — the last command is
-					prefilled, and up-arrow walks the same history.
-				{:else}
-					The shell exited. Respawn a fresh shell — the last command is prefilled, and up-arrow walks the same history.
-				{/if}
-			</div>
-			{#if command}
-				<div class="lost-cmd" title={command}>{command}</div>
-			{/if}
-			<div class="lost-actions">
-				{#if isContainerLoss && !containerRunning}
-					<button type="button" class="lost-btn" onclick={waitAndRespawn}>Respawn when running</button>
-				{:else}
-					<button type="button" class="lost-btn" onclick={respawn}>Respawn terminal</button>
-				{/if}
-				<button type="button" class="lost-btn subtle" onclick={closeThisTab}>Close tab</button>
-			</div>
-			{#if waitingForContainer}
-				<div class="lost-waiting">Waiting for the container to reach running…</div>
-			{/if}
-		</div>
 	{:else}
 		<div class="term-host" {@attach xtermAttachment}></div>
 	{/if}
@@ -626,59 +562,6 @@
 	.error {
 		padding: 8px 12px;
 		color: var(--m-danger);
-	}
-	.lost {
-		flex: 1;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		justify-content: center;
-		gap: 8px;
-		padding: 16px;
-		text-align: center;
-	}
-	.lost-title {
-		font-size: 13px;
-		font-weight: 600;
-		color: var(--m-fg);
-	}
-	.lost-sub {
-		font-size: 12px;
-		color: var(--m-fg-muted);
-		max-width: 420px;
-		line-height: 1.5;
-	}
-	.lost-actions {
-		display: flex;
-		gap: 8px;
-		margin-top: 4px;
-	}
-	.lost-btn {
-		font: inherit;
-		font-size: 12px;
-		padding: 5px 12px;
-		border-radius: 5px;
-		border: 1px solid var(--m-border-strong);
-		background: var(--m-bg-2);
-		color: var(--m-fg);
-		cursor: pointer;
-	}
-	.lost-btn:hover {
-		background: var(--m-bg-overlay);
-		border-color: var(--m-accent, #4f8cff);
-	}
-	.lost-btn.subtle {
-		background: transparent;
-		border-color: var(--m-border);
-		color: var(--m-fg-muted);
-	}
-	.lost-btn.subtle:hover {
-		color: var(--m-fg);
-		border-color: var(--m-border-strong);
-	}
-	.lost-waiting {
-		font-size: 11px;
-		color: var(--m-fg-muted);
 	}
 	.term-host {
 		flex: 1;

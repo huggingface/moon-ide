@@ -3,6 +3,7 @@
 Date: 2026-06-21
 Status: accepted
 Supersedes: the "No persistence in 3.0" section of [ADR 0009](0009-terminal-pty-and-targets.md)
+Superseded in part: the "Auto-close on shell exit; offer respawn on environment loss" section, by [ADR 0094](0094-close-terminals-on-exit.md)
 
 ## Context
 

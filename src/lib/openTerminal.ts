@@ -180,14 +180,11 @@ export function ensureActiveFolderTerminal(): void {
 	if (remembered !== undefined) {
 		const tab = tabs.find((t) => t.id === remembered);
 		if (tab && tab.kind === 'terminal') {
-			const session = terminalStore.sessionFor(remembered);
-			if (session && session.closedReason === null) {
-				bottomPanel.setActive(remembered);
-				return;
-			}
+			bottomPanel.setActive(remembered);
+			return;
 		}
-		// Remembered terminal is dead / gone — drop it so the
-		// next lookup falls through cleanly.
+		// Remembered terminal is gone — drop it so the next
+		// lookup falls through cleanly.
 		lastTerminalByFolder.delete(folderPath);
 	}
 	const containerCwd = containerCwdFor(folderPath);
@@ -196,17 +193,7 @@ export function ensureActiveFolderTerminal(): void {
 			return false;
 		}
 		const expectedCwd = t.target.kind === 'host' ? folderPath : containerCwd;
-		if (t.target.cwd !== expectedCwd) {
-			return false;
-		}
-		// Skip dead terminals (environment lost) — re-using a
-		// dead PTY isn't a thing; the user wants a live shell on
-		// the new folder.
-		const session = terminalStore.sessionFor(t.id);
-		if (session && session.closedReason !== null) {
-			return false;
-		}
-		return true;
+		return t.target.cwd === expectedCwd;
 	});
 	if (existing) {
 		bottomPanel.setActive(existing.id);
