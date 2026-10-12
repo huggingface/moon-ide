@@ -24,6 +24,7 @@
 	import ToolBodyOpenBrowser from './ToolBodyOpenBrowser.svelte';
 	import ToolBodyOpenTerminal from './ToolBodyOpenTerminal.svelte';
 	import { parseSubagentReport } from '../subagentReport';
+	import { hintFor, isHuggingFaceHost, parseHttpError } from '../coderError';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
 	import ToolImages from './ToolImages.svelte';
@@ -2587,6 +2588,24 @@
 		}, 1200);
 	}
 
+	async function onCopyErrorText(event: MouseEvent, text: string): Promise<void> {
+		const button = event.currentTarget;
+		if (!(button instanceof HTMLButtonElement)) {
+			return;
+		}
+		let ok = false;
+		try {
+			await navigator.clipboard.writeText(text);
+			ok = true;
+		} catch {
+			ok = false;
+		}
+		button.textContent = ok ? 'Copied' : 'Failed';
+		window.setTimeout(() => {
+			button.textContent = 'Copy';
+		}, 1200);
+	}
+
 	async function onOpenAttachment(attachment: { path: string; startLine: number }): Promise<void> {
 		// Open the file and jump to the first line of the captured
 		// range. We don't try to restore the original column / end
@@ -4233,6 +4252,7 @@
 	{:else if row.kind === 'aborted'}
 		<div class="row notice">aborted</div>
 	{:else if row.kind === 'error'}
+		{@const httpError = parseHttpError(row.text)}
 		<div class="row error" role="alert">
 			<div class="row-label">
 				error
@@ -4252,7 +4272,56 @@
 					>
 				{/if}
 			</div>
-			<div class="bubble">{row.text}</div>
+			{#if httpError === null}
+				<div class="bubble">{row.text}</div>
+			{:else}
+				{@const hint = hintFor(httpError)}
+				<div class="bubble error-card">
+					<div class="error-card-head">
+						<span class="error-status">{httpError.status}</span>
+						<span class="error-title">{httpError.title}</span>
+						<span class="error-host" title={httpError.endpoint}>{httpError.host}</span>
+					</div>
+					{#if httpError.prefix}
+						<div class="error-prefix">{httpError.prefix}</div>
+					{/if}
+					{#if httpError.message}
+						<div class="error-message">{httpError.message}</div>
+					{/if}
+					{#if hint}
+						<div class="error-hint">
+							{hint}
+							{#if (httpError.status === 401 || httpError.status === 403) && !isHuggingFaceHost(httpError.host)}
+								<button type="button" class="error-retry" onclick={() => (modelSettingsOpen = true)}
+									>model settings</button
+								>
+							{/if}
+						</div>
+					{/if}
+					<div class="error-meta">
+						{#if httpError.errorType}
+							<code>{httpError.errorType}</code>
+						{/if}
+						{#if httpError.requestId}
+							<span class="error-request-id">
+								request <code>{httpError.requestId}</code>
+							</span>
+						{/if}
+						<button
+							type="button"
+							class="error-retry error-copy"
+							title="Copy the full error text"
+							onclick={(event) => onCopyErrorText(event, row.text)}>Copy</button
+						>
+					</div>
+					{#if httpError.rawBody !== '' && httpError.rawBody !== httpError.message}
+						<details class="error-raw">
+							<summary>raw response</summary>
+							<pre>{httpError.rawBody}</pre>
+						</details>
+					{/if}
+				</div>
+			{/if}
 		</div>
 	{:else if row.kind === 'compaction'}
 		{@render compactionMarkup(row)}
@@ -5364,6 +5433,91 @@
 	.row.error .bubble {
 		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
 		color: var(--m-danger);
+	}
+	.row.error .error-card {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		color: var(--m-fg);
+		border-left: 3px solid var(--m-danger);
+	}
+	.error-card-head {
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+		min-width: 0;
+	}
+	.error-status {
+		flex-shrink: 0;
+		padding: 0 5px;
+		border-radius: 3px;
+		font-size: 11px;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		color: var(--m-bg);
+		background: var(--m-danger);
+	}
+	.error-title {
+		font-weight: 600;
+		color: var(--m-danger);
+	}
+	.error-host {
+		margin-left: auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+	}
+	.error-prefix {
+		font-size: 11px;
+		color: var(--m-fg-muted);
+	}
+	.error-message {
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+	.error-hint {
+		font-size: 12px;
+		color: var(--m-fg-muted);
+	}
+	.error-meta {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 4px 10px;
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+
+		& code {
+			font-size: 10px;
+			overflow-wrap: anywhere;
+			user-select: all;
+		}
+	}
+	.error-copy {
+		margin-left: auto;
+	}
+	.error-raw {
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+
+		& summary {
+			cursor: pointer;
+		}
+
+		& pre {
+			margin: 4px 0 0;
+			padding: 6px 8px;
+			max-height: 240px;
+			overflow: auto;
+			border-radius: 4px;
+			background: var(--m-bg-overlay);
+			color: var(--m-fg-muted);
+			white-space: pre-wrap;
+			overflow-wrap: anywhere;
+		}
 	}
 	.row.compaction .bubble {
 		background: var(--m-bg-overlay);
