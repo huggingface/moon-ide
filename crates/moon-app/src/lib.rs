@@ -15,12 +15,17 @@ use serde_json::Value;
 pub mod browser;
 mod catalog;
 pub mod coder;
+pub mod compose_logs;
 pub mod container;
+pub mod container_events;
 mod editorconfig;
 mod events;
 mod fs;
+mod lifecycle;
 pub mod logs;
 pub mod lsp;
+pub mod ports;
+pub mod project_compose;
 mod search;
 mod session;
 pub mod settings;
@@ -52,6 +57,8 @@ pub struct AppCore {
 	/// LSP broker for the active folder plus its event pump; built
 	/// lazily on the first `lsp_*` call.
 	pub lsp: tokio::sync::Mutex<Option<lsp::LspHandle>>,
+	/// Open `docker compose logs -f` tails behind the log tabs.
+	pub log_streams: compose_logs::LogStreams,
 }
 
 impl AppCore {
@@ -86,7 +93,21 @@ impl AppCore {
 				})*
 			};
 		}
-		route!(fs, search, editorconfig, session, coder, browser, logs, terminal, lsp);
+		route!(
+			fs,
+			search,
+			editorconfig,
+			session,
+			coder,
+			browser,
+			logs,
+			terminal,
+			lsp,
+			container,
+			project_compose,
+			compose_logs,
+			ports
+		);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
 }
@@ -196,6 +217,7 @@ mod tests {
 			terminals,
 			terminal_streams: Default::default(),
 			lsp: Default::default(),
+			log_streams: Default::default(),
 		};
 		(app, data)
 	}

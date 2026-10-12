@@ -138,32 +138,6 @@ pub fn run() {
 			commands::system::system_theme,
 			commands::editor_forward::editor_forward_finish,
 			commands::editor_forward::editor_forward_cancel,
-			commands::container::container_status,
-			commands::container::container_setup,
-			commands::container::container_pause,
-			commands::container::container_resume,
-			commands::container::container_rebuild,
-			commands::container::container_stop,
-			commands::container::container_teardown,
-			commands::container::container_apply_bound_folders,
-			commands::container::container_render_compose,
-			commands::project_compose::project_compose_status,
-			commands::project_compose::project_compose_up,
-			commands::project_compose::project_compose_pause,
-			commands::project_compose::project_compose_resume,
-			commands::project_compose::project_compose_rebuild,
-			commands::project_compose::project_compose_stop,
-			commands::project_compose::project_compose_down,
-			commands::project_compose::project_compose_service_start,
-			commands::project_compose::project_compose_service_stop,
-			commands::project_compose::project_compose_service_restart,
-			commands::project_compose::project_compose_service_recreate,
-			commands::ports::ports_list,
-			commands::ports::ports_set,
-			commands::ports::ports_status,
-			commands::ports::ports_reapply,
-			commands::compose_logs::compose_logs_open,
-			commands::compose_logs::compose_logs_close,
 			commands::next_edit::next_edit_probe,
 			commands::next_edit::next_edit_complete,
 			commands::next_edit::next_edit_server_start,
@@ -617,9 +591,7 @@ pub fn run() {
 				// state changes — a previous session's `compose stop`
 				// landing mid-launch, an external `docker stop`, a
 				// daemon restart — not just IDE-initiated ones.
-				if let Some(id) = app.state::<AppState>().workspace_id() {
-					commands::container_events::watch_container_events(app.handle().clone(), id.to_owned());
-				}
+				tauri::async_runtime::spawn(moon_app::container_events::watch(app.state::<AppState>().core.clone()));
 				let app_handle = app.handle().clone();
 				tauri::async_runtime::spawn(async move {
 					let state = app_handle.state::<AppState>();
@@ -634,8 +606,8 @@ pub fn run() {
 					if let Some(id) = state.workspace_id() {
 						focus_socket::await_previous_shutdown(&state.workspaces_dir, id).await;
 					}
-					shutdown::auto_resume_shell(&app_handle, &state).await;
-					shutdown::auto_resume_project_composes(&app_handle, &state).await;
+					state.core.auto_resume_shell().await;
+					state.core.auto_resume_project_composes().await;
 				});
 			}
 

@@ -1,4 +1,4 @@
-//! Tauri commands for workspace port forwarding.
+//! Workspace port-forwarding commands.
 //!
 //! User-facing surface is small: list current declared forwards,
 //! replace them as a full set, and snapshot per-port live state
@@ -17,9 +17,9 @@ use moon_container::{apply_forwards, list_forward_status, project_name_for_id};
 use moon_core::session as core_session;
 use moon_protocol::ports::{ForwardedPort, ForwardedPortStatus, PortsApplyResult};
 use moon_protocol::MoonError;
-use tauri::{AppHandle, Emitter, State};
 
-use crate::state::AppState;
+use crate::events::emit;
+use crate::AppCore;
 
 /// Emitted after every successful mutating command (`ports_set`,
 /// `ports_clear`). Payload: the latest `Vec<ForwardedPortStatus>`
@@ -32,12 +32,11 @@ pub const PORTS_STATE_EVENT: &str = "ports:state";
 /// Cheap: a single `session.json` read + parse. Doesn't touch
 /// docker. Returns `[]` for processes without a workspace bound
 /// (preboot mode) or when the file doesn't exist yet.
-#[tauri::command]
-pub async fn ports_list(state: State<'_, AppState>) -> Result<Vec<ForwardedPort>, MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn ports_list(app: &AppCore) -> Result<Vec<ForwardedPort>, MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Ok(Vec::new());
 	};
-	let session = core_session::load(&state.workspaces_dir, id).await?;
+	let session = core_session::load(&app.workspaces_dir, id).await?;
 	Ok(session.forwarded_ports)
 }
 
@@ -58,21 +57,16 @@ pub async fn ports_list(state: State<'_, AppState>) -> Result<Vec<ForwardedPort>
 /// in line — that matters because the alternative ("docker first,
 /// disk second") would let a transient daemon hiccup eat the
 /// user's port edits.
-#[tauri::command]
-pub async fn ports_set(
-	app: AppHandle,
-	state: State<'_, AppState>,
-	forwards: Vec<ForwardedPort>,
-) -> Result<PortsApplyResult, MoonError> {
+pub async fn ports_set(app: &AppCore, forwards: Vec<ForwardedPort>) -> Result<PortsApplyResult, MoonError> {
 	validate_forwards(&forwards)?;
-	let Some(id) = state.workspace_id() else {
+	let Some(id) = app.workspace_id() else {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let id = id.to_owned();
-	persist_forwards(&state.workspaces_dir, &id, forwards.clone()).await?;
+	persist_forwards(&app.workspaces_dir, &id, forwards.clone()).await?;
 	let project = project_name_for_id(&id).map_err(|err| MoonError::invalid(err.to_string()))?;
 	let result = apply_forwards(&project, &forwards).await?;
-	emit_state(&app, &project, &forwards).await;
+	emit_state(app, &project, &forwards).await;
 	Ok(result)
 }
 
@@ -84,12 +78,11 @@ pub async fn ports_set(
 ///
 /// Empty list when the workspace isn't bound or has no forwards
 /// declared — keeps the panel a one-liner without a round-trip.
-#[tauri::command]
-pub async fn ports_status(state: State<'_, AppState>) -> Result<Vec<ForwardedPortStatus>, MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn ports_status(app: &AppCore) -> Result<Vec<ForwardedPortStatus>, MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Ok(Vec::new());
 	};
-	let session = core_session::load(&state.workspaces_dir, id).await?;
+	let session = core_session::load(&app.workspaces_dir, id).await?;
 	if session.forwarded_ports.is_empty() {
 		return Ok(Vec::new());
 	}
@@ -132,7 +125,7 @@ async fn persist_forwards(
 	core_session::save(workspaces_dir, workspace_id, &session).await
 }
 
-async fn emit_state(app: &AppHandle, project: &moon_container::ProjectName, forwards: &[ForwardedPort]) {
+async fn emit_state(app: &AppCore, project: &moon_container::ProjectName, forwards: &[ForwardedPort]) {
 	let payload = match list_forward_status(project, forwards).await {
 		Ok(s) => s,
 		Err(err) => {
@@ -140,9 +133,7 @@ async fn emit_state(app: &AppHandle, project: &moon_container::ProjectName, forw
 			return;
 		}
 	};
-	if let Err(err) = app.emit(PORTS_STATE_EVENT, &payload) {
-		tracing::warn!(error = %err, "failed to emit ports:state");
-	}
+	emit(app.events.as_ref(), PORTS_STATE_EVENT, &payload);
 }
 
 /// Re-apply the currently persisted forward set to the proxy
@@ -154,15 +145,14 @@ async fn emit_state(app: &AppHandle, project: &moon_container::ProjectName, forw
 /// existing sidecar before starting a new one.
 ///
 /// Empty persisted list = no-op (we don't even probe docker).
-#[tauri::command]
-pub async fn ports_reapply(app: AppHandle, state: State<'_, AppState>) -> Result<PortsApplyResult, MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn ports_reapply(app: &AppCore) -> Result<PortsApplyResult, MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Ok(PortsApplyResult {
 			applied: Vec::new(),
 			conflicts: Vec::new(),
 		});
 	};
-	let session = core_session::load(&state.workspaces_dir, id).await?;
+	let session = core_session::load(&app.workspaces_dir, id).await?;
 	if session.forwarded_ports.is_empty() {
 		return Ok(PortsApplyResult {
 			applied: Vec::new(),
@@ -171,6 +161,13 @@ pub async fn ports_reapply(app: AppHandle, state: State<'_, AppState>) -> Result
 	}
 	let project = project_name_for_id(id).map_err(|err| MoonError::invalid(err.to_string()))?;
 	let result = apply_forwards(&project, &session.forwarded_ports).await?;
-	emit_state(&app, &project, &session.forwarded_ports).await;
+	emit_state(app, &project, &session.forwarded_ports).await;
 	Ok(result)
+}
+
+crate::commands! {
+	ports_list([app]),
+	ports_set([app] forwards: Vec<ForwardedPort>),
+	ports_status([app]),
+	ports_reapply([app]),
 }

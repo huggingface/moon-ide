@@ -9,10 +9,10 @@
 //!    --tail 500 <service>` with `kill_on_drop(true)` so the
 //!    child can't outlive its supervisor task.
 //! 3. Generates a stream UUID and supervisor task. The task pipes
-//!    stdout + stderr through Tauri events keyed on the UUID, then
+//!    stdout + stderr through events keyed on the UUID, then
 //!    awaits the child's exit and emits a final `closed` event.
 //! 4. Stores the supervisor's [`AbortHandle`] in
-//!    [`AppState::log_streams`] keyed on the UUID and hands the
+//!    [`AppCore::log_streams`] keyed on the UUID and hands the
 //!    UUID back to the frontend.
 //!
 //! The frontend later calls [`compose_logs_close`] to abort the
@@ -33,18 +33,26 @@
 //! ordering per-stream so the frontend's buffer can rely on
 //! line order without sequencing in payloads.
 
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use moon_container::ProjectCompose;
 use moon_protocol::container::{LogStreamClosed, LogStreamLine};
 use moon_protocol::MoonError;
-use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::events::{emit, EventSink};
+use crate::project_compose::require_project_handle;
+use crate::AppCore;
+
+/// Active `docker compose logs -f` supervisors, keyed by stream id.
+pub type LogStreams = Arc<Mutex<HashMap<String, AbortHandle>>>;
 
 /// Per-line event name. Payload is [`LogStreamLine`].
 pub const LOG_STREAM_LINE_EVENT: &str = "compose_logs:line";
@@ -63,55 +71,41 @@ const TAIL_LINES: &str = "500";
 /// at `folder_path`. Returns the stream UUID; the frontend uses it
 /// to subscribe to `compose_logs:*` events and to call
 /// [`compose_logs_close`] when the user closes the tab.
-#[tauri::command]
-pub async fn compose_logs_open(
-	app: AppHandle,
-	state: State<'_, AppState>,
-	folder_path: String,
-	service: String,
-) -> Result<String, MoonError> {
+pub async fn compose_logs_open(app: &AppCore, folder_path: String, service: String) -> Result<String, MoonError> {
 	let folder_path = Utf8PathBuf::from(folder_path);
-	let pc = require_project_handle(&state, &folder_path).await?;
+	let pc = require_project_handle(app, &folder_path).await?;
 
 	let stream_id = Uuid::new_v4().to_string();
-	let handle = spawn_supervisor(app, state.log_streams.clone(), stream_id.clone(), pc, service).await?;
-	state.log_streams.lock().await.insert(stream_id.clone(), handle);
+	let handle = spawn_supervisor(
+		app.events.clone(),
+		app.log_streams.clone(),
+		stream_id.clone(),
+		pc,
+		service,
+	)
+	.await?;
+	app.log_streams.lock().await.insert(stream_id.clone(), handle);
 	Ok(stream_id)
 }
 
 /// Close a previously-opened stream by aborting its supervisor.
 /// The supervisor's child was spawned with `kill_on_drop(true)`,
 /// so the docker process gets SIGKILL'd as the abort drops it.
-#[tauri::command]
-pub async fn compose_logs_close(state: State<'_, AppState>, stream_id: String) -> Result<(), MoonError> {
-	let handle = state.log_streams.lock().await.remove(&stream_id);
+pub async fn compose_logs_close(app: &AppCore, stream_id: String) -> Result<(), MoonError> {
+	let handle = app.log_streams.lock().await.remove(&stream_id);
 	if let Some(handle) = handle {
 		handle.abort();
 	}
 	Ok(())
 }
 
-/// Tauri command resolver mirror of `project_compose::require_project_handle`,
-/// duplicated locally to keep this module self-contained.
-async fn require_project_handle(state: &AppState, folder_path: &Utf8Path) -> Result<ProjectCompose, MoonError> {
-	let snapshot = state.workspaces.snapshot().await;
-	let bound = snapshot.folders.iter().any(|f| Utf8Path::new(&f.path) == folder_path);
-	if !bound {
-		return Err(MoonError::NotFound(format!("folder {folder_path}")));
-	}
-	let state_dir = state.workspace_state_dir(&snapshot.id);
-	let pc = ProjectCompose::for_folder(&snapshot.id, &state_dir, folder_path)?
-		.ok_or_else(|| MoonError::NotFound(format!("no compose file in {folder_path}")))?;
-	Ok(pc)
-}
-
 async fn spawn_supervisor(
-	app: AppHandle,
-	registry: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>>,
+	events: Arc<dyn EventSink>,
+	registry: LogStreams,
 	stream_id: String,
 	pc: ProjectCompose,
 	service: String,
-) -> Result<tokio::task::AbortHandle, MoonError> {
+) -> Result<AbortHandle, MoonError> {
 	let mut child = Command::new("docker")
 		.arg("compose")
 		.arg("-f")
@@ -139,26 +133,24 @@ async fn spawn_supervisor(
 		.take()
 		.ok_or_else(|| MoonError::internal("missing stderr pipe"))?;
 
-	let app_clone = app.clone();
 	let id_for_task = stream_id.clone();
-	let supervisor = tauri::async_runtime::spawn(async move {
+	let supervisor = tokio::spawn(async move {
 		// Move the child into the task so it gets dropped (and
 		// SIGKILL'd via `kill_on_drop`) when the task is aborted
 		// from `compose_logs_close`.
 		let mut child = child;
 
-		// Stdout reader. Detached: the supervisor doesn't await
-		// it, both readers finish naturally when the docker
-		// process closes its pipes, and emit failures only happen
-		// when the window itself is gone — we ignore them so a
-		// closed window can't leak the loop.
+		// Stdout reader. Both readers finish naturally when the
+		// docker process closes its pipes; the supervisor joins
+		// them before emitting `closed` so no line trails it.
 		let stdout_task = {
-			let app = app_clone.clone();
+			let events = events.clone();
 			let id = id_for_task.clone();
-			tauri::async_runtime::spawn(async move {
+			tokio::spawn(async move {
 				let mut lines = BufReader::new(stdout).lines();
 				while let Ok(Some(text)) = lines.next_line().await {
-					let _ = app.emit(
+					emit(
+						events.as_ref(),
 						LOG_STREAM_LINE_EVENT,
 						&LogStreamLine {
 							stream_id: id.clone(),
@@ -170,12 +162,13 @@ async fn spawn_supervisor(
 			})
 		};
 		let stderr_task = {
-			let app = app_clone.clone();
+			let events = events.clone();
 			let id = id_for_task.clone();
-			tauri::async_runtime::spawn(async move {
+			tokio::spawn(async move {
 				let mut lines = BufReader::new(stderr).lines();
 				while let Ok(Some(text)) = lines.next_line().await {
-					let _ = app.emit(
+					emit(
+						events.as_ref(),
 						LOG_STREAM_LINE_EVENT,
 						&LogStreamLine {
 							stream_id: id.clone(),
@@ -197,7 +190,8 @@ async fn spawn_supervisor(
 		registry.lock().await.remove(&id_for_task);
 
 		let code = exit.ok().and_then(|s| s.code());
-		let _ = app_clone.emit(
+		emit(
+			events.as_ref(),
 			LOG_STREAM_CLOSED_EVENT,
 			&LogStreamClosed {
 				stream_id: id_for_task,
@@ -206,5 +200,10 @@ async fn spawn_supervisor(
 		);
 	});
 
-	Ok(supervisor.inner().abort_handle())
+	Ok(supervisor.abort_handle())
+}
+
+crate::commands! {
+	compose_logs_open([app] folder_path: String, service: String),
+	compose_logs_close([app] stream_id: String),
 }

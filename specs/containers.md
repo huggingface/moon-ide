@@ -107,7 +107,7 @@ callers serialise behind one `docker compose ps`
 ([ADR 0020](decisions/0020-container-status-cache.md)).
 
 The workspace shell additionally gets **event-driven** freshness:
-a docker-events watcher (`src-tauri/src/commands/container_events.rs`)
+a docker-events watcher (`crates/moon-app/src/container_events.rs`)
 tails `docker events` filtered to the `moon-ws-<id>-dev-1`
 container and re-broadcasts `container:state` on any lifecycle
 action (start/stop/die/pause/kill/destroy). This is what closes

@@ -20,7 +20,7 @@ import { subscribe, type Unsubscribe } from './transport';
 import { ipc } from './ipc';
 import { formatError, type ContainerStateChange, type ContainerStatus } from './protocol';
 
-/** Tauri event name — must match `CONTAINER_STATE_EVENT` in `src-tauri/src/commands/container.rs`. */
+/** Tauri event name — must match `CONTAINER_STATE_EVENT` in `crates/moon-app/src/container.rs`. */
 const CONTAINER_STATE_EVENT = 'container:state';
 
 /** Identifies which mutating command is currently in flight. */

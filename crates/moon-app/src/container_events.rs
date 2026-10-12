@@ -26,13 +26,14 @@
 //! spawned (no daemon, no CLI) the watcher exits after logging,
 //! and the pip simply degrades to the old poll-on-focus cadence.
 
+use std::sync::Arc;
+
 use moon_terminal::container_name_for_workspace;
-use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::commands::container::emit_container_state;
-use crate::state::AppState;
+use crate::container::{emit_container_state, workspace_handle};
+use crate::AppCore;
 
 /// Docker event `Action` values that change the container's
 /// high-level state. We ignore the noisy ones (exec_create /
@@ -40,16 +41,14 @@ use crate::state::AppState;
 /// only these move the state the pip reports.
 const LIFECYCLE_ACTIONS: [&str; 7] = ["start", "stop", "die", "pause", "unpause", "kill", "destroy"];
 
-/// Spawn the watcher. Fire-and-forget: the caller drops the
-/// returned `JoinHandle`; the task lives until the process does
-/// or the events stream ends. Called once from app setup after
-/// the workspace id is known.
-pub fn watch_container_events(app: AppHandle, workspace_id: String) {
-	let container_name = container_name_for_workspace(&workspace_id);
-	tauri::async_runtime::spawn(run(app, container_name));
-}
-
-async fn run(app: AppHandle, container_name: String) {
+/// Run the watcher until the events stream ends. Meant to be
+/// spawned fire-and-forget once at startup; returns at once in
+/// preboot mode (no workspace, no container).
+pub async fn watch(app: Arc<AppCore>) {
+	let Some(workspace_id) = app.workspace_id() else {
+		return;
+	};
+	let container_name = container_name_for_workspace(workspace_id);
 	// `docker events --format '{{json .}}'` streams one JSON
 	// object per daemon event. We filter server-side to our
 	// container so the stream stays quiet even on a busy
@@ -121,9 +120,8 @@ fn is_lifecycle_event(line: &str) -> bool {
 /// reading is the only honest answer. Goes through the ADR 0020
 /// cache, which at this point has aged past its 1 s TTL for any
 /// reading taken before the stop landed.
-async fn on_lifecycle_event(app: &AppHandle) {
-	let state = app.state::<AppState>();
-	let container = match moon_app::container::workspace_handle(&state.core).await {
+async fn on_lifecycle_event(app: &AppCore) {
+	let container = match workspace_handle(app).await {
 		Ok(c) => c,
 		Err(err) => {
 			tracing::warn!(error = %err, "container events watcher: failed to build workspace handle");
@@ -131,7 +129,7 @@ async fn on_lifecycle_event(app: &AppHandle) {
 		}
 	};
 	match container.status().await {
-		Ok(status) => emit_container_state(app, &status),
+		Ok(status) => emit_container_state(app.events.as_ref(), &status),
 		Err(err) => tracing::warn!(error = %err, "container events watcher: status query failed"),
 	}
 }

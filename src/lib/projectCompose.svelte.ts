@@ -30,7 +30,7 @@ import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
 import { formatError, type ProjectComposeStateChange, type ProjectComposeStatus } from './protocol';
 
-/** Tauri event name — must match `PROJECT_COMPOSE_STATE_EVENT` in `src-tauri/src/commands/project_compose.rs`. */
+/** Tauri event name — must match `PROJECT_COMPOSE_STATE_EVENT` in `crates/moon-app/src/project_compose.rs`. */
 const PROJECT_COMPOSE_STATE_EVENT = 'project_compose:state';
 
 /** Project-level compose lifecycle verbs the folder bar can fire. */

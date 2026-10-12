@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
@@ -46,12 +45,8 @@ pub struct AppState {
 	/// this is the in-memory client cache (populated at startup if the
 	/// keyring has a token, otherwise lazily on first `slack_set_token`).
 	pub slack: SlackState,
-	/// Registry of active `docker compose logs -f` streams.
-	pub log_streams: Arc<Mutex<HashMap<String, AbortHandle>>>,
 	/// Filesystem watcher actor.
 	pub fs_watcher: FsWatcherHandle,
-	/// In-process AI coding agent (Phase 6).
-	pub coder: CoderHandle,
 	/// Optional `llama-server` child for local autocomplete (HF `--hf-repo`).
 	pub next_edit_server: Arc<NextEditServerSupervisor>,
 	/// Process mode + identity. The frontend's first hydrate
@@ -123,21 +118,20 @@ impl AppState {
 					AppMode::Workspace { id } => Some(id.clone()),
 					AppMode::Preboot => None,
 				},
-				coder: coder.clone(),
+				coder,
 				events,
 				preview_tunnels: moon_container::PreviewTunnels::new(),
 				logs,
 				terminals,
 				terminal_streams: Default::default(),
 				lsp: Default::default(),
+				log_streams: Default::default(),
 			}),
 			workspaces,
 			config_dir,
 			workspaces_dir,
 			slack,
-			log_streams: Arc::new(Mutex::new(HashMap::new())),
 			fs_watcher,
-			coder,
 			next_edit_server: Arc::new(NextEditServerSupervisor::default()),
 			mode,
 			focus_listener: Mutex::new(None),

@@ -13,10 +13,9 @@
 //! The crate is deliberately thin: it owns the spawn, the PTY
 //! handles, and a [`TerminalRegistry`] of what's currently open
 //! (so the coder's terminal-reading tools have something to ask).
-//! The supervisor / event-pump / Tauri-emitting glue lives in
-//! `src-tauri/src/commands/terminal.rs`, mirroring how
-//! `moon-container`'s lifecycle is consumed by
-//! `commands/container.rs`.
+//! The supervisor / event-pump glue lives in `moon-app`'s
+//! `terminal.rs`, mirroring how `moon-container`'s lifecycle is
+//! consumed by its `container.rs`.
 
 mod pty;
 mod registry;

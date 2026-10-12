@@ -27,7 +27,7 @@ import {
 } from './protocol';
 
 /** Tauri event name — must match `PORTS_STATE_EVENT` in
- *  `src-tauri/src/commands/ports.rs`. */
+ *  `crates/moon-app/src/ports.rs`. */
 const PORTS_STATE_EVENT = 'ports:state';
 
 class PortsStore {

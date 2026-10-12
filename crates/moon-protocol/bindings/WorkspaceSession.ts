@@ -78,10 +78,10 @@ coder_mcp?: CoderMcpWorkspaceConfig,
 /**
  * Per-folder "this folder's `docker-compose.yml` project was
  * `Running` when the IDE quit last time" map, keyed by the
- * folder's absolute path. `shutdown::stop_all` populates
+ * folder's absolute path. `AppCore::stop_all` populates
  * this immediately before issuing `docker compose stop` for
  * each folder; on next launch,
- * `shutdown::auto_resume_project_composes` reads it and
+ * `AppCore::auto_resume_project_composes` reads it and
  * brings the marked folders back up with `compose up -d`.
  *
  * Cleared (for a folder) by Stop / Down clicks in the UI so

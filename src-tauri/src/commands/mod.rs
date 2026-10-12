@@ -1,14 +1,9 @@
 pub mod app_info;
 pub mod app_state;
 pub mod companion;
-pub mod compose_logs;
-pub mod container;
-pub mod container_events;
 pub mod editor_forward;
 pub mod fs;
 pub mod next_edit;
-pub mod ports;
-pub mod project_compose;
 pub mod rpc;
 pub mod slack;
 pub mod system;
