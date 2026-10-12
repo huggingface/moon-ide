@@ -123,7 +123,7 @@ fn is_lifecycle_event(line: &str) -> bool {
 /// reading taken before the stop landed.
 async fn on_lifecycle_event(app: &AppHandle) {
 	let state = app.state::<AppState>();
-	let container = match crate::commands::container::workspace_handle(&state).await {
+	let container = match moon_app::container::workspace_handle(&state.core).await {
 		Ok(c) => c,
 		Err(err) => {
 			tracing::warn!(error = %err, "container events watcher: failed to build workspace handle");

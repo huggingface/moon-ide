@@ -1,9 +1,5 @@
-//! Tauri commands wrapping `moon-coder`.
-//!
-//! Phase 6.0 surface: device-flow sign-in, status probe, sign-out,
-//! one-shot `send`, mid-turn `abort`. Loop events stream out on the
-//! `coder:event` Tauri channel. See
-//! `specs/test-plans/0039-coder-skeleton.md`.
+//! Commands wrapping `moon-coder`. Loop events stream out on the
+//! `coder:event` channel.
 
 use camino::Utf8PathBuf;
 use moon_coder::{
@@ -20,9 +16,11 @@ use moon_protocol::coder_models::{
 };
 use moon_protocol::MoonError;
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, State};
 
-use crate::state::AppState;
+use std::sync::Arc;
+
+use crate::events::EventSink;
+use crate::AppCore;
 
 /// Channel name the loop's events are emitted on. The frontend
 /// listens via `getCurrent().listen('coder:event', ...)`. Mirrored in
@@ -30,17 +28,15 @@ use crate::state::AppState;
 pub const CODER_EVENT_CHANNEL: &str = "coder:event";
 
 /// Spawn the long-running task that re-broadcasts the coder's
-/// in-process broadcast channel onto Tauri's event bus. Called once
+/// in-process broadcast channel onto the event sink. Called once
 /// at app startup; the task lives for the entire process lifetime.
-pub fn spawn_event_pump(app: AppHandle, coder: CoderHandle) {
+pub fn spawn_event_pump(events: Arc<dyn EventSink>, coder: CoderHandle) {
 	let mut rx = coder.subscribe();
-	tauri::async_runtime::spawn(async move {
+	tokio::spawn(async move {
 		loop {
 			match rx.recv().await {
 				Ok(event) => {
-					if let Err(err) = app.emit(CODER_EVENT_CHANNEL, &event) {
-						tracing::warn!(error = %err, "failed to emit coder event");
-					}
+					crate::events::emit(events.as_ref(), CODER_EVENT_CHANNEL, &event);
 				}
 				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
 					// Rare, since we sized the channel generously.
@@ -60,9 +56,8 @@ pub fn spawn_event_pump(app: AppHandle, coder: CoderHandle) {
 
 /// Snapshot the coder's auth + busy state. Polled by the panel on
 /// mount so reopens land in the right shape.
-#[tauri::command]
-pub async fn coder_status(state: State<'_, AppState>) -> Result<CoderStatus, MoonError> {
-	state.coder.status().await.map_err(MoonError::from)
+pub async fn coder_status(app: &AppCore) -> Result<CoderStatus, MoonError> {
+	app.coder.status().await.map_err(MoonError::from)
 }
 
 /// Fetch the cached "Bound folders" description for `folder`
@@ -71,32 +66,28 @@ pub async fn coder_status(state: State<'_, AppState>) -> Result<CoderStatus, Moo
 /// regeneration on its next turn, and a `folder_summary_ready`
 /// event will fire when it finishes. Used by the project bar
 /// tooltip and sub-agent picker preview.
-#[tauri::command]
-pub async fn coder_folder_summary(state: State<'_, AppState>, folder: String) -> Result<Option<String>, MoonError> {
-	Ok(state.coder.folder_summary(&folder).await)
+pub async fn coder_folder_summary(app: &AppCore, folder: String) -> Result<Option<String>, MoonError> {
+	Ok(app.coder.folder_summary(&folder).await)
 }
 
 /// Kick off the HF device flow. Returns the user/device code pair
 /// immediately. The frontend opens `verification_uri_complete` in
 /// the system browser then calls [`coder_poll_device_code`] to wait
 /// for the consent screen.
-#[tauri::command]
-pub async fn coder_start_device_flow(state: State<'_, AppState>) -> Result<DeviceCode, MoonError> {
-	state.coder.start_device_flow().await.map_err(MoonError::from)
+pub async fn coder_start_device_flow(app: &AppCore) -> Result<DeviceCode, MoonError> {
+	app.coder.start_device_flow().await.map_err(MoonError::from)
 }
 
 /// Poll the token endpoint until the user approves / denies. Returns
 /// the freshly-fetched [`HfIdentity`] on success. The future blocks
 /// until completion; the frontend awaits with the modal still open.
-#[tauri::command]
-pub async fn coder_poll_device_code(state: State<'_, AppState>, code: DeviceCode) -> Result<HfIdentity, MoonError> {
-	state.coder.poll_device_code(code).await.map_err(MoonError::from)
+pub async fn coder_poll_device_code(app: &AppCore, code: DeviceCode) -> Result<HfIdentity, MoonError> {
+	app.coder.poll_device_code(code).await.map_err(MoonError::from)
 }
 
 /// Drop the keyring entry + the in-memory session. Idempotent.
-#[tauri::command]
-pub async fn coder_sign_out(state: State<'_, AppState>) -> Result<(), MoonError> {
-	state.coder.sign_out().await.map_err(MoonError::from)
+pub async fn coder_sign_out(app: &AppCore) -> Result<(), MoonError> {
+	app.coder.sign_out().await.map_err(MoonError::from)
 }
 
 /// Send one user message and start a turn. Non-blocking — the future
@@ -140,19 +131,18 @@ pub async fn coder_sign_out(state: State<'_, AppState>) -> Result<(), MoonError>
 /// the persistent desync a *failed* open leaves behind. `None` (no
 /// visible session yet — fresh folder) falls back to the visible-
 /// session resolution, which mints a blank session on first use.
-#[tauri::command]
 pub async fn coder_send(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	text: String,
 	images: Vec<ImageAttachment>,
 	session_id: Option<String>,
 ) -> Result<(), MoonError> {
 	let target = match session_id {
-		Some(id) => state.coder.send_to_as_user(&id, text, images).await,
-		None => state.coder.send(text, images).await,
+		Some(id) => app.coder.send_to_as_user(&id, text, images).await,
+		None => app.coder.send(text, images).await,
 	}
 	.map_err(MoonError::from)?;
-	persist_last_session(&state.config_dir, target.pointer_key(), Some(target.session_id.clone())).await;
+	persist_last_session(&app.config_dir, target.pointer_key(), Some(target.session_id.clone())).await;
 	Ok(())
 }
 
@@ -162,11 +152,10 @@ pub async fn coder_send(
 /// to populate the branch input. Falls back to an error string
 /// the panel surfaces verbatim when the model is unreachable —
 /// the user can still type a name manually.
-#[tauri::command]
-pub async fn coder_suggest_branch_name(state: State<'_, AppState>, message: String) -> Result<String, MoonError> {
-	let entry = state.workspaces.require_active_folder().await?;
+pub async fn coder_suggest_branch_name(app: &AppCore, message: String) -> Result<String, MoonError> {
+	let entry = app.workspaces.require_active_folder().await?;
 	let diff = entry.host.git_diff_summary().await.unwrap_or_default();
-	state
+	app
 		.coder
 		.suggest_branch_name(&message, &diff)
 		.await
@@ -179,11 +168,10 @@ pub async fn coder_suggest_branch_name(state: State<'_, AppState>, message: Stri
 /// panel's sparkle button inset on the commit textarea. Errors
 /// surface verbatim through the panel as a flash toast — the user
 /// can still type the message manually.
-#[tauri::command]
-pub async fn coder_suggest_commit_message(state: State<'_, AppState>, message: String) -> Result<String, MoonError> {
-	let entry = state.workspaces.require_active_folder().await?;
+pub async fn coder_suggest_commit_message(app: &AppCore, message: String) -> Result<String, MoonError> {
+	let entry = app.workspaces.require_active_folder().await?;
 	let diff = entry.host.git_diff_patch().await.unwrap_or_default();
-	state
+	app
 		.coder
 		.suggest_commit_message(&message, &diff)
 		.await
@@ -194,16 +182,15 @@ pub async fn coder_suggest_commit_message(state: State<'_, AppState>, message: S
 /// command for a terminal's `Ctrl+K` prompt. `target_kind` is the
 /// terminal's shell (`"host"` / `"container"`) and `cwd` its
 /// working directory — passed from the frontend since the
-/// terminal supervisor, not the workspace, owns that state. We
+/// terminal supervisor, not the workspace, owns that app. We
 /// fold in the active folder's git branch + local branch names so
 /// the model can resolve references like "the feat branch" or
 /// "rebase onto main". The result is prefilled into the PTY line
 /// (not executed); the user reviews it and presses Enter. Errors
 /// surface verbatim through a terminal flash — the user can still
 /// type the command manually.
-#[tauri::command]
 pub async fn coder_suggest_terminal_command(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	request: String,
 	target_kind: String,
 	cwd: String,
@@ -216,7 +203,7 @@ pub async fn coder_suggest_terminal_command(
 	// Git context is best-effort: a non-git folder (or no active
 	// folder at all) just means the model gets less to work with,
 	// not a hard error — a Ctrl+K request might be a plain `ls`.
-	if let Ok(entry) = state.workspaces.require_active_folder().await {
+	if let Ok(entry) = app.workspaces.require_active_folder().await {
 		if let Ok(branch) = entry.host.git_branch().await {
 			ctx.git_branch = branch.name.unwrap_or_default();
 		}
@@ -224,7 +211,7 @@ pub async fn coder_suggest_terminal_command(
 			ctx.git_branches = branches.join("\n");
 		}
 	}
-	state
+	app
 		.coder
 		.suggest_terminal_command(&request, &ctx)
 		.await
@@ -237,9 +224,8 @@ pub async fn coder_suggest_terminal_command(
 /// (per the multi-session "agents keep running per project"
 /// contract). Async because resolving the active folder + its
 /// `FolderSession` map entry needs `await`.
-#[tauri::command]
-pub async fn coder_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
-	state.coder.abort().await;
+pub async fn coder_abort(app: &AppCore) -> Result<(), MoonError> {
+	app.coder.abort().await;
 	Ok(())
 }
 
@@ -249,9 +235,8 @@ pub async fn coder_abort(state: State<'_, AppState>) -> Result<(), MoonError> {
 /// Returns `false` (no-op) when `id` no longer matches a queued
 /// steer — the runner already drained it at its last iteration
 /// top.
-#[tauri::command]
-pub async fn coder_drain_steer_now(state: State<'_, AppState>, id: String) -> Result<bool, MoonError> {
-	Ok(state.coder.drain_steer_now(&id).await)
+pub async fn coder_drain_steer_now(app: &AppCore, id: String) -> Result<bool, MoonError> {
+	Ok(app.coder.drain_steer_now(&id).await)
 }
 
 /// Pop a previously-queued steer (a `send` issued while a turn
@@ -261,9 +246,8 @@ pub async fn coder_drain_steer_now(state: State<'_, AppState>, id: String) -> Re
 /// queued steer — by the time the user pressed `Up`, the runner
 /// drained the queue at the top of the next iteration. Bound to
 /// `ArrowUp` on an empty composer in the panel.
-#[tauri::command]
-pub async fn coder_unqueue_steer(state: State<'_, AppState>, id: String) -> Result<Option<UnqueuedSteer>, MoonError> {
-	Ok(state.coder.unqueue_steer(&id).await)
+pub async fn coder_unqueue_steer(app: &AppCore, id: String) -> Result<Option<UnqueuedSteer>, MoonError> {
+	Ok(app.coder.unqueue_steer(&id).await)
 }
 
 /// Send a message to a sub-agent from the pop-out composer.
@@ -274,22 +258,16 @@ pub async fn coder_unqueue_steer(state: State<'_, AppState>, id: String) -> Resu
 /// involving the parent agent. Returns `false` when there's
 /// nothing to continue (unknown id / no transcript on disk) — the
 /// panel keeps the draft.
-#[tauri::command]
-pub async fn coder_continue_subagent(
-	state: State<'_, AppState>,
-	subagent_id: String,
-	text: String,
-) -> Result<bool, MoonError> {
-	Ok(state.coder.continue_subagent(&subagent_id, text).await?)
+pub async fn coder_continue_subagent(app: &AppCore, subagent_id: String, text: String) -> Result<bool, MoonError> {
+	Ok(app.coder.continue_subagent(&subagent_id, text).await?)
 }
 
 /// Stop one running sub-agent (the pop-out's stop button). Cancels
 /// only that sub-agent's token — the parent turn and sibling
 /// sub-agents keep running. Returns `false` when nothing is
 /// running under that id.
-#[tauri::command]
-pub fn coder_abort_subagent(state: State<'_, AppState>, subagent_id: String) -> Result<bool, MoonError> {
-	Ok(state.coder.abort_subagent(&subagent_id))
+pub async fn coder_abort_subagent(app: &AppCore, subagent_id: String) -> Result<bool, MoonError> {
+	Ok(app.coder.abort_subagent(&subagent_id))
 }
 
 /// Resolve an in-flight `ask_user` prompt on the active folder's
@@ -301,13 +279,12 @@ pub fn coder_abort_subagent(state: State<'_, AppState>, subagent_id: String) -> 
 /// way the row settles off the `tool_result` event. The user can
 /// always skip the prompt entirely by just sending a normal message
 /// instead of answering — that path runs through `coder_send`.
-#[tauri::command]
 pub async fn coder_respond_to_prompt(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	call_id: String,
 	response: PromptResponse,
 ) -> Result<bool, MoonError> {
-	Ok(state.coder.respond_to_prompt(&call_id, response).await)
+	Ok(app.coder.respond_to_prompt(&call_id, response).await)
 }
 
 /// Revert the active folder's visible session to just before its
@@ -320,16 +297,8 @@ pub async fn coder_respond_to_prompt(
 /// `open_session` reload path, so the panel rebuilds its rows from
 /// those events rather than from the return value. Refuses while a
 /// turn is in flight.
-#[tauri::command]
-pub async fn coder_revert_to_message(
-	state: State<'_, AppState>,
-	user_ordinal: usize,
-) -> Result<RevertedMessage, MoonError> {
-	state
-		.coder
-		.revert_to_message(user_ordinal)
-		.await
-		.map_err(MoonError::from)
+pub async fn coder_revert_to_message(app: &AppCore, user_ordinal: usize) -> Result<RevertedMessage, MoonError> {
+	app.coder.revert_to_message(user_ordinal).await.map_err(MoonError::from)
 }
 
 /// Replay the active folder's visible session from its
@@ -342,9 +311,8 @@ pub async fn coder_revert_to_message(
 /// Refused while a turn is in flight. The trimmed transcript replays
 /// on `coder:event` (via the `coder_revert_to_message` reload), then
 /// the new turn's events stream as a normal send.
-#[tauri::command]
-pub async fn coder_replay_from_message(state: State<'_, AppState>, user_ordinal: usize) -> Result<(), MoonError> {
-	state
+pub async fn coder_replay_from_message(app: &AppCore, user_ordinal: usize) -> Result<(), MoonError> {
+	app
 		.coder
 		.replay_from_message(user_ordinal)
 		.await
@@ -368,9 +336,8 @@ pub async fn coder_replay_from_message(state: State<'_, AppState>, user_ordinal:
 /// flight. The trimmed transcript replays on `coder:event` (via the
 /// reload), then the re-dispatched tool calls stream as normal
 /// `tool_call` / `tool_result` events.
-#[tauri::command]
-pub async fn coder_resume_from_tool_call(state: State<'_, AppState>, tool_call_id: String) -> Result<(), MoonError> {
-	state
+pub async fn coder_resume_from_tool_call(app: &AppCore, tool_call_id: String) -> Result<(), MoonError> {
+	app
 		.coder
 		.resume_from_tool_call(&tool_call_id)
 		.await
@@ -383,9 +350,8 @@ pub async fn coder_resume_from_tool_call(state: State<'_, AppState>, tool_call_i
 /// retry's output appends below it. Auth-gates, refused while a turn
 /// is in flight, and errors when the session has no messages to
 /// retry against.
-#[tauri::command]
-pub async fn coder_retry_last_turn(state: State<'_, AppState>) -> Result<(), MoonError> {
-	state.coder.retry_last_turn().await.map_err(MoonError::from)
+pub async fn coder_retry_last_turn(app: &AppCore) -> Result<(), MoonError> {
+	app.coder.retry_last_turn().await.map_err(MoonError::from)
 }
 
 /// Manually reapply a recorded `write_file` / `edit_file` tool
@@ -397,19 +363,14 @@ pub async fn coder_retry_last_turn(state: State<'_, AppState>) -> Result<(), Moo
 /// reapplyable call (unknown id, a non-write tool) or when the
 /// dispatch itself fails (e.g. an `edit_file` whose `find` no
 /// longer matches the current file).
-#[tauri::command]
-pub async fn coder_rerun_tool_call(
-	state: State<'_, AppState>,
-	tool_call_id: String,
-) -> Result<RerunToolOutcome, MoonError> {
-	state.coder.rerun_tool_call(tool_call_id).await.map_err(MoonError::from)
+pub async fn coder_rerun_tool_call(app: &AppCore, tool_call_id: String) -> Result<RerunToolOutcome, MoonError> {
+	app.coder.rerun_tool_call(tool_call_id).await.map_err(MoonError::from)
 }
 
 /// List persisted sessions for the active workspace folder. Empty
 /// when the folder has none — including when no folder is active.
-#[tauri::command]
-pub async fn coder_list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionSummary>, MoonError> {
-	state.coder.list_sessions().await.map_err(MoonError::from)
+pub async fn coder_list_sessions(app: &AppCore) -> Result<Vec<SessionSummary>, MoonError> {
+	app.coder.list_sessions().await.map_err(MoonError::from)
 }
 
 /// Session ids in the active folder with a turn currently in
@@ -419,9 +380,8 @@ pub async fn coder_list_sessions(state: State<'_, AppState>) -> Result<Vec<Sessi
 /// already running before the panel hydrated (a coordinator's
 /// workers spawned while the user was elsewhere, a webview
 /// reload, a lagged event pump).
-#[tauri::command]
-pub async fn coder_running_sessions(state: State<'_, AppState>) -> Result<Vec<String>, MoonError> {
-	Ok(state.coder.running_sessions_in(None).await)
+pub async fn coder_running_sessions(app: &AppCore) -> Result<Vec<String>, MoonError> {
+	Ok(app.coder.running_sessions_in(None).await)
 }
 
 /// Search the active folder's persisted sessions for a
@@ -429,18 +389,16 @@ pub async fn coder_running_sessions(state: State<'_, AppState>) -> Result<Vec<St
 /// (user prompts, assistant text/thinking, tool calls/results).
 /// Returns matching session ids; the panel filters its
 /// already-loaded list client-side. Empty query → empty result.
-#[tauri::command]
-pub async fn coder_search_sessions(state: State<'_, AppState>, query: String) -> Result<Vec<String>, MoonError> {
-	state.coder.search_sessions(&query).await.map_err(MoonError::from)
+pub async fn coder_search_sessions(app: &AppCore, query: String) -> Result<Vec<String>, MoonError> {
+	app.coder.search_sessions(&query).await.map_err(MoonError::from)
 }
 
 /// Snapshot of the active in-memory session, if any. `None` for a
 /// blank session — the panel uses this to decide between "show
 /// the sessions list" and "show this session's transcript" on
 /// mount.
-#[tauri::command]
-pub async fn coder_active_session(state: State<'_, AppState>) -> Result<Option<SessionSummary>, MoonError> {
-	Ok(state.coder.active_session().await)
+pub async fn coder_active_session(app: &AppCore) -> Result<Option<SessionSummary>, MoonError> {
+	Ok(app.coder.active_session().await)
 }
 
 /// The last-opened session id recorded for the **active workspace
@@ -455,20 +413,18 @@ pub async fn coder_active_session(state: State<'_, AppState>) -> Result<Option<S
 /// So switching between a parent and its worktree resolves to the
 /// session the user last opened in *that* worktree context, not a
 /// single shared id for the whole coder root.
-#[tauri::command]
-pub async fn coder_last_opened_session(state: State<'_, AppState>) -> Result<Option<String>, MoonError> {
-	let Some(folder) = active_folder_path(&state).await else {
+pub async fn coder_last_opened_session(app: &AppCore) -> Result<Option<String>, MoonError> {
+	let Some(folder) = active_folder_path(app).await else {
 		return Ok(None);
 	};
-	let app = app_state_store::load(&state.config_dir).await?;
+	let app = app_state_store::load(&app.config_dir).await?;
 	Ok(app.coder.last_session_by_folder.get(&folder).cloned())
 }
 
 /// Drop the in-memory session and start a blank one. Doesn't
 /// touch disk — empty sessions never write a file.
-#[tauri::command]
-pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSummary, MoonError> {
-	state.coder.new_session().await.map_err(MoonError::from)
+pub async fn coder_new_session(app: &AppCore) -> Result<SessionSummary, MoonError> {
+	app.coder.new_session().await.map_err(MoonError::from)
 }
 
 /// Start a fresh **coordinator** (orchestrator) session (ADR 0030).
@@ -476,20 +432,15 @@ pub async fn coder_new_session(state: State<'_, AppState>) -> Result<SessionSumm
 /// header so `run_turn` advertises the worker-management tools
 /// (`spawn_worker` / `observe_worker` / etc.) instead of `task` /
 /// `ask_user`, and seeds the coordinator system prompt.
-#[tauri::command]
-pub async fn coder_new_coordinator_session(state: State<'_, AppState>) -> Result<SessionSummary, MoonError> {
-	state.coder.new_coordinator_session().await.map_err(MoonError::from)
+pub async fn coder_new_coordinator_session(app: &AppCore) -> Result<SessionSummary, MoonError> {
+	app.coder.new_coordinator_session().await.map_err(MoonError::from)
 }
 
 /// Where `session_id` stands relative to a coordinator fleet (ADR 0052
 /// / 0084): `none`, `attached`, or `disconnected` (cut, final turn
 /// still running). Drives the session bar's disconnect / stop button.
-#[tauri::command]
-pub async fn coder_worker_link_state(
-	state: State<'_, AppState>,
-	session_id: String,
-) -> Result<WorkerLinkState, MoonError> {
-	Ok(state.coder.worker_link_state(&session_id).await)
+pub async fn coder_worker_link_state(app: &AppCore, session_id: String) -> Result<WorkerLinkState, MoonError> {
+	Ok(app.coder.worker_link_state(&session_id).await)
 }
 
 /// Unhook a coordinator-spawned worker from its orchestrator (ADR
@@ -497,50 +448,40 @@ pub async fn coder_worker_link_state(
 /// in-flight turn runs to completion. Clicking again while already
 /// disconnected cancels that turn ("stop it now"). Returns which of
 /// those happened so the panel can toast accordingly.
-#[tauri::command]
-pub async fn coder_disconnect_worker(
-	state: State<'_, AppState>,
-	session_id: String,
-) -> Result<DisconnectWorkerOutcome, MoonError> {
-	Ok(state.coder.disconnect_worker(&session_id).await)
+pub async fn coder_disconnect_worker(app: &AppCore, session_id: String) -> Result<DisconnectWorkerOutcome, MoonError> {
+	Ok(app.coder.disconnect_worker(&session_id).await)
 }
 
 /// Attach an existing session to a coordinator as a worker (ADR
 /// 0084) — the `/attach` composer command. Mounts either session
 /// from disk when needed; refuses when the target is still attached
 /// to a different coordinator.
-#[tauri::command]
 pub async fn coder_attach_worker(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	coordinator_id: String,
 	session_id: String,
 ) -> Result<AttachWorkerOutcome, MoonError> {
-	Ok(state.coder.attach_worker(&coordinator_id, &session_id).await?)
+	Ok(app.coder.attach_worker(&coordinator_id, &session_id).await?)
 }
 
 /// A coordinator's still-attached workers — the `/detach` picker when
 /// typed in a coordinator (ADR 0084).
-#[tauri::command]
-pub async fn coder_attached_workers(
-	state: State<'_, AppState>,
-	coordinator_id: String,
-) -> Result<Vec<FleetMember>, MoonError> {
-	Ok(state.coder.attached_workers(&coordinator_id).await)
+pub async fn coder_attached_workers(app: &AppCore, coordinator_id: String) -> Result<Vec<FleetMember>, MoonError> {
+	Ok(app.coder.attached_workers(&coordinator_id).await)
 }
 
 /// Live snapshot of a session's detached background process (ADR
 /// 0085): running status, exit code, log tail. The panel's live
 /// tail polls this while the row is expanded — same registry the
 /// model's `read_process` reads.
-#[tauri::command]
 pub async fn coder_read_background_process(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	session_id: String,
 	id: String,
 	tail_bytes: Option<usize>,
 ) -> Result<serde_json::Value, MoonError> {
 	Ok(
-		state
+		app
 			.coder
 			.read_background_process(&session_id, &id, tail_bytes.unwrap_or(8_000))
 			.await?,
@@ -550,13 +491,12 @@ pub async fn coder_read_background_process(
 /// Kill a session's detached background process — the panel's stop
 /// affordance (ADR 0085). Same semantics as the model's
 /// `stop_process` tool; the settlement event flips the row.
-#[tauri::command]
 pub async fn coder_stop_background_process(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	session_id: String,
 	id: String,
 ) -> Result<serde_json::Value, MoonError> {
-	Ok(state.coder.stop_background_process(&session_id, &id).await?)
+	Ok(app.coder.stop_background_process(&session_id, &id).await?)
 }
 
 /// Result of [`coder_new_worktree_session`]: the new bound-folder
@@ -585,9 +525,8 @@ pub struct NewWorktreeSession {
 ///   DWIM-created from a remote of the same name, like `git switch`)
 ///   so an agent can work on it in isolation — the parent's checkout
 ///   is never touched, so other agents aren't disturbed.
-#[tauri::command]
 pub async fn coder_new_worktree_session(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	base_branch: Option<String>,
 ) -> Result<NewWorktreeSession, MoonError> {
 	// Delegates to `CoderHandle::create_worktree_session` (ADR 0030
@@ -598,7 +537,7 @@ pub async fn coder_new_worktree_session(
 	// worker; a coordinator is created the same way with `Coordinator`.
 	// `parent_folder: None` = UI-driven: the active folder at click
 	// time is the parent, and the new session becomes visible.
-	let (session, workspace) = state
+	let (session, workspace) = app
 		.coder
 		.create_worktree_session(base_branch, None, moon_coder::tools::CoderMode::Agent, None)
 		.await?;
@@ -623,15 +562,14 @@ pub async fn coder_new_worktree_session(
 /// row must always make the row go away. A half-gone checkout (git
 /// forgot it but ignored leftovers like `node_modules` survived) is
 /// refused without `force` and deleted with it (ADR 0068).
-#[tauri::command]
 pub async fn coder_discard_worktree(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	path: String,
 	force: bool,
 ) -> Result<moon_protocol::workspace::Workspace, MoonError> {
 	use moon_protocol::workspace::FolderOrigin;
 
-	let entry = state
+	let entry = app
 		.workspaces
 		.folder_for_path(&path)
 		.await
@@ -647,7 +585,7 @@ pub async fn coder_discard_worktree(
 	// stale-leftover checkouts (ADR 0044 / ADR 0068), so a checkout
 	// git already forgot still discards instead of erroring forever.
 	let host_path = camino::Utf8Path::new(&path);
-	match state.workspaces.folder_for_path(&parent_path).await {
+	match app.workspaces.folder_for_path(&parent_path).await {
 		Some(parent) => {
 			// `git worktree remove` runs against the parent repo on its
 			// active shell target. The worktree's relative links resolve
@@ -655,7 +593,7 @@ pub async fn coder_discard_worktree(
 			// that target: the in-container `/workspace/<parent>/.worktrees/…`
 			// path when the workspace runs in a container, the host path
 			// otherwise.
-			let remove_path = if crate::commands::container::workspace_container_running(&state).await {
+			let remove_path = if crate::container::workspace_container_running(app).await {
 				moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), host_path)
 					.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
 			} else {
@@ -677,8 +615,8 @@ pub async fn coder_discard_worktree(
 			}
 		}
 	}
-	state.workspaces.remove_folder(&path).await?;
-	Ok(state.workspaces.snapshot().await)
+	app.workspaces.remove_folder(&path).await?;
+	Ok(app.workspaces.snapshot().await)
 }
 
 /// Merge a worktree's branch into `base_branch` on the parent repo,
@@ -700,16 +638,15 @@ pub async fn coder_discard_worktree(
 ///
 /// Returns the updated workspace snapshot so the frontend drops the
 /// nested folder row.
-#[tauri::command]
 pub async fn coder_merge_and_remove_worktree(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	path: String,
 	base_branch: String,
 ) -> Result<moon_protocol::workspace::Workspace, MoonError> {
 	use moon_protocol::git::BranchSwitchTarget;
 	use moon_protocol::workspace::FolderOrigin;
 
-	let entry = state
+	let entry = app
 		.workspaces
 		.folder_for_path(&path)
 		.await
@@ -720,7 +657,7 @@ pub async fn coder_merge_and_remove_worktree(
 	else {
 		return Err(MoonError::invalid(format!("{path} is not a worktree folder")));
 	};
-	let parent = state
+	let parent = app
 		.workspaces
 		.folder_for_path(&parent_path)
 		.await
@@ -740,10 +677,10 @@ pub async fn coder_merge_and_remove_worktree(
 	// Merge succeeded — clear worktree routing on affected sessions
 	// *before* pruning the checkout so the next turn falls back to
 	// the parent folder (now on base_branch with merged changes).
-	state.coder.clear_worktree_sessions(&path).await;
+	app.coder.clear_worktree_sessions(&path).await;
 
 	// Prune the worktree, delete the now-merged branch, and unbind.
-	let remove_path = if crate::commands::container::workspace_container_running(&state).await {
+	let remove_path = if crate::container::workspace_container_running(app).await {
 		moon_core::worktree::worktree_container_path(camino::Utf8Path::new(&parent_path), camino::Utf8Path::new(&path))
 			.unwrap_or_else(|| camino::Utf8PathBuf::from(&path))
 	} else {
@@ -757,8 +694,8 @@ pub async fn coder_merge_and_remove_worktree(
 	if let Err(err) = parent.host.git_delete_branch(&branch).await {
 		tracing::warn!(?err, branch = %branch, "failed to delete merged worktree branch");
 	}
-	state.workspaces.remove_folder(&path).await?;
-	Ok(state.workspaces.snapshot().await)
+	app.workspaces.remove_folder(&path).await?;
+	Ok(app.workspaces.snapshot().await)
 }
 
 /// Move the active folder's visible coder session into its own git
@@ -787,23 +724,22 @@ pub async fn coder_merge_and_remove_worktree(
 /// (ADR 0093): a fresh branch off the default branch, under the
 /// project's `.worktrees/`, whichever checkout is active — no main-tree
 /// reset, no clean-tree requirement.
-#[tauri::command]
-pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Result<NewWorktreeSession, MoonError> {
+pub async fn coder_move_session_to_worktree(app: &AppCore) -> Result<NewWorktreeSession, MoonError> {
 	use moon_core::host::WorktreeBranch;
 
 	use moon_protocol::workspace::FolderOrigin;
 
 	// Bail before touching git if there's nothing movable, so we never
 	// strand an orphaned worktree.
-	if !state.coder.can_move_visible_session().await.map_err(MoonError::from)? {
+	if !app.coder.can_move_visible_session().await.map_err(MoonError::from)? {
 		return Err(MoonError::invalid(
 			"no movable session (none is open, or it already runs in a worktree)",
 		));
 	}
-	let active = state.workspaces.require_active_folder().await?;
-	let blank = state.coder.visible_session_is_blank().await.map_err(MoonError::from)?;
+	let active = app.workspaces.require_active_folder().await?;
+	let blank = app.coder.visible_session_is_blank().await.map_err(MoonError::from)?;
 	let parent = match (&active.folder.origin, blank) {
-		(FolderOrigin::Worktree { parent_path, .. }, true) => state
+		(FolderOrigin::Worktree { parent_path, .. }, true) => app
 			.workspaces
 			.folder_for_path(parent_path)
 			.await
@@ -820,7 +756,7 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 	// tree's current branch — so the worktree opens on the session's
 	// own work, not whatever the main tree happens to be on (which
 	// could be a different session's branch).
-	let session_branch = state.coder.visible_session_branch().await.map_err(MoonError::from)?;
+	let session_branch = app.coder.visible_session_branch().await.map_err(MoonError::from)?;
 	let info = parent.host.git_branch().await?;
 	let default = info
 		.default_branch_remote_ref
@@ -874,19 +810,19 @@ pub async fn coder_move_session_to_worktree(state: State<'_, AppState>) -> Resul
 		.git_worktree_add_moving(&worktree_path, spec, reset_to)
 		.await?;
 
-	let wt_entry = state
+	let wt_entry = app
 		.workspaces
 		.add_worktree_folder(worktree_path, parent_path, branch.clone())
 		.await?;
 
-	let session = state
+	let session = app
 		.coder
 		.move_visible_session_to_worktree(wt_entry.folder.path.clone(), branch)
 		.await
 		.map_err(MoonError::from)?
 		.ok_or_else(|| MoonError::invalid("no visible session to move"))?;
 
-	let workspace = state.workspaces.snapshot().await;
+	let workspace = app.workspaces.snapshot().await;
 	Ok(NewWorktreeSession { workspace, session })
 }
 
@@ -907,15 +843,14 @@ fn fresh_agent_branch() -> String {
 /// Returns the updated summary so the panel can show a "switch back
 /// to this branch" chip; `None` when `HEAD` is detached or there's no
 /// persisted session to tie (e.g. a manual commit with nothing open).
-#[tauri::command]
-pub async fn coder_associate_branch(state: State<'_, AppState>) -> Result<Option<SessionSummary>, MoonError> {
-	let Some(folder) = state.workspaces.active_folder().await else {
+pub async fn coder_associate_branch(app: &AppCore) -> Result<Option<SessionSummary>, MoonError> {
+	let Some(folder) = app.workspaces.active_folder().await else {
 		return Ok(None);
 	};
 	let Some(branch) = folder.host.git_branch().await?.name else {
 		return Ok(None);
 	};
-	state
+	app
 		.coder
 		.set_visible_session_branch(branch)
 		.await
@@ -926,10 +861,9 @@ pub async fn coder_associate_branch(state: State<'_, AppState>) -> Result<Option
 /// folder's visible session. `force_host = true` pins this
 /// session's `bash` / shell tool to the host machine even while
 /// the workspace runs in a container; `false` restores auto.
-/// Returns the resolved force-host state.
-#[tauri::command]
-pub async fn coder_set_bash_target_override(state: State<'_, AppState>, force_host: bool) -> Result<bool, MoonError> {
-	state
+/// Returns the resolved force-host app.
+pub async fn coder_set_bash_target_override(app: &AppCore, force_host: bool) -> Result<bool, MoonError> {
+	app
 		.coder
 		.set_bash_target_override(force_host)
 		.await
@@ -940,9 +874,8 @@ pub async fn coder_set_bash_target_override(state: State<'_, AppState>, force_ho
 /// identified by `id`. Backend emits `session_loaded` + per-record
 /// replay events on the `coder:event` channel; the frontend reacts
 /// to those rather than getting the records back inline.
-#[tauri::command]
-pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Result<SessionSummary, MoonError> {
-	let summary = state.coder.open_session(id).await.map_err(MoonError::from)?;
+pub async fn coder_open_session(app: &AppCore, id: String) -> Result<SessionSummary, MoonError> {
+	let summary = app.coder.open_session(id).await.map_err(MoonError::from)?;
 	// Pointer key from the opened session's own worktree context
 	// (worktree path when it has one, else the coder root the open
 	// resolved against) — not the raw active folder. Opening a
@@ -951,10 +884,10 @@ pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Resul
 	// filtered out on the next folder switch.
 	let folder = match summary.worktree_root.clone() {
 		Some(root) => Some(root),
-		None => state.coder.coder_root_path().await,
+		None => app.coder.coder_root_path().await,
 	};
 	if let Some(folder) = folder {
-		persist_last_session(&state.config_dir, &folder, Some(summary.id.clone())).await;
+		persist_last_session(&app.config_dir, &folder, Some(summary.id.clone())).await;
 	}
 	Ok(summary)
 }
@@ -964,9 +897,8 @@ pub async fn coder_open_session(state: State<'_, AppState>, id: String) -> Resul
 /// the editor via the host-direct file path (same mechanism as
 /// `Ctrl+O` for files outside the workspace). Works for sub-agent
 /// ids too — they share the parent folder's slug.
-#[tauri::command]
-pub async fn coder_session_jsonl_path(state: State<'_, AppState>, id: String) -> Result<String, MoonError> {
-	let path = state.coder.session_jsonl_path(id).await.map_err(MoonError::from)?;
+pub async fn coder_session_jsonl_path(app: &AppCore, id: String) -> Result<String, MoonError> {
+	let path = app.coder.session_jsonl_path(id).await.map_err(MoonError::from)?;
 	Ok(path.into_string())
 }
 
@@ -976,26 +908,20 @@ pub async fn coder_session_jsonl_path(state: State<'_, AppState>, id: String) ->
 /// companion's title edit (`rename_session_in`): persisted as a
 /// `TitleUpdate` record and broadcast, so the list and header update
 /// from the event.
-#[tauri::command]
-pub async fn coder_rename_session(
-	state: State<'_, AppState>,
-	id: String,
-	title: String,
-) -> Result<SessionSummary, MoonError> {
-	state
+pub async fn coder_rename_session(app: &AppCore, id: String, title: String) -> Result<SessionSummary, MoonError> {
+	app
 		.coder
 		.rename_session_in(None, id, title)
 		.await
 		.map_err(MoonError::from)
 }
 
-#[tauri::command]
-pub async fn coder_delete_session(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
-	state.coder.delete_session(id.clone()).await.map_err(MoonError::from)?;
-	let folder = active_folder_path(&state).await;
+pub async fn coder_delete_session(app: &AppCore, id: String) -> Result<(), MoonError> {
+	app.coder.delete_session(id.clone()).await.map_err(MoonError::from)?;
+	let folder = active_folder_path(app).await;
 	if let Some(folder) = folder {
 		let id_owned = id.clone();
-		app_state_store::mutate(&state.config_dir, move |s| {
+		app_state_store::mutate(&app.config_dir, move |s| {
 			if s.coder.last_session_by_folder.get(&folder).map(|v| v.as_str()) == Some(id_owned.as_str()) {
 				s.coder.last_session_by_folder.remove(&folder);
 			}
@@ -1034,8 +960,8 @@ async fn persist_last_session(config_dir: &camino::Utf8Path, folder: &str, id: O
 /// Active workspace folder's absolute path, or `None` when the
 /// workspace is empty / no folder is bound. Used by the
 /// per-folder persistence helpers.
-async fn active_folder_path(state: &AppState) -> Option<String> {
-	state
+async fn active_folder_path(app: &AppCore) -> Option<String> {
+	app
 		.workspaces
 		.active_folder()
 		.await
@@ -1058,37 +984,36 @@ async fn active_folder_path(state: &AppState) -> Option<String> {
 /// at the value level when the lock is set; the lock is just the
 /// "where did this come from?" annotation the picker needs to
 /// route writes correctly.
-#[tauri::command]
-pub async fn coder_get_model_settings(state: State<'_, AppState>) -> Result<CoderModelSettings, MoonError> {
-	get_model_settings_impl(&state).await
+pub async fn coder_get_model_settings(app: &AppCore) -> Result<CoderModelSettings, MoonError> {
+	get_model_settings_impl(app).await
 }
 
 /// The shared settings context for this process (dirs + workspace
 /// id). The bodies of the settings commands moved to
-/// `moon_remote::settings` so the headless binary serves the exact
+/// `crate::settings` so the headless binary serves the exact
 /// same behaviour; these helpers adapt `AppState` to it.
-fn settings_context(state: &AppState) -> moon_remote::settings::SettingsContext {
-	moon_remote::settings::SettingsContext {
-		config_dir: state.config_dir.clone(),
-		workspaces_dir: state.workspaces_dir.clone(),
-		workspace_id: state.workspace_id().map(str::to_owned),
+fn settings_context(app: &AppCore) -> crate::settings::SettingsContext {
+	crate::settings::SettingsContext {
+		config_dir: app.config_dir.clone(),
+		workspaces_dir: app.workspaces_dir.clone(),
+		workspace_id: app.workspace_id().map(str::to_owned),
 	}
 }
 
-/// Body of [`coder_get_model_settings`] — see `moon_remote::settings`.
-pub(crate) async fn get_model_settings_impl(state: &AppState) -> Result<CoderModelSettings, MoonError> {
-	moon_remote::settings::get_model_settings(&state.coder, &settings_context(state)).await
+/// Body of [`coder_get_model_settings`] — see `crate::settings`.
+pub(crate) async fn get_model_settings_impl(app: &AppCore) -> Result<CoderModelSettings, MoonError> {
+	crate::settings::get_model_settings(&app.coder, &settings_context(app)).await
 }
 
-/// Read the per-workspace provider lock (see `moon_remote::settings`).
-async fn workspace_provider_lock(state: &AppState) -> Option<CoderProviderLock> {
-	moon_remote::settings::workspace_provider_lock(&settings_context(state)).await
+/// Read the per-workspace provider lock (see `crate::settings`).
+async fn workspace_provider_lock(app: &AppCore) -> Option<CoderProviderLock> {
+	crate::settings::workspace_provider_lock(&settings_context(app)).await
 }
 
 /// Apply `lock` to this workspace's `session.json` (see
-/// `moon_remote::settings`).
-async fn write_workspace_provider_lock(state: &AppState, lock: Option<CoderProviderLock>) -> Result<(), MoonError> {
-	moon_remote::settings::write_workspace_provider_lock(&settings_context(state), lock).await
+/// `crate::settings`).
+async fn write_workspace_provider_lock(app: &AppCore, lock: Option<CoderProviderLock>) -> Result<(), MoonError> {
+	crate::settings::write_workspace_provider_lock(&settings_context(app), lock).await
 }
 
 /// Persist + apply the new picker settings. Writes through
@@ -1107,26 +1032,22 @@ async fn write_workspace_provider_lock(state: &AppState, lock: Option<CoderProvi
 /// `Some(_)`, the workspace is pinned to the picked active
 /// provider. The lock is persisted into `session.json` and the
 /// runner is updated, but the global
-/// [`crate::commands::app_state`] active provider is left
+/// `app_state_save` active provider is left
 /// untouched — sibling workspaces keep their own behaviour. When
 /// the lock is `None`, the previous behaviour applies: the
 /// picked active provider becomes the new global default and any
 /// prior lock on this workspace is cleared.
-#[tauri::command]
-pub async fn coder_set_model_settings(
-	state: State<'_, AppState>,
-	settings: CoderModelSettings,
-) -> Result<(), MoonError> {
-	set_model_settings_impl(&state, settings).await
+pub async fn coder_set_model_settings(app: &AppCore, settings: CoderModelSettings) -> Result<(), MoonError> {
+	set_model_settings_impl(app, settings).await
 }
 
 /// Body of [`coder_set_model_settings`], shared with the bridge RPC
 /// surface (`crate::bridge_rpc`) so a provider switch from the
 /// companion applies + persists identically to one from the desktop
 /// picker (runner poke, per-workspace lock in `session.json`, global
-/// default in `state.json`).
-pub(crate) async fn set_model_settings_impl(state: &AppState, settings: CoderModelSettings) -> Result<(), MoonError> {
-	moon_remote::settings::set_model_settings(&state.coder, &settings_context(state), settings).await
+/// default in `app.json`).
+pub(crate) async fn set_model_settings_impl(app: &AppCore, settings: CoderModelSettings) -> Result<(), MoonError> {
+	crate::settings::set_model_settings(&app.coder, &settings_context(app), settings).await
 }
 
 /// Fetch the HF router's `/v1/models` catalog for the picker's
@@ -1139,9 +1060,8 @@ pub(crate) async fn set_model_settings_impl(state: &AppState, settings: CoderMod
 /// trip per call; the frontend caches the result for the
 /// lifetime of the popover so flipping tabs doesn't re-hit the
 /// network.
-#[tauri::command]
-pub async fn coder_list_models(state: State<'_, AppState>) -> Result<Vec<RouterModel>, MoonError> {
-	state.coder.list_models().await.map_err(MoonError::from)
+pub async fn coder_list_models(app: &AppCore) -> Result<Vec<RouterModel>, MoonError> {
+	app.coder.list_models().await.map_err(MoonError::from)
 }
 
 /// Allocate a fresh opaque provider id. The picker's `Add provider`
@@ -1151,9 +1071,8 @@ pub async fn coder_list_models(state: State<'_, AppState>) -> Result<Vec<RouterM
 /// Idempotent in the sense that a leaked id without any matching
 /// state is harmless — nothing reads the keyring slot until the
 /// provider config lands in `AppState`.
-#[tauri::command]
-pub async fn coder_new_provider_id(state: State<'_, AppState>) -> Result<String, MoonError> {
-	Ok(state.coder.new_provider_id())
+pub async fn coder_new_provider_id(app: &AppCore) -> Result<String, MoonError> {
+	Ok(app.coder.new_provider_id())
 }
 
 /// Probe a `(base_url, api_key)` pair before the picker commits.
@@ -1176,17 +1095,13 @@ pub struct ProbeProviderArgs {
 	pub kind: moon_protocol::coder_models::ProviderKind,
 }
 
-#[tauri::command]
-pub async fn coder_probe_provider(
-	state: State<'_, AppState>,
-	args: ProbeProviderArgs,
-) -> Result<ProviderProbeResult, MoonError> {
+pub async fn coder_probe_provider(app: &AppCore, args: ProbeProviderArgs) -> Result<ProviderProbeResult, MoonError> {
 	let key = if args.api_key.is_empty() {
 		None
 	} else {
 		Some(args.api_key.as_str())
 	};
-	state
+	app
 		.coder
 		.probe_provider(&args.base_url, args.kind, key)
 		.await
@@ -1204,12 +1119,8 @@ pub struct SetProviderApiKeyArgs {
 	pub key: String,
 }
 
-#[tauri::command]
-pub async fn coder_set_provider_api_key(
-	state: State<'_, AppState>,
-	args: SetProviderApiKeyArgs,
-) -> Result<(), MoonError> {
-	state
+pub async fn coder_set_provider_api_key(app: &AppCore, args: SetProviderApiKeyArgs) -> Result<(), MoonError> {
+	app
 		.coder
 		.set_provider_api_key(&args.id, &args.key)
 		.map_err(MoonError::from)
@@ -1218,9 +1129,8 @@ pub async fn coder_set_provider_api_key(
 /// Drop the keyring entry for a provider. Idempotent — fine to
 /// call on a provider that never had a key (the local-vLLM case
 /// where the user is just removing a stale entry).
-#[tauri::command]
-pub async fn coder_clear_provider_api_key(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
-	state.coder.clear_provider_api_key(&id).map_err(MoonError::from)
+pub async fn coder_clear_provider_api_key(app: &AppCore, id: String) -> Result<(), MoonError> {
+	app.coder.clear_provider_api_key(&id).map_err(MoonError::from)
 }
 
 /// Flat `/v1/models` catalog for a user-added provider. The
@@ -1234,12 +1144,8 @@ pub async fn coder_clear_provider_api_key(state: State<'_, AppState>, id: String
 /// the server doesn't expose the catalog endpoint; the picker
 /// shows "Catalog unavailable" and the user can still type a
 /// model slug directly into the field.
-#[tauri::command]
-pub async fn coder_list_provider_models(
-	state: State<'_, AppState>,
-	id: String,
-) -> Result<Vec<ProviderModelSummary>, MoonError> {
-	state.coder.list_provider_models(&id).await.map_err(MoonError::from)
+pub async fn coder_list_provider_models(app: &AppCore, id: String) -> Result<Vec<ProviderModelSummary>, MoonError> {
+	app.coder.list_provider_models(&id).await.map_err(MoonError::from)
 }
 
 /// OpenRouter credit status for a provider: account balance from
@@ -1247,9 +1153,8 @@ pub async fn coder_list_provider_models(
 /// The picker shows it on the OpenRouter tab when a key is
 /// configured. Errors (bad key, network, non-OpenRouter id)
 /// propagate verbatim; the modal renders them as "unavailable".
-#[tauri::command]
-pub async fn coder_openrouter_credits(state: State<'_, AppState>, id: String) -> Result<OpenRouterCredits, MoonError> {
-	state.coder.openrouter_credits(&id).await.map_err(MoonError::from)
+pub async fn coder_openrouter_credits(app: &AppCore, id: String) -> Result<OpenRouterCredits, MoonError> {
+	app.coder.openrouter_credits(&id).await.map_err(MoonError::from)
 }
 
 /// Side-channel persist of a brand-new provider entry. Used by
@@ -1264,9 +1169,8 @@ pub async fn coder_openrouter_credits(state: State<'_, AppState>, id: String) ->
 /// The keyring entry, if any, was already written via
 /// `coder_set_provider_api_key` against `config.id` before this
 /// call — we don't take the key as a parameter here.
-#[tauri::command]
-pub async fn coder_save_provider(state: State<'_, AppState>, config: CoderProviderConfig) -> Result<(), MoonError> {
-	let (providers, global_active) = app_state_store::mutate(&state.config_dir, move |s| {
+pub async fn coder_save_provider(app: &AppCore, config: CoderProviderConfig) -> Result<(), MoonError> {
+	let (providers, global_active) = app_state_store::mutate(&app.config_dir, move |s| {
 		let mut cfg = config.clone();
 		// `has_api_key` is keyring-derived; never trust the caller.
 		cfg.has_api_key = false;
@@ -1282,12 +1186,12 @@ pub async fn coder_save_provider(state: State<'_, AppState>, config: CoderProvid
 	// `active`; if we forwarded the global verbatim, adding a new
 	// provider in a locked workspace would silently flip the
 	// runner off the lock. Resolve the lock first.
-	let effective_active = match workspace_provider_lock(&state).await {
+	let effective_active = match workspace_provider_lock(app).await {
 		Some(CoderProviderLock::Hf) => None,
 		Some(CoderProviderLock::User { id }) => Some(id),
 		None => global_active,
 	};
-	state.coder.set_providers(providers, effective_active).await;
+	app.coder.set_providers(providers, effective_active).await;
 	Ok(())
 }
 
@@ -1302,13 +1206,12 @@ pub async fn coder_save_provider(state: State<'_, AppState>, config: CoderProvid
 /// lock. Sibling workspaces that pinned the same id (other OS
 /// processes) get the warn-and-fallback path on their next boot —
 /// we don't reach across processes to clean their `session.json`.
-#[tauri::command]
-pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Result<(), MoonError> {
+pub async fn coder_delete_provider(app: &AppCore, id: String) -> Result<(), MoonError> {
 	// Drop the keyring entry first; even if the AppState write
 	// fails, we don't want the credential to outlive the config.
-	let _ = state.coder.clear_provider_api_key(&id);
+	let _ = app.coder.clear_provider_api_key(&id);
 	let id_for_state = id.clone();
-	let (providers, global_active) = app_state_store::mutate(&state.config_dir, move |s| {
+	let (providers, global_active) = app_state_store::mutate(&app.config_dir, move |s| {
 		s.coder.providers.retain(|p| p.id != id_for_state);
 		if s.coder.active_provider.as_deref() == Some(id_for_state.as_str()) {
 			s.coder.active_provider = None;
@@ -1316,11 +1219,11 @@ pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Re
 		(s.coder.providers.clone(), s.coder.active_provider.clone())
 	})
 	.await?;
-	let workspace_lock = workspace_provider_lock(&state).await;
+	let workspace_lock = workspace_provider_lock(app).await;
 	let lock_pointed_at_deleted =
 		matches!(&workspace_lock, Some(CoderProviderLock::User { id: locked }) if locked == &id);
 	if lock_pointed_at_deleted {
-		write_workspace_provider_lock(&state, None).await?;
+		write_workspace_provider_lock(app, None).await?;
 	}
 	// Recompute the effective active provider: the lock — if it
 	// survived the deletion — still wins over the global default.
@@ -1336,7 +1239,7 @@ pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Re
 			None => global_active,
 		}
 	};
-	state.coder.set_providers(providers, effective_active).await;
+	app.coder.set_providers(providers, effective_active).await;
 	Ok(())
 }
 
@@ -1344,9 +1247,8 @@ pub async fn coder_delete_provider(state: State<'_, AppState>, id: String) -> Re
 /// model-settings popover reads this on mount so it can render the
 /// "set a key" / "key configured" state correctly. Cheap sync read
 /// of the in-memory cache — no keyring round-trip.
-#[tauri::command]
-pub async fn coder_web_search_configured(state: State<'_, AppState>) -> Result<bool, MoonError> {
-	Ok(state.coder.web_search_configured())
+pub async fn coder_web_search_configured(app: &AppCore) -> Result<bool, MoonError> {
+	Ok(app.coder.web_search_configured())
 }
 
 // ---------- HF Hub bucket sync commands ----------
@@ -1355,48 +1257,43 @@ pub async fn coder_web_search_configured(state: State<'_, AppState>) -> Result<b
 /// login plus every org they belong to. Populates the connect
 /// modal's dropdown. Driven off the cached OAuth identity, so
 /// the modal opens instantly.
-#[tauri::command]
-pub async fn coder_hub_list_namespaces(state: State<'_, AppState>) -> Result<Vec<HubNamespace>, MoonError> {
-	state.coder.hub_sync().list_namespaces().await.map_err(MoonError::from)
+pub async fn coder_hub_list_namespaces(app: &AppCore) -> Result<Vec<HubNamespace>, MoonError> {
+	app.coder.hub_sync().list_namespaces().await.map_err(MoonError::from)
 }
 
 /// Read the current workspace's Hub binding (if any). Cheap
 /// `session.json` read; the picker uses this on mount to render
 /// the "Connected to …" / "Connect" affordance.
-#[tauri::command]
-pub async fn coder_hub_get_binding(state: State<'_, AppState>) -> Result<Option<CoderHubBucket>, MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn coder_hub_get_binding(app: &AppCore) -> Result<Option<CoderHubBucket>, MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Ok(None);
 	};
-	let session = core_session::load(&state.workspaces_dir, id).await?;
+	let session = core_session::load(&app.workspaces_dir, id).await?;
 	Ok(session.coder_hub_bucket)
 }
 
 /// Provision a new bucket on the Hub, write the README, and bind
 /// it to the active workspace. `autosync` defaults to `false`;
 /// the modal nudges the user to flip it on but never auto-flips.
-#[tauri::command]
 pub async fn coder_hub_create_bucket(
-	state: State<'_, AppState>,
+	app: &AppCore,
 	namespace: String,
 	name: String,
 	private: bool,
 ) -> Result<CoderHubBucket, MoonError> {
-	let Some(id) = state.workspace_id() else {
+	let Some(id) = app.workspace_id() else {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let id = id.to_owned();
-	let workspace_label = workspace_display_label(&state, &id)
-		.await
-		.unwrap_or_else(|| name.clone());
-	let bucket = state
+	let workspace_label = workspace_display_label(app, &id).await.unwrap_or_else(|| name.clone());
+	let bucket = app
 		.coder
 		.hub_sync()
 		.create_bucket(&namespace, &name, private, &workspace_label)
 		.await?;
-	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
+	let mut session = core_session::load(&app.workspaces_dir, &id).await?;
 	session.coder_hub_bucket = Some(bucket.clone());
-	core_session::save(&state.workspaces_dir, &id, &session).await?;
+	core_session::save(&app.workspaces_dir, &id, &session).await?;
 	Ok(bucket)
 }
 
@@ -1404,13 +1301,12 @@ pub async fn coder_hub_create_bucket(
 /// No-op (returns `Ok`) when there's no binding — the modal
 /// shouldn't surface the toggle in that case, but guarding here
 /// keeps the IPC contract uniform across UI states.
-#[tauri::command]
-pub async fn coder_hub_set_autosync(state: State<'_, AppState>, enabled: bool) -> Result<(), MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn coder_hub_set_autosync(app: &AppCore, enabled: bool) -> Result<(), MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Ok(());
 	};
 	let id = id.to_owned();
-	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
+	let mut session = core_session::load(&app.workspaces_dir, &id).await?;
 	let Some(bucket) = session.coder_hub_bucket.as_mut() else {
 		return Ok(());
 	};
@@ -1418,42 +1314,40 @@ pub async fn coder_hub_set_autosync(state: State<'_, AppState>, enabled: bool) -
 		return Ok(());
 	}
 	bucket.autosync = enabled;
-	core_session::save(&state.workspaces_dir, &id, &session).await
+	core_session::save(&app.workspaces_dir, &id, &session).await
 }
 
 /// Drop the workspace's Hub binding (does not delete the bucket
 /// on the Hub — that's a separate web-UI action). Clears the
 /// in-flight upload cache too.
-#[tauri::command]
-pub async fn coder_hub_disconnect(state: State<'_, AppState>) -> Result<(), MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn coder_hub_disconnect(app: &AppCore) -> Result<(), MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Ok(());
 	};
 	let id = id.to_owned();
-	let mut session = core_session::load(&state.workspaces_dir, &id).await?;
+	let mut session = core_session::load(&app.workspaces_dir, &id).await?;
 	if session.coder_hub_bucket.is_none() {
 		return Ok(());
 	}
 	session.coder_hub_bucket = None;
-	core_session::save(&state.workspaces_dir, &id, &session).await
+	core_session::save(&app.workspaces_dir, &id, &session).await
 }
 
 /// Push one session JSONL to the bound bucket. Used by the row
 /// "Upload" affordance and the header "Sync all" button. Always
 /// available, regardless of `autosync`. Emits
 /// `coder:event` envelopes (`HubSyncStarted` / `HubSyncFinished`)
-/// for live UI state.
-#[tauri::command]
-pub async fn coder_hub_upload_session(state: State<'_, AppState>, session_id: String) -> Result<(), MoonError> {
-	let Some(id) = state.workspace_id() else {
+/// for live UI app.
+pub async fn coder_hub_upload_session(app: &AppCore, session_id: String) -> Result<(), MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let id = id.to_owned();
-	let Some(folder) = state.coder.active_folder().await else {
+	let Some(folder) = app.coder.active_folder().await else {
 		return Err(MoonError::invalid("no active workspace folder"));
 	};
 	let folder_path = Utf8PathBuf::from(folder);
-	state
+	app
 		.coder
 		.hub_sync()
 		.upload_session(&id, &folder_path, &session_id)
@@ -1469,12 +1363,11 @@ pub async fn coder_hub_upload_session(state: State<'_, AppState>, session_id: St
 /// also save the round-trip. Emits per-session
 /// `HubSyncStarted` / `HubSyncFinished` so the panel's row
 /// decorations animate in lockstep.
-#[tauri::command]
-pub async fn coder_hub_upload_all_sessions(state: State<'_, AppState>) -> Result<HubUploadAllSummary, MoonError> {
-	if state.workspace_id().is_none() {
+pub async fn coder_hub_upload_all_sessions(app: &AppCore) -> Result<HubUploadAllSummary, MoonError> {
+	if app.workspace_id().is_none() {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	}
-	state.coder.hub_upload_all_sessions().await.map_err(MoonError::from)
+	app.coder.hub_upload_all_sessions().await.map_err(MoonError::from)
 }
 
 /// Build the Hub web-viewer URL for `session_id` under the
@@ -1490,19 +1383,18 @@ pub async fn coder_hub_upload_all_sessions(state: State<'_, AppState>) -> Result
 /// active folder. Doesn't check whether the file actually exists
 /// on the Hub — the per-row affordance is gated on the local
 /// `uploaded` marker, which is enough.
-#[tauri::command]
-pub async fn coder_hub_session_url(state: State<'_, AppState>, session_id: String) -> Result<String, MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn coder_hub_session_url(app: &AppCore, session_id: String) -> Result<String, MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let id = id.to_owned();
-	let session = core_session::load(&state.workspaces_dir, &id).await?;
+	let session = core_session::load(&app.workspaces_dir, &id).await?;
 	let Some(bucket) = session.coder_hub_bucket else {
 		return Err(MoonError::invalid(
 			"no Hugging Face bucket connected for this workspace",
 		));
 	};
-	let Some(folder) = state.coder.active_folder().await else {
+	let Some(folder) = app.coder.active_folder().await else {
 		return Err(MoonError::invalid("no active workspace folder"));
 	};
 	let folder_path = Utf8PathBuf::from(folder);
@@ -1529,8 +1421,8 @@ pub async fn coder_hub_session_url(state: State<'_, AppState>, session_id: Strin
 ///    (early launch, dev path). Worse than (1) for multi-folder
 ///    workspaces but better than an empty README header.
 /// 3. `None` — caller falls back to the bucket name itself.
-async fn workspace_display_label(state: &AppState, workspace_id: &str) -> Option<String> {
-	if let Ok(app_state) = moon_core::app_state::load(&state.config_dir).await {
+async fn workspace_display_label(app: &AppCore, workspace_id: &str) -> Option<String> {
+	if let Ok(app_state) = moon_core::app_state::load(&app.config_dir).await {
 		if let Some(meta) = app_state.workspaces.iter().find(|m| m.id == workspace_id) {
 			let trimmed = meta.name.trim();
 			if !trimmed.is_empty() {
@@ -1538,7 +1430,7 @@ async fn workspace_display_label(state: &AppState, workspace_id: &str) -> Option
 			}
 		}
 	}
-	let folder = state.coder.active_folder().await?;
+	let folder = app.coder.active_folder().await?;
 	let path = Utf8PathBuf::from(folder);
 	path.file_name().map(|s| s.to_string())
 }
@@ -1546,27 +1438,24 @@ async fn workspace_display_label(state: &AppState, workspace_id: &str) -> Option
 /// Persist a new Tavily API key. Trimmed at the runner; empty
 /// values are rejected. After this returns Ok, the next agent
 /// turn will see `web_search` in its tool list.
-#[tauri::command]
-pub async fn coder_set_web_search_key(state: State<'_, AppState>, key: String) -> Result<(), MoonError> {
-	state.coder.set_web_search_key(&key).map_err(MoonError::from)
+pub async fn coder_set_web_search_key(app: &AppCore, key: String) -> Result<(), MoonError> {
+	app.coder.set_web_search_key(&key).map_err(MoonError::from)
 }
 
 /// Drop the Tavily key from the keyring. Idempotent.
-#[tauri::command]
-pub async fn coder_clear_web_search_key(state: State<'_, AppState>) -> Result<(), MoonError> {
-	state.coder.clear_web_search_key().map_err(MoonError::from)
+pub async fn coder_clear_web_search_key(app: &AppCore) -> Result<(), MoonError> {
+	app.coder.clear_web_search_key().map_err(MoonError::from)
 }
 
 /// The workspace's MCP server list: presets + custom entries,
 /// each with its per-workspace enabled flag. Cheap `session.json`
 /// read; no workspace bound degrades to the preset list with
 /// everything disabled so the settings section can still render.
-#[tauri::command]
-pub async fn coder_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerStatus>, MoonError> {
-	let Some(id) = state.workspace_id() else {
+pub async fn coder_mcp_servers(app: &AppCore) -> Result<Vec<McpServerStatus>, MoonError> {
+	let Some(id) = app.workspace_id() else {
 		return Ok(moon_coder::mcp::server_rows(&Default::default()));
 	};
-	let session = core_session::load(&state.workspaces_dir, id).await?;
+	let session = core_session::load(&app.workspaces_dir, id).await?;
 	Ok(moon_coder::mcp::server_rows(&session.coder_mcp))
 }
 
@@ -1574,13 +1463,12 @@ pub async fn coder_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServ
 /// next agent turn advertises (or stops advertising) the MCP
 /// meta-tools accordingly. Disabling also kills the server's live
 /// connection so the child process doesn't linger.
-#[tauri::command]
-pub async fn coder_mcp_set_enabled(state: State<'_, AppState>, id: String, enabled: bool) -> Result<(), MoonError> {
-	let Some(workspace_id) = state.workspace_id() else {
+pub async fn coder_mcp_set_enabled(app: &AppCore, id: String, enabled: bool) -> Result<(), MoonError> {
+	let Some(workspace_id) = app.workspace_id() else {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let workspace_id = workspace_id.to_owned();
-	let mut session = core_session::load(&state.workspaces_dir, &workspace_id).await?;
+	let mut session = core_session::load(&app.workspaces_dir, &workspace_id).await?;
 	let known = moon_coder::mcp::server_rows(&session.coder_mcp);
 	if !known.iter().any(|row| row.config.id == id) {
 		return Err(MoonError::invalid(format!("unknown MCP server `{id}`")));
@@ -1593,9 +1481,9 @@ pub async fn coder_mcp_set_enabled(state: State<'_, AppState>, id: String, enabl
 		session.coder_mcp.enabled.push(id.clone());
 	} else {
 		session.coder_mcp.enabled.retain(|e| e != &id);
-		state.coder.mcp_drop_connection(&id).await;
+		app.coder.mcp_drop_connection(&id).await;
 	}
-	core_session::save(&state.workspaces_dir, &workspace_id, &session).await
+	core_session::save(&app.workspaces_dir, &workspace_id, &session).await
 }
 
 #[derive(Deserialize)]
@@ -1613,12 +1501,8 @@ pub struct AddMcpServerArgs {
 /// Add a custom MCP server to the active workspace and enable it
 /// immediately — adding one is a statement of intent to use it.
 /// Returns the refreshed row list.
-#[tauri::command]
-pub async fn coder_mcp_add_custom(
-	state: State<'_, AppState>,
-	server: AddMcpServerArgs,
-) -> Result<Vec<McpServerStatus>, MoonError> {
-	let Some(workspace_id) = state.workspace_id() else {
+pub async fn coder_mcp_add_custom(app: &AppCore, server: AddMcpServerArgs) -> Result<Vec<McpServerStatus>, MoonError> {
+	let Some(workspace_id) = app.workspace_id() else {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let workspace_id = workspace_id.to_owned();
@@ -1631,32 +1515,100 @@ pub async fn coder_mcp_add_custom(
 		description: server.description.trim().to_string(),
 	};
 	moon_coder::mcp::validate_custom(&config)?;
-	let mut session = core_session::load(&state.workspaces_dir, &workspace_id).await?;
+	let mut session = core_session::load(&app.workspaces_dir, &workspace_id).await?;
 	session.coder_mcp.enabled.push(config.id.clone());
 	session.coder_mcp.custom.push(config);
-	core_session::save(&state.workspaces_dir, &workspace_id, &session).await?;
+	core_session::save(&app.workspaces_dir, &workspace_id, &session).await?;
 	Ok(moon_coder::mcp::server_rows(&session.coder_mcp))
 }
 
 /// Remove a custom MCP server (presets aren't removable — disable
 /// them instead). Kills any live connection. Returns the refreshed
 /// row list.
-#[tauri::command]
-pub async fn coder_mcp_remove_custom(
-	state: State<'_, AppState>,
-	id: String,
-) -> Result<Vec<McpServerStatus>, MoonError> {
-	let Some(workspace_id) = state.workspace_id() else {
+pub async fn coder_mcp_remove_custom(app: &AppCore, id: String) -> Result<Vec<McpServerStatus>, MoonError> {
+	let Some(workspace_id) = app.workspace_id() else {
 		return Err(MoonError::invalid("no workspace bound to this process"));
 	};
 	let workspace_id = workspace_id.to_owned();
-	let mut session = core_session::load(&state.workspaces_dir, &workspace_id).await?;
+	let mut session = core_session::load(&app.workspaces_dir, &workspace_id).await?;
 	if !session.coder_mcp.custom.iter().any(|c| c.id == id) {
 		return Err(MoonError::invalid(format!("no custom MCP server `{id}`")));
 	}
 	session.coder_mcp.custom.retain(|c| c.id != id);
 	session.coder_mcp.enabled.retain(|e| e != &id);
-	state.coder.mcp_drop_connection(&id).await;
-	core_session::save(&state.workspaces_dir, &workspace_id, &session).await?;
+	app.coder.mcp_drop_connection(&id).await;
+	core_session::save(&app.workspaces_dir, &workspace_id, &session).await?;
 	Ok(moon_coder::mcp::server_rows(&session.coder_mcp))
+}
+
+crate::commands! {
+	coder_status([app]),
+	coder_folder_summary([app] folder: String),
+	coder_start_device_flow([app]),
+	coder_poll_device_code([app] code: DeviceCode),
+	coder_sign_out([app]),
+	coder_send([app] text: String, images: Vec<ImageAttachment>, session_id: Option<String>),
+	coder_suggest_branch_name([app] message: String),
+	coder_suggest_commit_message([app] message: String),
+	coder_suggest_terminal_command([app] request: String, target_kind: String, cwd: String),
+	coder_abort([app]),
+	coder_drain_steer_now([app] id: String),
+	coder_unqueue_steer([app] id: String),
+	coder_continue_subagent([app] subagent_id: String, text: String),
+	coder_abort_subagent([app] subagent_id: String),
+	coder_respond_to_prompt([app] call_id: String, response: PromptResponse),
+	coder_revert_to_message([app] user_ordinal: usize),
+	coder_replay_from_message([app] user_ordinal: usize),
+	coder_resume_from_tool_call([app] tool_call_id: String),
+	coder_retry_last_turn([app]),
+	coder_rerun_tool_call([app] tool_call_id: String),
+	coder_list_sessions([app]),
+	coder_running_sessions([app]),
+	coder_search_sessions([app] query: String),
+	coder_active_session([app]),
+	coder_last_opened_session([app]),
+	coder_new_session([app]),
+	coder_new_coordinator_session([app]),
+	coder_worker_link_state([app] session_id: String),
+	coder_disconnect_worker([app] session_id: String),
+	coder_attach_worker([app] coordinator_id: String, session_id: String),
+	coder_attached_workers([app] coordinator_id: String),
+	coder_read_background_process([app] session_id: String, id: String, tail_bytes: Option<usize>),
+	coder_stop_background_process([app] session_id: String, id: String),
+	coder_new_worktree_session([app] base_branch: Option<String>),
+	coder_discard_worktree([app] path: String, force: bool),
+	coder_merge_and_remove_worktree([app] path: String, base_branch: String),
+	coder_move_session_to_worktree([app]),
+	coder_associate_branch([app]),
+	coder_set_bash_target_override([app] force_host: bool),
+	coder_open_session([app] id: String),
+	coder_session_jsonl_path([app] id: String),
+	coder_rename_session([app] id: String, title: String),
+	coder_delete_session([app] id: String),
+	coder_get_model_settings([app]),
+	coder_set_model_settings([app] settings: CoderModelSettings),
+	coder_list_models([app]),
+	coder_new_provider_id([app]),
+	coder_probe_provider([app] args: ProbeProviderArgs),
+	coder_set_provider_api_key([app] args: SetProviderApiKeyArgs),
+	coder_clear_provider_api_key([app] id: String),
+	coder_list_provider_models([app] id: String),
+	coder_openrouter_credits([app] id: String),
+	coder_save_provider([app] config: CoderProviderConfig),
+	coder_delete_provider([app] id: String),
+	coder_web_search_configured([app]),
+	coder_hub_list_namespaces([app]),
+	coder_hub_get_binding([app]),
+	coder_hub_create_bucket([app] namespace: String, name: String, private: bool),
+	coder_hub_set_autosync([app] enabled: bool),
+	coder_hub_disconnect([app]),
+	coder_hub_upload_session([app] session_id: String),
+	coder_hub_upload_all_sessions([app]),
+	coder_hub_session_url([app] session_id: String),
+	coder_set_web_search_key([app] key: String),
+	coder_clear_web_search_key([app]),
+	coder_mcp_servers([app]),
+	coder_mcp_set_enabled([app] id: String, enabled: bool),
+	coder_mcp_add_custom([app] server: AddMcpServerArgs),
+	coder_mcp_remove_custom([app] id: String),
 }

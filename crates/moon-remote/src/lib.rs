@@ -2,7 +2,7 @@
 //!
 //! Two things live here:
 //!
-//! - **The library** (`rpc`, `relay`, `settings`): the companion RPC
+//! - **The library** (`rpc`, `relay`): the companion RPC
 //!   dispatcher and the outbound relay client (ADR 0031), shared by
 //!   the desktop IDE (`src-tauri` links this crate) and the headless
 //!   binary so the phone-facing surface is one implementation.
@@ -16,10 +16,9 @@
 //!
 //! Renamed from `moon-agent` per ADR 0011; re-chartered from the
 //! stub "future RemoteHost server" to the headless enrolled IDE —
-//! see the headless ADR. The RemoteHost (SSH/Codespaces WorkspaceHost
-//! server) story remains future work and would live here too.
+//! see the headless ADR. Remote workspaces (ADR 0095) serve
+//! `moon-app`'s full command surface from here too.
 
 pub mod e2e;
 pub mod relay;
 pub mod rpc;
-pub mod settings;

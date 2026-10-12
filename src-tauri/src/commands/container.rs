@@ -14,10 +14,8 @@
 //! after they finish so any background subscribers stay in
 //! lockstep without polling.
 
-use camino::Utf8PathBuf;
 use moon_container::{
-	apply_forwards, list_forward_status, project_name_for_id, Workspace as ContainerWorkspace, WorkspaceConfig,
-	DEFAULT_DEV_IMAGE,
+	apply_forwards, list_forward_status, project_name_for_id, Workspace as ContainerWorkspace, DEFAULT_DEV_IMAGE,
 };
 use moon_core::session as core_session;
 use moon_protocol::container::{ContainerState, ContainerStateChange, ContainerStatus};
@@ -30,28 +28,6 @@ use crate::state::AppState;
 /// Emitted after every successful lifecycle command. Payload:
 /// [`ContainerStateChange`].
 pub const CONTAINER_STATE_EVENT: &str = "container:state";
-
-/// Build the container workspace handle for this process's
-/// workspace from the current bound-folder set. `pub(crate)` for
-/// the docker-events watcher (`container_events`).
-pub(crate) async fn workspace_handle(state: &AppState) -> Result<ContainerWorkspace, MoonError> {
-	let snapshot = state.workspaces.snapshot().await;
-	// Worktree-backed session folders (ADR 0028) are host-only — their
-	// tooling runs host-side, so they don't get a container bind mount.
-	let bound_folders: Vec<Utf8PathBuf> = snapshot
-		.folders
-		.iter()
-		.filter(|f| !matches!(f.origin, moon_protocol::workspace::FolderOrigin::Worktree { .. }))
-		.map(|f| Utf8PathBuf::from(&f.path))
-		.collect();
-	let state_dir = state.workspace_state_dir(&snapshot.id);
-	let container = ContainerWorkspace::new(WorkspaceConfig {
-		workspace_id: snapshot.id,
-		state_dir,
-		bound_folders,
-	})?;
-	Ok(container)
-}
 
 /// Snapshot status and broadcast the resulting `container:state`
 /// event. Called by every mutating command after it completes.
@@ -129,23 +105,12 @@ pub(crate) async fn reapply_persisted_forwards(app: &AppHandle, state: &AppState
 	}
 }
 
-/// Is this workspace's dev container currently `Running`?
-/// Best-effort: any error (no compose, daemon down) reads as `false`.
-/// Used by the worktree orchestration (ADR 0028 W.4.1) to decide
-/// whether a worktree's git ops run host- or container-side.
-pub(crate) async fn workspace_container_running(state: &AppState) -> bool {
-	let Ok(container) = workspace_handle(state).await else {
-		return false;
-	};
-	matches!(container.status().await, Ok(s) if matches!(s.state, ContainerState::Running))
-}
-
 /// Pure query — does not emit. The UI polls this on focus and
 /// after long-running operations the user might have invoked
 /// outside the IDE.
 #[tauri::command]
 pub async fn container_status(state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	Ok(container.status().await?)
 }
 
@@ -153,7 +118,7 @@ pub async fn container_status(state: State<'_, AppState>) -> Result<ContainerSta
 /// bound-folder set, then `docker compose up -d --wait`.
 #[tauri::command]
 pub async fn container_setup(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	container.setup(DEFAULT_DEV_IMAGE).await?;
 	reset_lsp_broker(&state).await;
 	let status = snapshot_and_emit(&app, &container).await?;
@@ -163,7 +128,7 @@ pub async fn container_setup(app: AppHandle, state: State<'_, AppState>) -> Resu
 
 #[tauri::command]
 pub async fn container_pause(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	container.pause().await?;
 	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, &container).await
@@ -171,7 +136,7 @@ pub async fn container_pause(app: AppHandle, state: State<'_, AppState>) -> Resu
 
 #[tauri::command]
 pub async fn container_resume(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	container.resume().await?;
 	reset_lsp_broker(&state).await;
 	let status = snapshot_and_emit(&app, &container).await?;
@@ -180,7 +145,7 @@ pub async fn container_resume(app: AppHandle, state: State<'_, AppState>) -> Res
 
 #[tauri::command]
 pub async fn container_rebuild(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	container.rebuild(DEFAULT_DEV_IMAGE).await?;
 	reset_lsp_broker(&state).await;
 	let status = snapshot_and_emit(&app, &container).await?;
@@ -190,7 +155,7 @@ pub async fn container_rebuild(app: AppHandle, state: State<'_, AppState>) -> Re
 
 #[tauri::command]
 pub async fn container_stop(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	container.stop().await?;
 	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, &container).await
@@ -198,7 +163,7 @@ pub async fn container_stop(app: AppHandle, state: State<'_, AppState>) -> Resul
 
 #[tauri::command]
 pub async fn container_teardown(app: AppHandle, state: State<'_, AppState>) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	container.teardown().await?;
 	reset_lsp_broker(&state).await;
 	snapshot_and_emit(&app, &container).await
@@ -215,7 +180,7 @@ pub async fn container_apply_bound_folders(
 	app: AppHandle,
 	state: State<'_, AppState>,
 ) -> Result<ContainerStatus, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	container.apply_bound_folders(DEFAULT_DEV_IMAGE).await?;
 	reset_lsp_broker(&state).await;
 	let status = snapshot_and_emit(&app, &container).await?;
@@ -226,6 +191,6 @@ pub async fn container_apply_bound_folders(
 /// Render what `compose.yaml` *would* contain without writing it.
 #[tauri::command]
 pub async fn container_render_compose(state: State<'_, AppState>) -> Result<String, MoonError> {
-	let container = workspace_handle(&state).await?;
+	let container = moon_app::container::workspace_handle(&state.core).await?;
 	Ok(container.render_compose(DEFAULT_DEV_IMAGE).yaml)
 }

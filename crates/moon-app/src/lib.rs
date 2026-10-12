@@ -13,12 +13,17 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 mod catalog;
+pub mod coder;
+pub mod container;
 mod editorconfig;
+mod events;
 mod fs;
 mod search;
 mod session;
+pub mod settings;
 
 pub use catalog::bump_last_active;
+pub use events::{emit, EventSink};
 
 /// State every dispatched command runs against. Grows as command
 /// groups move out of `src-tauri` (Phase 16.2).
@@ -30,6 +35,8 @@ pub struct AppCore {
 	pub workspaces_dir: Utf8PathBuf,
 	/// Workspace this process owns; `None` in preboot mode.
 	pub workspace_id: Option<String>,
+	pub coder: moon_coder::CoderHandle,
+	pub events: Arc<dyn EventSink>,
 }
 
 impl AppCore {
@@ -47,7 +54,7 @@ impl AppCore {
 				})*
 			};
 		}
-		route!(fs, search, editorconfig, session);
+		route!(fs, search, editorconfig, session, coder);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
 }
@@ -110,13 +117,36 @@ mod tests {
 	use super::*;
 	use serde_json::json;
 
-	fn app() -> AppCore {
-		AppCore {
-			workspaces: Arc::new(WorkspaceRegistry::new("test-workspace".into())),
-			config_dir: Utf8PathBuf::from("/nonexistent/config"),
-			workspaces_dir: Utf8PathBuf::from("/nonexistent/workspaces"),
+	struct NoEvents;
+
+	impl EventSink for NoEvents {
+		fn emit(&self, _event: &str, _payload: Value) {}
+	}
+
+	fn app() -> (AppCore, tempfile::TempDir) {
+		// `CoderHandle::new` warms the OS keyring; CI has no Secret Service.
+		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+		let data = tempfile::tempdir().unwrap();
+		let dir = |name: &str| Utf8PathBuf::from_path_buf(data.path().join(name)).unwrap();
+		let workspaces = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		let coder = moon_coder::CoderHandle::new(
+			workspaces.clone(),
+			dir("workspaces"),
+			dir("coder-sessions"),
+			dir("folder-summaries"),
+			moon_coder::CoderModels::default(),
+			Arc::new(moon_terminal::TerminalRegistry::default()),
+		)
+		.unwrap();
+		let app = AppCore {
+			workspaces,
+			config_dir: dir("config"),
+			workspaces_dir: dir("workspaces"),
 			workspace_id: Some("test-workspace".into()),
-		}
+			coder,
+			events: Arc::new(NoEvents),
+		};
+		(app, data)
 	}
 
 	#[tokio::test]
@@ -124,7 +154,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("a.txt");
 		let path = path.to_str().unwrap();
-		let app = app();
+		let (app, _data) = app();
 		app
 			.dispatch("fs_write_file_host", json!({ "path": path, "text": "hi" }))
 			.await
@@ -138,7 +168,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn rejects_unknown_methods_and_bad_params() {
-		let app = app();
+		let (app, _data) = app();
 		let unknown = app.dispatch("nope", Value::Null).await.unwrap_err();
 		assert!(unknown.to_string().contains("unknown method `nope`"), "{unknown}");
 		let bad = app.dispatch("fs_read_file_host", json!({})).await.unwrap_err();

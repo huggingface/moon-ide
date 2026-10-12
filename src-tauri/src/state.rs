@@ -138,7 +138,7 @@ pub enum TerminalCommand {
 }
 
 impl AppState {
-	// Eight fields by design: this is the process's whole world
+	// Many arguments by design: this is the process's whole world
 	// (workspace registry, paths, every long-lived actor handle).
 	// A builder or grouping struct would just shuffle the same
 	// arity around without paying for itself.
@@ -153,6 +153,7 @@ impl AppState {
 		mode: AppMode,
 		logs: Arc<LogSink>,
 		terminals: Arc<TerminalRegistry>,
+		events: Arc<dyn moon_app::EventSink>,
 	) -> Self {
 		Self {
 			core: Arc::new(moon_app::AppCore {
@@ -163,6 +164,8 @@ impl AppState {
 					AppMode::Workspace { id } => Some(id.clone()),
 					AppMode::Preboot => None,
 				},
+				coder: coder.clone(),
+				events,
 			}),
 			workspaces,
 			config_dir,

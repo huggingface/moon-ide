@@ -47,7 +47,7 @@ pub fn new_handler(
 	Arc::new(BridgeRpc::new(
 		coder,
 		workspaces,
-		moon_remote::settings::SettingsContext {
+		moon_app::settings::SettingsContext {
 			config_dir,
 			workspaces_dir,
 			workspace_id,

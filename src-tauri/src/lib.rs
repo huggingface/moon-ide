@@ -17,6 +17,7 @@
 mod agent_indicator;
 mod bridge_rpc;
 mod commands;
+mod events;
 mod focus_socket;
 mod fs_watcher;
 mod remote_bridge;
@@ -222,75 +223,6 @@ pub fn run() {
 			commands::companion::companion_pair_code,
 			commands::companion::companion_e2e_devices,
 			commands::companion::companion_e2e_revoke,
-			commands::coder::coder_status,
-			commands::coder::coder_folder_summary,
-			commands::coder::coder_start_device_flow,
-			commands::coder::coder_poll_device_code,
-			commands::coder::coder_sign_out,
-			commands::coder::coder_send,
-			commands::coder::coder_suggest_branch_name,
-			commands::coder::coder_suggest_commit_message,
-			commands::coder::coder_suggest_terminal_command,
-			commands::coder::coder_abort,
-			commands::coder::coder_drain_steer_now,
-			commands::coder::coder_continue_subagent,
-			commands::coder::coder_abort_subagent,
-			commands::coder::coder_unqueue_steer,
-			commands::coder::coder_respond_to_prompt,
-			commands::coder::coder_revert_to_message,
-			commands::coder::coder_replay_from_message,
-			commands::coder::coder_resume_from_tool_call,
-			commands::coder::coder_retry_last_turn,
-			commands::coder::coder_rerun_tool_call,
-			commands::coder::coder_list_sessions,
-			commands::coder::coder_running_sessions,
-			commands::coder::coder_search_sessions,
-			commands::coder::coder_active_session,
-			commands::coder::coder_last_opened_session,
-			commands::coder::coder_new_session,
-			commands::coder::coder_new_coordinator_session,
-			commands::coder::coder_worker_link_state,
-			commands::coder::coder_disconnect_worker,
-			commands::coder::coder_attach_worker,
-			commands::coder::coder_attached_workers,
-			commands::coder::coder_read_background_process,
-			commands::coder::coder_stop_background_process,
-			commands::coder::coder_new_worktree_session,
-			commands::coder::coder_discard_worktree,
-			commands::coder::coder_merge_and_remove_worktree,
-			commands::coder::coder_associate_branch,
-			commands::coder::coder_move_session_to_worktree,
-			commands::coder::coder_set_bash_target_override,
-			commands::coder::coder_open_session,
-			commands::coder::coder_delete_session,
-			commands::coder::coder_rename_session,
-			commands::coder::coder_session_jsonl_path,
-			commands::coder::coder_get_model_settings,
-			commands::coder::coder_set_model_settings,
-			commands::coder::coder_list_models,
-			commands::coder::coder_list_provider_models,
-			commands::coder::coder_openrouter_credits,
-			commands::coder::coder_new_provider_id,
-			commands::coder::coder_probe_provider,
-			commands::coder::coder_save_provider,
-			commands::coder::coder_delete_provider,
-			commands::coder::coder_set_provider_api_key,
-			commands::coder::coder_clear_provider_api_key,
-			commands::coder::coder_web_search_configured,
-			commands::coder::coder_set_web_search_key,
-			commands::coder::coder_clear_web_search_key,
-			commands::coder::coder_mcp_servers,
-			commands::coder::coder_mcp_set_enabled,
-			commands::coder::coder_mcp_add_custom,
-			commands::coder::coder_mcp_remove_custom,
-			commands::coder::coder_hub_list_namespaces,
-			commands::coder::coder_hub_get_binding,
-			commands::coder::coder_hub_create_bucket,
-			commands::coder::coder_hub_set_autosync,
-			commands::coder::coder_hub_disconnect,
-			commands::coder::coder_hub_upload_session,
-			commands::coder::coder_hub_upload_all_sessions,
-			commands::coder::coder_hub_session_url,
 			commands::ui::ui_set_right_panel,
 		])
 		.setup(move |app| {
@@ -507,7 +439,17 @@ pub fn run() {
 				terminals.clone(),
 			)
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
-			commands::coder::spawn_event_pump(app.handle().clone(), coder.clone());
+			let events: std::sync::Arc<dyn moon_app::EventSink> =
+				std::sync::Arc::new(events::TauriEvents(app.handle().clone()));
+			{
+				// Spawns with `tokio::spawn`, which needs the runtime
+				// the setup hook (main thread) isn't on.
+				let events = events.clone();
+				let coder = coder.clone();
+				tauri::async_runtime::spawn(async move {
+					moon_app::coder::spawn_event_pump(events, coder);
+				});
+			}
 			commands::browser::spawn_tabs_pump(app.handle().clone(), &coder);
 			// OS-level agent-activity indicator (per-workspace
 			// tray icon + window-icon status dot + taskbar
@@ -600,6 +542,7 @@ pub fn run() {
 				mode.clone(),
 				logs,
 				terminals,
+				events,
 			);
 			if let Some(abort) = focus_listener_abort {
 				*state.focus_listener.blocking_lock() = Some(abort);

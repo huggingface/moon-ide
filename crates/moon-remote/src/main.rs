@@ -20,12 +20,12 @@ use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
+use moon_app::settings::SettingsContext;
 use moon_core::app_state as app_state_store;
 use moon_core::session as core_session;
 use moon_core::WorkspaceRegistry;
 use moon_remote::relay;
 use moon_remote::rpc::{BridgeRpc, WorkspaceLauncher};
-use moon_remote::settings::SettingsContext;
 
 /// Same dir identity as the desktop app (`BUNDLE_IDENTIFIER` in
 /// `src-tauri`): the headless binary shares `state.json`,

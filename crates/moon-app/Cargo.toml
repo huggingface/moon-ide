@@ -8,6 +8,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+moon-coder = { workspace = true }
+moon-container = { workspace = true }
 moon-core = { workspace = true }
 moon-protocol = { workspace = true }
 
@@ -19,4 +21,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+keyring = { workspace = true }
+moon-terminal = { workspace = true }
 tempfile = { workspace = true }

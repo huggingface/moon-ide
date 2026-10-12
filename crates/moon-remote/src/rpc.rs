@@ -43,7 +43,7 @@ use moon_core::WorkspaceRegistry;
 use moon_protocol::container::{ContainerState, ContainerStatus, ProjectComposeStatus};
 use serde_json::Value;
 
-use crate::settings::SettingsContext;
+use moon_app::settings::SettingsContext;
 
 /// Handler a relay/focus listener dispatches one method call or
 /// stream subscription against. Implemented by [`BridgeRpc`]; kept a
@@ -652,7 +652,7 @@ impl BridgeRpcHandler for BridgeRpc {
 			// per-workspace lock in `session.json`, global default in
 			// `state.json`).
 			"coder_get_model_settings" => {
-				let settings = crate::settings::get_model_settings(&self.coder, &self.settings)
+				let settings = moon_app::settings::get_model_settings(&self.coder, &self.settings)
 					.await
 					.map_err(|e| e.to_string())?;
 				to_value(&settings)
@@ -678,14 +678,14 @@ impl BridgeRpcHandler for BridgeRpc {
 			// lives here. Workspace-scoped: enabled state persists in
 			// session.json; disabling drops the live connection.
 			"coder_mcp_servers" => {
-				let rows = crate::settings::mcp_servers(&self.settings)
+				let rows = moon_app::settings::mcp_servers(&self.settings)
 					.await
 					.map_err(|e| e.to_string())?;
 				to_value(&rows)
 			}
 			"coder_mcp_set_enabled" => {
 				let p: McpSetParams = parse_params(params)?;
-				crate::settings::mcp_set_enabled(&self.coder, &self.settings, &p.id, p.enabled)
+				moon_app::settings::mcp_set_enabled(&self.coder, &self.settings, &p.id, p.enabled)
 					.await
 					.map_err(|e| e.to_string())?;
 				to_value(&true)
@@ -738,14 +738,14 @@ impl BridgeRpcHandler for BridgeRpc {
 					payload_cap_mb: p.payload_cap_mb,
 					has_api_key: false,
 				};
-				let settings = crate::settings::add_provider(&self.coder, &self.settings, config, &p.api_key)
+				let settings = moon_app::settings::add_provider(&self.coder, &self.settings, config, &p.api_key)
 					.await
 					.map_err(|e| e.to_string())?;
 				Ok(serde_json::json!({ "id": id, "settings": settings }))
 			}
 			"coder_set_model_settings" => {
 				let p: SetModelSettingsParams = parse_params(params)?;
-				crate::settings::set_model_settings(&self.coder, &self.settings, p.settings)
+				moon_app::settings::set_model_settings(&self.coder, &self.settings, p.settings)
 					.await
 					.map_err(|e| e.to_string())?;
 				Ok(Value::Null)

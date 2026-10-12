@@ -1,11 +1,11 @@
-//! Shared model/provider settings surface for the companion RPC
+//! Shared model/provider settings surface
 //! (`coder_get_model_settings` / `coder_set_model_settings`).
 //!
-//! Lives here (not in `src-tauri`) so the desktop's Tauri commands
-//! and the headless `moon-remote serve` dispatcher execute the exact
-//! same body: runner poke, per-workspace provider lock in
-//! `session.json`, global defaults in `state.json`. The desktop
-//! wraps these in `MoonError`; the bridge dispatcher stringifies.
+//! Shared so the desktop's commands and the companion dispatcher in
+//! `moon-remote` execute the exact same body: runner poke,
+//! per-workspace provider lock in `session.json`, global defaults in
+//! `state.json`. The desktop wraps these in `MoonError`; the bridge
+//! dispatcher stringifies.
 
 use camino::Utf8PathBuf;
 use moon_coder::CoderHandle;
