@@ -38,7 +38,7 @@ For local containers, the host filesystem is the source of truth — moon-core r
 - **`moon-core`** (`crates/moon-core/`) — the workspace brain. Owns the workspace registry, the `WorkspaceHost` abstraction, the LSP multiplexer, the git layer, and the cross-repo indexer. Linked into both the Tauri app and the in-container runtime.
 - **`moon-container`** (`crates/moon-container/`, Phase 2) — the local-container `WorkspaceHost` impl: shells out to `docker compose` for lifecycle, `docker exec` for spawn / PTY, and bind-mount-aware path translation. See [`containers.md`](containers.md).
 - **`moon-coder`** (`crates/moon-coder/`, Phase 6) — the in-process AI coding agent: HF OAuth device flow + Inference Providers HTTP client, tool dispatcher routed through the active `WorkspaceHost`, append-only JSONL sessions synced to an HF private bucket via `hf-xet`. See [`coder.md`](coder.md). The "agent panel" in the UI is owned here, not by an external ACP binary.
-- **`moon-remote`** (`crates/moon-remote/`) — two things ([ADR 0059](decisions/0059-headless-enrolled-ide.md)): a **library** holding the companion RPC dispatcher + the outbound relay client (shared by `src-tauri` and the headless binary — one implementation of the phone-facing surface), and a **binary**: the headless enrolled IDE (`moon-remote serve`) that boots the coder on a remote machine and serves it through a `moon-bridge` relay, no webview. The originally-planned `RemoteHost` JSON-RPC server (SSH / Codespaces, no shared filesystem) remains future work and belongs in this crate when it lands.
+- **`moon-remote`** (`crates/moon-remote/`) — two things ([ADR 0059](decisions/0059-headless-enrolled-ide.md)): a **library** holding the companion RPC dispatcher + the outbound relay client (shared by `src-tauri` and the headless binary — one implementation of the phone-facing surface), and a **binary**: the headless enrolled IDE (`moon-remote serve`) that boots the coder on a remote machine and serves it through a `moon-bridge` relay, no webview. It also serves remote workspaces ([ADR 0095](decisions/0095-remote-workspaces.md)): the whole workspace process runs on a server and a desktop attaches over SSH as a front end, replacing the originally-planned `RemoteHost`.
 - **`moon-bridge`** (`crates/moon-bridge/`, future) — a host-resident daemon that exposes the coder + git surface to a mobile companion app over LAN WSS. Discovers running workspace processes by enumerating their per-workspace `instance.sock` files and relays the JSON-RPC surface + event streams to the phone over the same remote-mode framing `moon-remote` uses. One daemon per host, not one listener per workspace process. `moon-bridge` and `moon-remote` are the same "headless `moon-core` serving JSON-RPC over a channel" shape from different fronts (LAN companion vs. remote-host client) and are expected to converge — so we build the network framing once, not twice. See [`companion.md`](companion.md) and [ADR 0023](decisions/0023-mobile-companion-bridge.md).
 - **`moon-protocol`** (`crates/moon-protocol/`) — Serde-typed JSON-RPC schema. Single source of truth. TS types are generated from it (or kept in lockstep manually for now).
 
@@ -66,11 +66,11 @@ trait WorkspaceHost: Send + Sync {
 }
 ```
 
-Three implementations:
+Implementations:
 
 - `LocalHost` — uses `tokio::fs`, `tokio::process`, `notify`, `portable-pty` directly. Phase 0.
 - `ContainerHost` — fs ops are direct host I/O (the container's bind mount makes host paths and container paths point at the same bytes); `spawn` / `open_pty` route through `docker exec`. Phase 2. See [`containers.md`](containers.md#workspacehostcontainerhost).
-- `RemoteHost` — JSON-RPC client to `moon-remote` over a forwarded socket, for hosts where the filesystem isn't shared (SSH / Codespaces). Future.
+- ~~`RemoteHost`~~ — superseded by [ADR 0095](decisions/0095-remote-workspaces.md): instead of the core reaching a remote filesystem, the whole workspace process (core, `LocalHost` / `ContainerHost` included) runs on the server and the UI attaches to it over SSH.
 
 Phase 0 ships only `LocalHost` and exposes it through Tauri commands directly. The trait still exists so the UI's call sites don't need to change later.
 

@@ -603,6 +603,11 @@ JSON-RPC surface. `moon-remote serve` covers most of the practical
 ask (an always-on box runs the loop; phones drive it), but it is
 still one process per workspace whose in-flight turns die with it.
 
+[ADR 0095](decisions/0095-remote-workspaces.md) (Phase 16) builds on
+that box: desktops attach to its workspace processes over SSH as full
+front ends, so the same sessions are driven from either desktop and
+from the phone.
+
 This is **not** the relay-hub mode above. Relay hub (Phase 14) keeps the
 loop on the IDE and only forwards bytes; headless core moves the loop
 to the bridge machine. They share the JSON-RPC framing decision (that's

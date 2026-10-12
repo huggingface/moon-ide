@@ -30,6 +30,9 @@ The full phased plan. Update the **Status** column as phases land.
 | 11    | Slack chat panel                | scaffolded  |
 | 12    | Innovation track                | open-ended  |
 | 13    | Mobile companion                | planned     |
+| 14    | Remote / relay bridge           | landed      |
+| 15    | Headless enrolled IDE           | landed      |
+| 16    | Remote workspaces               | in progress |
 
 "Scaffolded" means: the module/spec slot exists but the feature is not real code yet. Each phase replaces "scaffolded" with "implemented" when its acceptance criteria are met.
 
@@ -196,3 +199,11 @@ A remote dev box serves its workspaces to the phone with no desktop session: `mo
 Architectural spec: [companion.md](companion.md) § "Headless enrolled IDE". Sub-phase work breakdown: [roadmaps/phase-15-headless-ide.md](roadmaps/phase-15-headless-ide.md). Decision: [ADR 0059 — headless enrolled IDE](decisions/0059-headless-enrolled-ide.md).
 
 **Acceptance**: shared lib extraction with desktop rewired (15.1); headless binary — login / enroll / workspace-add / serve with single-instance lock and phone-driven workspace launch (15.2); bridge stamps relayed events with their `(ide, workspace)` carrier and the phone filters (15.3). Deferred (local `moon-bridge` service from the headless socket, live `Register` refresh, containerised dev shells headless) — see the phase doc.
+
+## Phase 16 — Remote workspaces
+
+Work on one desktop, pick up on the other: a workspace's whole process (coder sessions, containers, terminals, LSP, git, browser-tab preview proxy) runs on an always-on server under `moon-remote serve`, and a desktop attaches to it over SSH as a front end running the same UI. Nothing is synced because there is one copy; in-flight turns survive a laptop closing. The workspace command surface becomes one name-dispatched JSON-RPC surface served in-process for local workspaces and over SSH for remote ones; browser tabs / port forwards tunnel explicitly; files move in and out by drag-and-drop / upload / download; one desktop is attached at a time, with takeover.
+
+Sub-phase work breakdown: [roadmaps/phase-16-remote-workspaces.md](roadmaps/phase-16-remote-workspaces.md). Decision: [ADR 0095 — remote workspaces](decisions/0095-remote-workspaces.md).
+
+**Acceptance**: frontend transport seam (16.1); one dispatched command surface (16.2); server + `attach` + desktop connect (16.3); terminal / LSP / fs / coder streams (16.4); browser-tab and port tunnels (16.5); file transfer (16.6); attach / takeover (16.7). Deferred (session sync, concurrent multi-desktop attach, desktops through the relay) — see the phase doc.
