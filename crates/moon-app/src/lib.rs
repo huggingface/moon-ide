@@ -19,6 +19,7 @@ pub mod container;
 mod editorconfig;
 mod events;
 mod fs;
+pub mod logs;
 mod search;
 mod session;
 pub mod settings;
@@ -40,6 +41,8 @@ pub struct AppCore {
 	pub events: Arc<dyn EventSink>,
 	/// Loopback tunnels backing browser tabs (ADR 0088).
 	pub preview_tunnels: moon_container::PreviewTunnels,
+	/// Diagnostic log sink behind the bottom-panel logs view.
+	pub logs: Arc<moon_core::LogSink>,
 }
 
 impl AppCore {
@@ -48,8 +51,10 @@ impl AppCore {
 	}
 
 	/// Start the tasks that forward in-process broadcasts (coder loop,
-	/// browser tabs) to the event sink. Must run on the tokio runtime.
+	/// browser tabs, logs) to the event sink. Must run on the tokio
+	/// runtime.
 	pub fn spawn_pumps(&self) {
+		logs::spawn_event_pump(self.events.clone(), self.logs.clone());
 		coder::spawn_event_pump(self.events.clone(), self.coder.clone());
 		browser::spawn_tabs_pump(self.events.clone(), &self.coder);
 	}
@@ -64,7 +69,7 @@ impl AppCore {
 				})*
 			};
 		}
-		route!(fs, search, editorconfig, session, coder, browser);
+		route!(fs, search, editorconfig, session, coder, browser, logs);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
 }
@@ -169,6 +174,7 @@ mod tests {
 			coder,
 			events: Arc::new(NoEvents),
 			preview_tunnels: moon_container::PreviewTunnels::new(),
+			logs: moon_core::LogSink::new(),
 		};
 		(app, data)
 	}

@@ -1,4 +1,4 @@
-//! Diagnostic logs IPC.
+//! Diagnostic logs commands.
 //!
 //! Frontend → backend surface for the bottom-panel "Logs" view:
 //!
@@ -14,62 +14,52 @@
 //!   format-on-save ran, …) appear in the same tab as backend ones
 //!   without a separate buffer.
 //!
-//! Live entries fan out via the `logs:entry` Tauri event from
+//! Live entries fan out via the `logs:entry` event from
 //! [`spawn_event_pump`], which the frontend listens for on startup.
 
 use std::sync::Arc;
 
+use crate::events::EventSink;
+use crate::AppCore;
 use moon_core::LogSink;
 use moon_protocol::logs::{LogEntry, LogLevel};
 use moon_protocol::MoonError;
-use tauri::{AppHandle, Emitter, State};
-
-use crate::state::AppState;
 
 /// Per-entry event name. Payload is [`LogEntry`].
 pub const LOGS_ENTRY_EVENT: &str = "logs:entry";
 
-#[tauri::command]
-pub async fn logs_snapshot(state: State<'_, AppState>, source: String) -> Result<Vec<LogEntry>, MoonError> {
-	Ok(state.logs.snapshot(&source))
+pub async fn logs_snapshot(app: &AppCore, source: String) -> Result<Vec<LogEntry>, MoonError> {
+	Ok(app.logs.snapshot(&source))
 }
 
-#[tauri::command]
-pub async fn logs_sources(state: State<'_, AppState>) -> Result<Vec<String>, MoonError> {
-	Ok(state.logs.sources())
+pub async fn logs_sources(app: &AppCore) -> Result<Vec<String>, MoonError> {
+	Ok(app.logs.sources())
 }
 
-#[tauri::command]
-pub async fn logs_clear(state: State<'_, AppState>, source: String) -> Result<(), MoonError> {
-	state.logs.clear(&source);
+pub async fn logs_clear(app: &AppCore, source: String) -> Result<(), MoonError> {
+	app.logs.clear(&source);
 	Ok(())
 }
 
-#[tauri::command]
-pub async fn logs_emit(
-	state: State<'_, AppState>,
-	source: String,
-	level: LogLevel,
-	message: String,
-) -> Result<(), MoonError> {
-	state.logs.emit(&source, level, message);
+pub async fn logs_emit(app: &AppCore, source: String, level: LogLevel, message: String) -> Result<(), MoonError> {
+	app.logs.emit(&source, level, message);
 	Ok(())
 }
 
 /// Subscribe to the sink's broadcast channel and re-emit each entry
-/// on the `logs:entry` Tauri event. Spawned once at startup.
+/// on the `logs:entry` event. Spawned once at startup.
 ///
 /// Posture matches the LSP event pump: a `Lagged` receiver logs the
 /// drop count and keeps going (back-fill comes through
 /// [`logs_snapshot`] anyway). `Closed` only happens during process
 /// teardown.
-pub fn spawn_event_pump(app: AppHandle, logs: Arc<LogSink>) {
+pub fn spawn_event_pump(events: Arc<dyn EventSink>, logs: Arc<LogSink>) {
 	let mut rx = logs.subscribe();
-	tauri::async_runtime::spawn(async move {
+	tokio::spawn(async move {
 		loop {
 			match rx.recv().await {
 				Ok(entry) => {
-					let _ = app.emit(LOGS_ENTRY_EVENT, &entry);
+					crate::events::emit(events.as_ref(), LOGS_ENTRY_EVENT, &entry);
 				}
 				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
 					tracing::warn!(skipped = n, "logs event pump lagged");
@@ -80,4 +70,11 @@ pub fn spawn_event_pump(app: AppHandle, logs: Arc<LogSink>) {
 			}
 		}
 	});
+}
+
+crate::commands! {
+	logs_snapshot([app] source: String),
+	logs_sources([app]),
+	logs_clear([app] source: String),
+	logs_emit([app] source: String, level: LogLevel, message: String),
 }

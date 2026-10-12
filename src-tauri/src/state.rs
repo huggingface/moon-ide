@@ -163,6 +163,7 @@ impl AppState {
 				coder: coder.clone(),
 				events,
 				preview_tunnels: moon_container::PreviewTunnels::new(),
+				logs: logs.clone(),
 			}),
 			workspaces,
 			config_dir,

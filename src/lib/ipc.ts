@@ -316,10 +316,10 @@ export const ipc = {
 		serverStatus: () => local<NextEditServerSnapshot>('next_edit_server_status'),
 	},
 	logs: {
-		snapshot: (source: string) => local<LogEntry[]>('logs_snapshot', { source }),
-		sources: () => local<string[]>('logs_sources'),
-		clear: (source: string) => local<void>('logs_clear', { source }),
-		emit: (source: string, level: LogLevel, message: string) => local<void>('logs_emit', { source, level, message }),
+		snapshot: (source: string) => call<LogEntry[]>('logs_snapshot', { source }),
+		sources: () => call<string[]>('logs_sources'),
+		clear: (source: string) => call<void>('logs_clear', { source }),
+		emit: (source: string, level: LogLevel, message: string) => call<void>('logs_emit', { source, level, message }),
 	},
 	lsp: {
 		open: (path: string, languageId: string, text: string) => local<void>('lsp_open', { path, languageId, text }),

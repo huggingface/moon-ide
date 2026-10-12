@@ -6,7 +6,6 @@ pub mod container;
 pub mod container_events;
 pub mod editor_forward;
 pub mod fs;
-pub mod logs;
 pub mod lsp;
 pub mod next_edit;
 pub mod ports;

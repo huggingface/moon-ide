@@ -181,10 +181,6 @@ pub fn run() {
 			commands::lsp::lsp_restart,
 			commands::lsp::lsp_refresh_open_diagnostics,
 			commands::lsp::lsp_notify_files_changed,
-			commands::logs::logs_snapshot,
-			commands::logs::logs_sources,
-			commands::logs::logs_clear,
-			commands::logs::logs_emit,
 			commands::next_edit::next_edit_probe,
 			commands::next_edit::next_edit_complete,
 			commands::next_edit::next_edit_server_start,
@@ -504,7 +500,6 @@ pub fn run() {
 			});
 
 			let logs = moon_core::LogSink::new();
-			commands::logs::spawn_event_pump(app.handle().clone(), logs.clone());
 			// Share the sink with every folder's `LocalHost` so
 			// format-on-save (and any future host-side pipeline
 			// we wire in) lands in the bottom-panel logs view
