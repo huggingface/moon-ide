@@ -1,5 +1,5 @@
 //! Active-folder filesystem watcher. Emits a single `fs:changed`
-//! Tauri event whenever something inside the active folder
+//! event whenever something inside the active folder
 //! changes, coalescing rapid-fire events (editors rewriting temp
 //! files, `cargo build` touching `target/`) into one notification
 //! per window.
@@ -55,7 +55,7 @@
 //!
 //! One tokio task owns the `notify::RecommendedWatcher` and drains
 //! its callback. Another side of the same task receives `SetRoot`
-//! commands from the Tauri command handlers. That keeps the
+//! commands from the workspace command handlers. That keeps the
 //! notify watcher entirely off the shared-state path — only the
 //! `mpsc::Sender` escapes the actor, so swapping backends (Linux
 //! inotify, macOS FSEvents, Windows ReadDirectoryChangesW) doesn't
@@ -64,19 +64,21 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ignore::WalkBuilder;
 use notify::event::{CreateKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 
 use moon_protocol as mp;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant, Sleep};
 
-/// Name of the Tauri event the frontend listens on. The payload
+use crate::events::{emit, EventSink};
+
+/// Name of the event the frontend listens on. The payload
 /// (`FsChangedPayload`) carries the workspace-relative paths that
 /// changed inside the debounce window so the frontend can narrow
 /// per-buffer refresh (HEAD content + working-tree reload) to the
@@ -136,7 +138,7 @@ struct FsChangedPayload {
 /// every fire walked the whole tree.
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// Public handle held by `AppState`. Cloneable; sends are
+/// Public handle held by `AppCore`. Cloneable; sends are
 /// lock-free and non-blocking.
 #[derive(Clone)]
 pub struct FsWatcherHandle {
@@ -159,16 +161,17 @@ enum Command {
 
 /// Spawn the actor and return its handle. Idempotent-safe in the
 /// sense that callers only ever call this once at startup; the
-/// actor lives for the app's lifetime.
-pub fn spawn(app: AppHandle) -> FsWatcherHandle {
+/// actor lives for the app's lifetime. Must run on the tokio
+/// runtime.
+pub fn spawn(events: Arc<dyn EventSink>) -> FsWatcherHandle {
 	let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-	tauri::async_runtime::spawn(async move {
-		run(app, cmd_rx).await;
+	tokio::spawn(async move {
+		run(events, cmd_rx).await;
 	});
 	FsWatcherHandle { commands: cmd_tx }
 }
 
-async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
+async fn run(events: Arc<dyn EventSink>, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 	let (event_tx, mut event_rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
 
 	// `notify` fires the callback on a dedicated thread. The send
@@ -252,7 +255,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 						last_emit = None;
 					}
 					None => {
-						// Sender dropped — AppState went away,
+						// Sender dropped — AppCore went away,
 						// app is shutting down. Exit the actor.
 						return;
 					}
@@ -291,7 +294,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 					// trailing window so any follow-up events in
 					// this same save burst collapse into one
 					// flush at the end.
-					emit_pending(&app, &mut pending_paths, &mut pending_kinds, &mut pending_topology);
+					emit_pending(&*events, &mut pending_paths, &mut pending_kinds, &mut pending_topology);
 					last_emit = Some(now);
 					trailing = None;
 				} else if trailing.is_none() {
@@ -309,7 +312,7 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 				if pending_paths.is_empty() {
 					continue;
 				}
-				emit_pending(&app, &mut pending_paths, &mut pending_kinds, &mut pending_topology);
+				emit_pending(&*events, &mut pending_paths, &mut pending_kinds, &mut pending_topology);
 				last_emit = Some(Instant::now());
 			}
 		}
@@ -318,11 +321,9 @@ async fn run(app: AppHandle, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
 
 /// Drain `pending_paths` + `pending_topology` into a single
 /// `fs:changed` emit. Pulled into a helper so the leading and
-/// trailing call sites match exactly. Logs at debug on emit
-/// failure (webview not attached / torn down) — the next event
-/// will re-arm the watcher and we'll retry.
+/// trailing call sites match exactly.
 fn emit_pending(
-	app: &AppHandle,
+	events: &dyn EventSink,
 	paths: &mut HashSet<PathBuf>,
 	kinds: &mut HashMap<PathBuf, Option<mp::lsp::LspFileChangeKind>>,
 	topology: &mut bool,
@@ -339,9 +340,7 @@ fn emit_pending(
 		topology_changed: *topology,
 	};
 	*topology = false;
-	if let Err(e) = app.emit(FS_CHANGED_EVENT, &payload) {
-		tracing::debug!(error = %e, "failed to emit fs:changed");
-	}
+	emit(events, FS_CHANGED_EVENT, &payload);
 }
 
 /// Await an optional `Sleep` inside `tokio::select!`. When the

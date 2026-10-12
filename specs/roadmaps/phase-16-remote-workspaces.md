@@ -27,8 +27,9 @@ files in and out of it.
 - Lands in slices (fs/search, git, terminal, LSP, containers, coder,
   the rest) so the desktop keeps working at every commit.
 - Landed: `moon-app` crate + `rpc` command + event sink; fs / git,
-  search, editorconfig, session, coder, browser, logs, terminal, LSP
-  and container / compose / ports / lifecycle groups.
+  search, editorconfig, session, coder, browser, logs, terminal, LSP,
+  container / compose / ports / lifecycle and workspace folders + fs
+  watcher groups.
 
 ## 16.3 — Server and attach
 

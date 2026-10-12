@@ -19,7 +19,6 @@ mod bridge_rpc;
 mod commands;
 mod events;
 mod focus_socket;
-mod fs_watcher;
 mod remote_bridge;
 mod shell_resolver;
 mod shutdown;
@@ -116,12 +115,6 @@ pub fn run() {
 			}
 		})
 		.invoke_handler(tauri::generate_handler![
-			commands::workspace::workspace_open_local,
-			commands::workspace::workspace_remove_folder,
-			commands::workspace::workspace_set_active_folder,
-			commands::workspace::workspace_sync_active_worktree_branch,
-			commands::workspace::workspace_active,
-			commands::workspace::workspace_list,
 			commands::fs::fs_reveal_in_folder,
 			commands::rpc::rpc,
 			commands::app_info::app_info,
@@ -296,7 +289,6 @@ pub fn run() {
 				config_dir.clone(),
 			);
 			let slack_state = state::SlackState::new(client_cell, poller.clone());
-			let fs_watcher = fs_watcher::spawn(app.handle().clone());
 
 			let workspace_registry = Arc::new(WorkspaceRegistry::new(workspace_id.clone()));
 
@@ -385,6 +377,10 @@ pub fn run() {
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			let events: std::sync::Arc<dyn moon_app::EventSink> =
 				std::sync::Arc::new(events::TauriEvents(app.handle().clone()));
+			// The setup hook isn't on the tokio runtime the watcher
+			// actor spawns onto.
+			let fs_watcher =
+				tauri::async_runtime::block_on(async { moon_app::fs_watcher::spawn(events.clone()) });
 			// OS-level agent-activity indicator (per-workspace
 			// tray icon + window-icon status dot + taskbar
 			// flash).
@@ -1283,7 +1279,7 @@ async fn restore_session(
 			"restored workspace folders"
 		);
 		let active_root = snap.active_folder.as_ref().map(std::path::PathBuf::from);
-		state.fs_watcher.set_root(active_root);
+		state.core.fs_watcher.set_root(active_root);
 	}
 
 	// Seed the poller from persisted UI state so a relaunch

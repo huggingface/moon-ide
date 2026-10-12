@@ -105,12 +105,12 @@ export const ipc = {
 	// or in preboot (no `--workspace` arg, empty catalog).
 	appInfo: () => local<AppInfo>('app_info'),
 	workspace: {
-		openLocal: (path: string) => local<Workspace>('workspace_open_local', { path }),
-		removeFolder: (path: string) => local<Workspace>('workspace_remove_folder', { path }),
-		setActiveFolder: (path: string) => local<Workspace>('workspace_set_active_folder', { path }),
-		syncActiveWorktreeBranch: () => local<Workspace>('workspace_sync_active_worktree_branch'),
-		active: () => local<Workspace | null>('workspace_active'),
-		list: () => local<Workspace[]>('workspace_list'),
+		openLocal: (path: string) => call<Workspace>('workspace_open_local', { path }),
+		removeFolder: (path: string) => call<Workspace>('workspace_remove_folder', { path }),
+		setActiveFolder: (path: string) => call<Workspace>('workspace_set_active_folder', { path }),
+		syncActiveWorktreeBranch: () => call<Workspace>('workspace_sync_active_worktree_branch'),
+		active: () => call<Workspace | null>('workspace_active'),
+		list: () => call<Workspace[]>('workspace_list'),
 	},
 	// Catalog of every workspace on the machine + create / delete /
 	// rename. Cross-process operations: writes to `state.json` are

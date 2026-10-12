@@ -21,6 +21,7 @@ pub mod container_events;
 mod editorconfig;
 mod events;
 mod fs;
+pub mod fs_watcher;
 mod lifecycle;
 pub mod logs;
 pub mod lsp;
@@ -30,6 +31,7 @@ mod search;
 mod session;
 pub mod settings;
 pub mod terminal;
+mod workspace;
 
 pub use catalog::bump_last_active;
 pub use events::{emit, EventSink};
@@ -59,6 +61,9 @@ pub struct AppCore {
 	pub lsp: tokio::sync::Mutex<Option<lsp::LspHandle>>,
 	/// Open `docker compose logs -f` tails behind the log tabs.
 	pub log_streams: compose_logs::LogStreams,
+	/// Watches the active folder and emits `fs:changed`; retargeted
+	/// by the folder commands.
+	pub fs_watcher: fs_watcher::FsWatcherHandle,
 }
 
 impl AppCore {
@@ -106,7 +111,8 @@ impl AppCore {
 			container,
 			project_compose,
 			compose_logs,
-			ports
+			ports,
+			workspace
 		);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
@@ -205,13 +211,15 @@ mod tests {
 			terminals.clone(),
 		)
 		.unwrap();
+		let events: Arc<dyn EventSink> = Arc::new(NoEvents);
 		let app = AppCore {
 			workspaces,
 			config_dir: dir("config"),
 			workspaces_dir: dir("workspaces"),
 			workspace_id: Some("test-workspace".into()),
 			coder,
-			events: Arc::new(NoEvents),
+			fs_watcher: fs_watcher::spawn(events.clone()),
+			events,
 			preview_tunnels: moon_container::PreviewTunnels::new(),
 			logs: moon_core::LogSink::new(),
 			terminals,

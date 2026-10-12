@@ -8,7 +8,6 @@ use moon_terminal::TerminalRegistry;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 
-use crate::fs_watcher::FsWatcherHandle;
 use crate::slack_poller::PollerHandle;
 
 pub struct AppState {
@@ -45,8 +44,6 @@ pub struct AppState {
 	/// this is the in-memory client cache (populated at startup if the
 	/// keyring has a token, otherwise lazily on first `slack_set_token`).
 	pub slack: SlackState,
-	/// Filesystem watcher actor.
-	pub fs_watcher: FsWatcherHandle,
 	/// Optional `llama-server` child for local autocomplete (HF `--hf-repo`).
 	pub next_edit_server: Arc<NextEditServerSupervisor>,
 	/// Process mode + identity. The frontend's first hydrate
@@ -101,7 +98,7 @@ impl AppState {
 		config_dir: Utf8PathBuf,
 		workspaces_dir: Utf8PathBuf,
 		slack: SlackState,
-		fs_watcher: FsWatcherHandle,
+		fs_watcher: moon_app::fs_watcher::FsWatcherHandle,
 		workspaces: Arc<WorkspaceRegistry>,
 		coder: CoderHandle,
 		mode: AppMode,
@@ -126,12 +123,12 @@ impl AppState {
 				terminal_streams: Default::default(),
 				lsp: Default::default(),
 				log_streams: Default::default(),
+				fs_watcher,
 			}),
 			workspaces,
 			config_dir,
 			workspaces_dir,
 			slack,
-			fs_watcher,
 			next_edit_server: Arc::new(NextEditServerSupervisor::default()),
 			mode,
 			focus_listener: Mutex::new(None),
