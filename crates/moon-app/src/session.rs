@@ -8,26 +8,24 @@
 //! Process-per-workspace: each process owns one workspace and
 //! reads/writes its own `session.json`. No `workspace_id`
 //! parameter: the file path is derived from
-//! `state.workspace_id()`.
+//! `app.workspace_id()`.
 
 use moon_core::session as core_session;
 use moon_protocol::session::WorkspaceSession;
 use moon_protocol::MoonError;
-use tauri::State;
 
-use crate::commands::window::bump_last_active;
-use crate::state::AppState;
+use crate::bump_last_active;
+use crate::AppCore;
 
-fn require_workspace_id(state: &AppState) -> Result<&str, MoonError> {
-	state
+fn require_workspace_id(app: &AppCore) -> Result<&str, MoonError> {
+	app
 		.workspace_id()
 		.ok_or_else(|| MoonError::invalid("session: no workspace bound to this process"))
 }
 
-#[tauri::command]
-pub async fn session_load(state: State<'_, AppState>) -> Result<WorkspaceSession, MoonError> {
-	let id = require_workspace_id(&state)?;
-	core_session::load(&state.workspaces_dir, id).await
+pub async fn session_load(app: &AppCore) -> Result<WorkspaceSession, MoonError> {
+	let id = require_workspace_id(app)?;
+	core_session::load(&app.workspaces_dir, id).await
 }
 
 /// Overlay the frontend's UI-only fields onto the backend-managed
@@ -67,18 +65,22 @@ fn merge_frontend_session(existing: WorkspaceSession, frontend: WorkspaceSession
 	}
 }
 
-#[tauri::command]
-pub async fn session_save(state: State<'_, AppState>, session: WorkspaceSession) -> Result<(), MoonError> {
-	let id = require_workspace_id(&state)?.to_owned();
-	let existing = core_session::load(&state.workspaces_dir, &id).await?;
+pub async fn session_save(app: &AppCore, session: WorkspaceSession) -> Result<(), MoonError> {
+	let id = require_workspace_id(app)?.to_owned();
+	let existing = core_session::load(&app.workspaces_dir, &id).await?;
 	let merged = merge_frontend_session(existing, session);
-	core_session::save(&state.workspaces_dir, &id, &merged).await?;
+	core_session::save(&app.workspaces_dir, &id, &merged).await?;
 	// Every persist tick is meaningful activity for the
 	// workspace — bumping `last_active_at` here means the
 	// "most-recently-active" sort tracks real usage rather than
 	// just process-launch events.
-	bump_last_active(&state, &id).await;
+	bump_last_active(&app.config_dir, &id).await;
 	Ok(())
+}
+
+crate::commands! {
+	session_load([app]),
+	session_save([app] session: WorkspaceSession),
 }
 
 #[cfg(test)]
@@ -144,7 +146,7 @@ mod tests {
 	#[test]
 	fn merge_keeps_backend_managed_fields_when_frontend_omits_them() {
 		// The frontend payload (constructed by `persistAppState`
-		// in `state.svelte.ts`) only fills in `folders` +
+		// in `app.svelte.ts`) only fills in `folders` +
 		// `active_folder_path`. Without the merge those nulled
 		// defaults would clobber every backend-managed slot —
 		// the user would lose their HF bucket binding, port
@@ -168,7 +170,7 @@ mod tests {
 		// The complement of the above: when the frontend payload
 		// updates `folders` / `active_folder_path`, those land
 		// verbatim — backend-managed fields don't get to veto
-		// the frontend's own state.
+		// the frontend's own app.
 		let existing = WorkspaceSession {
 			folders: vec![FolderSession {
 				folder_path: "/stale/path".into(),

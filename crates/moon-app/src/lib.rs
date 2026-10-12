@@ -6,30 +6,48 @@
 
 use std::sync::Arc;
 
+use camino::Utf8PathBuf;
 use moon_core::WorkspaceRegistry;
 use moon_protocol::MoonError;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+mod catalog;
+mod editorconfig;
 mod fs;
+mod search;
+mod session;
+
+pub use catalog::bump_last_active;
 
 /// State every dispatched command runs against. Grows as command
 /// groups move out of `src-tauri` (Phase 16.2).
 pub struct AppCore {
 	pub workspaces: Arc<WorkspaceRegistry>,
+	/// Machine-local app state (`state.json`: catalog, providers).
+	pub config_dir: Utf8PathBuf,
+	/// Root of the per-workspace state directories.
+	pub workspaces_dir: Utf8PathBuf,
+	/// Workspace this process owns; `None` in preboot mode.
+	pub workspace_id: Option<String>,
 }
 
 impl AppCore {
-	pub fn new(workspaces: Arc<WorkspaceRegistry>) -> Self {
-		Self { workspaces }
+	pub fn workspace_id(&self) -> Option<&str> {
+		self.workspace_id.as_deref()
 	}
 
 	/// Run `method` with its JSON `params` (an object keyed by the
 	/// camelCase argument names, same shape Tauri's `invoke` takes).
 	pub async fn dispatch(&self, method: &str, params: Value) -> Result<Value, MoonError> {
-		if let Some(result) = fs::dispatch(self, method, params).await {
-			return result;
+		macro_rules! route {
+			($($group:ident),*) => {
+				$(if $group::handles(method) {
+					return $group::dispatch(self, method, params).await;
+				})*
+			};
 		}
+		route!(fs, search, editorconfig, session);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
 }
@@ -47,18 +65,22 @@ fn to_value<T: serde::Serialize>(value: T) -> Result<Value, MoonError> {
 	serde_json::to_value(value).map_err(|e| MoonError::internal(e.to_string()))
 }
 
-/// Generates a module's `dispatch`: one arm per command, deserialising
+/// Generates a module's `handles` + `dispatch`: one arm per command, deserialising
 /// the camelCase params object into the listed arguments. `[app]`
 /// before the arguments passes the [`AppCore`] through.
 macro_rules! commands {
 	($( $name:ident ( $([$app:ident])? $( $arg:ident : $ty:ty ),* ) ),* $(,)?) => {
+		pub(crate) fn handles(method: &str) -> bool {
+			matches!(method, $( stringify!($name) )|*)
+		}
+
 		pub(crate) async fn dispatch(
 			app: &crate::AppCore,
 			method: &str,
 			params: serde_json::Value,
-		) -> Option<Result<serde_json::Value, moon_protocol::MoonError>> {
+		) -> Result<serde_json::Value, moon_protocol::MoonError> {
 			match method {
-				$( stringify!($name) => Some(async {
+				$( stringify!($name) => {
 					#[derive(serde::Deserialize)]
 					#[serde(rename_all = "camelCase")]
 					#[allow(dead_code)]
@@ -66,8 +88,8 @@ macro_rules! commands {
 					#[allow(unused_variables)]
 					let Args { $( $arg ),* } = crate::parse_params::<Args>(method, params)?;
 					crate::to_value($name($(crate::pass_app!($app, app),)? $( $arg ),*).await?)
-				}.await), )*
-				_ => None,
+				} )*
+				_ => Err(moon_protocol::MoonError::invalid(format!("unknown method `{method}`"))),
 			}
 		}
 	};
@@ -89,7 +111,12 @@ mod tests {
 	use serde_json::json;
 
 	fn app() -> AppCore {
-		AppCore::new(Arc::new(WorkspaceRegistry::new("test-workspace".into())))
+		AppCore {
+			workspaces: Arc::new(WorkspaceRegistry::new("test-workspace".into())),
+			config_dir: Utf8PathBuf::from("/nonexistent/config"),
+			workspaces_dir: Utf8PathBuf::from("/nonexistent/workspaces"),
+			workspace_id: Some("test-workspace".into()),
+		}
 	}
 
 	#[tokio::test]

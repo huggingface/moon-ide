@@ -155,7 +155,15 @@ impl AppState {
 		terminals: Arc<TerminalRegistry>,
 	) -> Self {
 		Self {
-			core: Arc::new(moon_app::AppCore::new(workspaces.clone())),
+			core: Arc::new(moon_app::AppCore {
+				workspaces: workspaces.clone(),
+				config_dir: config_dir.clone(),
+				workspaces_dir: workspaces_dir.clone(),
+				workspace_id: match &mode {
+					AppMode::Workspace { id } => Some(id.clone()),
+					AppMode::Preboot => None,
+				},
+			}),
 			workspaces,
 			config_dir,
 			workspaces_dir,

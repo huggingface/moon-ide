@@ -17,8 +17,7 @@
 //! returns a clear error explaining how to test multi-workspace
 //! flows (use a release build).
 
-use moon_core::app_state as core_app_state;
-use moon_protocol::workspace::{validate_workspace_id, WorkspaceMeta};
+use moon_protocol::workspace::validate_workspace_id;
 use moon_protocol::MoonError;
 use tauri::State;
 
@@ -61,7 +60,7 @@ pub(crate) async fn window_open_impl(state: &AppState, workspace_id: String) -> 
 		focus_socket::send_focus(&state.workspaces_dir, &workspace_id)
 			.await
 			.map_err(|err| MoonError::Internal(format!("failed to focus existing window: {err}")))?;
-		bump_last_active(state, &workspace_id).await;
+		moon_app::bump_last_active(&state.config_dir, &workspace_id).await;
 		return Ok(());
 	}
 
@@ -69,7 +68,7 @@ pub(crate) async fn window_open_impl(state: &AppState, workspace_id: String) -> 
 	// can actually spawn the child — in dev mode the user
 	// is told to restart `bun run dev`, and the next launch
 	// should restore the workspace they just asked for.
-	bump_last_active(state, &workspace_id).await;
+	moon_app::bump_last_active(&state.config_dir, &workspace_id).await;
 
 	if cfg!(debug_assertions) {
 		return Err(MoonError::invalid(format!(
@@ -108,37 +107,4 @@ pub async fn window_set_title(window: tauri::Window, title: String) -> Result<()
 		.set_title(&title)
 		.map_err(|err| MoonError::Internal(format!("failed to set window title: {err}")))?;
 	Ok(())
-}
-
-/// Bump `last_active_at` for `workspace_id` in the on-disk
-/// `state.json`. Best-effort: a write failure is logged but
-/// otherwise swallowed — the picker just shows a slightly stale
-/// "recent" sort until the next successful save.
-pub async fn bump_last_active(state: &AppState, workspace_id: &str) {
-	let now = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.map(|d| d.as_secs() as i64)
-		.unwrap_or(0);
-	let id = workspace_id.to_string();
-	let id_for_log = id.clone();
-	let result = core_app_state::mutate(&state.config_dir, move |s| {
-		for meta in s.workspaces.iter_mut() {
-			if meta.id == id {
-				meta.last_active_at = now;
-				return;
-			}
-		}
-		// The workspace was bumped before the catalog knew
-		// about it. Repair rather than silently drop.
-		s.workspaces.push(WorkspaceMeta {
-			id: id.clone(),
-			name: id,
-			last_active_at: now,
-			color: None,
-		});
-	})
-	.await;
-	if let Err(err) = result {
-		tracing::warn!(error = %err, workspace_id = %id_for_log, "failed to persist last_active_at bump");
-	}
 }

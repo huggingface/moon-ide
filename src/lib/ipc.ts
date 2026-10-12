@@ -208,10 +208,10 @@ export const ipc = {
 		branchSwitch: (target: BranchSwitchTarget) => call<void>('fs_branch_switch', { target }),
 	},
 	search: {
-		files: (options: FileSearchOptions) => local<FileSearchResult[]>('search_files', { options }),
-		content: (options: ContentSearchOptions) => local<ContentSearchResult>('search_content', { options }),
+		files: (options: FileSearchOptions) => call<FileSearchResult[]>('search_files', { options }),
+		content: (options: ContentSearchOptions) => call<ContentSearchResult>('search_content', { options }),
 		replaceContent: (options: ContentReplaceOptions) =>
-			local<ContentReplaceResult>('search_replace_content', { options }),
+			call<ContentReplaceResult>('search_replace_content', { options }),
 	},
 	appState: {
 		load: () => local<AppState>('app_state_load'),
@@ -223,14 +223,14 @@ export const ipc = {
 		// `<workspaces_dir>/<id>/session.json`. Process-per-
 		// workspace makes the workspace id implicit — the
 		// backend reads it from `state.workspace_id()`.
-		load: () => local<WorkspaceSession>('session_load'),
-		save: (session: WorkspaceSession) => local<void>('session_save', { session }),
+		load: () => call<WorkspaceSession>('session_load'),
+		save: (session: WorkspaceSession) => call<void>('session_save', { session }),
 	},
 	system: {
 		theme: () => local<SystemTheme>('system_theme'),
 	},
 	editorconfig: {
-		forPath: (path: string) => local<EditorConfig>('editorconfig_for_path', { path }),
+		forPath: (path: string) => call<EditorConfig>('editorconfig_for_path', { path }),
 	},
 	editorForward: {
 		// Resolve a pending `editor:request` event from the
