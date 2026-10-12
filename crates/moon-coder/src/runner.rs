@@ -68,6 +68,10 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 pub struct TurnSettled {
 	pub session_id: String,
 	pub title: String,
+	/// Folder the session is filed under (`SessionHeader::cwd`).
+	pub folder: String,
+	/// Worktree the session's tools run in, when it has one (ADR 0028).
+	pub worktree_root: Option<String>,
 	pub outcome: TurnOutcome,
 }
 
@@ -6533,6 +6537,8 @@ async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &
 	let _ = state.turn_settled.send(TurnSettled {
 		session_id: header.id.clone(),
 		title: header.title.clone(),
+		folder: header.cwd.clone(),
+		worktree_root: header.worktree_root.clone(),
 		outcome,
 	});
 }

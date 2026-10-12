@@ -1514,6 +1514,19 @@ export type EditRequest = {
 };
 
 /**
+ * Payload of the `coder:focus_session` Tauri event, emitted when
+ * the user clicks a turn-finished desktop notification (ADR 0089).
+ * `folder` is the folder the session is filed under; `worktree_root`
+ * is the worktree its tools run in, when it has one. Mirrors
+ * `FocusSessionPayload` in `src-tauri/src/turn_notification.rs`.
+ */
+export type CoderFocusSession = {
+	session_id: string;
+	folder: string;
+	worktree_root: string | null;
+};
+
+/**
  * Status of one bound folder's compose project (its own
  * `docker-compose.yml`). The folder bar's compose indicator
  * reads this; `compose_file == null` means the folder has no

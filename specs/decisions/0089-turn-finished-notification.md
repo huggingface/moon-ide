@@ -24,7 +24,7 @@ is unfocused:
   and the body is the session's last assistant message, with whitespace
   collapsed and truncated to 280 chars. When the turn failed, the
   summary ends in "(failed)" and the body is the error. Clicking the
-  notification focuses the window.
+  notification focuses the window (see the amendment below).
 
 One notification per settled turn, not per "all agents idle". Each
 finished conversation has its own answer to show.
@@ -47,3 +47,15 @@ and posts the notification via `notify-rust`.
   finished answer would wait on the slowest one.
 - **A user setting to toggle it**: hardcode first. Add a toggle once
   someone asks for one.
+
+## Amendment 2026-10-12 — clicking opens the session
+
+Focusing the window wasn't enough: with several bound folders the
+user still had to find the folder and session that finished. A click
+now also switches the folder bar to the session's worktree (else the
+folder it's filed under) and opens the session in the coder panel.
+The Tauri layer emits `coder:focus_session` (`{ session_id, folder,
+worktree_root }`) after focusing; the UI does the switch, so the
+folder change goes through the same path as clicking a session row.
+A folder that's no longer bound keeps the current folder and only
+opens the session.
