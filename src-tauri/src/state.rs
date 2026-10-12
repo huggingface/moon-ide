@@ -1,35 +1,17 @@
 use std::sync::Arc;
 
 use camino::Utf8PathBuf;
-use moon_coder::CoderHandle;
-use moon_core::{LogSink, NextEditServerSupervisor, WorkspaceRegistry};
+use moon_core::NextEditServerSupervisor;
 use moon_slack::{SlackClient, TokenStore};
-use moon_terminal::TerminalRegistry;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 
 use crate::slack_poller::PollerHandle;
 
 pub struct AppState {
-	/// The shared command surface (ADR 0095), served to the
-	/// frontend through `commands::rpc::rpc`.
-	pub core: Arc<moon_app::AppCore>,
-	/// The single workspace this process owns. Phase 7's
-	/// process-per-workspace model: each `moon-ide` process is
-	/// pinned to one workspace at startup (CLI arg
-	/// `--workspace <slug>`), so the registry is a singleton —
-	/// no map, no per-call resolution. Cross-workspace
-	/// operations (`workspace_create`, the picker, focus
-	/// existing) go cross-process via the per-workspace lock
-	/// socket; see [`crate::commands::window`] +
-	/// [`crate::focus_socket`].
-	///
-	/// In preboot mode (no `--workspace` arg, empty catalog)
-	/// the registry id is the sentinel
-	/// [`PREBOOT_WORKSPACE_ID`] and the registry never gains
-	/// folders; the frontend renders the "Name your workspace"
-	/// landing instead of the regular IDE chrome.
-	pub workspaces: Arc<WorkspaceRegistry>,
+	/// Where this window's workspace process runs; the frontend's
+	/// `call`s reach it through `commands::rpc::rpc`.
+	pub backend: Backend,
 	/// Where global, machine-local app state lives (theme,
 	/// catalog, slack creds). Set once at startup from Tauri's
 	/// `app_config_dir`.
@@ -66,6 +48,17 @@ pub struct AppState {
 	pub remote_bridge: Mutex<Option<crate::remote_bridge::RemoteBridgeHandle>>,
 }
 
+/// Where the workspace process behind this window lives (ADR 0095).
+pub enum Backend {
+	/// In this process. The workspace is the process's own: in
+	/// preboot mode (no `--workspace` arg, empty catalog) its id is
+	/// the sentinel [`PREBOOT_WORKSPACE_ID`] and it never gains
+	/// folders.
+	Local(Arc<moon_app::AppCore>),
+	/// On a server, reached over SSH.
+	Remote(crate::remote_workspace::RemoteWorkspace),
+}
+
 /// What this process is doing. Picked once at startup based on
 /// CLI args + catalog state; never mutates afterwards.
 #[derive(Debug, Clone)]
@@ -89,43 +82,15 @@ pub enum AppMode {
 pub const PREBOOT_WORKSPACE_ID: &str = "__preboot__";
 
 impl AppState {
-	// Many arguments by design: this is the process's whole world
-	// (workspace registry, paths, every long-lived actor handle).
-	// A builder or grouping struct would just shuffle the same
-	// arity around without paying for itself.
-	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		config_dir: Utf8PathBuf,
 		workspaces_dir: Utf8PathBuf,
 		slack: SlackState,
-		fs_watcher: moon_app::fs_watcher::FsWatcherHandle,
-		workspaces: Arc<WorkspaceRegistry>,
-		coder: CoderHandle,
 		mode: AppMode,
-		logs: Arc<LogSink>,
-		terminals: Arc<TerminalRegistry>,
-		events: Arc<dyn moon_app::EventSink>,
+		backend: Backend,
 	) -> Self {
 		Self {
-			core: Arc::new(moon_app::AppCore {
-				workspaces: workspaces.clone(),
-				config_dir: config_dir.clone(),
-				workspaces_dir: workspaces_dir.clone(),
-				workspace_id: match &mode {
-					AppMode::Workspace { id } => Some(id.clone()),
-					AppMode::Preboot => None,
-				},
-				coder,
-				events,
-				preview_tunnels: moon_container::PreviewTunnels::new(),
-				logs,
-				terminals,
-				terminal_streams: Default::default(),
-				lsp: Default::default(),
-				log_streams: Default::default(),
-				fs_watcher,
-			}),
-			workspaces,
+			backend,
 			config_dir,
 			workspaces_dir,
 			slack,
@@ -133,6 +98,14 @@ impl AppState {
 			mode,
 			focus_listener: Mutex::new(None),
 			remote_bridge: Mutex::new(None),
+		}
+	}
+
+	/// The in-process workspace, or `None` for a remote window.
+	pub fn local_core(&self) -> Option<&Arc<moon_app::AppCore>> {
+		match &self.backend {
+			Backend::Local(core) => Some(core),
+			Backend::Remote(_) => None,
 		}
 	}
 

@@ -74,6 +74,7 @@ import type {
 	PublishReviewRequest,
 	PublishReviewResult,
 	ReadFileResult,
+	RemoteStatus,
 	RightPanelKind,
 	SlackBotProfile,
 	SlackIdentity,
@@ -125,6 +126,10 @@ export const ipc = {
 		// "Ctrl+Shift+N" flow — together they create a new
 		// workspace or focus an existing one transparently.
 		create: (slug: string, name: string) => local<WorkspaceMeta>('workspace_create', { slug, name }),
+		// Catalog entry for a workspace running on a server (ADR 0095).
+		// Pair with `window.open` to attach to it.
+		addRemote: (name: string, host: string, workspace: string) =>
+			local<WorkspaceMeta>('workspace_add_remote', { name, host, workspace }),
 		delete: (slug: string) => local<void>('workspace_delete', { slug }),
 		rename: (slug: string, name: string) => local<WorkspaceMeta>('workspace_rename', { slug, name }),
 		// Update the badge colour for `slug`. Pass `''` (empty
@@ -140,6 +145,10 @@ export const ipc = {
 	// spawns a fresh `moon-ide --workspace <slug>` child;
 	// `close` exits this process; `setTitle` rewrites the
 	// calling window's OS title.
+	remote: {
+		status: () => local<RemoteStatus | null>('remote_status'),
+		reattach: () => local<void>('remote_reattach'),
+	},
 	window: {
 		open: (slug: string) => local<void>('window_open', { workspaceId: slug }),
 		close: () => local<void>('window_close'),

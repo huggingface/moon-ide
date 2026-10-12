@@ -27,6 +27,7 @@ pub async fn bump_last_active(config_dir: &Utf8Path, workspace_id: &str) {
 			name: id,
 			last_active_at: now,
 			color: None,
+			remote: None,
 		});
 	})
 	.await;

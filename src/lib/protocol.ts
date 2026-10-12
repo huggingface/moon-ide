@@ -96,7 +96,29 @@ export type AppInfo = {
 	 * deterministic hash-derived hue. Feeds the chrome tint
 	 * (ADR 0047). */
 	workspaceColor: string | null;
+	/** Set when this window fronts a remote workspace (ADR 0095). */
+	remote: RemoteTarget | null;
 };
+
+/**
+ * Where a remote workspace lives: an SSH destination and the
+ * workspace's slug in that server's catalog. Mirrors
+ * `moon_protocol::workspace::RemoteTarget`.
+ */
+export type RemoteTarget = {
+	host: string;
+	workspace: WorkspaceId;
+};
+
+/**
+ * Connection state of a remote workspace window, pushed on
+ * `remote:status`. Mirrors `moon_app::attach::RemoteStatus`.
+ */
+export type RemoteStatus =
+	| { state: 'connecting' }
+	| { state: 'connected' }
+	| { state: 'disconnected'; error: string }
+	| { state: 'detached' };
 
 /**
  * The full workspace shape — the running process's single
@@ -128,6 +150,8 @@ export type WorkspaceMeta = {
 	 * default every new workspace starts with. Drives the
 	 * per-window icon Tauri sets at startup. */
 	color?: string | null;
+	/** Set for a remote workspace (ADR 0095); absent for a local one. */
+	remote?: RemoteTarget;
 };
 
 export type FileSearchOptions = {

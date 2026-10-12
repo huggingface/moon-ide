@@ -2,6 +2,7 @@ import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { workspace } from './state.svelte';
 import { coder } from './coder.svelte';
 import { companion } from './companion.svelte';
+import { remoteConnect } from './remoteConnect.svelte';
 import { slack } from './slack.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
@@ -446,6 +447,11 @@ export const builtInCommands: Command[] = [
 		title: () => (coder.panelVisible ? 'Coder: Hide Panel' : 'Coder: Show Panel'),
 		shortcut: 'Ctrl+L',
 		run: () => coder.togglePanel(),
+	},
+	{
+		id: 'workspace.openRemote',
+		title: 'Workspace: Open remote workspace…',
+		run: () => remoteConnect.open(),
 	},
 	{
 		id: 'companion.pair',

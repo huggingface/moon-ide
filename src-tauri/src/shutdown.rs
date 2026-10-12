@@ -10,5 +10,9 @@ pub async fn stop_all(state: &AppState) {
 	} else {
 		tracing::info!("stop_all: stopped next_edit llama-server child (if any)");
 	}
-	state.core.stop_all().await;
+	// A remote workspace keeps running on its server when this window
+	// closes.
+	if let Some(core) = state.local_core() {
+		core.stop_all().await;
+	}
 }

@@ -370,6 +370,7 @@ async fn workspace_add(name: String, folder: Utf8PathBuf, slug: Option<String>) 
 				name: name_for_catalog,
 				color: None,
 				last_active_at: now,
+				remote: None,
 			});
 		}
 	})

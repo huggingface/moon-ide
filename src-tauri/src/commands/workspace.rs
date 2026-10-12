@@ -1,6 +1,6 @@
 use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
 use moon_core::app_state as core_app_state;
-use moon_protocol::workspace::{slugify_workspace_name, validate_workspace_id, WorkspaceMeta};
+use moon_protocol::workspace::{slugify_workspace_name, validate_workspace_id, RemoteTarget, WorkspaceMeta};
 use moon_protocol::MoonError;
 use tauri::{Manager, State};
 
@@ -71,11 +71,66 @@ pub async fn workspace_create(
 			name: name_owned,
 			last_active_at: now,
 			color: None,
+			remote: None,
 		};
 		s.workspaces.push(meta.clone());
 		meta
 	})
 	.await?;
+	Ok(meta)
+}
+
+/// Add a remote workspace (ADR 0095) to this machine's catalog: a
+/// local entry whose window attaches to `workspace` on the SSH
+/// destination `host`. The frontend follows up with `window_open`.
+/// The id is derived from `name` and must not collide with an
+/// existing entry.
+#[tauri::command]
+pub async fn workspace_add_remote(
+	state: State<'_, AppState>,
+	name: String,
+	host: String,
+	workspace: String,
+) -> Result<WorkspaceMeta, MoonError> {
+	let name = name.trim().to_owned();
+	let host = host.trim().to_owned();
+	if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
+		return Err(MoonError::invalid(format!("invalid ssh host `{host}`")));
+	}
+	validate_workspace_id(&workspace)?;
+	let slug = slugify_workspace_name(&name);
+	if slug.is_empty() {
+		return Err(MoonError::invalid(
+			"workspace name has no alphanumeric characters; pick a different name",
+		));
+	}
+	validate_workspace_id(&slug)?;
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs() as i64)
+		.unwrap_or(0);
+	let meta = WorkspaceMeta {
+		id: slug,
+		name,
+		last_active_at: now,
+		color: None,
+		remote: Some(RemoteTarget { host, workspace }),
+	};
+	let added = meta.clone();
+	let collided = core_app_state::mutate(&state.config_dir, move |s| {
+		if s.workspaces.iter().any(|m| m.id == added.id) {
+			return true;
+		}
+		s.workspaces.push(added);
+		false
+	})
+	.await?;
+	if collided {
+		return Err(MoonError::invalid(format!(
+			"a workspace named `{}` already exists; pick another name",
+			meta.id
+		)));
+	}
 	Ok(meta)
 }
 
@@ -100,6 +155,13 @@ pub async fn workspace_delete(state: State<'_, AppState>, slug: String) -> Resul
 	}
 
 	let state_dir = state.workspace_state_dir(&slug);
+	// A remote workspace's containers live on its server; deleting the
+	// entry only forgets it here.
+	let is_remote = core_app_state::load(&state.config_dir)
+		.await?
+		.workspaces
+		.iter()
+		.any(|m| m.id == slug && m.remote.is_some());
 
 	// Best-effort `compose down`. The compose project might
 	// still be running from a previous launch even if the
@@ -107,13 +169,15 @@ pub async fn workspace_delete(state: State<'_, AppState>, slug: String) -> Resul
 	// here (e.g. docker daemon unreachable) is logged but not
 	// fatal: the catalog removal below still happens so the
 	// user can clean up the stray container manually.
-	let container = ContainerWorkspace::new(WorkspaceConfig {
-		workspace_id: slug.clone(),
-		state_dir: state_dir.clone(),
-		bound_folders: Vec::new(),
-	})?;
-	if let Err(err) = container.teardown().await {
-		tracing::warn!(error = %err, slug = %slug, "compose down failed during workspace_delete");
+	if !is_remote {
+		let container = ContainerWorkspace::new(WorkspaceConfig {
+			workspace_id: slug.clone(),
+			state_dir: state_dir.clone(),
+			bound_folders: Vec::new(),
+		})?;
+		if let Err(err) = container.teardown().await {
+			tracing::warn!(error = %err, slug = %slug, "compose down failed during workspace_delete");
+		}
 	}
 
 	if state_dir.exists() {

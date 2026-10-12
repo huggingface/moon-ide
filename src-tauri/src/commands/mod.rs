@@ -4,6 +4,7 @@ pub mod companion;
 pub mod editor_forward;
 pub mod fs;
 pub mod next_edit;
+pub mod remote;
 pub mod rpc;
 pub mod slack;
 pub mod system;

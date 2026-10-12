@@ -20,6 +20,7 @@ pub async fn app_info(state: State<'_, AppState>) -> Result<AppInfo, MoonError> 
 			workspace_id: None,
 			workspace_name: None,
 			workspace_color: None,
+			remote: None,
 		}),
 		AppMode::Workspace { id } => {
 			let catalog = moon_core::app_state::load(&state.config_dir).await?;
@@ -29,6 +30,7 @@ pub async fn app_info(state: State<'_, AppState>) -> Result<AppInfo, MoonError> 
 				workspace_id: Some(id.clone()),
 				workspace_name: meta.map(|m| m.name.clone()),
 				workspace_color: meta.and_then(|m| m.color.clone()),
+				remote: meta.and_then(|m| m.remote.clone()),
 			})
 		}
 	}

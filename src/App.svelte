@@ -9,6 +9,8 @@
 	import BranchSwitcher from './lib/components/BranchSwitcher.svelte';
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import CompanionModal from './lib/components/CompanionModal.svelte';
+	import RemoteConnect from './lib/components/RemoteConnect.svelte';
+	import RemoteStatusOverlay from './lib/components/RemoteStatusOverlay.svelte';
 	import ChatPanel from './lib/components/ChatPanel.svelte';
 	import CoderPanel from './lib/components/CoderPanel.svelte';
 	import BottomPanel from './lib/components/BottomPanel.svelte';
@@ -27,6 +29,7 @@
 	import { applyWorkspaceScheme } from './lib/workspaceTheme';
 	import { workspacePicker } from './lib/workspacePicker.svelte';
 	import { workspaceCreate } from './lib/workspaceCreate.svelte';
+	import { remote } from './lib/remote.svelte';
 	import WorkspacePicker from './lib/components/WorkspacePicker.svelte';
 	import WorkspaceCreate from './lib/components/WorkspaceCreate.svelte';
 	import PrebootLanding from './lib/components/PrebootLanding.svelte';
@@ -441,6 +444,11 @@
 			workspace.hydrated = true;
 			return;
 		}
+		// A remote window's backend calls only work once the SSH channel
+		// is up; the splash (with the status overlay on top) holds until
+		// then.
+		await remote.init(info);
+		await remote.waitUntilConnected();
 		workspace.workspaceName = info.workspaceName ?? info.workspaceId;
 		// Paint the workspace colour scheme before the chrome first
 		// renders so no frame shows the neutral fallback palette.
@@ -615,6 +623,7 @@
 	<BranchSwitcher />
 	<WorkspacePicker />
 	<WorkspaceCreate />
+	<RemoteConnect />
 	{#if companion.modalOpen}
 		<CompanionModal />
 	{/if}
@@ -622,6 +631,7 @@
 		<div class="toast" role="status">{workspace.toast}</div>
 	{/if}
 {/if}
+<RemoteStatusOverlay />
 
 <style>
 	.app {

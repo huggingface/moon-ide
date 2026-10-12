@@ -20,6 +20,7 @@ mod commands;
 mod events;
 mod focus_socket;
 mod remote_bridge;
+mod remote_workspace;
 mod shutdown;
 mod slack_poller;
 mod state;
@@ -34,7 +35,7 @@ use moon_coder::CoderHandle;
 use moon_core::app_state as core_app_state;
 use moon_protocol::workspace::validate_workspace_id;
 use moon_slack::{SlackClient, TokenStore};
-use state::{AppMode, AppState, PREBOOT_WORKSPACE_ID};
+use state::{AppMode, AppState, Backend, PREBOOT_WORKSPACE_ID};
 use tauri::{Manager, RunEvent};
 use tokio::net::UnixListener;
 
@@ -116,11 +117,14 @@ pub fn run() {
 		.invoke_handler(tauri::generate_handler![
 			commands::fs::fs_reveal_in_folder,
 			commands::rpc::rpc,
+			commands::remote::remote_status,
+			commands::remote::remote_reattach,
 			commands::app_info::app_info,
 			commands::app_state::app_state_load,
 			commands::app_state::app_state_save,
 			commands::workspace::workspace_catalog,
 			commands::workspace::workspace_create,
+			commands::workspace::workspace_add_remote,
 			commands::workspace::workspace_delete,
 			commands::workspace::workspace_rename,
 			commands::workspace::workspace_set_color,
@@ -289,6 +293,30 @@ pub fn run() {
 			);
 			let slack_state = state::SlackState::new(client_cell, poller.clone());
 
+			// A remote workspace (ADR 0095) runs on its server; this
+			// process only fronts it.
+			let remote = loaded_state
+				.workspaces
+				.iter()
+				.find(|m| m.id == workspace_id)
+				.and_then(|m| m.remote.clone());
+			if let Some(target) = remote {
+				return setup_remote(
+					app,
+					RemoteSetup {
+						target,
+						mode,
+						config_dir,
+						workspaces_dir,
+						slack_state,
+						listener: deferred_focus_listener,
+						editor_registry,
+						poller,
+						loaded_state,
+					},
+				);
+			}
+
 			let workspace_registry = moon_app::boot::new_registry(workspace_id.clone(), workspaces_dir.clone());
 
 			// Resolve the effective active provider for this
@@ -418,22 +446,35 @@ pub fn run() {
 			// before the first folder gets added.
 			workspace_registry.set_log_sink(logs.clone());
 
+			let core = std::sync::Arc::new(moon_app::AppCore {
+				workspaces: workspace_registry,
+				config_dir: config_dir.clone(),
+				workspaces_dir: workspaces_dir.clone(),
+				workspace_id: match &mode {
+					AppMode::Workspace { id } => Some(id.clone()),
+					AppMode::Preboot => None,
+				},
+				coder,
+				events,
+				preview_tunnels: moon_container::PreviewTunnels::new(),
+				logs,
+				terminals,
+				terminal_streams: Default::default(),
+				lsp: Default::default(),
+				log_streams: Default::default(),
+				fs_watcher,
+			});
 			let state = AppState::new(
 				config_dir.clone(),
 				workspaces_dir.clone(),
 				slack_state,
-				fs_watcher,
-				workspace_registry,
-				coder,
 				mode.clone(),
-				logs,
-				terminals,
-				events,
+				Backend::Local(core.clone()),
 			);
 			// `tokio::spawn` needs the runtime the setup hook (main
 			// thread) isn't on; `block_on` keeps the subscriptions
 			// synchronous so no early event is missed.
-			tauri::async_runtime::block_on(async { state.core.spawn_pumps() });
+			tauri::async_runtime::block_on(async { core.spawn_pumps() });
 			if let Some(abort) = focus_listener_abort {
 				*state.focus_listener.blocking_lock() = Some(abort);
 			}
@@ -451,7 +492,7 @@ pub fn run() {
 
 			// Agents open terminals through the registry they share
 			// with the terminal commands (ADR 0090).
-			state.core.install_agent_terminals();
+			core.install_agent_terminals();
 			app.manage(state);
 
 			// Reconnect to a remote relay bridge when this IDE holds a
@@ -544,7 +585,7 @@ pub fn run() {
 				// state changes — a previous session's `compose stop`
 				// landing mid-launch, an external `docker stop`, a
 				// daemon restart — not just IDE-initiated ones.
-				tauri::async_runtime::spawn(moon_app::container_events::watch(app.state::<AppState>().core.clone()));
+				tauri::async_runtime::spawn(moon_app::container_events::watch(core.clone()));
 				let app_handle = app.handle().clone();
 				tauri::async_runtime::spawn(async move {
 					let state = app_handle.state::<AppState>();
@@ -559,8 +600,8 @@ pub fn run() {
 					if let Some(id) = state.workspace_id() {
 						focus_socket::await_previous_shutdown(&state.workspaces_dir, id).await;
 					}
-					state.core.auto_resume_shell().await;
-					state.core.auto_resume_project_composes().await;
+					core.auto_resume_shell().await;
+					core.auto_resume_project_composes().await;
 				});
 			}
 
@@ -1148,6 +1189,60 @@ fn inline_workspace(workspaces_dir: &Utf8PathBuf, slug: &str) -> Option<Bootstra
 	}
 }
 
+/// What [`setup_remote`] takes over from the shared setup prologue.
+struct RemoteSetup {
+	target: moon_protocol::workspace::RemoteTarget,
+	mode: AppMode,
+	config_dir: Utf8PathBuf,
+	workspaces_dir: Utf8PathBuf,
+	slack_state: state::SlackState,
+	listener: Option<UnixListener>,
+	editor_registry: Arc<focus_socket::EditorRegistry>,
+	poller: slack_poller::PollerHandle,
+	loaded_state: moon_protocol::app_state::AppState,
+}
+
+/// Setup for a window fronting a remote workspace (ADR 0095): no local
+/// workspace process — no coder, folders, watchers or containers —
+/// just the SSH-backed channel plus the desktop-shell pieces.
+fn setup_remote(app: &mut tauri::App, setup: RemoteSetup) -> Result<(), Box<dyn std::error::Error>> {
+	let RemoteSetup {
+		target,
+		mode,
+		config_dir,
+		workspaces_dir,
+		slack_state,
+		listener,
+		editor_registry,
+		poller,
+		loaded_state,
+	} = setup;
+	let events: Arc<dyn moon_app::EventSink> = Arc::new(events::TauriEvents(app.handle().clone()));
+	// `AttachClient::spawn` needs the tokio runtime the setup hook
+	// isn't on.
+	let remote = tauri::async_runtime::block_on(async { remote_workspace::RemoteWorkspace::connect(&target, events) })?;
+	// Phones reach a remote workspace through its server's relay, not
+	// this desktop.
+	let focus_listener_abort = listener.map(|listener| {
+		focus_socket::spawn_focus_listener(
+			listener,
+			app.handle().clone(),
+			editor_registry,
+			Arc::new(remote_workspace::NoCompanion),
+		)
+	});
+	let workspace_id = target.workspace.clone();
+	let state = AppState::new(config_dir, workspaces_dir, slack_state, mode, Backend::Remote(remote));
+	if let Some(abort) = focus_listener_abort {
+		*state.focus_listener.blocking_lock() = Some(abort);
+	}
+	system_theme_watcher::spawn(app.handle().clone());
+	tauri::async_runtime::block_on(restore_session(&state, &workspace_id, &poller, &loaded_state));
+	app.manage(state);
+	tracing::info!(host = %target.host, workspace = %target.workspace, "moon-ide started as a remote front end");
+	Ok(())
+}
+
 /// Restore folders + UI state for the workspace this process
 /// owns. Best-effort: a missing or malformed `session.json`
 /// falls back to an empty workspace; the frontend's first
@@ -1165,10 +1260,12 @@ async fn restore_session(
 			moon_protocol::session::WorkspaceSession::default()
 		}
 	};
-	if !session.folders.is_empty() || session.active_folder_path.is_some() {
-		moon_app::boot::restore_folders(&state.workspaces, &session).await;
+	// A remote window's folders live on its server.
+	let has_folders = !session.folders.is_empty() || session.active_folder_path.is_some();
+	if let (true, Some(core)) = (has_folders, state.local_core()) {
+		moon_app::boot::restore_folders(&core.workspaces, &session).await;
 
-		let snap = state.workspaces.snapshot().await;
+		let snap = core.workspaces.snapshot().await;
 		tracing::info!(
 			workspace = %workspace_id,
 			folders = snap.folders.len(),
@@ -1176,7 +1273,7 @@ async fn restore_session(
 			"restored workspace folders"
 		);
 		let active_root = snap.active_folder.as_ref().map(std::path::PathBuf::from);
-		state.core.fs_watcher.set_root(active_root);
+		core.fs_watcher.set_root(active_root);
 	}
 
 	// Seed the poller from persisted UI state so a relaunch

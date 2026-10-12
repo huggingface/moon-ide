@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::workspace::WorkspaceId;
+use crate::workspace::{RemoteTarget, WorkspaceId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -29,6 +29,9 @@ pub struct AppInfo {
 	/// without a second IPC. `None` means "use the deterministic
 	/// hash-derived hue". `None` in preboot mode.
 	pub workspace_color: Option<String>,
+	/// Set when this window is a front end to a remote workspace
+	/// (ADR 0095).
+	pub remote: Option<RemoteTarget>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]

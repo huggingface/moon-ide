@@ -241,6 +241,7 @@ mod tests {
 						name: format!("a-{i}"),
 						last_active_at: i,
 						color: None,
+						remote: None,
 					});
 				})
 				.await
@@ -256,6 +257,7 @@ mod tests {
 						name: format!("b-{i}"),
 						last_active_at: i,
 						color: None,
+						remote: None,
 					});
 				})
 				.await

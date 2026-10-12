@@ -106,6 +106,23 @@ pub struct WorkspaceMeta {
 	#[serde(default)]
 	#[ts(optional)]
 	pub color: Option<String>,
+	/// Set for a remote workspace (ADR 0095): its workspace process
+	/// runs on `host` and this desktop attaches to it over SSH.
+	/// `None` for a workspace that runs on this machine.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[ts(optional)]
+	pub remote: Option<RemoteTarget>,
+}
+
+/// Where a remote workspace lives: an SSH destination (anything
+/// `ssh` accepts, including `~/.ssh/config` aliases) and the
+/// workspace's slug in that server's own catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteTarget {
+	pub host: String,
+	pub workspace: WorkspaceId,
 }
 
 /// The running process's single workspace, holding zero or

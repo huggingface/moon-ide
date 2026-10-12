@@ -31,15 +31,25 @@ files in and out of it.
   container / compose / ports / lifecycle and workspace folders + fs
   watcher groups.
 
-## 16.3 — Server and attach
+## 16.3 — Server and attach (landed)
 
 - `moon-remote serve` hosts the full surface (not just the
   companion subset) next to the relay client.
 - `moon-remote attach --workspace <slug>`: stdio JSON-RPC bridged to
   the workspace process's local socket, launching `serve` if needed.
-- Desktop: "Connect to remote workspace…" (host + workspace), an SSH
-  `ControlMaster` connection, a window whose transport is that
-  connection; reconnect after network loss / sleep.
+- Desktop: "Workspace: Open remote workspace…" (host + workspace)
+  adds a catalog entry with a `remote` target; its window runs no
+  local workspace process and forwards `rpc` over an SSH
+  `ControlMaster` connection; reconnect with backoff after network
+  loss / sleep, page reload on reconnect so no store is stale.
+- Requirements on the server: `moon-remote` on the login-shell PATH,
+  the workspace created there (`moon-remote workspace-add`), key-based
+  SSH (`BatchMode`), and a Secret Service for the keyring (ADR 0035
+  recipe). Relay enrollment is optional.
+- Known gaps, picked up by later sub-phases: image / PDF previews
+  (asset protocol reads the desktop's disk), "Add folder" (opens a
+  local folder dialog), `$GIT_EDITOR` forwarding from remote
+  terminals.
 
 ## 16.4 — Streams
 
@@ -60,7 +70,7 @@ files in and out of it.
   progress and cancel, temp-file + rename, confirm before overwrite.
   Works for local workspaces as a copy.
 
-## 16.7 — Attach / takeover
+## 16.7 — Attach / takeover (landed with 16.3)
 
 - One attached desktop per workspace; a second attach detaches the
   first, which shows a "detached — attach again" state. UI state

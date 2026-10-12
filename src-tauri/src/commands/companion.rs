@@ -236,7 +236,7 @@ pub async fn companion_enroll(
 	// the phone's switcher shows launchable workspaces even when no
 	// process is listening. The currently-open workspace (`slug`) is
 	// marked `live: true`; the rest are `live: false`.
-	let slug = state.workspaces.workspace_id().await;
+	let slug = state.workspace_id().unwrap_or_default().to_owned();
 	let catalog = moon_core::app_state::load(&state.config_dir)
 		.await
 		.ok()
