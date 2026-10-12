@@ -1,5 +1,4 @@
-import { convertFileSrc } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { fileUrl, subscribe } from './transport';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { confirm, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { SvelteMap } from 'svelte/reactivity';
@@ -2234,7 +2233,7 @@ class WorkspaceState {
 		}
 		this.browserTabsWired = true;
 		try {
-			await listen<BrowserTabsChanged>('browser:tabs', ({ payload }) => {
+			await subscribe('browser:tabs', (payload: BrowserTabsChanged) => {
 				this.applyBrowserTabs(payload);
 			});
 			await wireBrowserBridge();
@@ -2253,8 +2252,8 @@ class WorkspaceState {
 		}
 		this.editorForwardWired = true;
 		try {
-			await listen<EditRequest>('editor:request', (event) => {
-				void this.handleEditorRequest(event.payload);
+			await subscribe('editor:request', (payload: EditRequest) => {
+				void this.handleEditorRequest(payload);
 			});
 		} catch {
 			// Event bind failed — the `moon-edit` shim will time
@@ -3846,9 +3845,9 @@ class WorkspaceState {
 		}
 		this.#folderRefreshWired = true;
 		try {
-			await listen<{ paths: string[]; kinds: (LspFileChangeKind | null)[]; topologyChanged: boolean }>(
+			await subscribe(
 				'fs:changed',
-				({ payload }) => {
+				(payload: { paths: string[]; kinds: (LspFileChangeKind | null)[]; topologyChanged: boolean }) => {
 					const subset = payload.paths.length > 0 ? new Set(payload.paths) : null;
 					// Sample up to 5 paths so a `git checkout` burst
 					// doesn't dump dozens of lines per emit; the user
@@ -3973,7 +3972,7 @@ class WorkspaceState {
 		}
 		this.#lspListenersWired = true;
 		try {
-			await listen<LspDiagnosticsEvent>('lsp:diagnostics', ({ payload }) => {
+			await subscribe('lsp:diagnostics', (payload: LspDiagnosticsEvent) => {
 				// Update the per-producer slice for this path,
 				// then recompute the flat union the editor reads.
 				// Empty `diagnostics` from a producer is a real
@@ -3999,7 +3998,7 @@ class WorkspaceState {
 				nextDiagnostics.set(payload.path, flat);
 				this.diagnostics = nextDiagnostics;
 			});
-			await listen<LspStatusEvent>('lsp:status', ({ payload }) => {
+			await subscribe('lsp:status', (payload: LspStatusEvent) => {
 				const prev = this.lspStatuses.get(payload.languageId)?.status ?? null;
 				const next = new Map(this.lspStatuses);
 				next.set(payload.languageId, payload);
@@ -4123,7 +4122,7 @@ class WorkspaceState {
 			this.#coderRefreshTimer = setTimeout(flush, 200);
 		};
 		try {
-			await listen<CoderRefreshEnvelope>('coder:event', ({ payload }) => {
+			await subscribe('coder:event', (payload: CoderRefreshEnvelope) => {
 				const kind = payload.event.kind;
 				if (kind === 'tool_call') {
 					const target = this.resolveCoderEventTargetFolder(payload);
@@ -5253,7 +5252,7 @@ class WorkspaceState {
 			kind,
 			isUntitled: false,
 			text: '',
-			previewUrl: convertFileSrc(absolute),
+			previewUrl: fileUrl(absolute),
 			loadedFingerprint: fingerprint(''),
 			loadedMtimeMs: null,
 			isDirty: false,
@@ -5325,7 +5324,7 @@ class WorkspaceState {
 			}
 			const absolute = await ipc.fs.absolutePath(path);
 			this.openFiles = this.openFiles.map((f) =>
-				f.path === path ? { ...f, previewUrl: `${convertFileSrc(absolute)}?t=${token}`, previewToken: token } : f,
+				f.path === path ? { ...f, previewUrl: `${fileUrl(absolute)}?t=${token}`, previewToken: token } : f,
 			);
 		} catch (err) {
 			frontendLog('fs-watcher', 'warn', `preview reload of ${path} failed: ${formatError(err)}`);
@@ -7148,7 +7147,7 @@ class WorkspaceState {
 		try {
 			// Linux runtime flips arrive via this event (the desktop
 			// shell's ashpd watcher re-emits the XDG portal signal).
-			await listen<SystemTheme>('system:theme-changed', ({ payload }) => {
+			await subscribe('system:theme-changed', (payload: SystemTheme) => {
 				this.updateSystemPrefersDark(resolveSystemTheme(payload));
 			});
 		} catch {

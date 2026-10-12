@@ -40,7 +40,7 @@
 //! alive across tab switches and keeps its scrollback. See
 //! `BottomPanel.svelte`.
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 import { SvelteMap } from 'svelte/reactivity';
 
 import { bottomPanel, type TerminalTab } from './bottomPanel.svelte';
@@ -113,7 +113,7 @@ class TerminalStore {
 	 * (never wrong) for shells whose prompt we don't recognise.
 	 * Not reactive: nothing renders it. */
 	#commands = new Map<string, string>();
-	#unlisten: UnlistenFn[] = [];
+	#unlisten: Unsubscribe[] = [];
 	#runtimeWired = false;
 	#onChange: (() => void) | null = null;
 	/** Terminal tabs hydrated from disk at launch, waiting for
@@ -147,23 +147,23 @@ class TerminalStore {
 		}
 		this.#runtimeWired = true;
 		try {
-			const onOutput = await listen<TerminalOutput>(OUTPUT_EVENT, (event) => {
-				this.#dispatchOutput(event.payload);
+			const onOutput = await subscribe(OUTPUT_EVENT, (payload: TerminalOutput) => {
+				this.#dispatchOutput(payload);
 			});
-			const onClosed = await listen<TerminalClosed>(CLOSED_EVENT, (event) => {
-				void this.#handleClosed(event.payload);
+			const onClosed = await subscribe(CLOSED_EVENT, (payload: TerminalClosed) => {
+				void this.#handleClosed(payload);
 			});
-			const onContainerState = await listen<ContainerStateChange>(CONTAINER_STATE_EVENT, (event) => {
-				void this.#reconcileContainerState(event.payload.status.state);
+			const onContainerState = await subscribe(CONTAINER_STATE_EVENT, (payload: ContainerStateChange) => {
+				void this.#reconcileContainerState(payload.status.state);
 			});
-			const onAgentOpened = await listen<TerminalAgentOpened>(AGENT_OPENED_EVENT, (event) => {
-				this.#adoptAgentTerminal(event.payload);
+			const onAgentOpened = await subscribe(AGENT_OPENED_EVENT, (payload: TerminalAgentOpened) => {
+				this.#adoptAgentTerminal(payload);
 			});
-			const onRespawned = await listen<TerminalRespawned>(RESPAWNED_EVENT, (event) => {
-				this.#handleRespawned(event.payload.stream_id);
+			const onRespawned = await subscribe(RESPAWNED_EVENT, (payload: TerminalRespawned) => {
+				this.#handleRespawned(payload.stream_id);
 			});
-			const onRemoved = await listen<TerminalRemoved>(REMOVED_EVENT, (event) => {
-				this.#forgetLocal(event.payload.stream_id);
+			const onRemoved = await subscribe(REMOVED_EVENT, (payload: TerminalRemoved) => {
+				this.#forgetLocal(payload.stream_id);
 			});
 			this.#unlisten.push(onOutput, onClosed, onContainerState, onAgentOpened, onRespawned, onRemoved);
 		} catch {

@@ -15,7 +15,7 @@
 //! `wireRuntime` remains as a backstop for anything the watcher
 //! misses; there's no periodic poller.
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 
 import { ipc } from './ipc';
 import { formatError, type ContainerStateChange, type ContainerStatus } from './protocol';
@@ -47,7 +47,7 @@ class ContainerPanelState {
 	previewVisible = $state(false);
 	previewError = $state<string | null>(null);
 
-	#unlisten: UnlistenFn[] = [];
+	#unlisten: Unsubscribe[] = [];
 	#runtimeWired = false;
 	/** In-flight `refresh()` promise. Callers that need a truthful
 	 *  status answer (the terminal-spawn helpers in particular) await
@@ -101,7 +101,7 @@ class ContainerPanelState {
 		}
 		return new Promise<boolean>((resolve) => {
 			let settled = false;
-			let unlistenPromise: Promise<UnlistenFn> | null = null;
+			let unlistenPromise: Promise<Unsubscribe> | null = null;
 			const cleanup = () => {
 				if (unlistenPromise) {
 					void unlistenPromise.then((unlisten) => unlisten());
@@ -115,16 +115,16 @@ class ContainerPanelState {
 				cleanup();
 				resolve(false);
 			}, timeoutMs);
-			unlistenPromise = listen<ContainerStateChange>(CONTAINER_STATE_EVENT, (event) => {
+			unlistenPromise = subscribe(CONTAINER_STATE_EVENT, (payload: ContainerStateChange) => {
 				if (settled) {
 					return;
 				}
-				if (event.payload.status.state === 'running') {
+				if (payload.status.state === 'running') {
 					settled = true;
 					clearTimeout(timer);
 					cleanup();
 					resolve(true);
-				} else if (event.payload.status.state === 'stopped' || event.payload.status.state === 'failed') {
+				} else if (payload.status.state === 'stopped' || payload.status.state === 'failed') {
 					// The shell settled on a non-running state — no
 					// point waiting further.
 					settled = true;
@@ -146,8 +146,8 @@ class ContainerPanelState {
 		}
 		this.#runtimeWired = true;
 		try {
-			const unlisten = await listen<ContainerStateChange>(CONTAINER_STATE_EVENT, (event) => {
-				this.status = event.payload.status;
+			const unlisten = await subscribe(CONTAINER_STATE_EVENT, (payload: ContainerStateChange) => {
+				this.status = payload.status;
 			});
 			this.#unlisten.push(unlisten);
 		} catch {

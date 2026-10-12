@@ -15,7 +15,7 @@
 //! See [specs/containers.md](../../specs/containers.md) §
 //! "Network and port forwarding".
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 
 import { ipc } from './ipc';
 import {
@@ -48,7 +48,7 @@ class PortsStore {
 	 *  inline; cleared when the user retries. */
 	conflicts = $state<ForwardedPort[]>([]);
 
-	#unlisten: UnlistenFn[] = [];
+	#unlisten: Unsubscribe[] = [];
 	#runtimeWired = false;
 
 	get forwards(): readonly ForwardedPort[] {
@@ -67,8 +67,8 @@ class PortsStore {
 		}
 		this.#runtimeWired = true;
 		try {
-			const unlisten = await listen<ForwardedPortStatus[]>(PORTS_STATE_EVENT, (event) => {
-				this.status = event.payload;
+			const unlisten = await subscribe(PORTS_STATE_EVENT, (payload: ForwardedPortStatus[]) => {
+				this.status = payload;
 			});
 			this.#unlisten.push(unlisten);
 		} catch {

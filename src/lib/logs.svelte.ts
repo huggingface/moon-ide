@@ -24,7 +24,7 @@
 //! is fine for a debug pane: the user always wants the most recent
 //! activity.
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
@@ -55,7 +55,7 @@ class DiagLogsStore {
 	 * sources are seeded from `logs_sources` on first init;
 	 * subsequent ones grow on every emit. */
 	#sources = new SvelteSet<string>();
-	#unlisten: UnlistenFn | null = null;
+	#unlisten: Unsubscribe | null = null;
 	#started = false;
 	/** Live entries that arrived from the Tauri pump and haven't
 	 * been folded into [`#bySource`] yet. Drained on the next
@@ -74,8 +74,8 @@ class DiagLogsStore {
 			return;
 		}
 		this.#started = true;
-		this.#unlisten = await listen<LogEntry>(ENTRY_EVENT, (event) => {
-			this.#enqueue(event.payload);
+		this.#unlisten = await subscribe(ENTRY_EVENT, (payload: LogEntry) => {
+			this.#enqueue(payload);
 		});
 		try {
 			const sources = await ipc.logs.sources();

@@ -16,7 +16,7 @@
 //!
 //! See `specs/coder.md` and `specs/test-plans/0039-coder-skeleton.md`.
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
 import {
@@ -1472,7 +1472,7 @@ export class CoderPanelState {
 	composerEl = $state<HTMLTextAreaElement | null>(null);
 
 	/** Tauri-listener cleanup; one entry per `wireRuntime` call. */
-	#unlisten: UnlistenFn[] = [];
+	#unlisten: Unsubscribe[] = [];
 	#listenersWired = false;
 	/** Flipped to `true` by `markWorkspaceReady()` once the
 	 *  `restoreAppState` folder-restore loop has finished mutating
@@ -2383,8 +2383,8 @@ export class CoderPanelState {
 		}
 		this.#listenersWired = true;
 		try {
-			const unlisten = await listen<CoderEventEnvelope>(CODER_EVENT_CHANNEL, (event) => {
-				this.#dispatchEnvelope(event.payload);
+			const unlisten = await subscribe(CODER_EVENT_CHANNEL, (payload: CoderEventEnvelope) => {
+				this.#dispatchEnvelope(payload);
 			});
 			this.#unlisten.push(unlisten);
 		} catch {
@@ -2401,7 +2401,7 @@ export class CoderPanelState {
 		// the daemon transitions on its own. Same `container:state`
 		// channel `container.svelte.ts` listens to.
 		try {
-			const unlisten = await listen('container:state', () => {
+			const unlisten = await subscribe('container:state', () => {
 				void this.refreshStatus();
 			});
 			this.#unlisten.push(unlisten);

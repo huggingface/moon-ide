@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { call } from './transport';
 
 import type {
 	AppInfo,
@@ -95,45 +95,45 @@ import type {
 	NextEditServerStartParams,
 } from './protocol';
 
-// Single auditable surface for all Tauri commands. Components MUST go
-// through this. Process-per-workspace (Phase 7) made every workspace
-// scoped command implicit on the process's own workspace, so no
-// `workspaceId` is threaded through the wire — `invoke` everywhere.
+// Single auditable surface for all workspace-process commands. Components
+// MUST go through this. Process-per-workspace (Phase 7) made every
+// workspace scoped command implicit on the process's own workspace, so no
+// `workspaceId` is threaded through the wire.
 export const ipc = {
 	// `app_info` is the very first IPC the frontend issues on
 	// hydrate to learn whether this process is in workspace mode
 	// or in preboot (no `--workspace` arg, empty catalog).
-	appInfo: () => invoke<AppInfo>('app_info'),
+	appInfo: () => call<AppInfo>('app_info'),
 	workspace: {
-		openLocal: (path: string) => invoke<Workspace>('workspace_open_local', { path }),
-		removeFolder: (path: string) => invoke<Workspace>('workspace_remove_folder', { path }),
-		setActiveFolder: (path: string) => invoke<Workspace>('workspace_set_active_folder', { path }),
-		syncActiveWorktreeBranch: () => invoke<Workspace>('workspace_sync_active_worktree_branch'),
-		active: () => invoke<Workspace | null>('workspace_active'),
-		list: () => invoke<Workspace[]>('workspace_list'),
+		openLocal: (path: string) => call<Workspace>('workspace_open_local', { path }),
+		removeFolder: (path: string) => call<Workspace>('workspace_remove_folder', { path }),
+		setActiveFolder: (path: string) => call<Workspace>('workspace_set_active_folder', { path }),
+		syncActiveWorktreeBranch: () => call<Workspace>('workspace_sync_active_worktree_branch'),
+		active: () => call<Workspace | null>('workspace_active'),
+		list: () => call<Workspace[]>('workspace_list'),
 	},
 	// Catalog of every workspace on the machine + create / delete /
 	// rename. Cross-process operations: writes to `state.json` are
 	// visible to sibling processes the next time they re-read the
 	// catalog (the picker re-reads on every open).
 	workspaces: {
-		catalog: () => invoke<WorkspaceMeta[]>('workspace_catalog'),
+		catalog: () => call<WorkspaceMeta[]>('workspace_catalog'),
 		// Idempotent create-or-switch: returns the existing
 		// catalog entry if the slug is already taken, otherwise
 		// appends a new one. Pass an empty `slug` to auto-derive
 		// it from `name`. Pair with `window.open` for the
 		// "Ctrl+Shift+N" flow — together they create a new
 		// workspace or focus an existing one transparently.
-		create: (slug: string, name: string) => invoke<WorkspaceMeta>('workspace_create', { slug, name }),
-		delete: (slug: string) => invoke<void>('workspace_delete', { slug }),
-		rename: (slug: string, name: string) => invoke<WorkspaceMeta>('workspace_rename', { slug, name }),
+		create: (slug: string, name: string) => call<WorkspaceMeta>('workspace_create', { slug, name }),
+		delete: (slug: string) => call<void>('workspace_delete', { slug }),
+		rename: (slug: string, name: string) => call<WorkspaceMeta>('workspace_rename', { slug, name }),
 		// Update the badge colour for `slug`. Pass `''` (empty
 		// string) to clear back to the deterministic hash-derived
 		// colour. When `slug` matches the running process's own
 		// workspace, the window icon repaints immediately —
 		// sibling processes pick up the change on their next
 		// launch.
-		setColor: (slug: string, color: string) => invoke<WorkspaceMeta>('workspace_set_color', { slug, color }),
+		setColor: (slug: string, color: string) => call<WorkspaceMeta>('workspace_set_color', { slug, color }),
 	},
 	// Window management. Process-per-workspace: `open` either
 	// focuses the sibling process that already owns `slug` or
@@ -141,82 +141,81 @@ export const ipc = {
 	// `close` exits this process; `setTitle` rewrites the
 	// calling window's OS title.
 	window: {
-		open: (slug: string) => invoke<void>('window_open', { workspaceId: slug }),
-		close: () => invoke<void>('window_close'),
-		setTitle: (title: string) => invoke<void>('window_set_title', { title }),
+		open: (slug: string) => call<void>('window_open', { workspaceId: slug }),
+		close: () => call<void>('window_close'),
+		setTitle: (title: string) => call<void>('window_set_title', { title }),
 	},
 	fs: {
-		readDir: (path: string) => invoke<DirEntry[]>('fs_read_dir', { path }),
-		collectPaths: (maxDepth: number) => invoke<CollectPathsResult>('fs_collect_paths', { maxDepth }),
+		readDir: (path: string) => call<DirEntry[]>('fs_read_dir', { path }),
+		collectPaths: (maxDepth: number) => call<CollectPathsResult>('fs_collect_paths', { maxDepth }),
 		collectPathsUnder: (rel: string, maxDepth: number) =>
-			invoke<CollectPathsResult>('fs_collect_paths_under', { rel, maxDepth }),
-		readFile: (path: string) => invoke<ReadFileResult>('fs_read_file', { path }),
-		writeFile: (path: string, text: string) => invoke<WriteFileResult>('fs_write_file', { path, text }),
+			call<CollectPathsResult>('fs_collect_paths_under', { rel, maxDepth }),
+		readFile: (path: string) => call<ReadFileResult>('fs_read_file', { path }),
+		writeFile: (path: string, text: string) => call<WriteFileResult>('fs_write_file', { path, text }),
 		// Host-direct read/write for files outside every bound folder. Bypasses
 		// the active `WorkspaceHost` so an external path stays readable when the
 		// active folder runs in a container (the in-container host can't see
 		// paths outside the bind mount). See `Workspace::openHostFile`.
-		readFileHost: (path: string) => invoke<ReadFileResult>('fs_read_file_host', { path }),
-		writeFileHost: (path: string, text: string) => invoke<WriteFileResult>('fs_write_file_host', { path, text }),
-		createFile: (path: string) => invoke<void>('fs_create_file', { path }),
-		createDir: (path: string) => invoke<void>('fs_create_dir', { path }),
-		rename: (from: string, to: string) => invoke<void>('fs_rename', { from, to }),
-		stat: (path: string) => invoke<StatResult>('fs_stat', { path }),
-		absolutePath: (path: string) => invoke<string>('fs_absolute_path', { path }),
+		readFileHost: (path: string) => call<ReadFileResult>('fs_read_file_host', { path }),
+		writeFileHost: (path: string, text: string) => call<WriteFileResult>('fs_write_file_host', { path, text }),
+		createFile: (path: string) => call<void>('fs_create_file', { path }),
+		createDir: (path: string) => call<void>('fs_create_dir', { path }),
+		rename: (from: string, to: string) => call<void>('fs_rename', { from, to }),
+		stat: (path: string) => call<StatResult>('fs_stat', { path }),
+		absolutePath: (path: string) => call<string>('fs_absolute_path', { path }),
 		// Returns a `data:` URL. Only for previews outside every bound
-		// folder — in-workspace files stream via `convertFileSrc`.
-		readPreviewHost: (path: string) => invoke<string>('fs_read_preview_host', { path }),
-		trash: (path: string) => invoke<void>('fs_trash', { path }),
-		delete: (path: string) => invoke<void>('fs_delete', { path }),
+		// folder — in-workspace files stream via `fileUrl`.
+		readPreviewHost: (path: string) => call<string>('fs_read_preview_host', { path }),
+		trash: (path: string) => call<void>('fs_trash', { path }),
+		delete: (path: string) => call<void>('fs_delete', { path }),
 		// Reveal an absolute host path in the host's file manager
 		// (Explorer / Finder / FileManager1 dbus). Callers resolve the
 		// workspace-relative path via `fs_absolute_path` first.
-		revealInFolder: (path: string) => invoke<void>('fs_reveal_in_folder', { path }),
-		gitStatusEntries: (paths: string[]) => invoke<GitStatusEntry[]>('fs_git_status_entries', { paths }),
-		gitExcludePath: () => invoke<string | null>('fs_git_exclude_path'),
-		gitChangeSummary: (folderPath: string) => invoke<GitChangeSummary>('fs_git_change_summary', { folderPath }),
-		gitRestorePaths: (paths: string[]) => invoke<void>('fs_git_restore_paths', { paths }),
-		gitAddPaths: (paths: string[]) => invoke<void>('fs_git_add_paths', { paths }),
-		gitBlame: (path: string) => invoke<GitFileBlame | null>('fs_git_blame', { path }),
+		revealInFolder: (path: string) => call<void>('fs_reveal_in_folder', { path }),
+		gitStatusEntries: (paths: string[]) => call<GitStatusEntry[]>('fs_git_status_entries', { paths }),
+		gitExcludePath: () => call<string | null>('fs_git_exclude_path'),
+		gitChangeSummary: (folderPath: string) => call<GitChangeSummary>('fs_git_change_summary', { folderPath }),
+		gitRestorePaths: (paths: string[]) => call<void>('fs_git_restore_paths', { paths }),
+		gitAddPaths: (paths: string[]) => call<void>('fs_git_add_paths', { paths }),
+		gitBlame: (path: string) => call<GitFileBlame | null>('fs_git_blame', { path }),
 		gitPermalink: (path: string, startLine: number, endLine: number) =>
-			invoke<GitPermalink | null>('fs_git_permalink', { path, startLine, endLine }),
-		gitBlobSha: (path: string) => invoke<string | null>('fs_git_blob_sha', { path }),
-		publishPrReview: (request: PublishReviewRequest) =>
-			invoke<PublishReviewResult>('fs_publish_pr_review', { request }),
-		gitHeadContent: (path: string) => invoke<string | null>('fs_git_head_content', { path }),
-		gitRefContent: (rev: string, path: string) => invoke<string | null>('fs_git_ref_content', { rev, path }),
-		gitDefaultBranchDiff: () => invoke<BranchDiffStatus | null>('fs_git_default_branch_diff'),
-		gitRemoteWebUrl: () => invoke<string | null>('fs_git_remote_web_url'),
-		gitBranch: () => invoke<GitBranchInfo>('fs_git_branch'),
-		gitCommit: (message: string, amend: boolean) => invoke<GitCommitResult>('fs_git_commit', { message, amend }),
+			call<GitPermalink | null>('fs_git_permalink', { path, startLine, endLine }),
+		gitBlobSha: (path: string) => call<string | null>('fs_git_blob_sha', { path }),
+		publishPrReview: (request: PublishReviewRequest) => call<PublishReviewResult>('fs_publish_pr_review', { request }),
+		gitHeadContent: (path: string) => call<string | null>('fs_git_head_content', { path }),
+		gitRefContent: (rev: string, path: string) => call<string | null>('fs_git_ref_content', { rev, path }),
+		gitDefaultBranchDiff: () => call<BranchDiffStatus | null>('fs_git_default_branch_diff'),
+		gitRemoteWebUrl: () => call<string | null>('fs_git_remote_web_url'),
+		gitBranch: () => call<GitBranchInfo>('fs_git_branch'),
+		gitCommit: (message: string, amend: boolean) => call<GitCommitResult>('fs_git_commit', { message, amend }),
 		gitCommitOnNewBranch: (branch: string, message: string) =>
-			invoke<GitCommitResult>('fs_git_commit_on_new_branch', { branch, message }),
-		gitWorktreeAdd: (path: string, branch: string) => invoke<GitWorktree>('fs_git_worktree_add', { path, branch }),
-		gitWorktreeList: () => invoke<GitWorktree[]>('fs_git_worktree_list'),
-		gitWorktreeRemove: (path: string, force: boolean) => invoke<void>('fs_git_worktree_remove', { path, force }),
-		gitPush: () => invoke<void>('fs_git_push'),
-		gitPublishBranch: () => invoke<void>('fs_git_publish_branch'),
-		gitPull: () => invoke<void>('fs_git_pull'),
-		gitMergeDefaultBranch: (remoteRef: string) => invoke<void>('fs_git_merge_default_branch', { remoteRef }),
-		gitMergeState: () => invoke<GitMergeState>('fs_git_merge_state'),
-		gitMergeAbort: () => invoke<void>('fs_git_merge_abort'),
-		gitFetch: () => invoke<void>('fs_git_fetch'),
-		gitHeadCommitMessage: () => invoke<string>('fs_git_head_commit_message'),
-		gitLog: (limit?: number) => invoke<CommitEntry[]>('fs_git_log', { limit: limit ?? null }),
-		gitCommitDiff: (sha: string) => invoke<CommitDiff | null>('fs_git_commit_diff', { sha }),
-		branchList: (prScope: PrListScope) => invoke<BranchList>('fs_branch_list', { prScope }),
-		gitExistingPrUrl: () => invoke<string | null>('fs_git_existing_pr_url'),
-		branchSwitch: (target: BranchSwitchTarget) => invoke<void>('fs_branch_switch', { target }),
+			call<GitCommitResult>('fs_git_commit_on_new_branch', { branch, message }),
+		gitWorktreeAdd: (path: string, branch: string) => call<GitWorktree>('fs_git_worktree_add', { path, branch }),
+		gitWorktreeList: () => call<GitWorktree[]>('fs_git_worktree_list'),
+		gitWorktreeRemove: (path: string, force: boolean) => call<void>('fs_git_worktree_remove', { path, force }),
+		gitPush: () => call<void>('fs_git_push'),
+		gitPublishBranch: () => call<void>('fs_git_publish_branch'),
+		gitPull: () => call<void>('fs_git_pull'),
+		gitMergeDefaultBranch: (remoteRef: string) => call<void>('fs_git_merge_default_branch', { remoteRef }),
+		gitMergeState: () => call<GitMergeState>('fs_git_merge_state'),
+		gitMergeAbort: () => call<void>('fs_git_merge_abort'),
+		gitFetch: () => call<void>('fs_git_fetch'),
+		gitHeadCommitMessage: () => call<string>('fs_git_head_commit_message'),
+		gitLog: (limit?: number) => call<CommitEntry[]>('fs_git_log', { limit: limit ?? null }),
+		gitCommitDiff: (sha: string) => call<CommitDiff | null>('fs_git_commit_diff', { sha }),
+		branchList: (prScope: PrListScope) => call<BranchList>('fs_branch_list', { prScope }),
+		gitExistingPrUrl: () => call<string | null>('fs_git_existing_pr_url'),
+		branchSwitch: (target: BranchSwitchTarget) => call<void>('fs_branch_switch', { target }),
 	},
 	search: {
-		files: (options: FileSearchOptions) => invoke<FileSearchResult[]>('search_files', { options }),
-		content: (options: ContentSearchOptions) => invoke<ContentSearchResult>('search_content', { options }),
+		files: (options: FileSearchOptions) => call<FileSearchResult[]>('search_files', { options }),
+		content: (options: ContentSearchOptions) => call<ContentSearchResult>('search_content', { options }),
 		replaceContent: (options: ContentReplaceOptions) =>
-			invoke<ContentReplaceResult>('search_replace_content', { options }),
+			call<ContentReplaceResult>('search_replace_content', { options }),
 	},
 	appState: {
-		load: () => invoke<AppState>('app_state_load'),
-		save: (appState: AppState) => invoke<void>('app_state_save', { appState }),
+		load: () => call<AppState>('app_state_load'),
+		save: (appState: AppState) => call<void>('app_state_save', { appState }),
 	},
 	session: {
 		// Per-workspace UI session blob (folders bound, tabs,
@@ -224,14 +223,14 @@ export const ipc = {
 		// `<workspaces_dir>/<id>/session.json`. Process-per-
 		// workspace makes the workspace id implicit — the
 		// backend reads it from `state.workspace_id()`.
-		load: () => invoke<WorkspaceSession>('session_load'),
-		save: (session: WorkspaceSession) => invoke<void>('session_save', { session }),
+		load: () => call<WorkspaceSession>('session_load'),
+		save: (session: WorkspaceSession) => call<void>('session_save', { session }),
 	},
 	system: {
-		theme: () => invoke<SystemTheme>('system_theme'),
+		theme: () => call<SystemTheme>('system_theme'),
 	},
 	editorconfig: {
-		forPath: (path: string) => invoke<EditorConfig>('editorconfig_for_path', { path }),
+		forPath: (path: string) => call<EditorConfig>('editorconfig_for_path', { path }),
 	},
 	editorForward: {
 		// Resolve a pending `editor:request` event from the
@@ -242,94 +241,94 @@ export const ipc = {
 		// Returns `false` if the id was unknown (already
 		// resolved, listener gone) — both cases are benign,
 		// the frontend treats them as success. See ADR 0021.
-		finish: (id: string) => invoke<boolean>('editor_forward_finish', { id }),
-		cancel: (id: string) => invoke<boolean>('editor_forward_cancel', { id }),
+		finish: (id: string) => call<boolean>('editor_forward_finish', { id }),
+		cancel: (id: string) => call<boolean>('editor_forward_cancel', { id }),
 	},
 	container: {
-		status: () => invoke<ContainerStatus>('container_status'),
-		setup: () => invoke<ContainerStatus>('container_setup'),
-		pause: () => invoke<ContainerStatus>('container_pause'),
-		resume: () => invoke<ContainerStatus>('container_resume'),
-		rebuild: () => invoke<ContainerStatus>('container_rebuild'),
-		stop: () => invoke<ContainerStatus>('container_stop'),
-		teardown: () => invoke<ContainerStatus>('container_teardown'),
-		applyBoundFolders: () => invoke<ContainerStatus>('container_apply_bound_folders'),
-		renderCompose: () => invoke<string>('container_render_compose'),
+		status: () => call<ContainerStatus>('container_status'),
+		setup: () => call<ContainerStatus>('container_setup'),
+		pause: () => call<ContainerStatus>('container_pause'),
+		resume: () => call<ContainerStatus>('container_resume'),
+		rebuild: () => call<ContainerStatus>('container_rebuild'),
+		stop: () => call<ContainerStatus>('container_stop'),
+		teardown: () => call<ContainerStatus>('container_teardown'),
+		applyBoundFolders: () => call<ContainerStatus>('container_apply_bound_folders'),
+		renderCompose: () => call<string>('container_render_compose'),
 	},
 	projectCompose: {
-		status: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_status', { folderPath }),
-		up: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_up', { folderPath }),
-		pause: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_pause', { folderPath }),
-		resume: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_resume', { folderPath }),
-		rebuild: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_rebuild', { folderPath }),
-		stop: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_stop', { folderPath }),
-		down: (folderPath: string) => invoke<ProjectComposeStatus>('project_compose_down', { folderPath }),
+		status: (folderPath: string) => call<ProjectComposeStatus>('project_compose_status', { folderPath }),
+		up: (folderPath: string) => call<ProjectComposeStatus>('project_compose_up', { folderPath }),
+		pause: (folderPath: string) => call<ProjectComposeStatus>('project_compose_pause', { folderPath }),
+		resume: (folderPath: string) => call<ProjectComposeStatus>('project_compose_resume', { folderPath }),
+		rebuild: (folderPath: string) => call<ProjectComposeStatus>('project_compose_rebuild', { folderPath }),
+		stop: (folderPath: string) => call<ProjectComposeStatus>('project_compose_stop', { folderPath }),
+		down: (folderPath: string) => call<ProjectComposeStatus>('project_compose_down', { folderPath }),
 		serviceStart: (folderPath: string, service: string) =>
-			invoke<ProjectComposeStatus>('project_compose_service_start', { folderPath, service }),
+			call<ProjectComposeStatus>('project_compose_service_start', { folderPath, service }),
 		serviceStop: (folderPath: string, service: string) =>
-			invoke<ProjectComposeStatus>('project_compose_service_stop', { folderPath, service }),
+			call<ProjectComposeStatus>('project_compose_service_stop', { folderPath, service }),
 		serviceRestart: (folderPath: string, service: string) =>
-			invoke<ProjectComposeStatus>('project_compose_service_restart', { folderPath, service }),
+			call<ProjectComposeStatus>('project_compose_service_restart', { folderPath, service }),
 		serviceRecreate: (folderPath: string, service: string) =>
-			invoke<ProjectComposeStatus>('project_compose_service_recreate', { folderPath, service }),
+			call<ProjectComposeStatus>('project_compose_service_recreate', { folderPath, service }),
 	},
 	browser: {
 		/** Turn a URL into one the webview can load: unchanged for
 		 *  `inContainer = false`, otherwise rewritten onto a host
 		 *  loopback tunnel that dials from inside the workspace
 		 *  shell (ADR 0088). */
-		resolveUrl: (url: string, inContainer: boolean) => invoke<string>('browser_resolve_url', { url, inContainer }),
+		resolveUrl: (url: string, inContainer: boolean) => call<string>('browser_resolve_url', { url, inContainer }),
 		// Tab registry (ADR 0088). Mutations answer via `browser:tabs`.
-		list: () => invoke<BrowserTab[]>('browser_tabs_list'),
+		list: () => call<BrowserTab[]>('browser_tabs_list'),
 		open: (url: string, inContainer: boolean, reuse: boolean) =>
-			invoke<BrowserTab>('browser_tab_open', { url, inContainer, reuse }),
-		navigate: (id: number, url: string) => invoke<BrowserTab>('browser_tab_navigate', { id, url }),
-		reload: (id: number) => invoke<void>('browser_tab_reload', { id }),
-		focus: (id: number) => invoke<void>('browser_tab_focus', { id }),
-		close: (id: number) => invoke<void>('browser_tab_close', { id }),
-		location: (id: number, url: string) => invoke<void>('browser_tab_location', { id, url }),
+			call<BrowserTab>('browser_tab_open', { url, inContainer, reuse }),
+		navigate: (id: number, url: string) => call<BrowserTab>('browser_tab_navigate', { id, url }),
+		reload: (id: number) => call<void>('browser_tab_reload', { id }),
+		focus: (id: number) => call<void>('browser_tab_focus', { id }),
+		close: (id: number) => call<void>('browser_tab_close', { id }),
+		location: (id: number, url: string) => call<void>('browser_tab_location', { id, url }),
 		/** Answer a `browser:page_request` (`error` non-null = failed). */
 		respond: (requestId: number, value: unknown, error: string | null) =>
-			invoke<void>('browser_page_respond', { requestId, value, error }),
+			call<void>('browser_page_respond', { requestId, value, error }),
 	},
 	ports: {
-		list: () => invoke<ForwardedPort[]>('ports_list'),
-		set: (forwards: ForwardedPort[]) => invoke<PortsApplyResult>('ports_set', { forwards }),
-		status: () => invoke<ForwardedPortStatus[]>('ports_status'),
-		reapply: () => invoke<PortsApplyResult>('ports_reapply'),
+		list: () => call<ForwardedPort[]>('ports_list'),
+		set: (forwards: ForwardedPort[]) => call<PortsApplyResult>('ports_set', { forwards }),
+		status: () => call<ForwardedPortStatus[]>('ports_status'),
+		reapply: () => call<PortsApplyResult>('ports_reapply'),
 	},
 	composeLogs: {
-		open: (folderPath: string, service: string) => invoke<string>('compose_logs_open', { folderPath, service }),
-		close: (streamId: string) => invoke<void>('compose_logs_close', { streamId }),
+		open: (folderPath: string, service: string) => call<string>('compose_logs_open', { folderPath, service }),
+		close: (streamId: string) => call<void>('compose_logs_close', { streamId }),
 	},
 	terminal: {
-		open: (request: TerminalOpenRequest) => invoke<string>('terminal_open', { request }),
-		write: (streamId: string, data: string) => invoke<void>('terminal_write', { streamId, data }),
-		resize: (streamId: string, cols: number, rows: number) => invoke<void>('terminal_resize', { streamId, cols, rows }),
-		close: (streamId: string) => invoke<void>('terminal_close', { streamId }),
+		open: (request: TerminalOpenRequest) => call<string>('terminal_open', { request }),
+		write: (streamId: string, data: string) => call<void>('terminal_write', { streamId, data }),
+		resize: (streamId: string, cols: number, rows: number) => call<void>('terminal_resize', { streamId, cols, rows }),
+		close: (streamId: string) => call<void>('terminal_close', { streamId }),
 	},
 	nextEdit: {
-		probe: (baseUrl: string) => invoke<NextEditProbeResult>('next_edit_probe', { baseUrl: baseUrl.trim() }),
-		complete: (params: NextEditCompleteParams) => invoke<NextEditCompleteResult>('next_edit_complete', { params }),
+		probe: (baseUrl: string) => call<NextEditProbeResult>('next_edit_probe', { baseUrl: baseUrl.trim() }),
+		complete: (params: NextEditCompleteParams) => call<NextEditCompleteResult>('next_edit_complete', { params }),
 		serverStart: (params: NextEditServerStartParams) =>
-			invoke<NextEditServerSnapshot>('next_edit_server_start', { params }),
-		serverStop: () => invoke<NextEditServerSnapshot>('next_edit_server_stop'),
-		serverStatus: () => invoke<NextEditServerSnapshot>('next_edit_server_status'),
+			call<NextEditServerSnapshot>('next_edit_server_start', { params }),
+		serverStop: () => call<NextEditServerSnapshot>('next_edit_server_stop'),
+		serverStatus: () => call<NextEditServerSnapshot>('next_edit_server_status'),
 	},
 	logs: {
-		snapshot: (source: string) => invoke<LogEntry[]>('logs_snapshot', { source }),
-		sources: () => invoke<string[]>('logs_sources'),
-		clear: (source: string) => invoke<void>('logs_clear', { source }),
-		emit: (source: string, level: LogLevel, message: string) => invoke<void>('logs_emit', { source, level, message }),
+		snapshot: (source: string) => call<LogEntry[]>('logs_snapshot', { source }),
+		sources: () => call<string[]>('logs_sources'),
+		clear: (source: string) => call<void>('logs_clear', { source }),
+		emit: (source: string, level: LogLevel, message: string) => call<void>('logs_emit', { source, level, message }),
 	},
 	lsp: {
-		open: (path: string, languageId: string, text: string) => invoke<void>('lsp_open', { path, languageId, text }),
-		update: (path: string, languageId: string, text: string) => invoke<void>('lsp_update', { path, languageId, text }),
-		close: (path: string, languageId: string) => invoke<void>('lsp_close', { path, languageId }),
+		open: (path: string, languageId: string, text: string) => call<void>('lsp_open', { path, languageId, text }),
+		update: (path: string, languageId: string, text: string) => call<void>('lsp_update', { path, languageId, text }),
+		close: (path: string, languageId: string) => call<void>('lsp_close', { path, languageId }),
 		hover: (path: string, languageId: string, position: LspPosition) =>
-			invoke<LspHover | null>('lsp_hover', { path, languageId, position }),
+			call<LspHover | null>('lsp_hover', { path, languageId, position }),
 		completion: (path: string, languageId: string, position: LspPosition) =>
-			invoke<LspCompletionList>('lsp_completion', { path, languageId, position }),
+			call<LspCompletionList>('lsp_completion', { path, languageId, position }),
 		// Lazy-resolve a completion item (the auto-import block lives
 		// here for `tsgo` / `rust-analyzer` / `pyright`). The
 		// `resolveToken` is the opaque string the matching item
@@ -339,13 +338,13 @@ export const ipc = {
 		// backend short-circuits to a no-op and gives us back the
 		// item we'd already have — same shape, no IPC fan-out.
 		completionResolve: (languageId: string, resolveToken: string) =>
-			invoke<LspCompletionItem>('lsp_completion_resolve', { languageId, resolveToken }),
+			call<LspCompletionItem>('lsp_completion_resolve', { languageId, resolveToken }),
 		definition: (path: string, languageId: string, position: LspPosition) =>
-			invoke<LspLocation | null>('lsp_definition', { path, languageId, position }),
+			call<LspLocation | null>('lsp_definition', { path, languageId, position }),
 		prepareRename: (path: string, languageId: string, position: LspPosition, fallbackWord: string) =>
-			invoke<LspPrepareRename | null>('lsp_prepare_rename', { path, languageId, position, fallbackWord }),
+			call<LspPrepareRename | null>('lsp_prepare_rename', { path, languageId, position, fallbackWord }),
 		rename: (path: string, languageId: string, position: LspPosition, newName: string) =>
-			invoke<LspWorkspaceEdit>('lsp_rename', { path, languageId, position, newName }),
+			call<LspWorkspaceEdit>('lsp_rename', { path, languageId, position, newName }),
 		// Quick-fix (`textDocument/codeAction`, `quickfix`-only) for
 		// one diagnostic the cursor is parked on. `producer` is the
 		// slot key the frontend received with the original
@@ -358,14 +357,14 @@ export const ipc = {
 		// frontend layers on top of every diagnostic regardless of
 		// what the server returned.
 		codeAction: (path: string, producer: string, range: LspRange, diagnostic: LspDiagnostic) =>
-			invoke<LspCodeAction[]>('lsp_code_action', { path, producer, range, diagnostic }),
+			call<LspCodeAction[]>('lsp_code_action', { path, producer, range, diagnostic }),
 		// Tear down the server slot for `languageId`. The next
 		// `open` / `update` / `hover` / `completion` lazily
 		// re-spawns it; the diag-logs panel exposes a "Restart"
 		// button per `lsp.*` source. No-op when no broker exists
 		// yet — calling restart before any LSP has spun up is
 		// fine.
-		restart: (languageId: string) => invoke<void>('lsp_restart', { languageId }),
+		restart: (languageId: string) => call<void>('lsp_restart', { languageId }),
 		// Re-pull diagnostics for every document on every running
 		// language server (optionally scoped to a subset of
 		// languages). The frontend uses this on window-focus
@@ -377,7 +376,7 @@ export const ipc = {
 		// invalidate the right caches and trigger a refresh on
 		// its own. Pass `[]` to refresh every running server.
 		refreshOpenDiagnostics: (languageIds: readonly string[]) =>
-			invoke<void>('lsp_refresh_open_diagnostics', { languageIds }),
+			call<void>('lsp_refresh_open_diagnostics', { languageIds }),
 		// Forward an fs-watcher batch to every running language
 		// server as one `workspace/didChangeWatchedFiles`
 		// notification per server, scoped through the globs that
@@ -392,130 +391,130 @@ export const ipc = {
 		// bytes). No-op when no broker has spun up yet, or when no
 		// server has registered a watcher matching any of the
 		// paths.
-		notifyFilesChanged: (changes: readonly LspFileChange[]) => invoke<void>('lsp_notify_files_changed', { changes }),
+		notifyFilesChanged: (changes: readonly LspFileChange[]) => call<void>('lsp_notify_files_changed', { changes }),
 	},
 	slack: {
-		setToken: (token: string) => invoke<SlackIdentity>('slack_set_token', { token }),
-		status: () => invoke<SlackStatus>('slack_status'),
-		clearToken: () => invoke<void>('slack_clear_token'),
-		listDmBots: () => invoke<SlackBotProfile[]>('slack_list_dm_bots'),
-		selectBot: (profile: SlackBotProfile) => invoke<void>('slack_select_bot', { profile }),
-		clearBot: () => invoke<void>('slack_clear_bot'),
-		getActiveBot: () => invoke<SlackBotProfile | null>('slack_get_active_bot'),
-		setWindowFocused: (focused: boolean) => invoke<void>('slack_set_window_focused', { focused }),
-		listSessions: (channel: string) => invoke<SlackSession[]>('slack_list_sessions', { channel }),
-		getThread: (channel: string, threadTs: string) => invoke<SlackMessage[]>('slack_get_thread', { channel, threadTs }),
-		setActiveThread: (threadTs: string | null) => invoke<void>('slack_set_active_thread', { threadTs }),
-		getUser: (userId: string) => invoke<SlackUserSummary>('slack_get_user', { userId }),
-		markRead: (channel: string, ts: string) => invoke<void>('slack_mark_read', { channel, ts }),
+		setToken: (token: string) => call<SlackIdentity>('slack_set_token', { token }),
+		status: () => call<SlackStatus>('slack_status'),
+		clearToken: () => call<void>('slack_clear_token'),
+		listDmBots: () => call<SlackBotProfile[]>('slack_list_dm_bots'),
+		selectBot: (profile: SlackBotProfile) => call<void>('slack_select_bot', { profile }),
+		clearBot: () => call<void>('slack_clear_bot'),
+		getActiveBot: () => call<SlackBotProfile | null>('slack_get_active_bot'),
+		setWindowFocused: (focused: boolean) => call<void>('slack_set_window_focused', { focused }),
+		listSessions: (channel: string) => call<SlackSession[]>('slack_list_sessions', { channel }),
+		getThread: (channel: string, threadTs: string) => call<SlackMessage[]>('slack_get_thread', { channel, threadTs }),
+		setActiveThread: (threadTs: string | null) => call<void>('slack_set_active_thread', { threadTs }),
+		getUser: (userId: string) => call<SlackUserSummary>('slack_get_user', { userId }),
+		markRead: (channel: string, ts: string) => call<void>('slack_mark_read', { channel, ts }),
 		postMessage: (channel: string, threadTs: string | null, text: string) =>
-			invoke<SlackMessage>('slack_post_message', { channel, threadTs, text }),
+			call<SlackMessage>('slack_post_message', { channel, threadTs, text }),
 	},
 	coder: {
-		status: () => invoke<CoderStatus>('coder_status'),
-		folderSummary: (folder: string) => invoke<string | null>('coder_folder_summary', { folder }),
-		startDeviceFlow: () => invoke<DeviceCode>('coder_start_device_flow'),
-		pollDeviceCode: (code: DeviceCode) => invoke<HfIdentity>('coder_poll_device_code', { code }),
-		signOut: () => invoke<void>('coder_sign_out'),
+		status: () => call<CoderStatus>('coder_status'),
+		folderSummary: (folder: string) => call<string | null>('coder_folder_summary', { folder }),
+		startDeviceFlow: () => call<DeviceCode>('coder_start_device_flow'),
+		pollDeviceCode: (code: DeviceCode) => call<HfIdentity>('coder_poll_device_code', { code }),
+		signOut: () => call<void>('coder_sign_out'),
 		send: (text: string, images: ImageAttachmentPayload[] = [], sessionId: string | null = null) =>
-			invoke<void>('coder_send', { text, images, sessionId }),
-		suggestBranchName: (message: string) => invoke<string>('coder_suggest_branch_name', { message }),
-		suggestCommitMessage: (message: string) => invoke<string>('coder_suggest_commit_message', { message }),
+			call<void>('coder_send', { text, images, sessionId }),
+		suggestBranchName: (message: string) => call<string>('coder_suggest_branch_name', { message }),
+		suggestCommitMessage: (message: string) => call<string>('coder_suggest_commit_message', { message }),
 		suggestTerminalCommand: (request: string, targetKind: string, cwd: string) =>
-			invoke<string>('coder_suggest_terminal_command', { request, targetKind, cwd }),
-		abort: () => invoke<void>('coder_abort'),
-		drainSteerNow: (id: string) => invoke<boolean>('coder_drain_steer_now', { id }),
-		unqueueSteer: (id: string) => invoke<UnqueuedSteer | null>('coder_unqueue_steer', { id }),
+			call<string>('coder_suggest_terminal_command', { request, targetKind, cwd }),
+		abort: () => call<void>('coder_abort'),
+		drainSteerNow: (id: string) => call<boolean>('coder_drain_steer_now', { id }),
+		unqueueSteer: (id: string) => call<UnqueuedSteer | null>('coder_unqueue_steer', { id }),
 		continueSubagent: (subagentId: string, text: string) =>
-			invoke<boolean>('coder_continue_subagent', { subagentId, text }),
-		abortSubagent: (subagentId: string) => invoke<boolean>('coder_abort_subagent', { subagentId }),
+			call<boolean>('coder_continue_subagent', { subagentId, text }),
+		abortSubagent: (subagentId: string) => call<boolean>('coder_abort_subagent', { subagentId }),
 		respondToPrompt: (callId: string, response: PromptResponse) =>
-			invoke<boolean>('coder_respond_to_prompt', { callId, response }),
-		revertToMessage: (userOrdinal: number) => invoke<RevertedMessage>('coder_revert_to_message', { userOrdinal }),
-		replayFromMessage: (userOrdinal: number) => invoke<void>('coder_replay_from_message', { userOrdinal }),
-		resumeFromToolCall: (toolCallId: string) => invoke<void>('coder_resume_from_tool_call', { toolCallId }),
-		retryLastTurn: () => invoke<void>('coder_retry_last_turn'),
-		rerunToolCall: (toolCallId: string) => invoke<RerunToolOutcome>('coder_rerun_tool_call', { toolCallId }),
-		listSessions: () => invoke<CoderSessionSummary[]>('coder_list_sessions'),
-		runningSessions: () => invoke<string[]>('coder_running_sessions'),
-		searchSessions: (query: string) => invoke<string[]>('coder_search_sessions', { query }),
-		activeSession: () => invoke<CoderSessionSummary | null>('coder_active_session'),
-		lastOpenedSession: () => invoke<string | null>('coder_last_opened_session'),
-		newSession: () => invoke<CoderSessionSummary>('coder_new_session'),
-		newCoordinatorSession: () => invoke<CoderSessionSummary>('coder_new_coordinator_session'),
-		workerLinkState: (sessionId: string) => invoke<WorkerLinkState>('coder_worker_link_state', { sessionId }),
-		disconnectWorker: (sessionId: string) => invoke<DisconnectWorkerOutcome>('coder_disconnect_worker', { sessionId }),
+			call<boolean>('coder_respond_to_prompt', { callId, response }),
+		revertToMessage: (userOrdinal: number) => call<RevertedMessage>('coder_revert_to_message', { userOrdinal }),
+		replayFromMessage: (userOrdinal: number) => call<void>('coder_replay_from_message', { userOrdinal }),
+		resumeFromToolCall: (toolCallId: string) => call<void>('coder_resume_from_tool_call', { toolCallId }),
+		retryLastTurn: () => call<void>('coder_retry_last_turn'),
+		rerunToolCall: (toolCallId: string) => call<RerunToolOutcome>('coder_rerun_tool_call', { toolCallId }),
+		listSessions: () => call<CoderSessionSummary[]>('coder_list_sessions'),
+		runningSessions: () => call<string[]>('coder_running_sessions'),
+		searchSessions: (query: string) => call<string[]>('coder_search_sessions', { query }),
+		activeSession: () => call<CoderSessionSummary | null>('coder_active_session'),
+		lastOpenedSession: () => call<string | null>('coder_last_opened_session'),
+		newSession: () => call<CoderSessionSummary>('coder_new_session'),
+		newCoordinatorSession: () => call<CoderSessionSummary>('coder_new_coordinator_session'),
+		workerLinkState: (sessionId: string) => call<WorkerLinkState>('coder_worker_link_state', { sessionId }),
+		disconnectWorker: (sessionId: string) => call<DisconnectWorkerOutcome>('coder_disconnect_worker', { sessionId }),
 		attachWorker: (coordinatorId: string, sessionId: string) =>
-			invoke<AttachWorkerOutcome>('coder_attach_worker', { coordinatorId, sessionId }),
-		attachedWorkers: (coordinatorId: string) => invoke<FleetMember[]>('coder_attached_workers', { coordinatorId }),
+			call<AttachWorkerOutcome>('coder_attach_worker', { coordinatorId, sessionId }),
+		attachedWorkers: (coordinatorId: string) => call<FleetMember[]>('coder_attached_workers', { coordinatorId }),
 		readBackgroundProcess: (sessionId: string, id: string) =>
-			invoke<BackgroundProcessSnapshot>('coder_read_background_process', { sessionId, id }),
+			call<BackgroundProcessSnapshot>('coder_read_background_process', { sessionId, id }),
 		stopBackgroundProcess: (sessionId: string, id: string) =>
-			invoke<unknown>('coder_stop_background_process', { sessionId, id }),
+			call<unknown>('coder_stop_background_process', { sessionId, id }),
 		newWorktreeSession: (baseBranch?: string) =>
-			invoke<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
-		discardWorktree: (path: string, force: boolean) => invoke<Workspace>('coder_discard_worktree', { path, force }),
+			call<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
+		discardWorktree: (path: string, force: boolean) => call<Workspace>('coder_discard_worktree', { path, force }),
 		mergeAndRemoveWorktree: (path: string, baseBranch: string) =>
-			invoke<Workspace>('coder_merge_and_remove_worktree', { path, baseBranch }),
-		associateBranch: () => invoke<CoderSessionSummary | null>('coder_associate_branch'),
-		moveSessionToWorktree: () => invoke<NewWorktreeSession>('coder_move_session_to_worktree'),
-		setBashTargetOverride: (forceHost: boolean) => invoke<boolean>('coder_set_bash_target_override', { forceHost }),
-		openSession: (id: string) => invoke<CoderSessionSummary>('coder_open_session', { id }),
-		deleteSession: (id: string) => invoke<void>('coder_delete_session', { id }),
-		renameSession: (id: string, title: string) => invoke<CoderSessionSummary>('coder_rename_session', { id, title }),
-		sessionJsonlPath: (id: string) => invoke<string>('coder_session_jsonl_path', { id }),
-		getModelSettings: () => invoke<CoderModelSettings>('coder_get_model_settings'),
-		setModelSettings: (settings: CoderModelSettings) => invoke<void>('coder_set_model_settings', { settings }),
-		listModels: () => invoke<RouterModel[]>('coder_list_models'),
-		listProviderModels: (id: string) => invoke<ProviderModelSummary[]>('coder_list_provider_models', { id }),
-		openrouterCredits: (id: string) => invoke<OpenRouterCredits>('coder_openrouter_credits', { id }),
-		newProviderId: () => invoke<string>('coder_new_provider_id'),
+			call<Workspace>('coder_merge_and_remove_worktree', { path, baseBranch }),
+		associateBranch: () => call<CoderSessionSummary | null>('coder_associate_branch'),
+		moveSessionToWorktree: () => call<NewWorktreeSession>('coder_move_session_to_worktree'),
+		setBashTargetOverride: (forceHost: boolean) => call<boolean>('coder_set_bash_target_override', { forceHost }),
+		openSession: (id: string) => call<CoderSessionSummary>('coder_open_session', { id }),
+		deleteSession: (id: string) => call<void>('coder_delete_session', { id }),
+		renameSession: (id: string, title: string) => call<CoderSessionSummary>('coder_rename_session', { id, title }),
+		sessionJsonlPath: (id: string) => call<string>('coder_session_jsonl_path', { id }),
+		getModelSettings: () => call<CoderModelSettings>('coder_get_model_settings'),
+		setModelSettings: (settings: CoderModelSettings) => call<void>('coder_set_model_settings', { settings }),
+		listModels: () => call<RouterModel[]>('coder_list_models'),
+		listProviderModels: (id: string) => call<ProviderModelSummary[]>('coder_list_provider_models', { id }),
+		openrouterCredits: (id: string) => call<OpenRouterCredits>('coder_openrouter_credits', { id }),
+		newProviderId: () => call<string>('coder_new_provider_id'),
 		probeProvider: (baseUrl: string, apiKey: string, kind: ProviderKind = 'custom') =>
-			invoke<ProviderProbeResult>('coder_probe_provider', {
+			call<ProviderProbeResult>('coder_probe_provider', {
 				args: { base_url: baseUrl, api_key: apiKey, kind },
 			}),
-		saveProvider: (config: CoderProviderConfig) => invoke<void>('coder_save_provider', { config }),
-		deleteProvider: (id: string) => invoke<void>('coder_delete_provider', { id }),
-		setProviderApiKey: (id: string, key: string) => invoke<void>('coder_set_provider_api_key', { args: { id, key } }),
-		clearProviderApiKey: (id: string) => invoke<void>('coder_clear_provider_api_key', { id }),
-		webSearchConfigured: () => invoke<boolean>('coder_web_search_configured'),
-		setWebSearchKey: (key: string) => invoke<void>('coder_set_web_search_key', { key }),
-		clearWebSearchKey: () => invoke<void>('coder_clear_web_search_key'),
-		hubListNamespaces: () => invoke<HubNamespace[]>('coder_hub_list_namespaces'),
-		hubGetBinding: () => invoke<CoderHubBucket | null>('coder_hub_get_binding'),
+		saveProvider: (config: CoderProviderConfig) => call<void>('coder_save_provider', { config }),
+		deleteProvider: (id: string) => call<void>('coder_delete_provider', { id }),
+		setProviderApiKey: (id: string, key: string) => call<void>('coder_set_provider_api_key', { args: { id, key } }),
+		clearProviderApiKey: (id: string) => call<void>('coder_clear_provider_api_key', { id }),
+		webSearchConfigured: () => call<boolean>('coder_web_search_configured'),
+		setWebSearchKey: (key: string) => call<void>('coder_set_web_search_key', { key }),
+		clearWebSearchKey: () => call<void>('coder_clear_web_search_key'),
+		hubListNamespaces: () => call<HubNamespace[]>('coder_hub_list_namespaces'),
+		hubGetBinding: () => call<CoderHubBucket | null>('coder_hub_get_binding'),
 		hubCreateBucket: (namespace: string, name: string, isPrivate: boolean) =>
-			invoke<CoderHubBucket>('coder_hub_create_bucket', { namespace, name, private: isPrivate }),
-		hubSetAutosync: (enabled: boolean) => invoke<void>('coder_hub_set_autosync', { enabled }),
-		hubDisconnect: () => invoke<void>('coder_hub_disconnect'),
-		hubUploadSession: (sessionId: string) => invoke<void>('coder_hub_upload_session', { sessionId }),
-		hubUploadAllSessions: () => invoke<HubUploadAllSummary>('coder_hub_upload_all_sessions'),
-		hubSessionUrl: (sessionId: string) => invoke<string>('coder_hub_session_url', { sessionId }),
-		mcpServers: () => invoke<McpServerStatus[]>('coder_mcp_servers'),
-		mcpSetEnabled: (id: string, enabled: boolean) => invoke<void>('coder_mcp_set_enabled', { id, enabled }),
+			call<CoderHubBucket>('coder_hub_create_bucket', { namespace, name, private: isPrivate }),
+		hubSetAutosync: (enabled: boolean) => call<void>('coder_hub_set_autosync', { enabled }),
+		hubDisconnect: () => call<void>('coder_hub_disconnect'),
+		hubUploadSession: (sessionId: string) => call<void>('coder_hub_upload_session', { sessionId }),
+		hubUploadAllSessions: () => call<HubUploadAllSummary>('coder_hub_upload_all_sessions'),
+		hubSessionUrl: (sessionId: string) => call<string>('coder_hub_session_url', { sessionId }),
+		mcpServers: () => call<McpServerStatus[]>('coder_mcp_servers'),
+		mcpSetEnabled: (id: string, enabled: boolean) => call<void>('coder_mcp_set_enabled', { id, enabled }),
 		mcpAddCustom: (server: {
 			label: string;
 			command: string;
 			args: string[];
 			env: Record<string, string>;
 			description: string;
-		}) => invoke<McpServerStatus[]>('coder_mcp_add_custom', { server }),
-		mcpRemoveCustom: (id: string) => invoke<McpServerStatus[]>('coder_mcp_remove_custom', { id }),
+		}) => call<McpServerStatus[]>('coder_mcp_add_custom', { server }),
+		mcpRemoveCustom: (id: string) => call<McpServerStatus[]>('coder_mcp_remove_custom', { id }),
 	},
 	ui: {
-		setRightPanel: (kind: RightPanelKind | null) => invoke<void>('ui_set_right_panel', { kind }),
+		setRightPanel: (kind: RightPanelKind | null) => call<void>('ui_set_right_panel', { kind }),
 	},
 	companion: {
-		status: () => invoke<CompanionStatus>('companion_status'),
-		revokeDevice: (deviceId: string) => invoke<void>('companion_revoke_device', { deviceId }),
-		revokeIde: (ideId: string) => invoke<void>('companion_revoke_ide', { ideId }),
-		pairCode: () => invoke<PairingQr>('companion_pair_code'),
+		status: () => call<CompanionStatus>('companion_status'),
+		revokeDevice: (deviceId: string) => call<void>('companion_revoke_device', { deviceId }),
+		revokeIde: (ideId: string) => call<void>('companion_revoke_ide', { ideId }),
+		pairCode: () => call<PairingQr>('companion_pair_code'),
 		enroll: (bridgeUrl: string, code: string, label: string) =>
-			invoke<void>('companion_enroll', { bridgeUrl, code, label }),
-		remoteStatus: () => invoke<RemoteBridgeStatus>('companion_remote_status'),
-		remoteDisconnect: () => invoke<void>('companion_remote_disconnect'),
-		remotePairCode: () => invoke<PairingQr>('companion_remote_pair_code'),
-		e2eDevices: () => invoke<AuthorizedPhone[]>('companion_e2e_devices'),
-		e2eRevoke: (deviceId: string) => invoke<void>('companion_e2e_revoke', { deviceId }),
+			call<void>('companion_enroll', { bridgeUrl, code, label }),
+		remoteStatus: () => call<RemoteBridgeStatus>('companion_remote_status'),
+		remoteDisconnect: () => call<void>('companion_remote_disconnect'),
+		remotePairCode: () => call<PairingQr>('companion_remote_pair_code'),
+		e2eDevices: () => call<AuthorizedPhone[]>('companion_e2e_devices'),
+		e2eRevoke: (deviceId: string) => call<void>('companion_e2e_revoke', { deviceId }),
 	},
 } as const;
 

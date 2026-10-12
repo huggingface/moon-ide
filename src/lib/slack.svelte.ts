@@ -11,7 +11,7 @@
 //! "open another folder", and a future "no folder open, just
 //! chatting" flow doesn't need the workspace to exist at all.
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { SvelteMap } from 'svelte/reactivity';
 
@@ -179,7 +179,7 @@ class SlackPanelState {
 	/** Cleanup handles for Tauri event listeners + window focus. Set
 	 * once on `wireRuntime`, dropped on app teardown (which doesn't
 	 * happen in practice, but be defensive). */
-	#unlisten: UnlistenFn[] = [];
+	#unlisten: Unsubscribe[] = [];
 
 	/** True iff `wireRuntime` has run — guards against double-binding
 	 * if the workspace state restores twice in dev with HMR. */
@@ -226,10 +226,10 @@ class SlackPanelState {
 		}
 		this.#runtimeWired = true;
 		try {
-			const unlistenThread = await listen<ThreadUpdatePayload>(THREAD_UPDATE_EVENT, (event) => {
-				this.#applyThreadUpdate(event.payload);
+			const unlistenThread = await subscribe(THREAD_UPDATE_EVENT, (payload: ThreadUpdatePayload) => {
+				this.#applyThreadUpdate(payload);
 			});
-			const unlistenDisconnect = await listen<unknown>(DISCONNECTED_EVENT, () => {
+			const unlistenDisconnect = await subscribe(DISCONNECTED_EVENT, () => {
 				void this.#handleBackendDisconnect();
 			});
 			this.#unlisten.push(unlistenThread, unlistenDisconnect);

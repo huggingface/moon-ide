@@ -8,7 +8,7 @@ to it over SSH with the full IDE (coder, review, terminals, browser
 tab, editor), picks up exactly where the other left off, and moves
 files in and out of it.
 
-## 16.1 — Frontend transport seam
+## 16.1 — Frontend transport seam (landed)
 
 - Every core call goes through one transport (`ipc.ts`), every push
   event through one subscription helper, and binary-preview URLs

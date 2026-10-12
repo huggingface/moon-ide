@@ -25,7 +25,7 @@
 //! verbose web server under load) would grow unbounded for as
 //! long as the tab is open and eventually OOM the renderer.
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 import { SvelteMap } from 'svelte/reactivity';
 
 import { bottomPanel, type LogTab } from './bottomPanel.svelte';
@@ -82,7 +82,7 @@ class ComposeLogsStore {
 	 * reactivity by mutating an external counter for the `seq`
 	 * field. */
 	#nextSeq = new Map<string, number>();
-	#unlisten: UnlistenFn[] = [];
+	#unlisten: Unsubscribe[] = [];
 	#runtimeWired = false;
 
 	async wireRuntime(): Promise<void> {
@@ -91,11 +91,11 @@ class ComposeLogsStore {
 		}
 		this.#runtimeWired = true;
 		try {
-			const onLine = await listen<LogStreamLine>(LINE_EVENT, (event) => {
-				this.#appendLine(event.payload);
+			const onLine = await subscribe(LINE_EVENT, (payload: LogStreamLine) => {
+				this.#appendLine(payload);
 			});
-			const onClosed = await listen<LogStreamClosed>(CLOSED_EVENT, (event) => {
-				this.#markClosed(event.payload);
+			const onClosed = await subscribe(CLOSED_EVENT, (payload: LogStreamClosed) => {
+				this.#markClosed(payload);
 			});
 			this.#unlisten.push(onLine, onClosed);
 		} catch {

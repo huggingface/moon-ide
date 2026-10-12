@@ -24,7 +24,7 @@
 //! ergonomics awkward and mask the workspace shell's much-simpler
 //! lifecycle behind a Map indirection.
 
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { subscribe, type Unsubscribe } from './transport';
 import { SvelteMap } from 'svelte/reactivity';
 
 import { ipc } from './ipc';
@@ -110,7 +110,7 @@ class ProjectComposeStateStore {
 	 * `forgetAll`. */
 	#backgroundPoller: ReturnType<typeof setInterval> | null = null;
 
-	#unlisten: UnlistenFn[] = [];
+	#unlisten: Unsubscribe[] = [];
 	#runtimeWired = false;
 
 	/**
@@ -124,8 +124,8 @@ class ProjectComposeStateStore {
 		}
 		this.#runtimeWired = true;
 		try {
-			const unlisten = await listen<ProjectComposeStateChange>(PROJECT_COMPOSE_STATE_EVENT, (event) => {
-				this.#snapshots.set(event.payload.folder_path, event.payload.project);
+			const unlisten = await subscribe(PROJECT_COMPOSE_STATE_EVENT, (payload: ProjectComposeStateChange) => {
+				this.#snapshots.set(payload.folder_path, payload.project);
 			});
 			this.#unlisten.push(unlisten);
 		} catch {

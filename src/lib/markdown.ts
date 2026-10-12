@@ -7,7 +7,7 @@ import DOMPurify from 'dompurify';
 // and `number` indexes the element type.
 type MdToken = ReturnType<typeof md.parse>[number];
 import { parse as parseYaml } from 'yaml';
-import { convertFileSrc } from '@tauri-apps/api/core';
+import { fileUrl } from './transport';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { extractFenceLanguages, highlightCode, loadHighlighters } from './editor/highlightCode';
 import { ipc } from './ipc';
@@ -956,7 +956,7 @@ export function resolveMarkdownLink(currentPath: string, href: string): string |
  * is more honest than silently dropping it.
  *
  * `toUrl` is injectable for tests; production callers use the
- * default (host `absolute_path` → `convertFileSrc`).
+ * default (host `absolute_path` → `fileUrl`).
  */
 export async function resolveMarkdownImages(
 	html: string,
@@ -997,7 +997,7 @@ export async function resolveMarkdownImages(
 async function workspaceImageUrl(workspacePath: string): Promise<string | null> {
 	try {
 		const absolute = await ipc.fs.absolutePath(workspacePath);
-		return convertFileSrc(absolute);
+		return fileUrl(absolute);
 	} catch {
 		return null;
 	}

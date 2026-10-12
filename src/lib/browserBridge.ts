@@ -7,7 +7,7 @@
 // focuses the tab and waits in a queue until the freshly loaded page
 // says hello.
 
-import { listen } from '@tauri-apps/api/event';
+import { subscribe } from './transport';
 import { ipc } from './ipc';
 import type { BrowserPageRequest } from './protocol';
 
@@ -117,7 +117,7 @@ export async function wireBrowserBridge(): Promise<void> {
 		return;
 	}
 	wired = true;
-	await listen<BrowserPageRequest>('browser:page_request', ({ payload }) => {
+	await subscribe('browser:page_request', (payload: BrowserPageRequest) => {
 		const frame = frames.get(payload.tab_id);
 		if (frame?.ready) {
 			send(frame, payload);
