@@ -4210,7 +4210,7 @@
 						: `Open sub-agent transcript (${subagent.targetFolder})`}
 					onclick={() => {
 						if (subagent.worker) {
-							void coder.openWorkerSession(subagent.worktreeRoot, subagent.id);
+							void coder.openSessionInFolder(subagent.worktreeRoot, subagent.id);
 						} else {
 							coder.openSubagent(subagent.id);
 						}

@@ -4,7 +4,22 @@
 //! focus state.
 
 use moon_coder::{TurnOutcome, TurnSettled};
-use tauri::AppHandle;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
+
+/// Emitted when the user clicks a turn notification, after the
+/// window is focused: the frontend switches to the session's
+/// folder and opens the session.
+pub const FOCUS_SESSION_EVENT: &str = "coder:focus_session";
+
+/// Payload of [`FOCUS_SESSION_EVENT`]. Mirrored in
+/// `src/lib/protocol.ts` as `CoderFocusSession`.
+#[derive(Debug, Clone, Serialize)]
+pub struct FocusSessionPayload {
+	pub session_id: String,
+	pub folder: String,
+	pub worktree_root: Option<String>,
+}
 
 /// Notification body cap, in chars. Notification servers clamp
 /// the visible body to a few lines anyway; this keeps a long
@@ -34,9 +49,14 @@ pub fn notify(app: &AppHandle, workspace_id: &str, event: &TurnSettled) {
 	{
 		notification
 			.hint(notify_rust::Hint::DesktopEntry("moon-ide".into()))
-			.action("default", "Focus window");
+			.action("default", "Open session");
 	}
 	let app = app.clone();
+	let focus = FocusSessionPayload {
+		session_id: event.session_id.clone(),
+		folder: event.folder.clone(),
+		worktree_root: event.worktree_root.clone(),
+	};
 	// `show` is a blocking D-Bus round trip, and waiting for the
 	// click blocks until the notification is dismissed.
 	tauri::async_runtime::spawn_blocking(move || {
@@ -49,13 +69,17 @@ pub fn notify(app: &AppHandle, workspace_id: &str, event: &TurnSettled) {
 		};
 		#[cfg(all(unix, not(target_os = "macos")))]
 		handle.wait_for_action(|action| {
-			if action == "default" {
-				crate::focus_socket::focus_main_window(&app);
+			if action != "default" {
+				return;
+			}
+			crate::focus_socket::focus_main_window(&app);
+			if let Err(err) = app.emit(FOCUS_SESSION_EVENT, &focus) {
+				tracing::warn!(error = %err, "failed to emit {FOCUS_SESSION_EVENT}");
 			}
 		});
 		#[cfg(not(all(unix, not(target_os = "macos"))))]
 		{
-			let _ = (handle, app);
+			let _ = (handle, app, focus);
 		}
 	});
 }

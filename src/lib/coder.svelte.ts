@@ -191,7 +191,7 @@ export type SubagentSummary = {
 	worktreeRoot: string | null;
 	/** `true` for a coordinator-spawned worker (`spawn_worker`) —
 	 *  the card's "Open" navigates to the worker's top-level
-	 *  session via [`CoderPanelState.openWorkerSession`] instead
+	 *  session via [`CoderPanelState.openSessionInFolder`] instead
 	 *  of the sub-agent pop-out. Not derivable from
 	 *  `worktreeRoot`: in-place workers have none. */
 	worker: boolean;
@@ -2479,7 +2479,7 @@ export class CoderPanelState {
 		const folder = this.current;
 		// Snapshot the visible pointer: this pass runs detached from
 		// the folder switch, racing any *explicit* open issued right
-		// after it (`openWorkerSession` — the coordinator's worker
+		// after it (`openSessionInFolder` — the coordinator's worker
 		// card switches folder, then opens the worker by id). If the
 		// pointer moves while we're awaiting below, the explicit open
 		// won; clobbering it to the list view was the "worker session
@@ -4108,18 +4108,17 @@ export class CoderPanelState {
 		this.view = 'subagent';
 	}
 
-	/** Navigate to a coordinator-spawned worker session. Workers are
-	 *  real top-level sessions in worktrees (ADR 0030), not sub-agent
-	 *  pop-outs — so "opening" them means switching the folder bar to
-	 *  the worktree (if it isn't already active) and opening the
-	 *  session by id, the same flow as clicking a row in the sessions
-	 *  list. `worktreeRoot` is the worktree folder path the worker
-	 *  operates against; `sessionId` is the worker's session id. */
-	async openWorkerSession(worktreeRoot: string | null, sessionId: string): Promise<void> {
-		if (worktreeRoot !== null && this.#activeFolderActual !== worktreeRoot && this.#onWorktreeSessionOpen !== null) {
+	/** Switch the folder bar to `folderPath` (if it isn't already
+	 *  active) and open the session by id, the same flow as clicking
+	 *  a row in the sessions list. Used for coordinator-spawned
+	 *  workers — real top-level sessions in worktrees (ADR 0030), not
+	 *  sub-agent pop-outs — and for clicked turn notifications
+	 *  (ADR 0089). `null` keeps the current folder. */
+	async openSessionInFolder(folderPath: string | null, sessionId: string): Promise<void> {
+		if (folderPath !== null && this.#activeFolderActual !== folderPath && this.#onWorktreeSessionOpen !== null) {
 			this.#suppressWorktreeSwitch = true;
 			try {
-				await this.#onWorktreeSessionOpen(worktreeRoot);
+				await this.#onWorktreeSessionOpen(folderPath);
 			} finally {
 				this.#suppressWorktreeSwitch = false;
 			}

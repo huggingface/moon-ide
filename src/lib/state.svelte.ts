@@ -18,6 +18,7 @@ import {
 	type CommitEntry,
 	type EditorConfig,
 	type BrowserTabsChanged,
+	type CoderFocusSession,
 	type EditRequest,
 	type FolderSession,
 	type GitBranchInfo,
@@ -1904,6 +1905,7 @@ class WorkspaceState {
 		// open a buffer in moon-ide. See ADR 0021.
 		void this.wireEditorForward();
 		void this.wireBrowserTabs();
+		void this.wireNotificationFocus();
 		void this.refreshNextEditServerStatusThenMaybeAutostart();
 		// Terminal output rides on its own event channel —
 		// see `terminal.svelte.ts`. Wired once at startup so
@@ -2243,6 +2245,39 @@ class WorkspaceState {
 		} catch (err) {
 			frontendLog('runtime', 'warn', `browser tabs: wiring failed: ${String(err)}`);
 		}
+	}
+
+	private notificationFocusWired = false;
+	private async wireNotificationFocus(): Promise<void> {
+		if (this.notificationFocusWired) {
+			return;
+		}
+		this.notificationFocusWired = true;
+		try {
+			await listen<CoderFocusSession>('coder:focus_session', ({ payload }) => {
+				void this.focusNotifiedSession(payload);
+			});
+		} catch (err) {
+			frontendLog('runtime', 'warn', `notification focus: wiring failed: ${String(err)}`);
+		}
+	}
+
+	/** A turn-finished notification was clicked (ADR 0089): show the
+	 *  session in the folder it ran in. Prefers the session's worktree,
+	 *  falls back to the folder it's filed under; a folder that's no
+	 *  longer bound (or the no-folder scratch anchor) keeps the current
+	 *  folder. */
+	private async focusNotifiedSession(req: CoderFocusSession): Promise<void> {
+		const bound = (path: string | null) =>
+			path !== null && (this.workspace?.folders.some((f) => f.path === path) ?? false);
+		let folder: string | null = null;
+		if (bound(req.worktree_root)) {
+			folder = req.worktree_root;
+		} else if (bound(req.folder)) {
+			folder = req.folder;
+		}
+		rightPanel.set('coder');
+		await coder.openSessionInFolder(folder, req.session_id);
 	}
 
 	private editorForwardWired = false;
