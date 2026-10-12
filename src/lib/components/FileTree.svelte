@@ -18,8 +18,10 @@
 	} from '@pierre/trees';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
+	import { getCurrentWebview, type DragDropEvent } from '@tauri-apps/api/webview';
 	import { workspace } from '../state.svelte';
 	import { ipc } from '../ipc';
+	import { transfers } from '../transfers.svelte';
 	import { formatError, type GitFileStatus, type GitStatusEntry } from '../protocol';
 
 	type Props = {
@@ -270,13 +272,23 @@
 		if (items.length === 0) {
 			return null;
 		}
+		const anchor = document.createElement('div');
+		anchor.setAttribute('data-file-tree-context-menu-root', 'true');
+		mountMenu(items, context.anchorRect, () => {
+			context.close();
+		});
+		return anchor;
+	}
+
+	function mountMenu(
+		items: ContextMenuItem[],
+		anchorRect: { left: number; top: number; width: number; height: number },
+		onClose: () => void,
+	) {
 		// A second `render` call replaces the first. Tear down the
 		// previous instance before mounting the new one so we don't
 		// leak Svelte components or orphan the portaled host.
 		disposeActiveMenu();
-
-		const anchor = document.createElement('div');
-		anchor.setAttribute('data-file-tree-context-menu-root', 'true');
 
 		const host = document.createElement('div');
 		host.setAttribute('data-file-tree-context-menu-root', 'true');
@@ -297,17 +309,10 @@
 
 		const instance = mountComponent(ContextMenu, {
 			target: host,
-			props: {
-				items,
-				anchorRect: context.anchorRect,
-				onClose: () => {
-					context.close();
-				},
-			},
+			props: { items, anchorRect, onClose },
 		});
 		activeMenuInstance = instance;
 		activeMenuHost = host;
-		return anchor;
 	}
 
 	function disposeActiveMenu() {
@@ -350,6 +355,25 @@
 				void startNewItem(targetDir, 'folder');
 			},
 		});
+		const absolutePath = absolutePathFor(item);
+		if (absolutePath !== null && item.kind === 'directory') {
+			items.push({
+				id: 'upload',
+				label: 'Upload file…',
+				onSelect: () => {
+					void transfers.pickAndUpload(absolutePath);
+				},
+			});
+		}
+		if (absolutePath !== null && item.kind === 'file') {
+			items.push({
+				id: 'download',
+				label: 'Download to this computer',
+				onSelect: () => {
+					void transfers.download(absolutePath);
+				},
+			});
+		}
 		// Rename uses Pierre's built-in inline-rename flow; the row
 		// becomes an editable input, Enter commits, Esc cancels.
 		// The workspace root itself can't be renamed via the tree
@@ -2097,10 +2121,136 @@
 		}
 		return null;
 	}
+
+	// Right-click below the last row: Pierre's menu is per-row, so the
+	// folder root gets its own small menu here.
+	function onTreeContextMenu(event: MouseEvent) {
+		const root = workspace.activeFolderPath;
+		if (!isVisibleMode() || root === null || pathFromComposedClick(event) !== null) {
+			return;
+		}
+		const inRows = event
+			.composedPath()
+			.some((node) => node instanceof Element && node.hasAttribute('data-file-tree-virtualized-scroll'));
+		if (!inRows) {
+			return;
+		}
+		event.preventDefault();
+		const items: ContextMenuItem[] = [
+			{
+				id: 'upload',
+				label: 'Upload file…',
+				onSelect: () => {
+					void transfers.pickAndUpload(root);
+				},
+			},
+		];
+		mountMenu(items, { left: event.clientX, top: event.clientY, width: 0, height: 0 }, disposeActiveMenu);
+	}
+
+	// OS file drops (Tauri's webview drag-drop; HTML5 drop events never
+	// see OS paths). Both tree modes listen; only the visible one acts.
+	let dragPaths: string[] = [];
+	let dropRoot = $state(false);
+
+	const DROP_ACCENT =
+		(typeof document !== 'undefined'
+			? getComputedStyle(document.documentElement).getPropertyValue('--m-accent').trim()
+			: '') || '#7ea3ff';
+
+	onMount(() => {
+		let disposed = false;
+		let unlisten: (() => void) | null = null;
+		void getCurrentWebview()
+			.onDragDropEvent(({ payload }) => {
+				onOsDragDrop(payload);
+			})
+			.then((fn) => {
+				if (disposed) {
+					fn();
+					return;
+				}
+				unlisten = fn;
+			});
+		return () => {
+			disposed = true;
+			unlisten?.();
+		};
+	});
+
+	function onOsDragDrop(event: DragDropEvent) {
+		if (event.type === 'leave') {
+			dragPaths = [];
+			showDropTarget(null);
+			return;
+		}
+		if (event.type === 'enter') {
+			dragPaths = event.paths;
+		}
+		const { x, y } = event.position.toLogical(window.devicePixelRatio);
+		const target = dropTargetAt(x, y);
+		if (event.type !== 'drop') {
+			showDropTarget(dragPaths.length > 0 ? target : null);
+			return;
+		}
+		showDropTarget(null);
+		const paths = event.paths;
+		dragPaths = [];
+		const root = workspace.activeFolderPath;
+		if (target === null || root === null || paths.length === 0) {
+			return;
+		}
+		void transfers.upload(paths, `${root.replace(/\/+$/, '')}/${target}`);
+	}
+
+	/** Folder-relative directory under the cursor (`''` = folder root), or `null` outside this tree. */
+	function dropTargetAt(x: number, y: number): string | null {
+		if (!treeMount || !tree || !isVisibleMode() || workspace.activeFolderPath === null) {
+			return null;
+		}
+		const rect = treeMount.getBoundingClientRect();
+		if (rect.width === 0 || x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+			return null;
+		}
+		const hit = tree.getFileTreeContainer()?.shadowRoot?.elementFromPoint(x, y) ?? null;
+		const path = hit?.closest('[data-item-path]')?.getAttribute('data-item-path') ?? '';
+		if (path.endsWith('/')) {
+			return path;
+		}
+		return path.slice(0, path.lastIndexOf('/') + 1);
+	}
+
+	function showDropTarget(target: string | null) {
+		dropRoot = target === '';
+		const shadow = tree?.getFileTreeContainer()?.shadowRoot;
+		if (!shadow) {
+			return;
+		}
+		let el = shadow.querySelector('style[data-moon-drop-target]') as HTMLStyleElement | null;
+		if (!el) {
+			el = document.createElement('style');
+			el.setAttribute('data-moon-drop-target', '');
+			shadow.appendChild(el);
+		}
+		const css = target
+			? `[data-item-path="${escapeAttr(target)}"] { box-shadow: inset 0 0 0 1px ${DROP_ACCENT}; }`
+			: '';
+		if (el.textContent !== css) {
+			el.textContent = css;
+		}
+	}
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="tree" bind:this={treeMount} onkeydown={onKeyDown} ondblclick={onDblClick} onclick={onTreeClick}></div>
+<div
+	class="tree"
+	class:drop-root={dropRoot}
+	bind:this={treeMount}
+	onkeydown={onKeyDown}
+	ondblclick={onDblClick}
+	onclick={onTreeClick}
+	oncontextmenu={onTreeContextMenu}
+></div>
 
 <style>
 	.tree {
@@ -2108,5 +2258,9 @@
 		width: 100%;
 		overflow: hidden;
 		--trees-row-font-family: var(--m-font-ui);
+	}
+	.tree.drop-root {
+		outline: 1px dashed var(--m-accent);
+		outline-offset: -2px;
 	}
 </style>

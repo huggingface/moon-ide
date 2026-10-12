@@ -26,6 +26,7 @@ mod shutdown;
 mod slack_poller;
 mod state;
 mod system_theme_watcher;
+mod transfer;
 mod turn_notification;
 mod window_icon;
 
@@ -171,7 +172,11 @@ pub fn run() {
 			commands::companion::companion_e2e_devices,
 			commands::companion::companion_e2e_revoke,
 			commands::ui::ui_set_right_panel,
+			transfer::transfer_upload,
+			transfer::transfer_download,
+			transfer::transfer_cancel,
 		])
+		.manage(transfer::Transfers::default())
 		.setup(move |app| {
 			let SetupInputs {
 				mode,

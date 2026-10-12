@@ -8,6 +8,7 @@
 	import ContainerPanel from './ContainerPanel.svelte';
 	import TerminalLauncher from './TerminalLauncher.svelte';
 	import ThemePicker from './ThemePicker.svelte';
+	import TransferStack from './TransferStack.svelte';
 	import { lspLanguageFor } from '../editor/lspLanguage';
 	import { bottomPanel } from '../bottomPanel.svelte';
 	import { ports } from '../ports.svelte';
@@ -656,6 +657,7 @@
 		<ThemePicker bind:this={themePicker} />
 	</div>
 </div>
+<TransferStack />
 
 <style>
 	.status {

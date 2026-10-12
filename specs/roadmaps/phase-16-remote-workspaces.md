@@ -68,12 +68,16 @@ files in and out of it.
   port number (skipped with a log line when that port is taken).
   Both ride `ssh -O forward` on the shared master connection.
 
-## 16.6 — File transfer
+## 16.6 — File transfer (landed)
 
 - Drag-and-drop from the OS onto the file tree and "Upload file…"
   upload; "Download to this computer" downloads. Streamed, with
   progress and cancel, temp-file + rename, confirm before overwrite.
   Works for local workspaces as a copy.
+- Landed: desktop `transfer_*` commands stream over the SSH
+  connection (remote `cat` / `sh -c`, size-checked before the rename)
+  or copy locally; `transfer:progress` drives a toast stack. Files
+  only; folders are rejected.
 
 ## 16.7 — Attach / takeover (landed with 16.3)
 

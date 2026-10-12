@@ -150,6 +150,13 @@ export const ipc = {
 		status: () => local<RemoteStatus | null>('remote_status'),
 		reattach: () => local<void>('remote_reattach'),
 	},
+	// Desktop <-> workspace-machine file copies (Phase 16.6). Each call
+	// returns a transfer id; progress arrives on `transfer:progress`.
+	transfer: {
+		upload: (sources: string[], targetDir: string) => local<string>('transfer_upload', { sources, targetDir }),
+		download: (source: string, destination: string) => local<string>('transfer_download', { source, destination }),
+		cancel: (id: string) => local<void>('transfer_cancel', { id }),
+	},
 	window: {
 		open: (slug: string) => local<void>('window_open', { workspaceId: slug }),
 		close: () => local<void>('window_close'),
