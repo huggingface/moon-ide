@@ -68,7 +68,7 @@ pub async fn stop_all(state: &AppState) {
 	// gives each server ~2s to flush state first (tsserver persists
 	// a cache file on graceful exit that speeds up the next boot).
 	{
-		let handle = state.lsp.lock().await.take();
+		let handle = state.core.lsp.lock().await.take();
 		if let Some(handle) = handle {
 			handle.broker.shutdown_all().await;
 			tracing::info!("stop_all: stopped lsp broker");

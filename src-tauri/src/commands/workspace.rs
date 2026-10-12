@@ -130,10 +130,10 @@ fn repoint_fs_watcher(state: &AppState, snap: &WorkspaceRecord) {
 /// latency here.
 async fn detach_lsp_teardown_if_root_changed(state: &AppState, snap: &WorkspaceRecord) {
 	let old_handle = match snap.active_folder.as_ref() {
-		None => state.lsp.lock().await.take(),
+		None => state.core.lsp.lock().await.take(),
 		Some(active) => {
 			let new_root = Utf8PathBuf::from(active);
-			let mut guard = state.lsp.lock().await;
+			let mut guard = state.core.lsp.lock().await;
 			match guard.as_ref() {
 				Some(existing) if existing.root == new_root => None,
 				_ => guard.take(),

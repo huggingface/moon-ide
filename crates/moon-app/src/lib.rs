@@ -20,6 +20,7 @@ mod editorconfig;
 mod events;
 mod fs;
 pub mod logs;
+pub mod lsp;
 mod search;
 mod session;
 pub mod settings;
@@ -48,6 +49,9 @@ pub struct AppCore {
 	/// output; shared with the coder's terminal tools (ADR 0048).
 	pub terminals: Arc<moon_terminal::TerminalRegistry>,
 	pub terminal_streams: terminal::TerminalStreams,
+	/// LSP broker for the active folder plus its event pump; built
+	/// lazily on the first `lsp_*` call.
+	pub lsp: tokio::sync::Mutex<Option<lsp::LspHandle>>,
 }
 
 impl AppCore {
@@ -82,7 +86,7 @@ impl AppCore {
 				})*
 			};
 		}
-		route!(fs, search, editorconfig, session, coder, browser, logs, terminal);
+		route!(fs, search, editorconfig, session, coder, browser, logs, terminal, lsp);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
 }
@@ -191,6 +195,7 @@ mod tests {
 			logs: moon_core::LogSink::new(),
 			terminals,
 			terminal_streams: Default::default(),
+			lsp: Default::default(),
 		};
 		(app, data)
 	}

@@ -1,10 +1,10 @@
-//! LSP Tauri commands.
+//! LSP commands.
 //!
 //! Thin surface: open / update / close (fire-and-forget-ish
 //! notifications) + hover / completion (requests). Diagnostics stream
 //! out on the `lsp:diagnostics` event; server status transitions
 //! (starting, running, unavailable, crashed, stopped) come through
-//! `lsp:status`. The broker lives behind [`AppState::lsp`] and is
+//! `lsp:status`. The broker lives behind [`AppCore::lsp`] and is
 //! spawned lazily on the first open call — we don't pay the TS server
 //! startup cost until the user actually opens a TS/JS file.
 //!
@@ -12,8 +12,7 @@
 //! through `MoonError` and every parameter is forwarded to the broker
 //! unchanged. "No policy" is the policy. Path validation, language-id
 //! mapping, and graceful `NotAvailable` fallback all live in
-//! `moon_core::lsp` so `moon-remote` (future remote runtime) and the
-//! Tauri shell share the same behaviour.
+//! `moon_core::lsp`.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use moon_container::{Workspace as ContainerWorkspace, WorkspaceConfig};
@@ -26,10 +25,10 @@ use moon_protocol::lsp::{
 };
 use moon_protocol::MoonError;
 use moon_terminal::{container_name_for_workspace, TerminalTarget};
-use tauri::async_runtime::JoinHandle;
-use tauri::{AppHandle, Emitter, State};
+use tokio::task::JoinHandle;
 
-use crate::state::AppState;
+use crate::events::emit;
+use crate::AppCore;
 
 /// `textDocument/publishDiagnostics` fan-out. Payload is
 /// `LspDiagnosticsEvent` (path + full diagnostic list). Full replacement
@@ -42,42 +41,27 @@ pub const LSP_DIAGNOSTICS_EVENT: &str = "lsp:diagnostics";
 /// when anything but `Running` is active.
 pub const LSP_STATUS_EVENT: &str = "lsp:status";
 
-#[tauri::command]
-pub async fn lsp_open(
-	state: State<'_, AppState>,
-	app: AppHandle,
-	path: String,
-	language_id: String,
-	text: String,
-) -> Result<(), MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+pub async fn lsp_open(app: &AppCore, path: String, language_id: String, text: String) -> Result<(), MoonError> {
+	let broker = ensure_broker(app).await?;
 	broker
 		.open(&path, text, &language_id)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
 
-#[tauri::command]
-pub async fn lsp_update(
-	state: State<'_, AppState>,
-	app: AppHandle,
-	path: String,
-	language_id: String,
-	text: String,
-) -> Result<(), MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+pub async fn lsp_update(app: &AppCore, path: String, language_id: String, text: String) -> Result<(), MoonError> {
+	let broker = ensure_broker(app).await?;
 	broker
 		.update(&path, text, &language_id)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
 
-#[tauri::command]
-pub async fn lsp_close(state: State<'_, AppState>, path: String, language_id: String) -> Result<(), MoonError> {
+pub async fn lsp_close(app: &AppCore, path: String, language_id: String) -> Result<(), MoonError> {
 	// Don't spawn a broker just to close a file — if we never had
 	// one, there's nothing to inform.
 	let broker = {
-		let guard = state.lsp.lock().await;
+		let guard = app.lsp.lock().await;
 		match guard.as_ref() {
 			Some(b) => b.broker.clone(),
 			None => return Ok(()),
@@ -89,44 +73,38 @@ pub async fn lsp_close(state: State<'_, AppState>, path: String, language_id: St
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
 
-#[tauri::command]
 pub async fn lsp_hover(
-	state: State<'_, AppState>,
-	app: AppHandle,
+	app: &AppCore,
 	path: String,
 	language_id: String,
 	position: LspPosition,
 ) -> Result<Option<LspHover>, MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+	let broker = ensure_broker(app).await?;
 	broker
 		.hover(&path, &language_id, position)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
 
-#[tauri::command]
 pub async fn lsp_completion_resolve(
-	state: State<'_, AppState>,
-	app: AppHandle,
+	app: &AppCore,
 	language_id: String,
 	resolve_token: String,
 ) -> Result<LspCompletionItem, MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+	let broker = ensure_broker(app).await?;
 	broker
 		.completion_resolve(&language_id, &resolve_token)
 		.await
 		.map_err(|e| MoonError::internal(e.to_string()))
 }
 
-#[tauri::command]
 pub async fn lsp_completion(
-	state: State<'_, AppState>,
-	app: AppHandle,
+	app: &AppCore,
 	path: String,
 	language_id: String,
 	position: LspPosition,
 ) -> Result<LspCompletionList, MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+	let broker = ensure_broker(app).await?;
 	broker
 		.completion(&path, &language_id, position)
 		.await
@@ -162,13 +140,9 @@ pub async fn lsp_completion(
 /// No-op when no broker exists yet (the user hasn't opened any
 /// LSP language file in this session): forwarding fs events to
 /// zero servers is a fine idempotent.
-#[tauri::command]
-pub async fn lsp_notify_files_changed(
-	state: State<'_, AppState>,
-	changes: Vec<LspFileChange>,
-) -> Result<(), MoonError> {
+pub async fn lsp_notify_files_changed(app: &AppCore, changes: Vec<LspFileChange>) -> Result<(), MoonError> {
 	let broker = {
-		let guard = state.lsp.lock().await;
+		let guard = app.lsp.lock().await;
 		match guard.as_ref() {
 			Some(b) => b.broker.clone(),
 			None => return Ok(()),
@@ -199,13 +173,9 @@ pub async fn lsp_notify_files_changed(
 /// for everything that path can't catch.
 ///
 /// No-op when no broker exists yet.
-#[tauri::command]
-pub async fn lsp_refresh_open_diagnostics(
-	state: State<'_, AppState>,
-	language_ids: Vec<String>,
-) -> Result<(), MoonError> {
+pub async fn lsp_refresh_open_diagnostics(app: &AppCore, language_ids: Vec<String>) -> Result<(), MoonError> {
 	let broker = {
-		let guard = state.lsp.lock().await;
+		let guard = app.lsp.lock().await;
 		match guard.as_ref() {
 			Some(b) => b.broker.clone(),
 			None => return Ok(()),
@@ -227,10 +197,9 @@ pub async fn lsp_refresh_open_diagnostics(
 /// and wants the IDE to pick up the new binary without bouncing
 /// the whole window. No-op when no broker exists yet — calling
 /// restart before any LSP has spun up is a fine idempotent.
-#[tauri::command]
-pub async fn lsp_restart(state: State<'_, AppState>, language_id: String) -> Result<(), MoonError> {
+pub async fn lsp_restart(app: &AppCore, language_id: String) -> Result<(), MoonError> {
 	let broker = {
-		let guard = state.lsp.lock().await;
+		let guard = app.lsp.lock().await;
 		match guard.as_ref() {
 			Some(b) => b.broker.clone(),
 			None => return Ok(()),
@@ -244,15 +213,13 @@ pub async fn lsp_restart(state: State<'_, AppState>, language_id: String) -> Res
 /// Returns `Ok(None)` when the server doesn't know (e.g. the cursor
 /// is on whitespace, a keyword with no jump, or a literal). The UI
 /// treats that as "no link underline" rather than an error.
-#[tauri::command]
 pub async fn lsp_definition(
-	state: State<'_, AppState>,
-	app: AppHandle,
+	app: &AppCore,
 	path: String,
 	language_id: String,
 	position: LspPosition,
 ) -> Result<Option<LspLocation>, MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+	let broker = ensure_broker(app).await?;
 	broker
 		.definition(&path, &language_id, position)
 		.await
@@ -266,16 +233,14 @@ pub async fn lsp_definition(
 /// placeholder when the server returned a bare range with no
 /// placeholder (the common shape — see
 /// `translate::prepare_rename_response`).
-#[tauri::command]
 pub async fn lsp_prepare_rename(
-	state: State<'_, AppState>,
-	app: AppHandle,
+	app: &AppCore,
 	path: String,
 	language_id: String,
 	position: LspPosition,
 	fallback_word: String,
 ) -> Result<Option<LspPrepareRename>, MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+	let broker = ensure_broker(app).await?;
 	broker
 		.prepare_rename(&path, &language_id, position, &fallback_word)
 		.await
@@ -287,16 +252,14 @@ pub async fn lsp_prepare_rename(
 /// nothing to change (cursor wasn't on a real symbol, server
 /// doesn't implement rename); the F2 flow treats that the same
 /// as a `None` from `lsp_prepare_rename`.
-#[tauri::command]
 pub async fn lsp_rename(
-	state: State<'_, AppState>,
-	app: AppHandle,
+	app: &AppCore,
 	path: String,
 	language_id: String,
 	position: LspPosition,
 	new_name: String,
 ) -> Result<LspWorkspaceEdit, MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+	let broker = ensure_broker(app).await?;
 	broker
 		.rename(&path, &language_id, position, &new_name)
 		.await
@@ -311,16 +274,14 @@ pub async fn lsp_rename(
 /// that server. Returns the empty list when nothing is wired up
 /// for the producer or the server isn't running; the lint
 /// tooltip falls back to the always-on "Fix in coder" entry.
-#[tauri::command]
 pub async fn lsp_code_action(
-	state: State<'_, AppState>,
-	app: AppHandle,
+	app: &AppCore,
 	path: String,
 	producer: String,
 	range: LspRange,
 	diagnostic: LspDiagnostic,
 ) -> Result<Vec<LspCodeAction>, MoonError> {
-	let broker = ensure_broker(&state, &app).await?;
+	let broker = ensure_broker(app).await?;
 	broker
 		.code_action(&path, &producer, range, diagnostic)
 		.await
@@ -365,15 +326,15 @@ pub enum BrokerTarget {
 /// Otherwise — container not up, no container config, or container
 /// failed — fall back to the host spawner. The routing table is
 /// documented in [`specs/lsp.md#container-backed-lsp`].
-async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::Arc<LspBroker>, MoonError> {
-	let snap = state.workspaces.snapshot().await;
+async fn ensure_broker(app: &AppCore) -> Result<std::sync::Arc<LspBroker>, MoonError> {
+	let snap = app.workspaces.snapshot().await;
 	let active = snap
 		.active_folder
 		.ok_or_else(|| MoonError::invalid("lsp: no active folder; open a workspace before using LSP"))?;
 	let root = Utf8PathBuf::from(active);
 
 	let target = resolve_target(
-		state,
+		app,
 		&snap.id,
 		&snap
 			.folders
@@ -384,21 +345,21 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 	)
 	.await;
 
-	let mut guard = state.lsp.lock().await;
+	let mut guard = app.lsp.lock().await;
 	if let Some(existing) = guard.as_ref() {
 		if existing.root == root && existing.target == target {
 			return Ok(existing.broker.clone());
 		}
 		// Active folder or container target changed. Detach the
 		// teardown to a background task so the rebuild path
-		// doesn't hold `state.lsp` across `shutdown_all().await`
+		// doesn't hold `app.lsp` across `shutdown_all().await`
 		// — sequential per-server with 2s shutdown + 2s child-
 		// wait budgets, so synchronously waiting would gate
 		// every subsequent `lsp_*` IPC behind the full teardown
 		// (matching what `detach_lsp_teardown_if_root_changed`
 		// already does for the folder-switch entry point).
 		let old = guard.take().expect("guard.take after is_some");
-		tauri::async_runtime::spawn(async move {
+		tokio::spawn(async move {
 			old.broker.shutdown_all().await;
 		});
 	}
@@ -428,17 +389,17 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 		}
 	};
 
-	let broker = LspBroker::new_with_spawner(root.clone(), spawner, translator, state.logs.clone());
+	let broker = LspBroker::new_with_spawner(root.clone(), spawner, translator, app.logs.clone());
 	let mut rx = broker.subscribe();
-	let app_clone = app.clone();
-	let pump = tauri::async_runtime::spawn(async move {
+	let events = app.events.clone();
+	let pump = tokio::spawn(async move {
 		loop {
 			match rx.recv().await {
 				Ok(LspServerEvent::Diagnostics(ev)) => {
-					let _ = app_clone.emit(LSP_DIAGNOSTICS_EVENT, &ev);
+					emit(events.as_ref(), LSP_DIAGNOSTICS_EVENT, &ev);
 				}
 				Ok(LspServerEvent::StatusChanged(ev)) => {
-					let _ = app_clone.emit(LSP_STATUS_EVENT, &ev);
+					emit(events.as_ref(), LSP_STATUS_EVENT, &ev);
 				}
 				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
 					// Should be rare (256-deep channel, one UI
@@ -477,12 +438,12 @@ async fn ensure_broker(state: &AppState, app: &AppHandle) -> Result<std::sync::A
 /// resolves to `Host` too: a container-spawned LSP would see no
 /// files at the translated path.
 async fn resolve_target(
-	state: &AppState,
+	app: &AppCore,
 	workspace_id: &str,
 	bound_folders: &[Utf8PathBuf],
 	root: &Utf8Path,
 ) -> BrokerTarget {
-	let state_dir = state.workspace_state_dir(workspace_id);
+	let state_dir = app.workspaces_dir.join(workspace_id);
 	let ws = match ContainerWorkspace::new(WorkspaceConfig {
 		workspace_id: workspace_id.to_owned(),
 		state_dir,
@@ -496,7 +457,7 @@ async fn resolve_target(
 	};
 	match ws.status().await {
 		Ok(status) if matches!(status.state, ContainerState::Running) => {
-			let mount_root = state
+			let mount_root = app
 				.workspaces
 				.folder_for_path(root.as_str())
 				.await
@@ -517,4 +478,20 @@ async fn resolve_target(
 			BrokerTarget::Host
 		}
 	}
+}
+
+crate::commands! {
+	lsp_open([app] path: String, language_id: String, text: String),
+	lsp_update([app] path: String, language_id: String, text: String),
+	lsp_close([app] path: String, language_id: String),
+	lsp_hover([app] path: String, language_id: String, position: LspPosition),
+	lsp_completion_resolve([app] language_id: String, resolve_token: String),
+	lsp_completion([app] path: String, language_id: String, position: LspPosition),
+	lsp_notify_files_changed([app] changes: Vec<LspFileChange>),
+	lsp_refresh_open_diagnostics([app] language_ids: Vec<String>),
+	lsp_restart([app] language_id: String),
+	lsp_definition([app] path: String, language_id: String, position: LspPosition),
+	lsp_prepare_rename([app] path: String, language_id: String, position: LspPosition, fallback_word: String),
+	lsp_rename([app] path: String, language_id: String, position: LspPosition, new_name: String),
+	lsp_code_action([app] path: String, producer: String, range: LspRange, diagnostic: LspDiagnostic),
 }

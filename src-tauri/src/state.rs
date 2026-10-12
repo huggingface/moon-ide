@@ -9,7 +9,6 @@ use moon_terminal::TerminalRegistry;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::AbortHandle;
 
-use crate::commands::lsp::LspHandle;
 use crate::fs_watcher::FsWatcherHandle;
 use crate::slack_poller::PollerHandle;
 
@@ -51,8 +50,6 @@ pub struct AppState {
 	pub log_streams: Arc<Mutex<HashMap<String, AbortHandle>>>,
 	/// Filesystem watcher actor.
 	pub fs_watcher: FsWatcherHandle,
-	/// LSP broker plus its event-pump task.
-	pub lsp: Arc<Mutex<Option<LspHandle>>>,
 	/// In-process AI coding agent (Phase 6).
 	pub coder: CoderHandle,
 	/// Optional `llama-server` child for local autocomplete (HF `--hf-repo`).
@@ -62,11 +59,6 @@ pub struct AppState {
 	/// to decide whether to render the preboot landing or the
 	/// regular IDE shell.
 	pub mode: AppMode,
-	/// Diagnostic log sink. Wired into the LSP broker (and,
-	/// later, format-on-save / fs-watcher / git) so user-
-	/// facing breadcrumbs are available in the bottom-panel
-	/// logs view instead of only in launcher stderr.
-	pub logs: Arc<LogSink>,
 	/// Abort handle for the per-workspace focus-socket listener
 	/// task (see [`crate::focus_socket::spawn_focus_listener`]).
 	/// Held so shutdown can drop the listening `UnixListener`
@@ -134,9 +126,10 @@ impl AppState {
 				coder: coder.clone(),
 				events,
 				preview_tunnels: moon_container::PreviewTunnels::new(),
-				logs: logs.clone(),
+				logs,
 				terminals,
 				terminal_streams: Default::default(),
+				lsp: Default::default(),
 			}),
 			workspaces,
 			config_dir,
@@ -144,11 +137,9 @@ impl AppState {
 			slack,
 			log_streams: Arc::new(Mutex::new(HashMap::new())),
 			fs_watcher,
-			lsp: Arc::new(Mutex::new(None)),
 			coder,
 			next_edit_server: Arc::new(NextEditServerSupervisor::default()),
 			mode,
-			logs,
 			focus_listener: Mutex::new(None),
 			remote_bridge: Mutex::new(None),
 		}

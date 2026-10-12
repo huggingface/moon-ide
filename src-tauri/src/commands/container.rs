@@ -51,7 +51,7 @@ pub(crate) fn emit_container_state(app: &AppHandle, status: &ContainerStatus) {
 /// `lsp_open` call rebuilds against the current state (container
 /// up → `DockerExec` spawner; container down → host fallback).
 async fn reset_lsp_broker(state: &AppState) {
-	let handle = state.lsp.lock().await.take();
+	let handle = state.core.lsp.lock().await.take();
 	if let Some(handle) = handle {
 		handle.broker.shutdown_all().await;
 	}

@@ -322,13 +322,13 @@ export const ipc = {
 		emit: (source: string, level: LogLevel, message: string) => call<void>('logs_emit', { source, level, message }),
 	},
 	lsp: {
-		open: (path: string, languageId: string, text: string) => local<void>('lsp_open', { path, languageId, text }),
-		update: (path: string, languageId: string, text: string) => local<void>('lsp_update', { path, languageId, text }),
-		close: (path: string, languageId: string) => local<void>('lsp_close', { path, languageId }),
+		open: (path: string, languageId: string, text: string) => call<void>('lsp_open', { path, languageId, text }),
+		update: (path: string, languageId: string, text: string) => call<void>('lsp_update', { path, languageId, text }),
+		close: (path: string, languageId: string) => call<void>('lsp_close', { path, languageId }),
 		hover: (path: string, languageId: string, position: LspPosition) =>
-			local<LspHover | null>('lsp_hover', { path, languageId, position }),
+			call<LspHover | null>('lsp_hover', { path, languageId, position }),
 		completion: (path: string, languageId: string, position: LspPosition) =>
-			local<LspCompletionList>('lsp_completion', { path, languageId, position }),
+			call<LspCompletionList>('lsp_completion', { path, languageId, position }),
 		// Lazy-resolve a completion item (the auto-import block lives
 		// here for `tsgo` / `rust-analyzer` / `pyright`). The
 		// `resolveToken` is the opaque string the matching item
@@ -338,13 +338,13 @@ export const ipc = {
 		// backend short-circuits to a no-op and gives us back the
 		// item we'd already have — same shape, no IPC fan-out.
 		completionResolve: (languageId: string, resolveToken: string) =>
-			local<LspCompletionItem>('lsp_completion_resolve', { languageId, resolveToken }),
+			call<LspCompletionItem>('lsp_completion_resolve', { languageId, resolveToken }),
 		definition: (path: string, languageId: string, position: LspPosition) =>
-			local<LspLocation | null>('lsp_definition', { path, languageId, position }),
+			call<LspLocation | null>('lsp_definition', { path, languageId, position }),
 		prepareRename: (path: string, languageId: string, position: LspPosition, fallbackWord: string) =>
-			local<LspPrepareRename | null>('lsp_prepare_rename', { path, languageId, position, fallbackWord }),
+			call<LspPrepareRename | null>('lsp_prepare_rename', { path, languageId, position, fallbackWord }),
 		rename: (path: string, languageId: string, position: LspPosition, newName: string) =>
-			local<LspWorkspaceEdit>('lsp_rename', { path, languageId, position, newName }),
+			call<LspWorkspaceEdit>('lsp_rename', { path, languageId, position, newName }),
 		// Quick-fix (`textDocument/codeAction`, `quickfix`-only) for
 		// one diagnostic the cursor is parked on. `producer` is the
 		// slot key the frontend received with the original
@@ -357,14 +357,14 @@ export const ipc = {
 		// frontend layers on top of every diagnostic regardless of
 		// what the server returned.
 		codeAction: (path: string, producer: string, range: LspRange, diagnostic: LspDiagnostic) =>
-			local<LspCodeAction[]>('lsp_code_action', { path, producer, range, diagnostic }),
+			call<LspCodeAction[]>('lsp_code_action', { path, producer, range, diagnostic }),
 		// Tear down the server slot for `languageId`. The next
 		// `open` / `update` / `hover` / `completion` lazily
 		// re-spawns it; the diag-logs panel exposes a "Restart"
 		// button per `lsp.*` source. No-op when no broker exists
 		// yet — calling restart before any LSP has spun up is
 		// fine.
-		restart: (languageId: string) => local<void>('lsp_restart', { languageId }),
+		restart: (languageId: string) => call<void>('lsp_restart', { languageId }),
 		// Re-pull diagnostics for every document on every running
 		// language server (optionally scoped to a subset of
 		// languages). The frontend uses this on window-focus
@@ -376,7 +376,7 @@ export const ipc = {
 		// invalidate the right caches and trigger a refresh on
 		// its own. Pass `[]` to refresh every running server.
 		refreshOpenDiagnostics: (languageIds: readonly string[]) =>
-			local<void>('lsp_refresh_open_diagnostics', { languageIds }),
+			call<void>('lsp_refresh_open_diagnostics', { languageIds }),
 		// Forward an fs-watcher batch to every running language
 		// server as one `workspace/didChangeWatchedFiles`
 		// notification per server, scoped through the globs that
@@ -391,7 +391,7 @@ export const ipc = {
 		// bytes). No-op when no broker has spun up yet, or when no
 		// server has registered a watcher matching any of the
 		// paths.
-		notifyFilesChanged: (changes: readonly LspFileChange[]) => local<void>('lsp_notify_files_changed', { changes }),
+		notifyFilesChanged: (changes: readonly LspFileChange[]) => call<void>('lsp_notify_files_changed', { changes }),
 	},
 	slack: {
 		setToken: (token: string) => local<SlackIdentity>('slack_set_token', { token }),
