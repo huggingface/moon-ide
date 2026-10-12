@@ -12,6 +12,7 @@ use moon_protocol::MoonError;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+pub mod browser;
 mod catalog;
 pub mod coder;
 pub mod container;
@@ -37,11 +38,20 @@ pub struct AppCore {
 	pub workspace_id: Option<String>,
 	pub coder: moon_coder::CoderHandle,
 	pub events: Arc<dyn EventSink>,
+	/// Loopback tunnels backing browser tabs (ADR 0088).
+	pub preview_tunnels: moon_container::PreviewTunnels,
 }
 
 impl AppCore {
 	pub fn workspace_id(&self) -> Option<&str> {
 		self.workspace_id.as_deref()
+	}
+
+	/// Start the tasks that forward in-process broadcasts (coder loop,
+	/// browser tabs) to the event sink. Must run on the tokio runtime.
+	pub fn spawn_pumps(&self) {
+		coder::spawn_event_pump(self.events.clone(), self.coder.clone());
+		browser::spawn_tabs_pump(self.events.clone(), &self.coder);
 	}
 
 	/// Run `method` with its JSON `params` (an object keyed by the
@@ -54,7 +64,7 @@ impl AppCore {
 				})*
 			};
 		}
-		route!(fs, search, editorconfig, session, coder);
+		route!(fs, search, editorconfig, session, coder, browser);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
 }
@@ -68,8 +78,21 @@ fn parse_params<T: DeserializeOwned>(method: &str, params: Value) -> Result<T, M
 	serde_json::from_value(params).map_err(|e| MoonError::invalid(format!("{method}: bad params: {e}")))
 }
 
-fn to_value<T: serde::Serialize>(value: T) -> Result<Value, MoonError> {
-	serde_json::to_value(value).map_err(|e| MoonError::internal(e.to_string()))
+/// What a command may return: a serialisable `Result`, or nothing.
+trait IntoRpc {
+	fn into_rpc(self) -> Result<Value, MoonError>;
+}
+
+impl<T: serde::Serialize> IntoRpc for Result<T, MoonError> {
+	fn into_rpc(self) -> Result<Value, MoonError> {
+		serde_json::to_value(self?).map_err(|e| MoonError::internal(e.to_string()))
+	}
+}
+
+impl IntoRpc for () {
+	fn into_rpc(self) -> Result<Value, MoonError> {
+		Ok(Value::Null)
+	}
 }
 
 /// Generates a module's `handles` + `dispatch`: one arm per command, deserialising
@@ -94,7 +117,7 @@ macro_rules! commands {
 					struct Args { $( $arg: $ty ),* }
 					#[allow(unused_variables)]
 					let Args { $( $arg ),* } = crate::parse_params::<Args>(method, params)?;
-					crate::to_value($name($(crate::pass_app!($app, app),)? $( $arg ),*).await?)
+					crate::IntoRpc::into_rpc($name($(crate::pass_app!($app, app),)? $( $arg ),*).await)
 				} )*
 				_ => Err(moon_protocol::MoonError::invalid(format!("unknown method `{method}`"))),
 			}
@@ -145,6 +168,7 @@ mod tests {
 			workspace_id: Some("test-workspace".into()),
 			coder,
 			events: Arc::new(NoEvents),
+			preview_tunnels: moon_container::PreviewTunnels::new(),
 		};
 		(app, data)
 	}

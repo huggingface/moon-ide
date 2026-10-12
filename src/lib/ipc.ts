@@ -277,19 +277,19 @@ export const ipc = {
 		 *  `inContainer = false`, otherwise rewritten onto a host
 		 *  loopback tunnel that dials from inside the workspace
 		 *  shell (ADR 0088). */
-		resolveUrl: (url: string, inContainer: boolean) => local<string>('browser_resolve_url', { url, inContainer }),
+		resolveUrl: (url: string, inContainer: boolean) => call<string>('browser_resolve_url', { url, inContainer }),
 		// Tab registry (ADR 0088). Mutations answer via `browser:tabs`.
-		list: () => local<BrowserTab[]>('browser_tabs_list'),
+		list: () => call<BrowserTab[]>('browser_tabs_list'),
 		open: (url: string, inContainer: boolean, reuse: boolean) =>
-			local<BrowserTab>('browser_tab_open', { url, inContainer, reuse }),
-		navigate: (id: number, url: string) => local<BrowserTab>('browser_tab_navigate', { id, url }),
-		reload: (id: number) => local<void>('browser_tab_reload', { id }),
-		focus: (id: number) => local<void>('browser_tab_focus', { id }),
-		close: (id: number) => local<void>('browser_tab_close', { id }),
-		location: (id: number, url: string) => local<void>('browser_tab_location', { id, url }),
+			call<BrowserTab>('browser_tab_open', { url, inContainer, reuse }),
+		navigate: (id: number, url: string) => call<BrowserTab>('browser_tab_navigate', { id, url }),
+		reload: (id: number) => call<void>('browser_tab_reload', { id }),
+		focus: (id: number) => call<void>('browser_tab_focus', { id }),
+		close: (id: number) => call<void>('browser_tab_close', { id }),
+		location: (id: number, url: string) => call<void>('browser_tab_location', { id, url }),
 		/** Answer a `browser:page_request` (`error` non-null = failed). */
 		respond: (requestId: number, value: unknown, error: string | null) =>
-			local<void>('browser_page_respond', { requestId, value, error }),
+			call<void>('browser_page_respond', { requestId, value, error }),
 	},
 	ports: {
 		list: () => local<ForwardedPort[]>('ports_list'),

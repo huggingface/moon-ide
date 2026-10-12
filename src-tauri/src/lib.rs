@@ -158,15 +158,6 @@ pub fn run() {
 			commands::project_compose::project_compose_service_stop,
 			commands::project_compose::project_compose_service_restart,
 			commands::project_compose::project_compose_service_recreate,
-			commands::browser::browser_resolve_url,
-			commands::browser::browser_tabs_list,
-			commands::browser::browser_tab_open,
-			commands::browser::browser_tab_navigate,
-			commands::browser::browser_tab_reload,
-			commands::browser::browser_tab_focus,
-			commands::browser::browser_tab_close,
-			commands::browser::browser_tab_location,
-			commands::browser::browser_page_respond,
 			commands::ports::ports_list,
 			commands::ports::ports_set,
 			commands::ports::ports_status,
@@ -441,16 +432,6 @@ pub fn run() {
 			.map_err(|err| format!("could not init moon-coder: {err}"))?;
 			let events: std::sync::Arc<dyn moon_app::EventSink> =
 				std::sync::Arc::new(events::TauriEvents(app.handle().clone()));
-			{
-				// Spawns with `tokio::spawn`, which needs the runtime
-				// the setup hook (main thread) isn't on.
-				let events = events.clone();
-				let coder = coder.clone();
-				tauri::async_runtime::spawn(async move {
-					moon_app::coder::spawn_event_pump(events, coder);
-				});
-			}
-			commands::browser::spawn_tabs_pump(app.handle().clone(), &coder);
 			// OS-level agent-activity indicator (per-workspace
 			// tray icon + window-icon status dot + taskbar
 			// flash).
@@ -544,6 +525,10 @@ pub fn run() {
 				terminals,
 				events,
 			);
+			// `tokio::spawn` needs the runtime the setup hook (main
+			// thread) isn't on; `block_on` keeps the subscriptions
+			// synchronous so no early event is missed.
+			tauri::async_runtime::block_on(async { state.core.spawn_pumps() });
 			if let Some(abort) = focus_listener_abort {
 				*state.focus_listener.blocking_lock() = Some(abort);
 			}

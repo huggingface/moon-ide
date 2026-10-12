@@ -3431,6 +3431,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3585,7 +3586,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
 ]
 
