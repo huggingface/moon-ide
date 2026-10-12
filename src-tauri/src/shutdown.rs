@@ -45,7 +45,7 @@ pub async fn stop_all(state: &AppState) {
 	// Without this step `docker exec` children survive the
 	// IDE process and accumulate as orphans on the daemon.
 	{
-		let mut registry = state.terminal_streams.lock().await;
+		let mut registry = state.core.terminal_streams.lock().await;
 		let count = registry.len();
 		for (_, handle) in registry.drain() {
 			handle.task.abort();

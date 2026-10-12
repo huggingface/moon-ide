@@ -3418,6 +3418,7 @@ dependencies = [
 name = "moon-app"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "camino",
  "keyring",
@@ -3432,6 +3433,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3549,7 +3551,6 @@ dependencies = [
  "anyhow",
  "ashpd",
  "async-trait",
- "base64 0.22.1",
  "camino",
  "dirs",
  "futures-util",

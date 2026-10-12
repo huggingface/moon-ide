@@ -164,10 +164,6 @@ pub fn run() {
 			commands::ports::ports_reapply,
 			commands::compose_logs::compose_logs_open,
 			commands::compose_logs::compose_logs_close,
-			commands::terminal::terminal_open,
-			commands::terminal::terminal_write,
-			commands::terminal::terminal_resize,
-			commands::terminal::terminal_close,
 			commands::lsp::lsp_open,
 			commands::lsp::lsp_update,
 			commands::lsp::lsp_close,
@@ -541,11 +537,7 @@ pub fn run() {
 
 			// Agents open terminals through the registry they share
 			// with the terminal commands (ADR 0090).
-			state
-				.terminals
-				.set_spawner(std::sync::Arc::new(commands::terminal::AgentTerminalSpawner {
-					app: app.handle().clone(),
-				}));
+			state.core.install_agent_terminals();
 			app.manage(state);
 
 			// Reconnect to a remote relay bridge when this IDE holds a

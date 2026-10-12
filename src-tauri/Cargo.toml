@@ -80,11 +80,6 @@ libc = "0.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 ashpd = "0.10"
-# Terminal IPC ferries arbitrary 8-bit PTY bytes (escape sequences,
-# UTF-8 fragments split mid-codepoint on read boundaries) over Tauri's
-# JSON payload codec; base64 framing keeps the wire format honest.
-# `base64` 0.22 ships the `Engine` trait we use directly.
-base64 = "0.22"
 
 [dev-dependencies]
 tempfile = { workspace = true }

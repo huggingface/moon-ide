@@ -23,6 +23,7 @@ pub mod logs;
 mod search;
 mod session;
 pub mod settings;
+pub mod terminal;
 
 pub use catalog::bump_last_active;
 pub use events::{emit, EventSink};
@@ -43,11 +44,23 @@ pub struct AppCore {
 	pub preview_tunnels: moon_container::PreviewTunnels,
 	/// Diagnostic log sink behind the bottom-panel logs view.
 	pub logs: Arc<moon_core::LogSink>,
+	/// What's open in the terminal tabs plus each one's retained
+	/// output; shared with the coder's terminal tools (ADR 0048).
+	pub terminals: Arc<moon_terminal::TerminalRegistry>,
+	pub terminal_streams: terminal::TerminalStreams,
 }
 
 impl AppCore {
 	pub fn workspace_id(&self) -> Option<&str> {
 		self.workspace_id.as_deref()
+	}
+
+	/// Let agents open, restart and close terminals through the
+	/// registry they share with the terminal commands (ADR 0090).
+	pub fn install_agent_terminals(self: &Arc<Self>) {
+		self.terminals.set_spawner(Arc::new(terminal::AgentTerminalSpawner {
+			app: Arc::downgrade(self),
+		}));
 	}
 
 	/// Start the tasks that forward in-process broadcasts (coder loop,
@@ -69,7 +82,7 @@ impl AppCore {
 				})*
 			};
 		}
-		route!(fs, search, editorconfig, session, coder, browser, logs);
+		route!(fs, search, editorconfig, session, coder, browser, logs, terminal);
 		Err(MoonError::invalid(format!("unknown method `{method}`")))
 	}
 }
@@ -157,13 +170,14 @@ mod tests {
 		let data = tempfile::tempdir().unwrap();
 		let dir = |name: &str| Utf8PathBuf::from_path_buf(data.path().join(name)).unwrap();
 		let workspaces = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		let terminals = Arc::new(moon_terminal::TerminalRegistry::default());
 		let coder = moon_coder::CoderHandle::new(
 			workspaces.clone(),
 			dir("workspaces"),
 			dir("coder-sessions"),
 			dir("folder-summaries"),
 			moon_coder::CoderModels::default(),
-			Arc::new(moon_terminal::TerminalRegistry::default()),
+			terminals.clone(),
 		)
 		.unwrap();
 		let app = AppCore {
@@ -175,6 +189,8 @@ mod tests {
 			events: Arc::new(NoEvents),
 			preview_tunnels: moon_container::PreviewTunnels::new(),
 			logs: moon_core::LogSink::new(),
+			terminals,
+			terminal_streams: Default::default(),
 		};
 		(app, data)
 	}

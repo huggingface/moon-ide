@@ -49,15 +49,6 @@ pub struct AppState {
 	pub slack: SlackState,
 	/// Registry of active `docker compose logs -f` streams.
 	pub log_streams: Arc<Mutex<HashMap<String, AbortHandle>>>,
-	/// Registry of active terminal sessions.
-	pub terminal_streams: Arc<Mutex<HashMap<String, TerminalStreamHandle>>>,
-	/// What's open in the terminal tabs, plus each terminal's
-	/// retained output. Distinct from `terminal_streams`, which
-	/// holds the write/abort handles this process needs: this one is
-	/// the read side, shared with `moon-coder` so an agent can list
-	/// and read the terminals of the project it's working in
-	/// (ADR 0048).
-	pub terminals: Arc<TerminalRegistry>,
 	/// Filesystem watcher actor.
 	pub fs_watcher: FsWatcherHandle,
 	/// LSP broker plus its event-pump task.
@@ -113,26 +104,6 @@ pub enum AppMode {
 /// workspace can collide.
 pub const PREBOOT_WORKSPACE_ID: &str = "__preboot__";
 
-/// Owning handle the terminal commands keep per stream. The
-/// `tx` channel is read by the supervisor task; sending fails
-/// once the supervisor exits (process dead) so write commands
-/// translate that to a no-op. `task` is the supervisor itself:
-/// aborting it drops the PTY (killing the child), and an in-place
-/// restart awaits it so the old supervisor's exit bookkeeping can't
-/// land on the new shell.
-pub struct TerminalStreamHandle {
-	pub tx: tokio::sync::mpsc::Sender<TerminalCommand>,
-	pub task: tauri::async_runtime::JoinHandle<()>,
-}
-
-/// Inputs the terminal supervisor accepts on its mpsc channel.
-/// Resize is in-band so we don't need a second mutex around the
-/// `PtySession`.
-pub enum TerminalCommand {
-	Write(Vec<u8>),
-	Resize { cols: u16, rows: u16 },
-}
-
 impl AppState {
 	// Many arguments by design: this is the process's whole world
 	// (workspace registry, paths, every long-lived actor handle).
@@ -164,14 +135,14 @@ impl AppState {
 				events,
 				preview_tunnels: moon_container::PreviewTunnels::new(),
 				logs: logs.clone(),
+				terminals,
+				terminal_streams: Default::default(),
 			}),
 			workspaces,
 			config_dir,
 			workspaces_dir,
 			slack,
 			log_streams: Arc::new(Mutex::new(HashMap::new())),
-			terminal_streams: Arc::new(Mutex::new(HashMap::new())),
-			terminals,
 			fs_watcher,
 			lsp: Arc::new(Mutex::new(None)),
 			coder,

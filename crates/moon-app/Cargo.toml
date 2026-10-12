@@ -12,7 +12,9 @@ moon-coder = { workspace = true }
 moon-container = { workspace = true }
 moon-core = { workspace = true }
 moon-protocol = { workspace = true }
+moon-terminal = { workspace = true }
 
+async-trait = { workspace = true }
 camino = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,8 +22,8 @@ base64 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 keyring = { workspace = true }
-moon-terminal = { workspace = true }
 tempfile = { workspace = true }

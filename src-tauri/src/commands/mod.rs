@@ -13,7 +13,6 @@ pub mod project_compose;
 pub mod rpc;
 pub mod slack;
 pub mod system;
-pub mod terminal;
 pub mod ui;
 pub mod window;
 pub mod workspace;

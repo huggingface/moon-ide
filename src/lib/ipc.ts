@@ -302,10 +302,10 @@ export const ipc = {
 		close: (streamId: string) => local<void>('compose_logs_close', { streamId }),
 	},
 	terminal: {
-		open: (request: TerminalOpenRequest) => local<string>('terminal_open', { request }),
-		write: (streamId: string, data: string) => local<void>('terminal_write', { streamId, data }),
-		resize: (streamId: string, cols: number, rows: number) => local<void>('terminal_resize', { streamId, cols, rows }),
-		close: (streamId: string) => local<void>('terminal_close', { streamId }),
+		open: (request: TerminalOpenRequest) => call<string>('terminal_open', { request }),
+		write: (streamId: string, data: string) => call<void>('terminal_write', { streamId, data }),
+		resize: (streamId: string, cols: number, rows: number) => call<void>('terminal_resize', { streamId, cols, rows }),
+		close: (streamId: string) => call<void>('terminal_close', { streamId }),
 	},
 	nextEdit: {
 		probe: (baseUrl: string) => local<NextEditProbeResult>('next_edit_probe', { baseUrl: baseUrl.trim() }),
