@@ -14,6 +14,9 @@ use crate::fs_watcher::FsWatcherHandle;
 use crate::slack_poller::PollerHandle;
 
 pub struct AppState {
+	/// The shared command surface (ADR 0095), served to the
+	/// frontend through `commands::rpc::rpc`.
+	pub core: Arc<moon_app::AppCore>,
 	/// The single workspace this process owns. Phase 7's
 	/// process-per-workspace model: each `moon-ide` process is
 	/// pinned to one workspace at startup (CLI arg
@@ -152,6 +155,7 @@ impl AppState {
 		terminals: Arc<TerminalRegistry>,
 	) -> Self {
 		Self {
+			core: Arc::new(moon_app::AppCore::new(workspaces.clone())),
 			workspaces,
 			config_dir,
 			workspaces_dir,

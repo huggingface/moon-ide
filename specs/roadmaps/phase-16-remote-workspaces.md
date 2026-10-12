@@ -26,6 +26,7 @@ files in and out of it.
   clipboard, focus) that stay local in both modes.
 - Lands in slices (fs/search, git, terminal, LSP, containers, coder,
   the rest) so the desktop keeps working at every commit.
+- Landed: `moon-app` crate + `rpc` command + fs / git group.
 
 ## 16.3 — Server and attach
 

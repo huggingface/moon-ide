@@ -3415,6 +3415,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "moon-app"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "camino",
+ "moon-core",
+ "moon-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "moon-bridge"
 version = "0.0.0"
 dependencies = [
@@ -3537,6 +3552,7 @@ dependencies = [
  "ignore",
  "keyring",
  "libc",
+ "moon-app",
  "moon-coder",
  "moon-container",
  "moon-core",

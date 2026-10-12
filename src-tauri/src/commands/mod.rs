@@ -14,6 +14,7 @@ pub mod lsp;
 pub mod next_edit;
 pub mod ports;
 pub mod project_compose;
+pub mod rpc;
 pub mod search;
 pub mod session;
 pub mod slack;

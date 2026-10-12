@@ -10,6 +10,7 @@ members = [
 	"crates/moon-slack",
 	"crates/moon-container",
 	"crates/moon-terminal",
+	"crates/moon-app",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ moon-container = { path = "crates/moon-container" }
 tempfile = "3.16"
 moon-terminal = { path = "crates/moon-terminal" }
 moon-remote = { path = "crates/moon-remote" }
+moon-app = { path = "crates/moon-app" }
 
 anyhow = "1.0"
 async-trait = "0.1.92"
