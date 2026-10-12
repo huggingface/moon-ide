@@ -112,7 +112,7 @@ pub async fn coder_sign_out(app: &AppCore) -> Result<(), MoonError> {
 ///    into a self-healing one — the first send after a relaunch
 ///    refreshes the pointer for next time.
 ///
-/// The pointer key + session id come from the [`SendTarget`] the
+/// The pointer key + session id come from the `SendTarget` the
 /// send itself resolved — **not** from re-reading the active folder
 /// after the await. A user who hits Enter and immediately switches
 /// projects would otherwise pin the message's session under the new

@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 
 use camino::Utf8PathBuf;
-use moon_container::{ProjectCompose, Workspace as ContainerWorkspace, WorkspaceConfig, DEFAULT_DEV_IMAGE};
+use moon_container::{ProjectCompose, DEFAULT_DEV_IMAGE};
 use moon_protocol::container::ContainerState;
 
 use crate::container::{emit_container_state, reapply_persisted_forwards};
@@ -128,11 +128,9 @@ impl AppCore {
 			tracing::warn!(error = %err, "stop_all: failed to persist compose_auto_resume snapshot");
 		}
 
-		let shell = ContainerWorkspace::new(WorkspaceConfig {
-			workspace_id: workspace_id.clone(),
-			state_dir,
-			bound_folders: bound,
-		});
+		// Same bound-folder set as `container_setup` (worktrees
+		// excluded), so the rendered compose.yaml can't drift.
+		let shell = crate::container::workspace_handle(self).await;
 		match shell {
 			Ok(shell) => {
 				if let Err(err) = shell.stop().await {
@@ -158,16 +156,7 @@ impl AppCore {
 	/// Best-effort. If `setup` fails, the pip surfaces the error via
 	/// the user's first popover open — the IDE itself still launches.
 	pub async fn auto_resume_shell(&self) {
-		let snapshot = self.workspaces.snapshot().await;
-		let workspace_id = snapshot.id.clone();
-		let bound: Vec<Utf8PathBuf> = snapshot.folders.iter().map(|f| Utf8PathBuf::from(&f.path)).collect();
-
-		let state_dir = self.workspaces_dir.join(&workspace_id);
-		let shell = match ContainerWorkspace::new(WorkspaceConfig {
-			workspace_id,
-			state_dir,
-			bound_folders: bound,
-		}) {
+		let shell = match crate::container::workspace_handle(self).await {
 			Ok(s) => s,
 			Err(err) => {
 				tracing::warn!(error = %err, "auto_resume_shell: failed to build workspace handle");
