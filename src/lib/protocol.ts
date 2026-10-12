@@ -13,6 +13,14 @@ export type DirEntry = {
 	is_hidden: boolean;
 };
 
+/** One directory listing from `fs_browse`. Mirrors `moon_app::fs::BrowseResult`. */
+export type BrowseResult = {
+	path: string;
+	parent: string | null;
+	dirs: string[];
+	files: string[];
+};
+
 export type ReadFileResult = {
 	text: string;
 	mtime_ms: number | null;

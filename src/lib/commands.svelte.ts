@@ -1,8 +1,9 @@
-import { confirm, open } from '@tauri-apps/plugin-dialog';
+import { confirm } from '@tauri-apps/plugin-dialog';
 import { workspace } from './state.svelte';
 import { coder } from './coder.svelte';
 import { companion } from './companion.svelte';
 import { remoteConnect } from './remoteConnect.svelte';
+import { pathPicker } from './pathPicker.svelte';
 import { slack } from './slack.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
@@ -199,8 +200,8 @@ export const builtInCommands: Command[] = [
 		id: 'workspace.openFolder',
 		title: 'Add Folder…',
 		run: async () => {
-			const selected = await open({ directory: true, multiple: false });
-			if (typeof selected === 'string') {
+			const selected = await pathPicker.pickFolder();
+			if (selected !== null) {
 				await workspace.openLocal(selected);
 			}
 		},
@@ -221,8 +222,8 @@ export const builtInCommands: Command[] = [
 				workspace.flash('Open a folder before opening a file.');
 				return;
 			}
-			const selected = await open({ directory: false, multiple: false });
-			if (typeof selected === 'string') {
+			const selected = await pathPicker.pickFile();
+			if (selected !== null) {
 				await workspace.openHostFile(selected);
 			}
 		},

@@ -11,6 +11,6 @@ use crate::state::{AppState, Backend};
 pub async fn rpc(state: State<'_, AppState>, method: String, params: Value) -> Result<Value, MoonError> {
 	match &state.backend {
 		Backend::Local(core) => core.dispatch(&method, params).await,
-		Backend::Remote(remote) => remote.client.call(&method, params).await,
+		Backend::Remote(remote) => remote.call(&method, params).await,
 	}
 }

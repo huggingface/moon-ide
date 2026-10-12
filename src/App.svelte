@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { open } from '@tauri-apps/plugin-dialog';
 	import Sidebar from './lib/components/Sidebar.svelte';
 	import EditorPane from './lib/components/EditorPane.svelte';
 	import StatusBar from './lib/components/StatusBar.svelte';
@@ -10,6 +9,8 @@
 	import CommandPalette from './lib/components/CommandPalette.svelte';
 	import CompanionModal from './lib/components/CompanionModal.svelte';
 	import RemoteConnect from './lib/components/RemoteConnect.svelte';
+	import PathPicker from './lib/components/PathPicker.svelte';
+	import { pathPicker } from './lib/pathPicker.svelte';
 	import RemoteStatusOverlay from './lib/components/RemoteStatusOverlay.svelte';
 	import ChatPanel from './lib/components/ChatPanel.svelte';
 	import CoderPanel from './lib/components/CoderPanel.svelte';
@@ -197,8 +198,8 @@
 					workspace.flash('Open a folder before opening a file.');
 					return;
 				}
-				const selected = await open({ directory: false, multiple: false });
-				if (typeof selected === 'string') {
+				const selected = await pathPicker.pickFile();
+				if (selected !== null) {
 					await workspace.openHostFile(selected);
 				}
 				return;
@@ -475,8 +476,8 @@
 	}
 
 	async function pickFolder() {
-		const selected = await open({ directory: true, multiple: false });
-		if (typeof selected !== 'string') {
+		const selected = await pathPicker.pickFolder();
+		if (selected === null) {
 			return;
 		}
 		await workspace.openLocal(selected);
@@ -631,6 +632,7 @@
 		<div class="toast" role="status">{workspace.toast}</div>
 	{/if}
 {/if}
+<PathPicker />
 <RemoteStatusOverlay />
 
 <style>

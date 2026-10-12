@@ -46,22 +46,27 @@ files in and out of it.
   the workspace created there (`moon-remote workspace-add`), key-based
   SSH (`BatchMode`), and a Secret Service for the keyring (ADR 0035
   recipe). Relay enrollment is optional.
-- Known gaps, picked up by later sub-phases: image / PDF previews
-  (asset protocol reads the desktop's disk), "Add folder" (opens a
-  local folder dialog), `$GIT_EDITOR` forwarding from remote
-  terminals.
+- Remaining gap: `$GIT_EDITOR` forwarding from remote terminals
+  (`git commit` without `-m` can't open its message in the editor).
 
-## 16.4 — Streams
+## 16.4 — Streams (landed)
 
 - Terminals, LSP, fs-watch and coder events over the attach channel;
   input / resize back. Usable latency on a normal home connection.
+- Image / PDF / video previews load through the desktop's
+  `moonfile://` scheme, which pages bytes via `fs_read_range` and
+  honours `Range` for video seeking.
+- "Add folder" / "Open file" browse the server's filesystem
+  (`fs_browse`) instead of opening the desktop's native dialog.
 
-## 16.5 — Tunnels
+## 16.5 — Tunnels (landed)
 
 - Browser tabs: loopback listener per preview target forwarded to the
   server's preview proxy; "open in system browser" uses the same
   local URL.
-- Declared port forwards land on the desktop's loopback.
+- Declared port forwards land on the desktop's loopback, on the same
+  port number (skipped with a log line when that port is taken).
+  Both ride `ssh -O forward` on the shared master connection.
 
 ## 16.6 — File transfer
 

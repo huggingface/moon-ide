@@ -31,7 +31,20 @@ export function subscribe(event: string, handler: (payload: never) => void): Pro
 	return listen<never>(event, ({ payload }) => handler(payload));
 }
 
+let remoteFiles = false;
+
+/**
+ * A remote window's files live on the server, so previews load through
+ * the desktop's `moonfile://` scheme instead of the asset protocol.
+ */
+export function useRemoteFiles(): void {
+	remoteFiles = true;
+}
+
 /** URL the webview can load a workspace file's bytes from (image / PDF previews). */
 export function fileUrl(absolutePath: string): string {
+	if (remoteFiles) {
+		return `moonfile://localhost/${encodeURIComponent(absolutePath)}`;
+	}
 	return convertFileSrc(absolutePath);
 }

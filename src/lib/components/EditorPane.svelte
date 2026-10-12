@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { pathPicker } from '../pathPicker.svelte';
 	import EditorTabs from './EditorTabs.svelte';
 	import Editor from './Editor.svelte';
 	import DiffView from './DiffView.svelte';
@@ -10,7 +11,6 @@
 	import CommitView from './CommitView.svelte';
 	import BrowserView from './BrowserView.svelte';
 	import Welcome from './Welcome.svelte';
-	import { open } from '@tauri-apps/plugin-dialog';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
 	import { isReviewPath } from '../util/reviewPath';
@@ -134,8 +134,8 @@
 	});
 
 	async function pickFolder() {
-		const selected = await open({ directory: true, multiple: false });
-		if (typeof selected !== 'string') {
+		const selected = await pathPicker.pickFolder();
+		if (selected === null) {
 			return;
 		}
 		await workspace.openLocal(selected);

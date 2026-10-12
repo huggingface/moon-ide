@@ -127,6 +127,85 @@ pub async fn fs_read_preview_host(app: &AppCore, path: String) -> Result<String,
 	Ok(format!("data:{mime};base64,{encoded}"))
 }
 
+/// One directory of the workspace machine's filesystem, for the path
+/// picker a remote window uses instead of the desktop's native dialog
+/// (ADR 0095). Hidden entries are skipped; names are sorted.
+#[derive(serde::Serialize)]
+pub struct BrowseResult {
+	pub path: String,
+	pub parent: Option<String>,
+	pub dirs: Vec<String>,
+	pub files: Vec<String>,
+}
+
+/// List `path` (the user's home directory when `None`).
+pub async fn fs_browse(path: Option<String>) -> Result<BrowseResult, MoonError> {
+	let path = match path {
+		Some(path) => Utf8PathBuf::from(path),
+		None => std::env::var("HOME")
+			.map(Utf8PathBuf::from)
+			.map_err(|_| MoonError::internal("HOME is not set on the workspace machine"))?,
+	};
+	let mut entries = tokio::fs::read_dir(&path).await?;
+	let mut dirs = Vec::new();
+	let mut files = Vec::new();
+	while let Some(entry) = entries.next_entry().await? {
+		let Ok(name) = entry.file_name().into_string() else {
+			continue;
+		};
+		if name.starts_with('.') {
+			continue;
+		}
+		// Follows symlinks, so a linked checkout lists as a directory.
+		match tokio::fs::metadata(entry.path()).await {
+			Ok(meta) if meta.is_dir() => dirs.push(name),
+			Ok(_) => files.push(name),
+			Err(_) => {}
+		}
+	}
+	dirs.sort();
+	files.sort();
+	Ok(BrowseResult {
+		parent: path.parent().map(|p| p.to_string()),
+		path: path.into_string(),
+		dirs,
+		files,
+	})
+}
+
+/// One slice of a file's bytes plus its total size and preview MIME,
+/// for streaming previews (images, PDFs, video) into a remote window
+/// (ADR 0095), where the webview can't read the server's disk.
+#[derive(serde::Serialize)]
+pub struct FileRange {
+	/// Base64.
+	pub data: String,
+	pub offset: u64,
+	pub total: u64,
+	pub mime: Option<&'static str>,
+}
+
+/// Largest slice one call returns; callers page through bigger files.
+const RANGE_MAX_BYTES: u64 = 4_000_000;
+
+pub async fn fs_read_range(path: String, offset: u64, length: u64) -> Result<FileRange, MoonError> {
+	use tokio::io::{AsyncReadExt, AsyncSeekExt};
+	let abs = Utf8PathBuf::from(&path);
+	let mut file = tokio::fs::File::open(&abs).await?;
+	let total = file.metadata().await?.len();
+	let offset = offset.min(total);
+	let length = length.min(RANGE_MAX_BYTES).min(total - offset);
+	file.seek(std::io::SeekFrom::Start(offset)).await?;
+	let mut bytes = vec![0; length as usize];
+	file.read_exact(&mut bytes).await?;
+	Ok(FileRange {
+		data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+		offset,
+		total,
+		mime: preview_mime(&abs),
+	})
+}
+
 /// Extension → MIME for the types the preview views render. Mirrors
 /// `src/lib/util/fileKind.ts`'s `IMAGE_EXTS` / `VIDEO_EXTS` (plus
 /// `pdf`) — keep the two in step, or the frontend will route a file
@@ -587,6 +666,8 @@ pub async fn fs_git_commit_diff(app: &AppCore, sha: String) -> Result<Option<Com
 }
 
 crate::commands! {
+	fs_browse(path: Option<String>),
+	fs_read_range(path: String, offset: u64, length: u64),
 	fs_read_dir([app] path: String),
 	fs_collect_paths_under([app] rel: String, max_depth: u32),
 	fs_collect_paths([app] max_depth: u32),
@@ -677,5 +758,37 @@ mod tests {
 		assert_eq!(preview_mime(Utf8Path::new("a.rs")), None);
 		assert_eq!(preview_mime(Utf8Path::new("a.mkv")), None);
 		assert_eq!(preview_mime(Utf8Path::new("noext")), None);
+	}
+
+	#[tokio::test]
+	async fn read_range_pages_through_a_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("clip.mp4");
+		std::fs::write(&path, b"0123456789").unwrap();
+		let path = path.to_str().unwrap().to_owned();
+		let range = fs_read_range(path.clone(), 3, 4).await.unwrap();
+		assert_eq!((range.offset, range.total, range.mime), (3, 10, Some("video/mp4")));
+		let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, range.data).unwrap();
+		assert_eq!(bytes, b"3456");
+		let tail = fs_read_range(path, 8, 100).await.unwrap();
+		assert_eq!(
+			tail.data,
+			base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"89")
+		);
+	}
+
+	#[tokio::test]
+	async fn browse_lists_visible_dirs_and_files_sorted() {
+		let dir = tempfile::tempdir().unwrap();
+		for name in ["b", "a", ".hidden"] {
+			std::fs::create_dir(dir.path().join(name)).unwrap();
+		}
+		std::fs::write(dir.path().join("z.txt"), "").unwrap();
+		let root = dir.path().to_str().unwrap().to_owned();
+		let listing = fs_browse(Some(root.clone())).await.unwrap();
+		assert_eq!(listing.dirs, ["a", "b"]);
+		assert_eq!(listing.files, ["z.txt"]);
+		assert_eq!(listing.path, root);
+		assert!(listing.parent.is_some());
 	}
 }

@@ -5,7 +5,7 @@
 
 import { ipc } from './ipc';
 import type { AppInfo, RemoteStatus, RemoteTarget } from './protocol';
-import { subscribe } from './transport';
+import { subscribe, useRemoteFiles } from './transport';
 
 class RemoteStore {
 	target = $state<RemoteTarget | null>(null);
@@ -20,6 +20,7 @@ class RemoteStore {
 			return;
 		}
 		this.target = info.remote;
+		useRemoteFiles();
 		await subscribe('remote:status', (status: RemoteStatus) => {
 			this.#sawEvent = true;
 			this.#apply(status);

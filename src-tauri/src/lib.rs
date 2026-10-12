@@ -18,6 +18,7 @@ mod agent_indicator;
 mod bridge_rpc;
 mod commands;
 mod events;
+mod file_protocol;
 mod focus_socket;
 mod remote_bridge;
 mod remote_workspace;
@@ -99,6 +100,12 @@ pub fn run() {
 		// restores it on next launch. No code on our side — the
 		// plugin hooks into window creation and close events.
 		.plugin(tauri_plugin_window_state::Builder::new().build())
+		.register_asynchronous_uri_scheme_protocol(file_protocol::SCHEME, |ctx, request, responder| {
+			let app = ctx.app_handle().clone();
+			tauri::async_runtime::spawn(async move {
+				responder.respond(file_protocol::handle(app, request).await);
+			});
+		})
 		// Focus flips feed the agent-activity indicator: focusing
 		// the window acknowledges a green "agents finished" dot
 		// on the tray icon. `try_state` — the indicator only

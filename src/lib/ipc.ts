@@ -74,6 +74,7 @@ import type {
 	PublishReviewRequest,
 	PublishReviewResult,
 	ReadFileResult,
+	BrowseResult,
 	RemoteStatus,
 	RightPanelKind,
 	SlackBotProfile,
@@ -160,6 +161,9 @@ export const ipc = {
 		collectPathsUnder: (rel: string, maxDepth: number) =>
 			call<CollectPathsResult>('fs_collect_paths_under', { rel, maxDepth }),
 		readFile: (path: string) => call<ReadFileResult>('fs_read_file', { path }),
+		// Directory listing on the workspace's machine, outside any bound
+		// folder: the remote window's path picker (ADR 0095).
+		browse: (path: string | null) => call<BrowseResult>('fs_browse', { path }),
 		writeFile: (path: string, text: string) => call<WriteFileResult>('fs_write_file', { path, text }),
 		// Host-direct read/write for files outside every bound folder. Bypasses
 		// the active `WorkspaceHost` so an external path stays readable when the

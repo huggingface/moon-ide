@@ -3553,6 +3553,7 @@ dependencies = [
  "anyhow",
  "ashpd",
  "async-trait",
+ "base64 0.22.1",
  "camino",
  "dirs",
  "futures-util",
@@ -3587,6 +3588,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
