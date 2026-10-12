@@ -12,6 +12,8 @@ use moon_protocol::MoonError;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+pub mod attach;
+pub mod boot;
 pub mod browser;
 mod catalog;
 pub mod coder;
@@ -30,6 +32,7 @@ pub mod project_compose;
 mod search;
 mod session;
 pub mod settings;
+mod shell_resolver;
 pub mod terminal;
 mod workspace;
 
@@ -185,7 +188,7 @@ macro_rules! pass_app {
 pub(crate) use pass_app;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 	use serde_json::json;
 
@@ -196,6 +199,10 @@ mod tests {
 	}
 
 	fn app() -> (AppCore, tempfile::TempDir) {
+		app_with_events(Arc::new(NoEvents))
+	}
+
+	pub(crate) fn app_with_events(events: Arc<dyn EventSink>) -> (AppCore, tempfile::TempDir) {
 		// `CoderHandle::new` warms the OS keyring; CI has no Secret Service.
 		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
 		let data = tempfile::tempdir().unwrap();
@@ -211,7 +218,6 @@ mod tests {
 			terminals.clone(),
 		)
 		.unwrap();
-		let events: Arc<dyn EventSink> = Arc::new(NoEvents);
 		let app = AppCore {
 			workspaces,
 			config_dir: dir("config"),

@@ -20,7 +20,6 @@ mod commands;
 mod events;
 mod focus_socket;
 mod remote_bridge;
-mod shell_resolver;
 mod shutdown;
 mod slack_poller;
 mod state;
@@ -32,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf;
 use moon_coder::CoderHandle;
-use moon_core::{app_state as core_app_state, WorkspaceRegistry};
+use moon_core::app_state as core_app_state;
 use moon_protocol::workspace::validate_workspace_id;
 use moon_slack::{SlackClient, TokenStore};
 use state::{AppMode, AppState, PREBOOT_WORKSPACE_ID};
@@ -290,19 +289,7 @@ pub fn run() {
 			);
 			let slack_state = state::SlackState::new(client_cell, poller.clone());
 
-			let workspace_registry = Arc::new(WorkspaceRegistry::new(workspace_id.clone()));
-
-			// Plug a [`ShellResolver`] into the registry so
-			// every folder's `LocalHost` can route format-on-save
-			// through the workspace shell container when it's
-			// running. Held as a `Weak` so dropping the registry
-			// doesn't keep the resolver — and therefore the
-			// registry — alive.
-			let shell_resolver = std::sync::Arc::new(shell_resolver::WorkspaceShellResolver::new(
-				Arc::downgrade(&workspace_registry),
-				workspaces_dir.clone(),
-			));
-			workspace_registry.set_shell_resolver(moon_core::ShellResolverHandle::new(shell_resolver));
+			let workspace_registry = moon_app::boot::new_registry(workspace_id.clone(), workspaces_dir.clone());
 
 			// Resolve the effective active provider for this
 			// workspace: a per-workspace lock (in `session.json`)
@@ -330,37 +317,7 @@ pub fn run() {
 			} else {
 				None
 			};
-			let effective_active_provider = match &initial_provider_lock {
-				Some(moon_protocol::coder_models::CoderProviderLock::Hf) => None,
-				Some(moon_protocol::coder_models::CoderProviderLock::User { id }) => Some(id.clone()),
-				None => loaded_state.coder.active_provider.clone(),
-			};
-
-			// Seed the coder with the user's persisted model picks
-			// + `bill_to` + user-added providers. Empty slugs on
-			// the protocol side resolve to the hardcoded defaults
-			// inside `CoderModels::standard()` / `cheap()` /
-			// `bill_to()`; frontend stores wire-format slugs (with
-			// optional `:provider` suffix) so the runner doesn't
-			// have to concatenate suffixes at request time. The
-			// `has_api_key` flag on each provider is overwritten
-			// inside `CoderHandle::new` from the keyring — we don't
-			// trust whatever was on disk.
-			let initial_coder_models = moon_coder::CoderModels {
-				standard: loaded_state.coder.standard_model.clone(),
-				cheap: loaded_state.coder.cheap_model.clone(),
-				bill_to: if loaded_state.coder.bill_to.is_empty() {
-					None
-				} else {
-					Some(loaded_state.coder.bill_to.clone())
-				},
-				providers: loaded_state.coder.providers.clone(),
-				active_provider: effective_active_provider,
-				context_window_overrides: std::sync::Arc::new(loaded_state.coder.context_window_overrides.clone()),
-				rotation: std::sync::Arc::new(loaded_state.coder.rotation.clone()),
-				reasoning_effort: loaded_state.coder.reasoning_effort.clone(),
-				..moon_coder::CoderModels::default()
-			};
+			let initial_coder_models = moon_app::boot::coder_models(&loaded_state, initial_provider_lock.as_ref());
 			// Shared with the coder so its `list_terminals` /
 			// `read_terminal` tools see the same open terminals the
 			// user does (ADR 0048). Created here because both
@@ -1209,67 +1166,7 @@ async fn restore_session(
 		}
 	};
 	if !session.folders.is_empty() || session.active_folder_path.is_some() {
-		for folder in &session.folders {
-			let path = Utf8PathBuf::from(&folder.folder_path);
-			// Worktree-backed session folders (ADR 0028) re-bind as
-			// nested worktree folders so their session keeps routing
-			// to the checkout. The git worktree itself persisted on
-			// disk, so this is just re-registering the binding. Folders
-			// are stored in insertion order, so a worktree's parent is
-			// always re-added before it.
-			let result = match &folder.origin {
-				moon_protocol::workspace::FolderOrigin::Worktree { parent_path, branch } => {
-					// An orphan worktree (its parent didn't restore —
-					// removed from the session, or gone from disk) is
-					// unreachable in the folder bar and can't be
-					// discarded through the parent. Skip it so the
-					// workspace self-heals instead of re-binding a row
-					// the user can't act on. Folders are stored in
-					// insertion order, so a surviving parent is always
-					// re-added before its worktrees.
-					if state.workspaces.folder_for_path(parent_path).await.is_none() {
-						tracing::warn!(path = %path, parent = %parent_path, "skipping orphan worktree folder (parent not restored)");
-						continue;
-					}
-					// A checkout removed while the IDE was closed
-					// (`git worktree remove` in a terminal) would
-					// re-bind as a dead row the user can only
-					// dismiss by hand — skip it and forget the
-					// stale git metadata, which would otherwise
-					// refuse a later `git worktree add` at the same
-					// deterministic path (ADR 0063).
-					if !path.is_dir() {
-						tracing::warn!(path = %path, "skipping worktree folder whose checkout is gone from disk");
-						if let Some(parent) = state.workspaces.folder_for_path(parent_path).await {
-							if let Err(err) = parent.host.git_worktree_forget(&path).await {
-								tracing::warn!(error = %err, path = %path, "git worktree prune failed for a vanished checkout");
-							}
-						}
-						continue;
-					}
-					state
-						.workspaces
-						.add_worktree_folder(path.clone(), parent_path.clone(), branch.clone())
-						.await
-				}
-				moon_protocol::workspace::FolderOrigin::UserPicked => state.workspaces.add_folder(path.clone()).await,
-			};
-			if let Err(e) = result {
-				tracing::warn!(error = %e, path = %path, "failed to restore folder");
-			}
-		}
-		if let Some(active) = session.active_folder_path.as_ref() {
-			if let Err(e) = state.workspaces.set_active_folder(active).await {
-				tracing::warn!(error = %e, path = %active, "failed to restore active folder");
-			}
-		}
-		// Disk is the source of truth for worktrees (ADR 0079): adopt
-		// IDE-managed checkouts under a bound folder's `.worktrees/`
-		// that session.json didn't list — a corrupt/healed session.json
-		// or a checkout outliving its owning session. Rows reappear
-		// instead of pinning their branches behind git's "used by
-		// worktree" refusal.
-		state.workspaces.adopt_disk_worktrees().await;
+		moon_app::boot::restore_folders(&state.workspaces, &session).await;
 
 		let snap = state.workspaces.snapshot().await;
 		tracing::info!(

@@ -86,6 +86,13 @@ enum Command {
 		#[arg(long)]
 		workspace: String,
 	},
+	/// Attach stdin/stdout to the workspace's `serve` process (ADR
+	/// 0095), starting it in the background if it isn't running. The
+	/// desktop runs this over `ssh` to open a remote workspace.
+	Attach {
+		#[arg(long)]
+		workspace: String,
+	},
 	/// Manage the workspace shell container. When it's running,
 	/// agents' `bash` / format / lint route into it exactly like
 	/// the desktop (the routing is shared moon-coder code); when
@@ -193,7 +200,9 @@ fn main() -> anyhow::Result<()> {
 	// Same fix as the desktop (`src-tauri/src/lib.rs`).
 	let _ = rustls::crypto::ring::default_provider().install_default();
 
+	// stderr: `attach` uses stdout as its data channel.
 	tracing_subscriber::fmt()
+		.with_writer(std::io::stderr)
 		.with_env_filter(
 			tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,moon_remote=debug".into()),
 		)
@@ -207,6 +216,7 @@ fn main() -> anyhow::Result<()> {
 			Command::WorkspaceAdd { name, folder, slug } => workspace_add(name, folder, slug).await,
 			Command::WorkspaceRemoveFolder { workspace, folder } => workspace_remove_folder(workspace, folder).await,
 			Command::Serve { workspace } => serve(workspace).await,
+			Command::Attach { workspace } => attach(workspace).await,
 			Command::Pair { workspace, no_qr } => pair(workspace, no_qr).await,
 			Command::Devices { revoke } => devices(revoke),
 			Command::Container {
@@ -560,19 +570,15 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 			.await
 			.map_err(|err| anyhow::anyhow!("could not start ssh-agent proxy: {err}"))?;
 	}
-	let cred = relay::load_credential()?
-		.ok_or_else(|| anyhow::anyhow!("not enrolled — run `moon-remote enroll --bridge wss://… --code …` first"))?;
 	let config_dir = config_dir()?;
 	let (data_dir, workspaces_dir) = data_dirs()?;
 	let coder_sessions_dir = data_dir.join("coder-sessions");
 	let folder_summaries_dir = data_dir.join("folder-summaries");
 
 	// Single-instance lock (ADR 0014): own the workspace or bail.
-	// The listener is held for liveness probes (`connect` succeeding
-	// = live owner); R/S frames from a *local* moon-bridge are not
-	// served headless — the relay is the supported path.
-	let pair_ctx: Arc<tokio::sync::OnceCell<PairCtx>> = Arc::new(tokio::sync::OnceCell::new());
-	let _instance = instance_bind(&workspaces_dir, &slug, Arc::clone(&pair_ctx)).await?;
+	// Connections queue in the backlog until the workspace has booted
+	// and the accept loop starts.
+	let listener = instance_bind(&workspaces_dir, &slug).await?;
 
 	// Bump last-active + load the catalog & coder defaults.
 	let slug_for_bump = slug.clone();
@@ -592,66 +598,15 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		"unknown workspace `{slug}` — run `moon-remote workspace-add` (or create it in the desktop) first"
 	);
 
-	let registry = Arc::new(WorkspaceRegistry::new(slug.clone()));
-
-	// Folder restore from session.json — same walk as the desktop's
-	// `restore_session`, minus the UI bits.
+	let registry = moon_app::boot::new_registry(slug.clone(), workspaces_dir.clone());
+	let logs = moon_core::LogSink::new();
+	registry.set_log_sink(logs.clone());
 	let session = core_session::load(&workspaces_dir, &slug).await.unwrap_or_default();
 	anyhow::ensure!(
 		!session.folders.is_empty(),
 		"workspace `{slug}` has no bound folders — run `moon-remote workspace-add --slug {slug} --folder <path>`"
 	);
-	for folder in &session.folders {
-		let path = Utf8PathBuf::from(&folder.folder_path);
-		let result = match &folder.origin {
-			moon_protocol::workspace::FolderOrigin::Worktree { parent_path, branch } => {
-				if registry.folder_for_path(parent_path).await.is_none() {
-					tracing::warn!(path = %path, parent = %parent_path, "skipping orphan worktree folder");
-					continue;
-				}
-				registry
-					.add_worktree_folder(path.clone(), parent_path.clone(), branch.clone())
-					.await
-			}
-			moon_protocol::workspace::FolderOrigin::UserPicked => registry.add_folder(path.clone()).await,
-		};
-		if let Err(e) = result {
-			tracing::warn!(error = %e, path = %path, "failed to restore folder");
-		}
-	}
-	if let Some(active) = session.active_folder_path.as_ref() {
-		if let Err(e) = registry.set_active_folder(active).await {
-			tracing::warn!(error = %e, path = %active, "failed to restore active folder");
-		}
-	}
-	// Disk is the source of truth for worktrees (ADR 0079): adopt
-	// IDE-managed checkouts under a bound folder's `.worktrees/`
-	// that session.json didn't list. Same sweep as the desktop's
-	// `restore_session`.
-	registry.adopt_disk_worktrees().await;
-
-	// Models seed: per-workspace provider lock beats the global
-	// active provider (same resolution as the desktop's setup).
-	let effective_active_provider = match &session.coder_provider_lock {
-		Some(moon_protocol::coder_models::CoderProviderLock::Hf) => None,
-		Some(moon_protocol::coder_models::CoderProviderLock::User { id }) => Some(id.clone()),
-		None => loaded_state.coder.active_provider.clone(),
-	};
-	let initial_coder_models = moon_coder::CoderModels {
-		standard: loaded_state.coder.standard_model.clone(),
-		cheap: loaded_state.coder.cheap_model.clone(),
-		bill_to: if loaded_state.coder.bill_to.is_empty() {
-			None
-		} else {
-			Some(loaded_state.coder.bill_to.clone())
-		},
-		providers: loaded_state.coder.providers.clone(),
-		active_provider: effective_active_provider,
-		context_window_overrides: Arc::new(loaded_state.coder.context_window_overrides.clone()),
-		rotation: Arc::new(loaded_state.coder.rotation.clone()),
-		reasoning_effort: loaded_state.coder.reasoning_effort.clone(),
-		..moon_coder::CoderModels::default()
-	};
+	moon_app::boot::restore_folders(&registry, &session).await;
 
 	let terminals = Arc::new(moon_terminal::TerminalRegistry::default());
 	let coder = moon_coder::CoderHandle::new(
@@ -659,17 +614,50 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		workspaces_dir.clone(),
 		coder_sessions_dir,
 		folder_summaries_dir,
-		initial_coder_models,
-		terminals,
+		moon_app::boot::coder_models(&loaded_state, session.coder_provider_lock.as_ref()),
+		terminals.clone(),
 	)
 	.map_err(|err| anyhow::anyhow!("could not init moon-coder: {err}"))?;
 	coder.spawn_prime_context_windows();
 
-	// Persist folder binds/unbinds as they happen. The desktop's
-	// frontend saves session state continuously, but headless has no
-	// frontend — without this, folders a coordinator binds at
-	// runtime (`clone_repo`, `init_repo`, worker worktrees) evaporate
-	// on restart. `WorkspaceFoldersChanged` fires on every such
+	// The full desktop surface (ADR 0095), delivered to whichever
+	// desktop is attached.
+	let hub = Arc::new(moon_app::attach::AttachHub::default());
+	let events: Arc<dyn moon_app::EventSink> = hub.clone();
+	let fs_watcher = moon_app::fs_watcher::spawn(events.clone());
+	fs_watcher.set_root(registry.snapshot().await.active_folder.map(std::path::PathBuf::from));
+	let core = Arc::new(moon_app::AppCore {
+		workspaces: registry.clone(),
+		config_dir: config_dir.clone(),
+		workspaces_dir: workspaces_dir.clone(),
+		workspace_id: Some(slug.clone()),
+		coder: coder.clone(),
+		events,
+		preview_tunnels: moon_container::PreviewTunnels::new(),
+		logs,
+		terminals,
+		terminal_streams: Default::default(),
+		lsp: Default::default(),
+		log_streams: Default::default(),
+		fs_watcher,
+	});
+	core.spawn_pumps();
+	core.install_agent_terminals();
+	tokio::spawn(moon_app::container_events::watch(core.clone()));
+	{
+		let core = core.clone();
+		tokio::spawn(async move {
+			// Shell first: per-folder composes attach to its network.
+			core.auto_resume_shell().await;
+			core.auto_resume_project_composes().await;
+		});
+	}
+
+	// Persist folder binds/unbinds as they happen. An attached
+	// desktop saves session state itself, but while none is —
+	// without this, folders a coordinator binds at runtime
+	// (`clone_repo`, `init_repo`, worker worktrees) evaporate on
+	// restart. `WorkspaceFoldersChanged` fires on every such
 	// mutation; the reconcile keeps existing per-folder UI fields
 	// (open tabs, etc.) for folders that survive.
 	{
@@ -715,20 +703,87 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		});
 	}
 
+	// The phone path is optional: a server that never enrolled with a
+	// relay still serves attached desktops.
+	let pair_ctx: Arc<tokio::sync::OnceCell<PairCtx>> = Arc::new(tokio::sync::OnceCell::new());
+	let mut relay_status = match relay::load_credential()? {
+		Some(cred) => Some(start_relay(
+			cred,
+			&slug,
+			&loaded_state,
+			&coder,
+			&registry,
+			&config_dir,
+			&workspaces_dir,
+			&pair_ctx,
+		)),
+		None => {
+			tracing::info!("not enrolled with a relay; serving attached desktops only");
+			None
+		}
+	};
+
+	let _instance = serve_instance(listener, Arc::clone(&pair_ctx), core.clone(), hub);
+	tracing::info!(workspace = %slug, "moon-remote serving");
+
+	let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+	loop {
+		tokio::select! {
+			_ = tokio::signal::ctrl_c() => break,
+			_ = terminate.recv() => break,
+			changed = async {
+				match relay_status.as_mut() {
+					Some(rx) => rx.changed().await,
+					None => std::future::pending().await,
+				}
+			} => {
+				let Some(rx) = relay_status.as_ref() else {
+					continue;
+				};
+				if changed.is_err() {
+					anyhow::bail!("relay connection task ended unexpectedly");
+				}
+				let status = rx.borrow().clone();
+				match (&status.connected, &status.error) {
+					(true, _) => tracing::info!(phones = status.connected_phones, "relay connected"),
+					(false, Some(err)) => tracing::warn!(error = %err, "relay disconnected; retrying"),
+					(false, None) => tracing::info!("relay connecting…"),
+				}
+			}
+		}
+	}
+	tracing::info!("shutting down");
+	core.stop_all().await;
+	Ok(())
+}
+
+/// Connect to the enrolled relay so phones can drive this workspace
+/// (ADR 0059). Returns the connection-status receiver.
+#[allow(clippy::too_many_arguments)]
+fn start_relay(
+	cred: relay::RemoteBridgeCredential,
+	slug: &str,
+	loaded_state: &moon_protocol::app_state::AppState,
+	coder: &moon_coder::CoderHandle,
+	registry: &Arc<WorkspaceRegistry>,
+	config_dir: &Utf8Path,
+	workspaces_dir: &Utf8Path,
+	pair_ctx: &tokio::sync::OnceCell<PairCtx>,
+) -> tokio::sync::watch::Receiver<relay::RemoteBridgeStatus> {
 	let plain_rpc: Arc<dyn moon_remote::rpc::BridgeRpcHandler> = Arc::new(BridgeRpc::new(
 		coder.clone(),
 		registry.clone(),
 		SettingsContext {
-			config_dir: config_dir.clone(),
-			workspaces_dir: workspaces_dir.clone(),
-			workspace_id: Some(slug.clone()),
+			config_dir: config_dir.to_owned(),
+			workspaces_dir: workspaces_dir.to_owned(),
+			workspace_id: Some(slug.to_owned()),
 		},
 		Some(Arc::new(HeadlessLauncher)),
 	));
 	// Relay path is strict (ADR 0087): only end-to-end sealed calls
 	// from phones this host paired itself reach the dispatcher.
 	let e2e = Arc::new(moon_remote::e2e::E2eEndpoint::keyring(
-		slug.clone(),
+		slug.to_owned(),
 		moon_remote::e2e::host_label(),
 	));
 	let rpc: Arc<dyn moon_remote::rpc::BridgeRpcHandler> =
@@ -756,34 +811,14 @@ async fn serve(slug: String) -> anyhow::Result<()> {
 		workspaces,
 		rpc,
 	));
+	let status = handle.status_receiver();
 	let _ = pair_ctx.set(PairCtx {
-		handle: Arc::clone(&handle),
+		handle,
 		e2e,
 		ide_id: cred.ide_id.clone(),
 	});
-	tracing::info!(workspace = %slug, bridge = %cred.bridge_url, ide_id = %cred.ide_id, "moon-remote serving");
-
-	// Log status transitions until we're told to stop.
-	let mut status_rx = handle.status_receiver();
-	loop {
-		tokio::select! {
-			_ = tokio::signal::ctrl_c() => {
-				tracing::info!("interrupted; shutting down");
-				return Ok(());
-			}
-			changed = status_rx.changed() => {
-				if changed.is_err() {
-					anyhow::bail!("relay connection task ended unexpectedly");
-				}
-				let status = status_rx.borrow().clone();
-				match (&status.connected, &status.error) {
-					(true, _) => tracing::info!(phones = status.connected_phones, "relay connected"),
-					(false, Some(err)) => tracing::warn!(error = %err, "relay disconnected; retrying"),
-					(false, None) => tracing::info!("relay connecting…"),
-				}
-			}
-		}
-	}
+	tracing::info!(bridge = %cred.bridge_url, ide_id = %cred.ide_id, "relay enabled");
+	status
 }
 
 /// Show or persist the model picks. Writes the same `state.json`
@@ -863,7 +898,7 @@ impl PairCtx {
 	}
 }
 
-/// The one request `instance.sock` answers headless: `{"op":"pair"}`.
+/// Opening request on `instance.sock`: `{"op":"attach"}` or `{"op":"pair"}`.
 #[derive(serde::Deserialize)]
 struct InstanceRequest {
 	op: String,
@@ -874,20 +909,12 @@ fn instance_socket_path(workspaces_dir: &Utf8Path, slug: &str) -> Utf8PathBuf {
 }
 
 /// Bind the per-workspace single-instance socket (same path +
-/// stale-recovery semantics as the desktop's `focus_socket::try_bind`)
-/// and hold it. Liveness probes connect and drop; the only request
-/// served is a local `pair` (same user — the socket lives in the
-/// user's data dir). R/S frames from a local moon-bridge are not
-/// served headless: the relay is the supported path.
-async fn instance_bind(
-	workspaces_dir: &Utf8Path,
-	slug: &str,
-	pair_ctx: Arc<tokio::sync::OnceCell<PairCtx>>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+/// stale-recovery semantics as the desktop's `focus_socket::try_bind`).
+async fn instance_bind(workspaces_dir: &Utf8Path, slug: &str) -> anyhow::Result<tokio::net::UnixListener> {
 	let path = instance_socket_path(workspaces_dir, slug);
 	tokio::fs::create_dir_all(path.parent().expect("socket path has a parent")).await?;
-	let listener = match tokio::net::UnixListener::bind(path.as_std_path()) {
-		Ok(l) => l,
+	match tokio::net::UnixListener::bind(path.as_std_path()) {
+		Ok(l) => Ok(l),
 		Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
 			// Live owner or stale debris? Probe: only a real listener
 			// accepts.
@@ -900,37 +927,140 @@ async fn instance_bind(
 				anyhow::bail!("workspace `{slug}` is already being served by another process");
 			}
 			tokio::fs::remove_file(path.as_std_path()).await?;
-			tokio::net::UnixListener::bind(path.as_std_path())?
+			Ok(tokio::net::UnixListener::bind(path.as_std_path())?)
 		}
-		Err(err) => return Err(err.into()),
-	};
-	Ok(tokio::spawn(async move {
+		Err(err) => Err(err.into()),
+	}
+}
+
+/// Answer `instance.sock`: each connection opens with one JSON request
+/// line. `{"op":"attach"}` turns the connection into the attached
+/// desktop's channel (ADR 0095); `{"op":"pair"}` answers a local
+/// `moon-remote pair`. Liveness probes connect and drop. Same user
+/// only — the socket lives in the user's data dir.
+fn serve_instance(
+	listener: tokio::net::UnixListener,
+	pair_ctx: Arc<tokio::sync::OnceCell<PairCtx>>,
+	core: Arc<moon_app::AppCore>,
+	hub: Arc<moon_app::attach::AttachHub>,
+) -> tokio::task::JoinHandle<()> {
+	tokio::spawn(async move {
 		while let Ok((stream, _)) = listener.accept().await {
 			let pair_ctx = Arc::clone(&pair_ctx);
+			let core = core.clone();
+			let hub = hub.clone();
 			tokio::spawn(async move {
-				use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-				let (read, mut write) = stream.into_split();
-				let mut line = String::new();
-				let mut reader = tokio::io::BufReader::new(read.take(4096));
-				let read = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_line(&mut line)).await;
-				if !matches!(read, Ok(Ok(n)) if n > 0) {
+				use tokio::io::AsyncWriteExt;
+				let (mut read, mut write) = stream.into_split();
+				let line = tokio::time::timeout(std::time::Duration::from_secs(5), read_request_line(&mut read)).await;
+				let Ok(Some(line)) = line else {
 					return;
-				}
+				};
 				let Ok(req) = serde_json::from_str::<InstanceRequest>(line.trim()) else {
 					return;
 				};
 				let reply = match (req.op.as_str(), pair_ctx.get()) {
+					("attach", _) => {
+						moon_app::attach::serve_connection(core, hub, read, write).await;
+						return;
+					}
 					("pair", Some(ctx)) => match ctx.link().await {
 						Ok(link) => serde_json::json!({ "link": link }),
 						Err(err) => serde_json::json!({ "error": err.to_string() }),
 					},
-					("pair", None) => serde_json::json!({ "error": "serve is still starting — retry in a moment" }),
+					("pair", None) => serde_json::json!({ "error": "this workspace isn't enrolled with a relay" }),
 					_ => return,
 				};
 				let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
 			});
 		}
-	}))
+	})
+}
+
+/// Read the opening request line byte by byte, so nothing after it is
+/// swallowed into a buffer: for `attach` the rest of the stream is the
+/// desktop's frames.
+async fn read_request_line(read: &mut tokio::net::unix::OwnedReadHalf) -> Option<String> {
+	use tokio::io::AsyncReadExt;
+	let mut line = Vec::new();
+	loop {
+		let byte = read.read_u8().await.ok()?;
+		if byte == b'\n' {
+			return String::from_utf8(line).ok();
+		}
+		if line.len() >= 4096 {
+			return None;
+		}
+		line.push(byte);
+	}
+}
+
+/// `moon-remote attach`: bridge stdio to the workspace process's
+/// `instance.sock`, launching `serve` detached when nothing answers.
+async fn attach(slug: String) -> anyhow::Result<()> {
+	use tokio::io::AsyncWriteExt;
+	moon_protocol::workspace::validate_workspace_id(&slug)?;
+	let (_, workspaces_dir) = data_dirs()?;
+	let path = instance_socket_path(&workspaces_dir, &slug);
+	let stream = match tokio::net::UnixStream::connect(path.as_std_path()).await {
+		Ok(stream) => stream,
+		Err(_) => {
+			launch_serve(&workspaces_dir, &slug)?;
+			wait_for_socket(&path).await?
+		}
+	};
+	let (mut sock_read, mut sock_write) = stream.into_split();
+	sock_write.write_all(b"{\"op\":\"attach\"}\n").await?;
+	let mut stdin = tokio::io::stdin();
+	let mut stdout = tokio::io::stdout();
+	// Whichever side closes first ends the session: the desktop going
+	// away, or the server detaching us for a newer attachment.
+	tokio::select! {
+		_ = tokio::io::copy(&mut stdin, &mut sock_write) => {}
+		_ = async {
+			let _ = tokio::io::copy(&mut sock_read, &mut stdout).await;
+			let _ = stdout.flush().await;
+		} => {}
+	}
+	Ok(())
+}
+
+/// Start `moon-remote serve` in its own process group so it outlives
+/// this `attach` (and the ssh session that ran it). Output goes to
+/// `<workspace>/run/serve.log`.
+fn launch_serve(workspaces_dir: &Utf8Path, slug: &str) -> anyhow::Result<()> {
+	use std::os::unix::process::CommandExt;
+	let run_dir = workspaces_dir.join(slug).join("run");
+	std::fs::create_dir_all(&run_dir)?;
+	let log = std::fs::OpenOptions::new()
+		.create(true)
+		.append(true)
+		.open(run_dir.join("serve.log"))?;
+	let mut command = std::process::Command::new(std::env::current_exe()?);
+	command
+		.args(["serve", "--workspace", slug])
+		.stdin(std::process::Stdio::null())
+		.stdout(log.try_clone()?)
+		.stderr(log)
+		.process_group(0);
+	command.spawn()?;
+	Ok(())
+}
+
+async fn wait_for_socket(path: &Utf8Path) -> anyhow::Result<tokio::net::UnixStream> {
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+	loop {
+		if let Ok(stream) = tokio::net::UnixStream::connect(path.as_std_path()).await {
+			return Ok(stream);
+		}
+		if tokio::time::Instant::now() > deadline {
+			anyhow::bail!(
+				"`moon-remote serve` didn't come up within 60s; see {}",
+				path.with_file_name("serve.log")
+			);
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+	}
 }
 
 /// `moon-remote pair`: ask the workspace's running `serve` for a

@@ -3,7 +3,7 @@
 //! format-on-save).
 //!
 //! Mirrors the routing decision the LSP layer makes in
-//! `commands::lsp::resolve_target` and the agent's bash tool
+//! `lsp::resolve_target` and the agent's bash tool
 //! makes in `moon_coder::tools::resolve_bash_target` — build a
 //! `ContainerWorkspace` from the current bound-folder set, query
 //! its lifecycle status, and return [`ShellTarget::Container`]
