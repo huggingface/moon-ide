@@ -2094,6 +2094,15 @@ parent's checkout (and every other agent) is left undisturbed. The
 agent" action (local branches and open-PR head refs); the coder
 panel's worktree button covers the fresh-branch default.
 
+An **agent** can move its own session into a worktree with the
+`enter_worktree` tool ([ADR 0096](decisions/0096-agent-enter-worktree.md)),
+advertised to top-level `Agent` sessions in a project: `name` starts
+`moon/<slug>` off the default branch (or `base`), `branch` checks out
+an existing branch, attaching to its IDE-managed worktree when one
+already exists. The routing applies from the next tool call of the
+same turn, and the base prompt steers agents to it instead of a hand-
+rolled `git worktree add` / `git checkout -b`.
+
 Created on opt-in (`git worktree add`), re-bound at startup (the
 folder's `origin` rides `session.json`, with disk adoption as the
 backstop — see ADR 0079 below), and **pruned** by the

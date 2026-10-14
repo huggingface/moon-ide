@@ -1887,7 +1887,12 @@ export type CoderEvent =
 	  }
 	| { kind: 'replay'; events: CoderEvent[]; in_flight: boolean }
 	| { kind: 'session_title_updated'; id: string; title: string }
-	| { kind: 'session_worktree_cleared'; id: string }
+	| {
+			kind: 'session_worktree_changed';
+			id: string;
+			worktree_root: string | null;
+			worktree_branch: string | null;
+	  }
 	| { kind: 'session_list_changed' }
 	| { kind: 'workspace_folders_changed' }
 	| { kind: 'folder_summary_ready'; folder: string; description: string }

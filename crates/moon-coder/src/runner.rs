@@ -2418,19 +2418,7 @@ impl CoderHandle {
 			}
 		};
 		let branch = spec.name().to_string();
-		let branch_slug = branch.replace('/', "-");
-		let worktree_path = camino::Utf8Path::new(&parent_path)
-			.join(moon_core::WORKTREES_DIR_NAME)
-			.join(&branch_slug);
-		if let Some(parent_dir) = worktree_path.parent() {
-			std::fs::create_dir_all(parent_dir.as_std_path())?;
-		}
-		parent.host.git_worktree_add(&worktree_path, spec).await?;
-		let wt_entry = self
-			.state
-			.workspaces
-			.add_worktree_folder(worktree_path, parent_path, branch.clone())
-			.await?;
+		let wt_entry = add_project_worktree(&self.state, &parent, spec).await?;
 		// Mint the session in the chosen mode and stamp the worktree
 		// routing. Builds from `new_blank_with_mode` so a coordinator
 		// worker gets its system-prompt seed; an ordinary worker is
@@ -2697,7 +2685,7 @@ impl CoderHandle {
 
 	/// Clear `worktree_root` + `worktree_branch` on every mounted
 	/// runtime whose header points at `worktree_root`, persist the
-	/// header rewrite, and emit `SessionWorktreeCleared` so the
+	/// header rewrite, and emit `SessionWorktreeChanged` so the
 	/// frontend patches its cached session state without a full
 	/// reload. Used after merging a worktree's branch and removing
 	/// the checkout — the session now drives its parent folder's
@@ -2740,7 +2728,11 @@ impl CoderHandle {
 					}
 				}
 				let sink = FolderEventSink::new(self.state.events.clone(), folder_path.to_string(), id.clone());
-				sink.send(CoderEvent::SessionWorktreeCleared { id });
+				sink.send(CoderEvent::SessionWorktreeChanged {
+					id,
+					worktree_root: None,
+					worktree_branch: None,
+				});
 			}
 		}
 	}
@@ -5877,6 +5869,127 @@ async fn free_worker_branch(parent: &moon_core::WorkspaceFolderEntry, parent_pat
 	format!("moon/{slug}-{:08x}", now_ms & 0xffff_ffff)
 }
 
+/// Check out `spec` at `<project>/.worktrees/<branch-slug>` — inside
+/// the project so it rides the project's container bind mount (ADR
+/// 0029) — and bind the checkout as a worktree folder of `project`.
+async fn add_project_worktree(
+	state: &CoderState,
+	project: &WorkspaceFolderEntry,
+	spec: moon_core::host::WorktreeBranch,
+) -> Result<Arc<WorkspaceFolderEntry>, CoderError> {
+	let branch = spec.name().to_string();
+	let worktree_path = Utf8Path::new(&project.folder.path)
+		.join(moon_core::WORKTREES_DIR_NAME)
+		.join(branch.replace('/', "-"));
+	if let Some(dir) = worktree_path.parent() {
+		std::fs::create_dir_all(dir.as_std_path())?;
+	}
+	project.host.git_worktree_add(&worktree_path, spec).await?;
+	let entry = state
+		.workspaces
+		.add_worktree_folder(worktree_path, project.folder.path.clone(), branch)
+		.await?;
+	Ok(entry)
+}
+
+/// `enter_worktree` (ADR 0096): move this session into a worktree of
+/// its project — a fresh `moon/<name>` branch, or an existing branch
+/// (attaching to its IDE-managed worktree when it already has one).
+/// Stamps the routing on the session header like the panel's
+/// move-into-worktree button does, and returns the worktree's folder
+/// so the dispatcher can re-point the rest of the turn at it.
+async fn handle_enter_worktree(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<(Value, Arc<WorkspaceFolderEntry>), CoderError> {
+	use crate::worktree_tool::{EnterWorktreeTarget, ENTER_WORKTREE};
+	use moon_core::host::WorktreeBranch;
+	use moon_protocol::workspace::FolderOrigin;
+
+	let target = crate::worktree_tool::parse_enter_worktree_args(args)?;
+	let Some(folder) = state.workspaces.folder_for_path(sink.folder()).await else {
+		return Err(CoderError::invalid_args(
+			ENTER_WORKTREE,
+			"this session isn't filed under a bound project folder, so there is no repository to branch",
+		));
+	};
+	let project = state.coder_root_of(folder).await;
+	let project_path = project.folder.path.clone();
+	let (entry, created) = match target {
+		EnterWorktreeTarget::New { name, base } => {
+			let Some(slug) = worker_branch_slug(&name) else {
+				return Err(CoderError::invalid_args(
+					ENTER_WORKTREE,
+					"name must contain at least one letter or digit — it becomes the branch name",
+				));
+			};
+			let branch = free_worker_branch(&project, &project_path, &slug).await;
+			let spec = WorktreeBranch::NewFrom {
+				name: branch,
+				start: base,
+			};
+			(add_project_worktree(state, &project, spec).await?, true)
+		}
+		EnterWorktreeTarget::Existing(branch) => {
+			// A checkout made out-of-band under `.worktrees/` (an agent's
+			// own `git worktree add`) isn't bound until the turn-end
+			// sweep; bind it now so it can be attached to.
+			state.workspaces.adopt_disk_worktrees().await;
+			let bound = state.workspaces.folders().await.into_iter().find(|f| {
+				matches!(
+					&f.folder.origin,
+					FolderOrigin::Worktree { parent_path, branch: b } if parent_path == &project_path && b == &branch
+				)
+			});
+			match bound {
+				Some(entry) => (entry, false),
+				None => (
+					add_project_worktree(state, &project, WorktreeBranch::Existing(branch)).await?,
+					true,
+				),
+			}
+		}
+	};
+	let FolderOrigin::Worktree { branch, .. } = &entry.folder.origin else {
+		return Err(CoderError::Internal(
+			"worktree folder bound without a worktree origin".into(),
+		));
+	};
+	let branch = branch.clone();
+	let worktree_root = entry.folder.path.clone();
+	let (id, session_dir, header) = {
+		let mut session = rt.session.lock().await;
+		session.header.worktree_root = Some(worktree_root.clone());
+		session.header.worktree_branch = Some(branch.clone());
+		(
+			session.header.id.clone(),
+			session.session_dir.clone(),
+			session.header.clone(),
+		)
+	};
+	if let Some(dir) = session_dir {
+		if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+			tracing::warn!(?err, "failed to persist enter_worktree header rewrite");
+		}
+	}
+	sink.send(CoderEvent::SessionWorktreeChanged {
+		id,
+		worktree_root: Some(worktree_root.clone()),
+		worktree_branch: Some(branch.clone()),
+	});
+	sink.send(CoderEvent::WorkspaceFoldersChanged);
+	let mut result = json!({
+		"branch": branch,
+		"worktree_path": worktree_root,
+		"created": created,
+		"next": "Your tools now run in this worktree: use relative paths for files in it. Commit here; push with `git push -u origin HEAD` so the branch lands under its own name on the remote.",
+	});
+	attach_container_mount_note(state, &project_path, &mut result).await;
+	Ok((result, entry))
+}
+
 /// Compact snapshot of a worker session's current state (ADR 0030).
 /// The shape an orchestrator's `observe_worker` tool returns — enough
 /// to decide what to do next (steer, abort, answer, report) without
@@ -6622,7 +6735,7 @@ async fn run_turn(
 		CoderMode::from_top_level_wire(session.header.mode.as_deref())
 	};
 	let force_host_bash = rt.force_host_bash.load(std::sync::atomic::Ordering::Relaxed);
-	let cx = ToolContext::with_format_queue(folder_entry, mode, format_queue)
+	let mut cx = ToolContext::with_format_queue(folder_entry, mode, format_queue)
 		.with_force_host_bash(rt.force_host_bash.clone())
 		.with_background(background);
 	// Tool list composition branches on the top-level session mode
@@ -6637,6 +6750,7 @@ async fn run_turn(
 	// which is how the depth-1 cap is enforced — a sub-agent
 	// literally cannot describe a sub-sub-agent because the model
 	// never sees the tool.
+	let scratch = state.is_no_folder_root(&routing_path).await;
 	let mut tool_defs = state.tools.definitions();
 	// MCP meta-tools (ADR 0033): only present when the workspace
 	// has enabled servers, so the model never sees a surface that
@@ -6657,6 +6771,9 @@ async fn run_turn(
 	}
 	if mode.allows_ask_user() {
 		tool_defs.push(ask_user_tool_definition());
+	}
+	if mode == CoderMode::Agent && !scratch {
+		tool_defs.push(crate::worktree_tool::enter_worktree_tool_definition());
 	}
 	if mode == CoderMode::Coordinator {
 		tool_defs.push(crate::coordinator::spawn_worker_tool_definition());
@@ -6688,7 +6805,6 @@ async fn run_turn(
 	// (empty workspace) passes `None` — no project rules to read,
 	// and its "no folders bound" section is written from the
 	// scratch root instead.
-	let scratch = state.is_no_folder_root(&routing_path).await;
 	refresh_system_prompt(state, rt, &routing_path, scratch, force_host_bash, mode).await;
 	// Schedule background regeneration for any bound folder whose
 	// summary cache is missing or stale. Detached tokio tasks; we
@@ -6850,7 +6966,7 @@ async fn run_turn(
 				// Replayed from a checkpoint, so the calls come off
 				// disk rather than a live stream — no output cap in
 				// play.
-				dispatch_tool_calls(state, rt, sink, &cx, &cancel, &calls, false).await?;
+				dispatch_tool_calls(state, rt, sink, &mut cx, &cancel, &calls, false).await?;
 				continue;
 			}
 		}
@@ -7169,7 +7285,7 @@ async fn run_turn(
 			state,
 			rt,
 			sink,
-			&cx,
+			&mut cx,
 			&cancel,
 			&response.tool_calls,
 			response.hit_output_cap(),
@@ -7397,7 +7513,7 @@ async fn dispatch_tool_calls(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
 	sink: &FolderEventSink,
-	cx: &ToolContext,
+	cx: &mut ToolContext,
 	cancel: &CancellationToken,
 	calls: &[crate::inference::ToolCall],
 	hit_output_cap: bool,
@@ -7431,7 +7547,7 @@ async fn dispatch_tool_calls(
 		});
 		let dispatched_at = std::time::Instant::now();
 		let outcome = if call.function.name == "task" {
-			handle_task(state, rt, sink, cx, &call.id, &args).await
+			handle_task(state, rt, sink, &*cx, &call.id, &args).await
 		} else if call.function.name == "task_collect" {
 			// Detached-sub-agent report fetch ([ADR 0053]).
 			handle_task_collect(state, rt, &args, cancel).await
@@ -7454,6 +7570,20 @@ async fn dispatch_tool_calls(
 			// `task`, before falling through to the
 			// generic registry dispatch.
 			handle_todo_write(rt, &args).await
+		} else if call.function.name == crate::worktree_tool::ENTER_WORKTREE {
+			// Re-point the rest of the turn — later calls in this batch
+			// and every following round-trip — at the worktree, and
+			// re-orient the system prompt's active folder to match.
+			match handle_enter_worktree(state, rt, sink, &args).await {
+				Ok((result, entry)) => {
+					let routing_path = Utf8PathBuf::from(entry.folder.path.clone());
+					cx.folder = entry;
+					let force_host = rt.force_host_bash.load(std::sync::atomic::Ordering::Relaxed);
+					refresh_system_prompt(state, rt, &routing_path, false, force_host, cx.mode).await;
+					Ok(result)
+				}
+				Err(err) => Err(err),
+			}
 		} else if call.function.name == "spawn_worker" {
 			// Coordinator-only (ADR 0030). Mints a peer
 			// top-level session in a worktree + seeds it with
@@ -13667,5 +13797,81 @@ mod tests {
 			"force_host_override must read the visible session's header"
 		);
 		assert_eq!(status.bash_target.as_deref(), Some("host"));
+	}
+
+	#[tokio::test]
+	async fn enter_worktree_moves_the_session_and_attaches_to_an_existing_worktree() {
+		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+
+		let repo_dir = tempfile::TempDir::new().unwrap();
+		let repo = Utf8PathBuf::from_path_buf(repo_dir.path().canonicalize().unwrap()).unwrap();
+		for args in [
+			&["init", "-q", "-b", "main"][..],
+			&[
+				"-c",
+				"user.name=t",
+				"-c",
+				"user.email=t@t",
+				"commit",
+				"-q",
+				"--allow-empty",
+				"-m",
+				"init",
+			],
+		] {
+			let ok = std::process::Command::new("git")
+				.args(args)
+				.current_dir(repo.as_std_path())
+				.status()
+				.unwrap()
+				.success();
+			assert!(ok, "git {args:?} failed");
+		}
+
+		let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		registry.add_folder(repo.clone()).await.unwrap();
+		let data_dir = tempfile::TempDir::new().unwrap();
+		let coder = CoderHandle::new(
+			registry.clone(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("workspaces")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("coder-sessions")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("folder-summaries")).unwrap(),
+			CoderModels::default(),
+			Arc::new(moon_terminal::TerminalRegistry::default()),
+		)
+		.unwrap();
+		let state = coder.state.clone();
+		let session = || {
+			let blank = Session::new_blank();
+			let sink = FolderEventSink::new(state.events.clone(), repo.to_string(), blank.header.id.clone());
+			(Arc::new(SessionRuntime::new(blank)), sink)
+		};
+
+		let (rt, sink) = session();
+		let (result, entry) = handle_enter_worktree(&state, &rt, &sink, &json!({ "name": "Fix login" }))
+			.await
+			.unwrap();
+		let expected = repo.join(".worktrees").join("moon-fix-login");
+		assert_eq!(result["branch"], "moon/fix-login");
+		assert_eq!(result["created"], true);
+		assert_eq!(entry.folder.path, expected.as_str());
+		assert!(registry.folder_for_path(expected.as_str()).await.is_some());
+		let header = rt.session.lock().await.header.clone();
+		assert_eq!(header.worktree_root.as_deref(), Some(expected.as_str()));
+		assert_eq!(header.worktree_branch.as_deref(), Some("moon/fix-login"));
+
+		// A second session asking for the same branch joins the
+		// existing worktree instead of failing on git's "already
+		// checked out" refusal.
+		let (rt2, sink2) = session();
+		let (result, entry) = handle_enter_worktree(&state, &rt2, &sink2, &json!({ "branch": "origin/moon/fix-login" }))
+			.await
+			.unwrap();
+		assert_eq!(result["created"], false);
+		assert_eq!(entry.folder.path, expected.as_str());
+		assert_eq!(
+			rt2.session.lock().await.header.worktree_root.as_deref(),
+			Some(expected.as_str())
+		);
 	}
 }

@@ -256,6 +256,10 @@ When asked to review a branch / PR against `main` (or `master`), scope to what t
 - Commits: `git log <base>..HEAD --first-parent --no-merges`.
 - Diff: `git diff <base>...HEAD` (triple-dot — same view as GitHub's "Files changed").
 
+## Starting a branch
+
+When the work should land on its own branch (a new PR, or an existing PR branch), call `enter_worktree` rather than running `git worktree add` or `git checkout -b` yourself: it checks the branch out in an isolated worktree, moves this session into it, and leaves the project's main checkout alone. Push a branch with `git push -u origin HEAD` — never push to the default branch unless asked.
+
 ## Todo list
 
 `todo_write` is a small in-context plan you maintain as you work. Use it when:

@@ -37,6 +37,7 @@ pub mod subagent;
 pub mod todo;
 pub mod tools;
 pub mod web;
+pub mod worktree_tool;
 
 pub use auth::{Authenticator, DeviceCode, HfIdentity, HfOrg, TokenStore};
 pub use browser_tabs::BrowserTabRegistry;

@@ -3816,23 +3816,20 @@ export class CoderPanelState {
 					folder.sessions = folder.sessions.map((s) => (s.id === event.id ? { ...s, title: event.title } : s));
 				}
 				return;
-			case 'session_worktree_cleared':
-				// Patch the session's worktree fields to null without
-				// a full reload — the session now drives its parent
-				// folder's main tree (the worktree was merged + removed).
+			case 'session_worktree_changed': {
+				// Patch the session's worktree fields without a full
+				// reload: cleared after a merge + remove (the session
+				// now drives its parent's main tree), or set when the
+				// agent moved itself into a worktree (`enter_worktree`).
+				const worktree = { worktree_root: event.worktree_root, worktree_branch: event.worktree_branch };
 				if (session.activeSession?.id === event.id) {
-					session.activeSession = {
-						...session.activeSession,
-						worktree_root: null,
-						worktree_branch: null,
-					};
+					session.activeSession = { ...session.activeSession, ...worktree };
 				}
 				if (folder.sessions !== null) {
-					folder.sessions = folder.sessions.map((s) =>
-						s.id === event.id ? { ...s, worktree_root: null, worktree_branch: null } : s,
-					);
+					folder.sessions = folder.sessions.map((s) => (s.id === event.id ? { ...s, ...worktree } : s));
 				}
 				return;
+			}
 			case 'subagent_spawned': {
 				// Re-emitted on a user-driven resume (pop-out
 				// follow-up) with the same ids — merge instead of

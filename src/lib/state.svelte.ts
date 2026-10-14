@@ -2254,7 +2254,7 @@ class WorkspaceState {
 		}
 		this.notificationFocusWired = true;
 		try {
-			await listen<CoderFocusSession>('coder:focus_session', ({ payload }) => {
+			await subscribe('coder:focus_session', (payload: CoderFocusSession) => {
 				void this.focusNotifiedSession(payload);
 			});
 		} catch (err) {
