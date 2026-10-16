@@ -24,6 +24,7 @@
 	import ToolBodyOpenBrowser from './ToolBodyOpenBrowser.svelte';
 	import ToolBodyOpenTerminal from './ToolBodyOpenTerminal.svelte';
 	import { parseSubagentReport } from '../subagentReport';
+	import { splitTextLinks } from '../textLinks';
 	import { hintFor, isHuggingFaceHost, parseHttpError } from '../coderError';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
@@ -3730,7 +3731,19 @@
 			</div>
 			{#if parsed.prose.trim().length > 0}
 				{#if inParentTranscript}
-					<div class="bubble">{parsed.prose}</div>
+					<!-- Plain text, but bare http(s) URLs become links that
+						 open in the OS browser (never navigate the webview). -->
+					<div class="bubble">
+						{#each splitTextLinks(parsed.prose) as seg, i (i)}{#if seg.kind === 'link'}<a
+									class="bubble-link"
+									href={seg.href}
+									title={seg.href}
+									onclick={(event) => {
+										event.preventDefault();
+										void openUrl(seg.href);
+									}}>{seg.text}</a
+								>{:else}{seg.text}{/if}{/each}
+					</div>
 				{:else}
 					<!-- Sub-agent user rows are usually model-authored
 						 markdown (the `task` instructions the parent
@@ -5250,6 +5263,11 @@
 	}
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+	}
+	.bubble-link {
+		color: var(--m-accent);
+		text-decoration: underline;
+		word-break: break-all;
 	}
 	/* Markdown-rendered user bubbles (sub-agent pop-out): same
 	   `pre-wrap` opt-out as `.assistant-bubble` — the markdown
