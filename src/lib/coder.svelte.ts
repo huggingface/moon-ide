@@ -4123,6 +4123,25 @@ export class CoderPanelState {
 		await this.openSession(sessionId);
 	}
 
+	/** Where a coordinator's worker session lives, for the
+	 *  worker-addressing tool rows (`steer_worker`, `observe_worker`,
+	 *  …) to jump into it. The worker id is its session id. Prefers
+	 *  the `spawn_worker` card summary from this session, falling
+	 *  back to the folder's sessions list for workers attached rather
+	 *  than spawned here. `null` when the worker isn't known. */
+	workerSessionTarget(workerId: string): { folder: string | null } | null {
+		for (const summary of this.subagentSummaries.values()) {
+			if (summary.worker && summary.id === workerId) {
+				return { folder: summary.worktreeRoot };
+			}
+		}
+		const listed = this.sessions?.find((s) => s.id === workerId);
+		if (listed === undefined) {
+			return null;
+		}
+		return { folder: listed.worktree_root ?? null };
+	}
+
 	/** Return from a sub-agent pop-out one navigation level: to the
 	 *  outer sub-agent's pop-out when the user drilled into a nested
 	 *  card, else to the parent's session transcript. Keeps the

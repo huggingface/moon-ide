@@ -1834,6 +1834,28 @@
 	 *  We collapse the hint to the first line of the value so a
 	 *  multi-line bash heredoc doesn't blow up the row height; the
 	 *  full payload remains visible in the expanded body. */
+	const WORKER_ADDRESSING_TOOLS = new Set([
+		'observe_worker',
+		'steer_worker',
+		'abort_worker',
+		'review_worker_changes',
+		'commit_worker_changes',
+		'merge_worker_changes',
+		'discard_worker_worktree',
+		'retire_worker',
+		'respond_to_worker_prompt',
+	]);
+
+	/** Worker id targeted by a coordinator's worker-addressing tool
+	 *  call, or `null` for every other tool. */
+	function toolWorkerId(name: string, args: unknown): string | null {
+		if (!WORKER_ADDRESSING_TOOLS.has(name) || typeof args !== 'object' || args === null) {
+			return null;
+		}
+		const id = (args as Record<string, unknown>).worker_id;
+		return typeof id === 'string' && id.length > 0 ? id : null;
+	}
+
 	function toolHint(name: string, args: unknown): string | null {
 		if (typeof args !== 'object' || args === null) {
 			return null;
@@ -3916,6 +3938,8 @@
 		{@const subagent = coder.subagentSummaries.get(row.id) ?? null}
 		{@const elapsedMs = row.hasResult ? (row.durationMs ?? 0) : Math.max(0, nowTick - row.startedAt)}
 		{@const hint = toolHint(row.name, row.args)}
+		{@const workerId = inParentTranscript ? toolWorkerId(row.name, row.args) : null}
+		{@const workerTarget = workerId !== null ? coder.workerSessionTarget(workerId) : null}
 		<div class="row tool" class:err={row.isError}>
 			<!-- One-line collapsed shape: status dot, tool name,
 				 status word, elapsed counter — chevron on the right
@@ -3938,6 +3962,20 @@
 							 overflow; the expanded body still has the
 							 full payload. -->
 						<span class="tool-hint" title={hint}>{hint}</span>
+					{/if}
+					{#if workerId !== null && workerTarget !== null}
+						<!-- Same jump as the `spawn_worker` card. Lives in the
+							 summary, so it must not toggle the `<details>`. -->
+						<button
+							type="button"
+							class="tool-open-worker"
+							title="Open worker session"
+							onclick={(event) => {
+								event.preventDefault();
+								event.stopPropagation();
+								void coder.openSessionInFolder(workerTarget.folder, workerId);
+							}}>open session →</button
+						>
 					{/if}
 					{#if !row.hasResult && row.liveOutput}
 						<!-- Streaming glance (ADR 0085): the running command's
@@ -5860,6 +5898,22 @@
 	.subagent-open {
 		font-weight: 500;
 		color: var(--m-fg-muted);
+	}
+	.tool-open-worker {
+		flex: 0 0 auto;
+		padding: 0 6px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: transparent;
+		color: var(--m-fg-muted);
+		font: inherit;
+		font-size: 11px;
+		white-space: nowrap;
+		cursor: pointer;
+	}
+	.tool-open-worker:hover {
+		color: var(--m-fg);
+		border-color: var(--m-accent);
 	}
 	/* Pre-first-round-trip placeholder — keeps the footer at a
 	   stable height while the sub-agent's first `token_usage`
