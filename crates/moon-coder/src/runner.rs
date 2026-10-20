@@ -3774,6 +3774,7 @@ impl CoderHandle {
 		// turn. The panel-side recovery (synthesising
 		// `ToolResult` events) lives in the replay loop below.
 		let orphan_tool_call_ids = sessions::orphan_tool_call_ids(&records);
+		let unfinished_detached = unfinished_detached_subagent_ids(&records);
 		// A cold restart (`!already_mounted`, below) can resume an
 		// interrupted `ask_user` prompt instead of erroring it: the
 		// call's args (questions/options) survive in the Assistant
@@ -4091,6 +4092,28 @@ impl CoderHandle {
 					result: serde_json::json!({ "error": "Interrupted before tool completed." }),
 					is_error: true,
 					duration_ms: None,
+				});
+			}
+		}
+		// Background sub-agents outlive the spawning turn (ADR 0091),
+		// so `in_flight` says nothing about them. A spawn with no
+		// finish record is either still running (live registry entry,
+		// leave it) or settled / lost to a restart — settle its card
+		// here, otherwise the panel's running pips stay lit forever.
+		if !unfinished_detached.is_empty() {
+			let registry = self.state.detached_tasks.read().await;
+			for subagent_id in unfinished_detached {
+				let was_error = match registry.entry(&subagent_id) {
+					None => true,
+					Some(entry) => match &*entry.finish.lock().await {
+						None => continue,
+						Some(finish) => !matches!(finish, DetachedFinish::Done(_)),
+					},
+				};
+				replay_events.push(CoderEvent::SubagentFinished {
+					subagent_id,
+					tokens_used_estimate: 0,
+					was_error,
 				});
 			}
 		}
@@ -11403,6 +11426,29 @@ fn emit_replay_events(out: &mut Vec<CoderEvent>, record: SessionRecord, created_
 /// `sub_dir`. Boxed return type because async recursion needs the
 /// indirection (same shape as [`Coder::open_session_boxed`]); the
 /// depth-2 cap bounds the recursion in practice.
+/// Detached (`task`) sub-agent ids spawned in `records` whose
+/// `SubagentFinished` record hasn't landed, in spawn order.
+fn unfinished_detached_subagent_ids(records: &[SessionRecord]) -> Vec<String> {
+	let finished: HashSet<&str> = records
+		.iter()
+		.filter_map(|r| match r {
+			SessionRecord::SubagentFinished { subagent_id, .. } => Some(subagent_id.as_str()),
+			_ => None,
+		})
+		.collect();
+	records
+		.iter()
+		.filter_map(|r| match r {
+			SessionRecord::SubagentSpawned {
+				subagent_id,
+				detached: true,
+				..
+			} if !finished.contains(subagent_id.as_str()) => Some(subagent_id.clone()),
+			_ => None,
+		})
+		.collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replay_subagent_spawned<'a>(
 	out: &'a mut Vec<CoderEvent>,

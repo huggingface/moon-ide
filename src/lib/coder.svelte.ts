@@ -468,6 +468,25 @@ class SessionViewState {
 	 *  when the session was reopened by a path other than an
 	 *  explicit `openSession` (e.g. HMR rehydrate). */
 	openIpcMs: number | null = null;
+
+	/** "Is this session doing work?" — a turn in flight, or a
+	 *  background `task` sub-agent still running after the parent's
+	 *  turn ended (ADR 0091). The running pips (folder bar, session
+	 *  list) read this rather than `busy` so they keep pulsing until
+	 *  the sub-agents settle and the report wakes the parent.
+	 *  Coordinator workers are excluded: they're sessions of their
+	 *  own and light their own rows. */
+	get working(): boolean {
+		if (this.busy) {
+			return true;
+		}
+		for (const summary of this.subagentSummaries.values()) {
+			if (summary.status === 'running' && !summary.worker) {
+				return true;
+			}
+		}
+		return false;
+	}
 }
 
 /** Per-bound-folder UI state. One instance per folder we've ever
@@ -530,7 +549,7 @@ class FolderState {
 	 *  session has no bucket yet (no events ever arrived for
 	 *  it). */
 	isSessionRunning(sessionId: string): boolean {
-		return this.sessionsById.get(sessionId)?.busy ?? false;
+		return this.sessionsById.get(sessionId)?.working ?? false;
 	}
 
 	/** "Is the session with `sessionId` parked on an `ask_user`
@@ -1226,7 +1245,7 @@ export class CoderPanelState {
 	get anyBusy(): boolean {
 		for (const folder of this.byFolder.values()) {
 			for (const session of folder.sessionsById.values()) {
-				if (session.busy) {
+				if (session.working) {
 					return true;
 				}
 			}
@@ -1242,7 +1261,7 @@ export class CoderPanelState {
 	 *  `sessionsById` `SvelteMap`; the lazy-create of an empty
 	 *  folder bucket per bound folder is cheap. */
 	busyForFolder(folder: string): boolean {
-		return this.#rollupForFolder(folder, (session) => session.busy);
+		return this.#rollupForFolder(folder, (session) => session.working);
 	}
 
 	/** "Is any session rooted at this folder itself parked on an
@@ -1284,7 +1303,7 @@ export class CoderPanelState {
 	busyForWorktree(coderRoot: string, worktreeRoot: string): boolean {
 		const f = this.bucketFor(coderRoot);
 		for (const [id, session] of f.sessionsById) {
-			if (session.busy && this.#sessionWorktreeRoot(f, id) === worktreeRoot) {
+			if (session.working && this.#sessionWorktreeRoot(f, id) === worktreeRoot) {
 				return true;
 			}
 		}

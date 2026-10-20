@@ -1015,6 +1015,15 @@ batch's trailing `TurnComplete` terminator clears the pip, so `Replay`
 carries an `in_flight` flag and the frontend re-asserts **running** /
 **needs input** after applying the batch.
 
+**Running** also covers a session whose turn has ended but whose
+background `task` sub-agents are still going ([ADR 0091](decisions/0091-background-only-subagents.md)):
+the pip stays lit until each settles and the report wakes the parent.
+Coordinator workers don't count — they light their own rows. Since
+`in_flight` says nothing about sub-agents, the replay settles any
+spawn with no finish record whose run isn't live in the in-memory
+registry (lost to a restart) with a synthetic `SubagentFinished`, so
+a reopened session can't leave the pip stuck on.
+
 The **running** pip is event-driven but reconciled against the
 backend: every sessions-list refresh also fetches
 `coder_running_sessions` (the ids with a turn in flight in the active

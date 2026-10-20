@@ -76,6 +76,35 @@ describe('folder-bar agent-status rollups (ADR 0028)', () => {
 		expect(coder.busyForFolder(PARENT)).toBe(false);
 		expect(coder.busyForWorktree(PARENT, WORKTREE)).toBe(true);
 	});
+
+	it('stays lit while a background sub-agent runs after the turn ended (ADR 0091)', () => {
+		const coder = new CoderPanelState();
+		coder.bucketFor(PARENT).sessions = [summary('main-session', null)];
+		const session = coder.sessionStateFor(PARENT, 'main-session');
+		const sub = {
+			id: 'sub-1',
+			toolCallId: 'call-1',
+			targetFolder: PARENT,
+			mode: 'research' as const,
+			status: 'running' as const,
+			resultPreview: null,
+			tokensUsedEstimate: 0,
+			subSessionId: null,
+			worktreeRoot: null,
+			worker: false,
+			detached: true,
+		};
+		session.subagentSummaries = new Map([['call-1', sub]]);
+
+		expect(coder.busyForFolder(PARENT)).toBe(true);
+		expect(coder.bucketFor(PARENT).isSessionRunning('main-session')).toBe(true);
+
+		session.subagentSummaries = new Map([['call-1', { ...sub, status: 'done' as const }]]);
+		expect(coder.busyForFolder(PARENT)).toBe(false);
+
+		session.subagentSummaries = new Map([['call-1', { ...sub, worker: true }]]);
+		expect(coder.busyForFolder(PARENT)).toBe(false);
+	});
 });
 
 function terminalAttachment(overrides: Partial<TerminalAttachment> = {}): TerminalAttachment {
