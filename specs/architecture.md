@@ -92,6 +92,14 @@ Phase 0 ships only `LocalHost` and exposes it through Tauri commands directly. T
 
 Any host operation can fail because the host is gone (container stopped, network blip). The UI must treat workspace I/O as fallible and surface a degraded state without crashing. The core auto-reconnects to the agent in remote mode.
 
+## Build follow-ups
+
+The desktop main bundle exceeds the 2 MB warning budget (about 2.05 MB).
+Reducing it needs a separate code-splitting review; do not hide growth by
+raising the budget during launcher repair. The CSS minifier also warns on
+the custom `::highlight(...)` selectors used by in-document search; preserve
+those selectors when updating the minifier.
+
 ## Open questions
 
 - Whether `moon-core` should own its own tokio runtime or share Tauri's. Currently shares Tauri's.
