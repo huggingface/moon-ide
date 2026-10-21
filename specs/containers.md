@@ -709,6 +709,27 @@ token-based fj logins are the reliable path for containers; a
 host-side `fj` run refreshes OAuth tokens for the container to pick
 up.
 
+## `hf` (Hugging Face) login forwarding
+
+The host's Hugging Face home (`$HF_HOME` →
+`$XDG_CACHE_HOME/huggingface` → `~/.cache/huggingface`; skipped if
+absent) bind-mounts read-only at `/home/dev/.moon-host/huggingface`,
+and `HF_TOKEN_PATH` / `HF_STORED_TOKENS_PATH` on the `dev` service
+point into it. `hf auth whoami`, `huggingface_hub` and
+`@huggingface/hub` in the container then use the host's login.
+
+- **A separate path, not the container's own `~/.cache/huggingface`**,
+  so the container keeps its own writable hub / xet cache. Only the
+  token files are shared.
+- **The directory, not the `token` file.** Logging in or out on the
+  host replaces or deletes the file, which would leave a file mount
+  stale. With a directory mount, host login changes show up live with
+  no Rebuild.
+- **Not `HF_TOKEN`.** That would freeze the token at compose-render
+  time, so a host re-login would need a Rebuild.
+- **Read-only**, for the same reason as gh. An in-container
+  `hf auth login` fails instead of rewriting the host's token.
+
 ## Editor forwarding
 
 `git commit` without `-m`, `git rebase -i`, `crontab -e`, etc.

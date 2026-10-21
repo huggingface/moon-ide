@@ -71,8 +71,9 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::compose::{
-	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, FjDataMount, GhConfigMount, HostGhToken,
-	HostGitIdentity, MoonEditSocketMount, SshAgentForward, SshConfigMount, SshKnownHostsMount, SshPublicKeyMount,
+	generate_compose, BoundMount, ComposeRender, ComposeRenderOptions, FjDataMount, GhConfigMount, HfHomeMount,
+	HostGhToken, HostGitIdentity, MoonEditSocketMount, SshAgentForward, SshConfigMount, SshKnownHostsMount,
+	SshPublicKeyMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
 use crate::port_forward::stop_forwards;
@@ -302,6 +303,7 @@ impl Workspace {
 		let gh_config = detect_host_gh_config();
 		let gh_token = detect_host_gh_token(gh_config.as_ref());
 		let fj_data = detect_host_fj_data_dir();
+		let hf_home = detect_host_hf_home();
 		// The IDE's per-workspace focus socket lives in the
 		// `run/` subdir of `state_dir`. moon-ide creates that
 		// directory before any compose call runs (pre-Tauri in
@@ -329,6 +331,7 @@ impl Workspace {
 			gh_config: gh_config.as_ref(),
 			gh_token: gh_token.as_ref(),
 			fj_data: fj_data.as_ref(),
+			hf_home: hf_home.as_ref(),
 			moon_edit_socket: Some(&moon_edit),
 		})
 	}
@@ -1101,6 +1104,31 @@ pub(crate) fn detect_host_fj_data_dir() -> Option<FjDataMount> {
 		return None;
 	};
 	Some(FjDataMount { host_path: path })
+}
+
+/// Resolve the host's Hugging Face home so the in-container
+/// `hf` shares the host's login. Same resolution as
+/// `huggingface_hub`: `$HF_HOME`, else `$XDG_CACHE_HOME/huggingface`,
+/// else `~/.cache/huggingface`.
+///
+/// Mounted whenever the directory exists, token or not: the
+/// mount is live, so a host `hf auth login` after the container
+/// started still propagates. A missing dir is skipped — Docker
+/// would auto-create it root-owned and shadow a later login.
+pub(crate) fn detect_host_hf_home() -> Option<HfHomeMount> {
+	let env = |key: &str| std::env::var(key).ok().filter(|s| !s.is_empty());
+	let path = match env("HF_HOME") {
+		Some(dir) => Utf8PathBuf::from(dir),
+		None => match env("XDG_CACHE_HOME") {
+			Some(cache) => Utf8PathBuf::from(cache).join("huggingface"),
+			None => Utf8PathBuf::from(env("HOME")?).join(".cache/huggingface"),
+		},
+	};
+	if !path.is_dir() {
+		tracing::debug!(%path, "no Hugging Face home found; skipping hf auth pass-through into the container");
+		return None;
+	}
+	Some(HfHomeMount { host_path: path })
 }
 
 fn read_git_global_config(key: &str) -> Option<String> {

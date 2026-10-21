@@ -377,6 +377,29 @@ pub struct FjDataMount {
 	pub host_path: Utf8PathBuf,
 }
 
+/// In-container path the host's Hugging Face home is mounted at.
+/// Deliberately *not* `dev`'s own `~/.cache/huggingface`: the
+/// container keeps its own (writable) hub / xet cache, and only
+/// the token files are pointed at the host copy via
+/// `HF_TOKEN_PATH` / `HF_STORED_TOKENS_PATH`.
+pub const HF_HOME_CONTAINER_PATH: &str = "/home/dev/.moon-host/huggingface";
+
+/// Bind-mount of the host's Hugging Face home (`$HF_HOME`,
+/// default `~/.cache/huggingface`) into the dev container,
+/// read-only, so `hf auth whoami`, `huggingface_hub` and
+/// `@huggingface/hub` inside the container see the host's login.
+///
+/// The directory is mounted rather than the `token` file so a
+/// host `hf auth login` / `logout` (which replaces / deletes the
+/// file) shows up live instead of leaving a stale file mount.
+/// Read-only for the same reason as [`GhConfigMount`]: the host
+/// owns the auth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfHomeMount {
+	/// Absolute host-side path to the Hugging Face home.
+	pub host_path: Utf8PathBuf,
+}
+
 /// The host's `git config --global user.{name,email}`, projected
 /// into the dev container as `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
 /// environment variables.
@@ -460,6 +483,10 @@ pub struct ComposeRenderOptions<'a> {
 	/// is then unauthenticated). No companion env var — fj reads
 	/// credentials only from `keys.json`.
 	pub fj_data: Option<&'a FjDataMount>,
+	/// Optional host Hugging Face home bind mount, plus the
+	/// `HF_TOKEN_PATH` / `HF_STORED_TOKENS_PATH` env pointing
+	/// into it. `None` leaves the in-container `hf` logged out.
+	pub hf_home: Option<&'a HfHomeMount>,
 	/// Optional bind-mount of the workspace's socket directory
 	/// for editor forwarding. The lifecycle layer typically
 	/// populates this unconditionally — the `run/` directory is
@@ -527,6 +554,7 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 		|| options.ssh_known_hosts.is_some()
 		|| options.gh_config.is_some()
 		|| options.fj_data.is_some()
+		|| options.hf_home.is_some()
 		|| options.moon_edit_socket.is_some();
 	if options.bound_mounts.is_empty() && !has_extra_mount {
 		// Empty list is valid YAML and compose accepts it; this
@@ -623,6 +651,16 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 				container = FJ_DATA_CONTAINER_PATH,
 			);
 		}
+		if let Some(hf) = options.hf_home {
+			// Read-only by design — same one-source-of-truth
+			// rule as the gh config mount.
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}:ro",
+				host = hf.host_path.as_str(),
+				container = HF_HOME_CONTAINER_PATH,
+			);
+		}
 		if let Some(edit) = options.moon_edit_socket {
 			// Read-write by necessity — Unix-socket `connect()`
 			// needs write permission on the inode, and a
@@ -656,6 +694,13 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	}
 	if let Some(token) = options.gh_token {
 		env.push(("GH_TOKEN", token.token.clone()));
+	}
+	if options.hf_home.is_some() {
+		env.push(("HF_TOKEN_PATH", format!("{HF_HOME_CONTAINER_PATH}/token")));
+		env.push((
+			"HF_STORED_TOKENS_PATH",
+			format!("{HF_HOME_CONTAINER_PATH}/stored_tokens"),
+		));
 	}
 	if !env.is_empty() {
 		let _ = writeln!(yaml, "    environment:");
@@ -711,6 +756,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -750,6 +796,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("    init: true"));
@@ -774,6 +821,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -800,6 +848,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		};
 		let a = generate_compose(opts.clone());
@@ -823,6 +872,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("image: huggingface/moon-base:0.1"));
@@ -843,6 +893,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 		assert!(render.yaml.contains("name: moon-ws-scratch"));
@@ -866,6 +917,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -904,6 +956,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 		assert!(render
@@ -939,6 +992,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -970,6 +1024,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1006,6 +1061,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1038,6 +1094,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1072,6 +1129,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1107,6 +1165,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1138,6 +1197,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1177,6 +1237,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1204,6 +1265,7 @@ mod tests {
 			gh_config: Some(&gh),
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1232,6 +1294,7 @@ mod tests {
 			gh_config: Some(&gh),
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1261,6 +1324,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: Some(&fj),
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1270,6 +1334,43 @@ mod tests {
 				.contains("- /home/me/.local/share/forgejo-cli:/home/dev/.local/share/forgejo-cli:ro"),
 			"got:\n{}",
 			render.yaml
+		);
+	}
+
+	#[test]
+	fn hf_home_mount_renders_read_only_volume_and_token_paths() {
+		let project = project();
+		let hf = HfHomeMount {
+			host_path: Utf8PathBuf::from("/home/me/.cache/huggingface"),
+		};
+		let render = generate_compose(ComposeRenderOptions {
+			project: &project,
+			dev_image: "moon-base:dev",
+			bound_mounts: &[mount("/home/me/code/moon-ide", "moon-ide")],
+			ssh_agent: None,
+			ssh_public_keys: &[],
+			ssh_config: None,
+			ssh_known_hosts: None,
+			git_identity: None,
+			gh_config: None,
+			gh_token: None,
+			fj_data: None,
+			hf_home: Some(&hf),
+			moon_edit_socket: None,
+		});
+
+		let yaml = &render.yaml;
+		assert!(
+			yaml.contains("- /home/me/.cache/huggingface:/home/dev/.moon-host/huggingface:ro"),
+			"got:\n{yaml}"
+		);
+		assert!(
+			yaml.contains("HF_TOKEN_PATH: \"/home/dev/.moon-host/huggingface/token\""),
+			"got:\n{yaml}"
+		);
+		assert!(
+			yaml.contains("HF_STORED_TOKENS_PATH: \"/home/dev/.moon-host/huggingface/stored_tokens\""),
+			"got:\n{yaml}"
 		);
 	}
 
@@ -1291,6 +1392,7 @@ mod tests {
 			gh_config: None,
 			gh_token: Some(&token),
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1320,6 +1422,7 @@ mod tests {
 			gh_config: None,
 			gh_token: Some(&token),
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 
@@ -1349,6 +1452,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: None,
 		});
 		// Double-quoted scalar with `"` → `\"` and `\` → `\\`.
@@ -1379,6 +1483,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: Some(&edit),
 		});
 		// Read-write (no `:ro` suffix) — Unix-socket connect needs
@@ -1420,6 +1525,7 @@ mod tests {
 			gh_config: None,
 			gh_token: None,
 			fj_data: None,
+			hf_home: None,
 			moon_edit_socket: Some(&edit),
 		});
 		assert!(!render.yaml.contains("volumes:\n      []"));
