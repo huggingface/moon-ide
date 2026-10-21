@@ -77,6 +77,21 @@ describe('folder-bar agent-status rollups (ADR 0028)', () => {
 		expect(coder.busyForWorktree(PARENT, WORKTREE)).toBe(true);
 	});
 
+	it("switching to the parent doesn't clear a worktree session's finished marker", () => {
+		const coder = new CoderPanelState();
+		const bucket = coder.bucketFor(PARENT);
+		bucket.sessions = [summary('main-session', null), summary('wt-session', WORKTREE)];
+		bucket.visibleSessionId = 'wt-session';
+		bucket.view = 'session';
+		coder.sessionStateFor(PARENT, 'wt-session').attentionPending = true;
+
+		coder.setActiveFolder(PARENT, PARENT);
+		expect(coder.attentionPendingForWorktree(PARENT, WORKTREE)).toBe(true);
+
+		coder.setActiveFolder(PARENT, WORKTREE);
+		expect(coder.attentionPendingForWorktree(PARENT, WORKTREE)).toBe(false);
+	});
+
 	it('stays lit while a background sub-agent runs after the turn ended (ADR 0091)', () => {
 		const coder = new CoderPanelState();
 		coder.bucketFor(PARENT).sessions = [summary('main-session', null)];

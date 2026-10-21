@@ -2350,9 +2350,14 @@ export class CoderPanelState {
 			// looking at it — drop its per-row `finished` marker too.
 			// (Switching to the list view leaves other rows' markers
 			// intact; only the visible session counts as "seen".)
+			// A worktree shares its parent's bucket (ADR 0028), so the
+			// pointer may still name a session from another worktree
+			// context — the select pass below swaps it out without the
+			// user ever seeing it, so it must keep its marker.
 			if (bucket !== undefined && bucket.view === 'session' && bucket.visibleSessionId !== null) {
 				const visible = bucket.sessionsById.get(bucket.visibleSessionId);
-				if (visible !== undefined) {
+				const target = actual !== path ? actual : null;
+				if (visible !== undefined && this.#sessionWorktreeRoot(bucket, bucket.visibleSessionId) === target) {
 					visible.attentionPending = false;
 				}
 			}
