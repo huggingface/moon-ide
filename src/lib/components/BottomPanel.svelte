@@ -191,14 +191,14 @@
 	);
 
 	function quickHost() {
-		openHostTerminal();
+		void openHostTerminal();
 	}
 
 	function quickContainer() {
 		if (!canOpenContainerTerminal()) {
 			return;
 		}
-		openContainerTerminal();
+		void openContainerTerminal();
 	}
 </script>
 

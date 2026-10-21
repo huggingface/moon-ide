@@ -52,7 +52,7 @@
 		// `containerRunning` reads the settled state.
 		await container.awaitRefreshed();
 		if (!containerRunning) {
-			openHostTerminal();
+			void openHostTerminal();
 			return;
 		}
 		open = !open;
@@ -63,7 +63,7 @@
 	}
 
 	function pickHost() {
-		openHostTerminal();
+		void openHostTerminal();
 		close();
 	}
 
@@ -71,7 +71,7 @@
 		if (!containerRunning) {
 			return;
 		}
-		openContainerTerminal();
+		void openContainerTerminal();
 		close();
 	}
 

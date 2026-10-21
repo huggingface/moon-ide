@@ -113,6 +113,12 @@ class TerminalStore {
 	 * (never wrong) for shells whose prompt we don't recognise.
 	 * Not reactive: nothing renders it. */
 	#commands = new Map<string, string>();
+	/** Terminals the user has typed or pasted into. Lets the
+	 *  folder-switch auto-spawn close its own terminals that were
+	 *  never used instead of piling them up. Keystrokes only —
+	 *  xterm's `onData` also carries the terminal's replies to
+	 *  shell queries, which would mark every fresh shell. */
+	#touched = new Set<string>();
 	#unlisten: Unsubscribe[] = [];
 	#runtimeWired = false;
 	#onChange: (() => void) | null = null;
@@ -193,6 +199,14 @@ class TerminalStore {
 			return;
 		}
 		this.#commands.set(streamId, trimmed);
+	}
+
+	markTouched(streamId: string): void {
+		this.#touched.add(streamId);
+	}
+
+	isTouched(streamId: string): boolean {
+		return this.#touched.has(streamId);
 	}
 
 	/** Snapshot of the restore list for
@@ -411,6 +425,7 @@ class TerminalStore {
 		this.#writers.delete(streamId);
 		this.#pending.delete(streamId);
 		this.#commands.delete(streamId);
+		this.#touched.delete(streamId);
 		if (this.activeSelection?.streamId === streamId) {
 			this.activeSelection = null;
 		}

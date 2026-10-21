@@ -249,6 +249,9 @@
 		// `^L` and clear its screen, dropping the selected
 		// scrollback on the floor.
 		t.attachCustomKeyEventHandler((event) => {
+			if (event.type === 'keydown') {
+				terminalStore.markTouched(tab.id);
+			}
 			if (event.type !== 'keydown' || !event.ctrlKey || event.altKey || event.metaKey) {
 				return true;
 			}

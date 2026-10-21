@@ -2152,7 +2152,7 @@ class WorkspaceState {
 			return;
 		}
 		if (canOpenContainerTerminal()) {
-			openContainerTerminal();
+			void openContainerTerminal();
 			return;
 		}
 		// Container isn't up yet — the launch-time auto-resume may
@@ -2166,10 +2166,10 @@ class WorkspaceState {
 			return;
 		}
 		if (canOpenContainerTerminal()) {
-			openContainerTerminal();
+			void openContainerTerminal();
 			return;
 		}
-		openHostTerminal();
+		void openHostTerminal();
 	}
 
 	private nextEditProbeWired = false;

@@ -40,15 +40,22 @@ const DEFAULT_ROWS = 24;
  *  without bound across a long session of bind / unbind cycles. */
 const lastTerminalByFolder = new Map<string, string>();
 
+/** Terminals [`ensureActiveFolderTerminal`] spawned on its own.
+ *  The next folder switch closes the ones the user never typed
+ *  into, so hopping across projects / worktrees doesn't leave a
+ *  trail of idle shells; any keystroke promotes one to a normal
+ *  terminal that stays. */
+const autoSpawned = new Set<string>();
+
 /** Open a host terminal rooted at the active folder
  * (or `$HOME` when no folder is selected). */
-export function openHostTerminal(): void {
+export function openHostTerminal(): Promise<string> {
 	const folder = workspace.activeFolder?.path ?? null;
 	const target: TerminalTarget = {
 		kind: 'host',
 		cwd: folder,
 	};
-	void terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS, folder);
+	return terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS, folder);
 }
 
 /** True when a container terminal can actually be spawned —
@@ -78,13 +85,12 @@ export function canOpenContainerTerminal(): boolean {
  *  user has already picked) and the launcher popover (where the
  *  popover is gated on a known state) call the specific helpers
  *  directly. */
-export async function openPreferredTerminal(): Promise<void> {
+export async function openPreferredTerminal(): Promise<string | null> {
 	await container.awaitRefreshed();
 	if (canOpenContainerTerminal()) {
-		openContainerTerminal();
-		return;
+		return openContainerTerminal();
 	}
-	openHostTerminal();
+	return openHostTerminal();
 }
 
 /** Open a container terminal at `/workspace/<active-folder>`,
@@ -92,9 +98,9 @@ export async function openPreferredTerminal(): Promise<void> {
  * when the workspace container isn't running, so callers can
  * always invoke this from a click handler — disabling the
  * trigger is a UX nicety, not a safety requirement. */
-export function openContainerTerminal(): void {
+export function openContainerTerminal(): Promise<string> | null {
 	if (container.state !== 'running') {
-		return;
+		return null;
 	}
 	const folder = workspace.activeFolder;
 	const cwd = folder ? containerCwdFor(folder.path) : '/workspace';
@@ -102,7 +108,7 @@ export function openContainerTerminal(): void {
 		kind: 'container',
 		cwd,
 	};
-	void terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS, folder?.path ?? null);
+	return terminalStore.open(target, DEFAULT_COLS, DEFAULT_ROWS, folder?.path ?? null);
 }
 
 // `/home/me/code/moon-landing` → `/workspace/moon-landing`.
@@ -156,6 +162,9 @@ export function containerCwdFor(absolutePath: string): string {
  *    preferred mode: container when the workspace container is
  *    up, host otherwise.
  *
+ * Either way, terminals a previous switch spawned that the user
+ * never typed into are closed (see [`autoSpawned`]).
+ *
  * No-op when the panel is hidden or hosts no terminals at all —
  * we don't surprise users who collapsed the strip or only have
  * log / diag tabs open. Initial workspace hydration also calls
@@ -181,6 +190,7 @@ export function ensureActiveFolderTerminal(): void {
 		const tab = tabs.find((t) => t.id === remembered);
 		if (tab && tab.kind === 'terminal') {
 			bottomPanel.setActive(remembered);
+			closeIdleAutoSpawned(remembered);
 			return;
 		}
 		// Remembered terminal is gone — drop it so the next
@@ -197,13 +207,37 @@ export function ensureActiveFolderTerminal(): void {
 	});
 	if (existing) {
 		bottomPanel.setActive(existing.id);
+		closeIdleAutoSpawned(existing.id);
 		return;
 	}
 	// Spawn a fresh one in the preferred mode. `openPreferredTerminal`
 	// awaits the in-flight container refresh so a folder switch
 	// triggered before the startup probe resolves still picks the
-	// container when it's up.
-	void openPreferredTerminal();
+	// container when it's up. Idle auto-spawned terminals close
+	// only once the replacement exists, so the panel never drops
+	// to zero terminals in between.
+	void openPreferredTerminal().then((id) => {
+		if (id === null) {
+			return;
+		}
+		autoSpawned.add(id);
+		closeIdleAutoSpawned(id);
+	});
+}
+
+/** Close every auto-spawned terminal except `keep` that the user
+ *  never typed into. Touched ones graduate out of the set. */
+function closeIdleAutoSpawned(keep: string): void {
+	for (const id of autoSpawned) {
+		if (id === keep) {
+			continue;
+		}
+		autoSpawned.delete(id);
+		if (terminalStore.isTouched(id)) {
+			continue;
+		}
+		void terminalStore.close(id);
+	}
 }
 
 /** Snapshot the bottom panel's currently-active terminal as the
