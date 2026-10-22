@@ -194,7 +194,32 @@ export type OpenFile = {
  *  what the user/agent asked for — shown in the URL bar — not the
  *  tunnel URL the iframe loads. `reloadToken` bumps force a fresh
  *  load. */
-export type BrowserTabView = { id: number; url: string; inContainer: boolean; reloadToken: number };
+export type BrowserTabView = {
+	id: number;
+	url: string;
+	inContainer: boolean;
+	folder: string | null;
+	reloadToken: number;
+};
+
+/** Placeholder buffer backing a `browser://<id>` tab. */
+function browserBuffer(path: string, url: string): OpenFile {
+	return {
+		path,
+		name: browserTabName(url),
+		kind: 'text',
+		isUntitled: false,
+		text: '',
+		previewUrl: '',
+		loadedFingerprint: fingerprint(''),
+		loadedMtimeMs: null,
+		isDirty: false,
+		isDeleted: false,
+		isExternal: false,
+		pendingEdit: null,
+		previewToken: 0,
+	};
+}
 
 class FolderState {
 	paths = $state<string[]>([]);
@@ -4747,6 +4772,7 @@ class WorkspaceState {
 				id: tab.id,
 				url: tab.url,
 				inContainer: tab.in_container,
+				folder: tab.folder,
 				reloadToken: (prior?.reloadToken ?? 0) + bump,
 			};
 		}
@@ -4760,7 +4786,12 @@ class WorkspaceState {
 			const focused = change.focus === tab.id;
 			const owner = this.#browserTabOwner(path);
 			if (owner === null) {
-				this.#attachBrowserBuffer(path, this.focusedSide, focused);
+				const home = tab.folder === null ? undefined : this.folderStates.get(tab.folder);
+				if (home && tab.folder !== this.activeFolderPath) {
+					this.#attachBrowserBufferTo(home, path, focused);
+				} else {
+					this.#attachBrowserBuffer(path, this.focusedSide, focused);
+				}
 				continue;
 			}
 			if (owner !== this.activeFolderPath) {
@@ -4819,28 +4850,43 @@ class WorkspaceState {
 		this.editorViewTick++;
 	}
 
+	/** New tab filed under a folder that isn't the active one (the
+	 *  opening agent session's, e.g. its worktree); it shows up when
+	 *  the user switches there. */
+	#attachBrowserBufferTo(state: FolderState, path: string, activate: boolean) {
+		const tab = this.browserTabs[path];
+		if (!tab) {
+			return;
+		}
+		if (!state.openFiles.some((f) => f.path === path)) {
+			state.openFiles = [...state.openFiles, browserBuffer(path, tab.url)];
+		}
+		const side = state.focusedSide;
+		const tabs = side === 'left' ? state.leftTabs : state.rightTabs;
+		if (!tabs.includes(path)) {
+			if (side === 'left') {
+				state.leftTabs = [...tabs, path];
+			} else {
+				state.rightTabs = [...tabs, path];
+			}
+		}
+		if (!activate) {
+			return;
+		}
+		if (side === 'left') {
+			state.leftActive = path;
+		} else {
+			state.rightActive = path;
+		}
+	}
+
 	#attachBrowserBuffer(path: string, side: SplitSide, activate: boolean) {
 		const tab = this.browserTabs[path];
 		if (!tab) {
 			return;
 		}
 		if (!this.openFiles.some((f) => f.path === path)) {
-			const file: OpenFile = {
-				path,
-				name: browserTabName(tab.url),
-				kind: 'text',
-				isUntitled: false,
-				text: '',
-				previewUrl: '',
-				loadedFingerprint: fingerprint(''),
-				loadedMtimeMs: null,
-				isDirty: false,
-				isDeleted: false,
-				isExternal: false,
-				pendingEdit: null,
-				previewToken: 0,
-			};
-			this.openFiles = [...this.openFiles, file];
+			this.openFiles = [...this.openFiles, browserBuffer(path, tab.url)];
 		}
 		const tabs = this.tabsFor(side);
 		if (!tabs.includes(path)) {

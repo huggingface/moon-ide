@@ -18,6 +18,10 @@ pub struct BrowserTab {
 	/// Resolve the URL inside the workspace shell container (through
 	/// a loopback tunnel) rather than on the host.
 	pub in_container: bool,
+	/// Bound folder (host path) of the agent session that opened the
+	/// tab — a worktree after `enter_worktree`. The frontend files a
+	/// new tab under it; `None` (user-opened) means the active folder.
+	pub folder: Option<String>,
 }
 
 /// Payload of the `browser:tabs` event: the full tab set after a

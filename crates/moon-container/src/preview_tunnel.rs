@@ -1,13 +1,15 @@
 //! Host-loopback preview proxies for the IDE's browser tabs
 //! (ADR 0088).
 //!
-//! Each `(side, host, port)` target gets one HTTP/1 proxy listening on
+//! Each `(sides, host, port)` target gets one HTTP/1 proxy listening on
 //! `127.0.0.1:<ephemeral>`. Upstream connections are dialed either
-//! directly (host targets) or with `docker exec -i <container> ncat
-//! <host> <port>` (container targets) — the dial happens *inside* the
+//! directly (host side) or with `docker exec -i <container> ncat
+//! <host> <port>` (container side) — the dial happens *inside* the
 //! container, so a dev server bound to the container's own loopback is
-//! reachable and compose service names resolve. No sidecar, no
-//! published port, nothing survives the IDE process.
+//! reachable and compose service names resolve. Sides are tried in
+//! order until one connects, so a `localhost` URL works whichever side
+//! the server actually runs on. No sidecar, no published port, nothing
+//! survives the IDE process.
 //!
 //! The proxy is HTTP-aware for one reason: HTML responses get the page
 //! bridge (`preview_bridge.js`) injected, which is what lets an agent
@@ -27,6 +29,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -36,7 +39,7 @@ use hyper::client::conn::http1::SendRequest;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -45,7 +48,10 @@ use tokio::task::JoinHandle;
 /// In-page bridge injected into every proxied HTML document.
 const BRIDGE_JS: &str = include_str!("preview_bridge.js");
 
-/// Which side of the container boundary a preview URL means.
+/// Upper bound on one in-container dial (exec + TCP connect).
+const CONTAINER_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Which side of the container boundary a preview URL is dialed from.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PreviewTarget {
 	Host,
@@ -55,7 +61,8 @@ pub enum PreviewTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Dial {
-	target: PreviewTarget,
+	/// Tried in order; the first that connects serves the connection.
+	sides: Vec<PreviewTarget>,
 	host: String,
 	port: u16,
 }
@@ -79,10 +86,14 @@ impl PreviewTunnels {
 	}
 
 	/// Host-side loopback port whose proxy reaches `host:port` as
-	/// seen from `target`. Creates the listener on first use.
-	pub async fn ensure(&self, target: PreviewTarget, host: &str, port: u16) -> io::Result<u16> {
+	/// seen from the first of `sides` that accepts the connection.
+	/// Creates the listener on first use.
+	pub async fn ensure(&self, sides: Vec<PreviewTarget>, host: &str, port: u16) -> io::Result<u16> {
+		if sides.is_empty() {
+			return Err(io::Error::other("preview proxy needs at least one side to dial from"));
+		}
 		let dial = Dial {
-			target,
+			sides,
 			host: host.to_owned(),
 			port,
 		};
@@ -159,13 +170,8 @@ async fn proxy_request(
 	};
 	result.unwrap_or_else(|err| {
 		let body = format!(
-			"moon-ide preview proxy: could not reach {}:{} ({}): {err}",
-			dial.host,
-			dial.port,
-			match &dial.target {
-				PreviewTarget::Host => "host".to_owned(),
-				PreviewTarget::Container(name) => format!("inside {name}"),
-			}
+			"moon-ide preview proxy: could not reach {}:{} - {err}\n\nIs the server running and listening on that port?",
+			dial.host, dial.port,
 		);
 		let mut resp = Response::new(full(Bytes::from(body)));
 		*resp.status_mut() = StatusCode::BAD_GATEWAY;
@@ -307,27 +313,94 @@ fn empty() -> ProxyBody {
 trait UpstreamIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> UpstreamIo for T {}
 
+/// First side of `dial` that connects; the error lists why each failed.
 async fn connect(dial: &Dial) -> io::Result<Box<dyn UpstreamIo>> {
-	match &dial.target {
-		PreviewTarget::Host => Ok(Box::new(TcpStream::connect((dial.host.as_str(), dial.port)).await?)),
-		PreviewTarget::Container(container) => {
-			let mut child = Command::new("docker")
-				.args(["exec", "-i", container, "ncat", &dial.host, &dial.port.to_string()])
-				.stdin(Stdio::piped())
-				.stdout(Stdio::piped())
-				.stderr(Stdio::null())
-				.kill_on_drop(true)
-				.spawn()?;
-			let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-				return Err(io::Error::other("docker exec has no stdio"));
-			};
-			Ok(Box::new(ChildIo {
-				stdin,
-				stdout,
-				_child: child,
-			}))
+	let mut failures = Vec::with_capacity(dial.sides.len());
+	for side in &dial.sides {
+		let attempt = match side {
+			PreviewTarget::Host => TcpStream::connect((dial.host.as_str(), dial.port))
+				.await
+				.map(|stream| Box::new(stream) as Box<dyn UpstreamIo>),
+			PreviewTarget::Container(container) => connect_in_container(container, &dial.host, dial.port)
+				.await
+				.map(|io| Box::new(io) as Box<dyn UpstreamIo>),
+		};
+		match attempt {
+			Ok(io) => return Ok(io),
+			Err(err) => failures.push(match side {
+				PreviewTarget::Host => format!("on the host: {err}"),
+				PreviewTarget::Container(name) => format!("inside {name}: {err}"),
+			}),
 		}
 	}
+	Err(io::Error::other(failures.join("; ")))
+}
+
+/// `docker exec` an `ncat -v` dial and wait for it to report the TCP
+/// connection, so a refused dial fails here (with ncat's reason)
+/// instead of surfacing later as an opaque closed upstream.
+async fn connect_in_container(container: &str, host: &str, port: u16) -> io::Result<ChildIo> {
+	let mut child = Command::new("docker")
+		.args(["exec", "-i", container, "ncat", "-v", host, &port.to_string()])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.kill_on_drop(true)
+		.spawn()?;
+	let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
+		return Err(io::Error::other("docker exec has no stdio"));
+	};
+	let mut lines = BufReader::new(stderr).lines();
+	let mut reasons = Vec::new();
+	let wait = async {
+		while let Some(line) = lines.next_line().await? {
+			if line.contains("Connected to") {
+				return Ok(true);
+			}
+			reasons.push(line);
+		}
+		Ok::<_, io::Error>(false)
+	};
+	match tokio::time::timeout(CONTAINER_DIAL_TIMEOUT, wait).await {
+		Ok(Ok(true)) => {}
+		Ok(Ok(false)) => return Err(io::Error::other(describe_dial_failure(&reasons))),
+		Ok(Err(err)) => return Err(err),
+		Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out connecting")),
+	}
+	// Keep draining so ncat never blocks on a full stderr pipe; ends
+	// when the process does.
+	tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+	Ok(ChildIo {
+		stdin,
+		stdout,
+		_child: child,
+	})
+}
+
+/// Condense a failed dial's stderr (ncat or docker) into one reason.
+fn describe_dial_failure(lines: &[String]) -> String {
+	let all = lines.join("\n");
+	if all.contains("No such container") || all.contains("is not running") {
+		return "workspace container is not running".to_owned();
+	}
+	if all.contains("executable file not found") {
+		return "`ncat` is not installed in the container".to_owned();
+	}
+	let reasons: Vec<&str> = lines
+		.iter()
+		.map(|line| line.trim())
+		.filter(|line| {
+			!line.is_empty()
+				&& !line.starts_with("Ncat: Version")
+				&& !line.contains("Trying next address")
+				&& !line.contains("failed: Connection refused")
+		})
+		.map(|line| line.strip_prefix("Ncat: ").unwrap_or(line))
+		.collect();
+	if reasons.is_empty() {
+		return "dial exited without connecting".to_owned();
+	}
+	reasons.join("; ")
 }
 
 /// A dial process's stdio as one duplex stream. Dropping it kills the
@@ -373,6 +446,37 @@ mod tests {
 		assert!(bare.starts_with("<script>") && bare.ends_with("</script>hello"));
 	}
 
+	#[test]
+	fn dial_failures_are_condensed() {
+		let refused = [
+			"Ncat: Version 7.93 ( https://nmap.org/ncat )",
+			"Ncat: Connection to ::1 failed: Connection refused.",
+			"Ncat: Trying next address...",
+			"Ncat: Connection refused.",
+		]
+		.map(String::from);
+		assert_eq!(describe_dial_failure(&refused), "Connection refused.");
+		let gone = ["Error response from daemon: No such container: moon-ws-x-dev-1".to_owned()];
+		assert_eq!(describe_dial_failure(&gone), "workspace container is not running");
+		assert_eq!(describe_dial_failure(&[]), "dial exited without connecting");
+	}
+
+	#[tokio::test]
+	async fn later_sides_are_tried_and_failures_reported() {
+		let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+		let upstream_port = upstream.local_addr().unwrap().port();
+		drop(upstream);
+		let dial = Dial {
+			sides: vec![PreviewTarget::Host, PreviewTarget::Host],
+			host: "127.0.0.1".to_owned(),
+			port: upstream_port,
+		};
+		let Err(err) = connect(&dial).await else {
+			panic!("nothing listens on the port");
+		};
+		assert_eq!(err.to_string().matches("on the host:").count(), 2);
+	}
+
 	#[tokio::test]
 	async fn upgrades_are_spliced() {
 		let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -395,7 +499,7 @@ mod tests {
 
 		let tunnels = PreviewTunnels::new();
 		let local = tunnels
-			.ensure(PreviewTarget::Host, "127.0.0.1", upstream_port)
+			.ensure(vec![PreviewTarget::Host], "127.0.0.1", upstream_port)
 			.await
 			.unwrap();
 		let mut client = TcpStream::connect(("127.0.0.1", local)).await.unwrap();
@@ -436,12 +540,12 @@ mod tests {
 
 		let tunnels = PreviewTunnels::new();
 		let local = tunnels
-			.ensure(PreviewTarget::Host, "127.0.0.1", upstream_port)
+			.ensure(vec![PreviewTarget::Host], "127.0.0.1", upstream_port)
 			.await
 			.unwrap();
 		assert_eq!(
 			tunnels
-				.ensure(PreviewTarget::Host, "127.0.0.1", upstream_port)
+				.ensure(vec![PreviewTarget::Host], "127.0.0.1", upstream_port)
 				.await
 				.unwrap(),
 			local

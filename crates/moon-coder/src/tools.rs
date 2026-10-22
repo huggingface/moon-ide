@@ -1455,7 +1455,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"open_browser",
-				"Open a URL in a browser tab inside the IDE so the user can see it — typically a dev server you just started (\"check out the preview here\"). Loopback URLs (`localhost`, `127.0.0.1`, `0.0.0.0`) and compose service names resolve on the same side `bash` runs on: when `bash` runs in the workspace container, the IDE tunnels to the container's port itself, so no port forward is needed and a server bound to the container's `127.0.0.1` is reachable. Only `http`/`https`. If a tab already shows the same URL it is focused and reloaded instead of duplicated. Returns the `tab_id` to use with `browser_tab`. This only shows the page to the user; it does not return page content (use `web_fetch` or `bash` + `curl` for that). Mention the URL in your reply as well.",
+				"Open a URL in a browser tab inside the IDE so the user can see it — typically a dev server you just started (\"check out the preview here\"). The IDE tunnels to the server itself, so `localhost` URLs work whether it runs on the host or in the workspace container (even bound to `127.0.0.1`), and compose service names work too — no port forward or `0.0.0.0` bind needed. Only `http`/`https`. If a tab already shows the same URL it is focused and reloaded instead of duplicated. Returns the `tab_id` to use with `browser_tab`. This only shows the page to the user; it does not return page content (use `web_fetch` or `bash` + `curl` for that). Mention the URL in your reply as well.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -2664,7 +2664,9 @@ impl ToolRegistry {
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("open_browser", err.to_string()))?;
 		let url = parse_browser_url("open_browser", &parsed.url)?;
 		let in_container = self.browser_in_container(cx).await;
-		let (tab, reused) = self.browser_tabs.open(&url, in_container, true);
+		let (tab, reused) = self
+			.browser_tabs
+			.open(&url, in_container, Some(cx.folder.folder.path.as_str()), true);
 		Ok(json!({
 			"tab_id": tab.id,
 			"url": tab.url,

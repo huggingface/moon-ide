@@ -566,7 +566,9 @@ host port busy) and a clickable `http://localhost:<port>` link.
 The IDE's browser tab reaches container URLs without a forward:
 an ephemeral host-loopback HTTP proxy per target whose upstream
 connections `docker exec` `ncat` inside `dev`, so container-loopback
-servers and service names work. It also injects the page bridge the
+servers and service names work. Loopback URLs fall back to the other
+side (host / container) when nothing answers on the tab's side
+([ADR 0097](decisions/0097-preview-proxy-side-fallback.md)). It also injects the page bridge the
 coder drives. Process-lifetime, never persisted, not shown in the
 Ports panel. The dev image needs `ncat` (`moon-base` ships it). See
 [ADR 0088](decisions/0088-in-ide-browser-tab.md).

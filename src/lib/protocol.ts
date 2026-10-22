@@ -2309,6 +2309,8 @@ export type BrowserTab = {
 	id: number;
 	url: string;
 	in_container: boolean;
+	/** Folder of the agent session that opened it; `null` = active folder. */
+	folder: string | null;
 };
 
 /** Mirrors `moon_protocol::browser::BrowserTabsChanged` — payload of

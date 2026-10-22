@@ -10,4 +10,10 @@ export type BrowserTab = { id: number, url: string,
  * Resolve the URL inside the workspace shell container (through
  * a loopback tunnel) rather than on the host.
  */
-in_container: boolean, };
+in_container: boolean, 
+/**
+ * Bound folder (host path) of the agent session that opened the
+ * tab — a worktree after `enter_worktree`. The frontend files a
+ * new tab under it; `None` (user-opened) means the active folder.
+ */
+folder: string | null, };

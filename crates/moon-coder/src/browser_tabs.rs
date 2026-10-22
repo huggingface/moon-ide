@@ -134,10 +134,11 @@ impl BrowserTabRegistry {
 		self.lock().tabs.iter().find(|tab| tab.id == id).cloned()
 	}
 
-	/// Open a tab on `url`, focused. With `reuse`, an existing tab on
-	/// the same URL and side is focused and reloaded instead; the bool
+	/// Open a tab on `url`, focused, filed under `folder` (see
+	/// [`BrowserTab::folder`]). With `reuse`, an existing tab on the
+	/// same URL and side is focused and reloaded instead; the bool
 	/// reports whether that happened.
-	pub fn open(&self, url: &str, in_container: bool, reuse: bool) -> (BrowserTab, bool) {
+	pub fn open(&self, url: &str, in_container: bool, folder: Option<&str>, reuse: bool) -> (BrowserTab, bool) {
 		let mut inner = self.lock();
 		if reuse {
 			if let Some(existing) = inner
@@ -154,6 +155,7 @@ impl BrowserTabRegistry {
 			id: inner.next_id,
 			url: url.to_owned(),
 			in_container,
+			folder: folder.map(str::to_owned),
 		};
 		inner.next_id += 1;
 		inner.tabs.push(tab.clone());
@@ -220,17 +222,18 @@ mod tests {
 	fn open_reuse_navigate_close() {
 		let registry = BrowserTabRegistry::new();
 		let mut rx = registry.subscribe();
-		let (first, reused) = registry.open("http://localhost:5173/", true, true);
+		let (first, reused) = registry.open("http://localhost:5173/", true, None, true);
 		assert!(!reused);
 		assert_eq!(rx.try_recv().unwrap().focus, Some(first.id));
 
-		let (again, reused) = registry.open("http://localhost:5173/", true, true);
+		let (again, reused) = registry.open("http://localhost:5173/", true, None, true);
 		assert!(reused);
 		assert_eq!(again.id, first.id);
 		assert_eq!(rx.try_recv().unwrap().reload, Some(first.id));
 
-		let (other, _) = registry.open("http://localhost:5173/", false, true);
+		let (other, _) = registry.open("http://localhost:5173/", false, Some("/w/app"), true);
 		assert_ne!(other.id, first.id);
+		assert_eq!(other.folder.as_deref(), Some("/w/app"));
 
 		let moved = registry
 			.navigate(first.id, "http://localhost:5173/about", None)
@@ -249,7 +252,7 @@ mod tests {
 	#[tokio::test]
 	async fn page_request_round_trip() {
 		let registry = std::sync::Arc::new(BrowserTabRegistry::new());
-		let (tab, _) = registry.open("http://localhost:3000/", false, false);
+		let (tab, _) = registry.open("http://localhost:3000/", false, None, false);
 		let err = registry
 			.page_request(tab.id, "snapshot", Value::Null, Duration::from_secs(1))
 			.await

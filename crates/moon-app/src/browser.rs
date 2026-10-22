@@ -24,8 +24,9 @@ use crate::AppCore;
 /// are replaced with a `127.0.0.1:<ephemeral>` preview proxy that
 /// reaches the original host/port as seen from the host
 /// (`in_container = false`) or from inside the workspace shell —
-/// loopback, compose service names, anything its DNS resolves. The
-/// proxy injects the page bridge the coder's `browser_page` tool
+/// loopback, compose service names, anything its DNS resolves.
+/// Loopback URLs fall back to the other side when nothing answers on
+/// the first. The proxy injects the page bridge the coder's `browser_page` tool
 /// drives. `https` URLs aren't proxied (the proxy speaks plain HTTP):
 /// host ones load directly without the bridge, container ones are
 /// refused.
@@ -51,18 +52,31 @@ pub async fn browser_resolve_url(app: &AppCore, url: String, in_container: bool)
 	let Some(port) = parsed.port_or_known_default() else {
 		return Err(MoonError::invalid("url has no port"));
 	};
-	let target = if in_container {
-		let Some(id) = app.workspace_id() else {
-			return Err(MoonError::invalid("no workspace bound to this process"));
-		};
-		let project = project_name_for_id(id).map_err(|err| MoonError::invalid(err.to_string()))?;
-		PreviewTarget::Container(dev_container_name(&project))
+	let container = match app.workspace_id().map(project_name_for_id) {
+		Some(Ok(project)) => Some(PreviewTarget::Container(dev_container_name(&project))),
+		Some(Err(err)) if in_container => return Err(MoonError::invalid(err.to_string())),
+		Some(Err(_)) => None,
+		None if in_container => return Err(MoonError::invalid("no workspace bound to this process")),
+		None => None,
+	};
+	// A loopback URL is ambiguous across the container boundary (an
+	// agent's `bash` side needn't be where the server runs), so the
+	// other side is the fallback. Other hosts only make sense on the
+	// side that named them.
+	let loopback = is_loopback(&dial_host);
+	let sides: Vec<PreviewTarget> = if in_container {
+		container
+			.into_iter()
+			.chain(loopback.then_some(PreviewTarget::Host))
+			.collect()
 	} else {
-		PreviewTarget::Host
+		std::iter::once(PreviewTarget::Host)
+			.chain(container.filter(|_| loopback))
+			.collect()
 	};
 	let local_port = app
 		.preview_tunnels
-		.ensure(target, &dial_host, port)
+		.ensure(sides, &dial_host, port)
 		.await
 		.map_err(MoonError::io)?;
 	parsed
@@ -72,6 +86,10 @@ pub async fn browser_resolve_url(app: &AppCore, url: String, in_container: bool)
 		.set_port(Some(local_port))
 		.map_err(|()| MoonError::internal("could not set proxy port"))?;
 	Ok(parsed.into())
+}
+
+fn is_loopback(host: &str) -> bool {
+	host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Payload: `BrowserTabsChanged`. Mirrored in `src/lib/app.svelte.ts`.
@@ -124,7 +142,7 @@ pub async fn browser_tab_open(
 	in_container: bool,
 	reuse: bool,
 ) -> Result<BrowserTab, MoonError> {
-	Ok(app.coder.browser_tabs().open(&url, in_container, reuse).0)
+	Ok(app.coder.browser_tabs().open(&url, in_container, None, reuse).0)
 }
 
 pub async fn browser_tab_navigate(app: &AppCore, id: u32, url: String) -> Result<BrowserTab, MoonError> {
