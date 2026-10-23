@@ -2023,8 +2023,7 @@ pub async fn list_sessions(dir: &Utf8Path) -> Result<Vec<SessionSummary>, CoderE
 /// list's search box.
 ///
 /// Matches against the *parsed* records — user prompts, assistant
-/// text + thinking, tool calls (name + arguments) and tool
-/// results, titles, persisted errors — never the raw JSONL bytes.
+/// text and titles (see [`record_matches`]) — never the raw JSONL bytes.
 /// A raw scan would false-positive on base64 image payloads and
 /// signed thinking blocks, whose alphabets contain most short
 /// query strings. Each file is scanned line-by-line and abandoned
@@ -2103,32 +2102,17 @@ async fn session_matches(path: &Utf8Path, needle: &str) -> Result<bool, CoderErr
 	}
 }
 
-/// The record-level match predicate behind [`search_sessions`].
-/// Covers the fields a user would think of as "the transcript":
-/// prompts, assistant prose + reasoning, tool calls (a file path in
-/// an `edit_file` argument is a natural thing to search for) and
-/// their results, title renames, persisted errors. Metadata-only
-/// records (usage, todos snapshots, compaction bookkeeping,
-/// sub-agent lifecycle) don't participate.
+/// The record-level match predicate behind [`search_sessions`]: the
+/// conversation itself — user prompts, assistant prose — plus title
+/// renames (the list shows titles). Reasoning, tool calls and tool
+/// results are left out: they mention nearly every path and
+/// identifier, so any code-ish query matched most sessions.
 fn record_matches(record: &SessionRecord, needle: &str) -> bool {
 	let contains = |s: &str| s.to_lowercase().contains(needle);
 	match record {
 		SessionRecord::User { text, .. } => contains(text),
-		SessionRecord::Assistant {
-			content,
-			thinking,
-			tool_calls,
-			..
-		} => {
-			content.as_deref().is_some_and(contains)
-				|| thinking.as_deref().is_some_and(contains)
-				|| tool_calls
-					.iter()
-					.any(|c| contains(&c.function.name) || contains(&c.function.arguments))
-		}
-		SessionRecord::Tool { content, .. } => contains(content),
+		SessionRecord::Assistant { content, .. } => content.as_deref().is_some_and(contains),
 		SessionRecord::TitleUpdate { title } => contains(title),
-		SessionRecord::Error { message } => contains(message),
 		_ => false,
 	}
 }
@@ -4446,6 +4430,36 @@ mod tests {
 				tool_calls: Vec::new(),
 				model: None,
 				stop_reason: None,
+			},
+		)
+		.await
+		.unwrap();
+
+		// Bridge only in reasoning / tool traffic: not a hit.
+		let tooling = make_test_header("sess-tooling");
+		append_record(
+			&dir,
+			&tooling,
+			&SessionRecord::Assistant {
+				content: Some("looking".into()),
+				thinking: Some("maybe the bridge".into()),
+				thinking_blocks: Vec::new(),
+				tool_calls: Vec::new(),
+				model: None,
+				stop_reason: None,
+			},
+		)
+		.await
+		.unwrap();
+		append_record(
+			&dir,
+			&tooling,
+			&SessionRecord::Tool {
+				tool_call_id: "call-1".into(),
+				tool_name: "read_file".into(),
+				content: "crates/moon-bridge/src/main.rs".into(),
+				duration_ms: None,
+				images: Vec::new(),
 			},
 		)
 		.await
