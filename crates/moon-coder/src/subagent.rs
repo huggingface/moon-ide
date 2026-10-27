@@ -378,6 +378,8 @@ fn serialize_mode_wire<S: serde::Serializer>(mode: &CoderMode, s: S) -> Result<S
 /// the call spawns; only the model-facing tool name reflects the
 /// user-facing concept.
 pub fn task_tool_definition() -> ToolDefinition {
+	let mut worktree_schema = crate::worktree_tool::worktree_target_schema();
+	worktree_schema["description"] = json!("`agent` mode only. Run the sub-agent in its own git worktree of the target folder's project, so its edits land on a separate branch: `name` starts a fresh `moon/<name>` branch off the default branch (or `base`), `branch` checks out an existing one (attaching to its IDE-managed worktree if it has one). Use this whenever the delegated work should end up on its own branch or PR — including in a sibling folder, where you can't `enter_worktree` yourself. The result reports the branch and worktree path.");
 	ToolDefinition::function(
 		"task",
 		"Delegate a self-contained task to a sub-agent that runs in the background. Sub-agents run in their own context — you spend tokens on the task description and the final report, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
@@ -404,7 +406,8 @@ The sub-agent has no access to your conversation history — describe the task s
 				"system_prompt": {
 					"type": "string",
 					"description": "Optional override for the sub-agent's system prompt. Most callers should leave this empty and rely on the mode-default prompt."
-				}
+				},
+				"worktree": worktree_schema
 			},
 			"required": ["task"]
 		}),
@@ -1895,6 +1898,8 @@ You can delegate self-contained read-only investigations to nested research sub-
 
 Read before you edit — don't invent file paths. Use `edit_file` for surgical changes inside large files; reach for `write_file` for new files and whole-file rewrites.
 
+Don't create git worktrees yourself (`git worktree add`): when the work needs its own branch, the parent starts you inside one, and the working folder below says so. Push a branch with `git push -u origin HEAD`, never to the default branch.
+
 Return a single coherent text result when you finish. The parent will see only that string and a short transcript of your tool calls; do not address them as "you" or assume shared context.
 "#;
 
@@ -1907,12 +1912,17 @@ pub(crate) fn build_subagent_system_prompt(mode: CoderMode, folder: &Arc<Workspa
 		// `unreachable!` so a future call path can't panic a turn.
 		CoderMode::Coordinator => AGENT_SYSTEM_PROMPT,
 	};
-	let header = format!(
+	let mut header = format!(
 		"## Task\n\n{task}\n\n## Working folder\n\n- **{name}** at `{path}`\n",
 		task = task.trim(),
 		name = folder.folder.name,
 		path = folder.folder.path,
 	);
+	if let moon_protocol::workspace::FolderOrigin::Worktree { branch, .. } = &folder.folder.origin {
+		header.push_str(&format!(
+			"- A git worktree on branch `{branch}`, separate from the project's main checkout. Commit here.\n"
+		));
+	}
 	let mut out = String::with_capacity(base.len() + header.len() + 16);
 	out.push_str(base.trim_end());
 	out.push_str("\n\n");

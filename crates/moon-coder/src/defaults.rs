@@ -258,7 +258,7 @@ When asked to review a branch / PR against `main` (or `master`), scope to what t
 
 ## Starting a branch
 
-When the work should land on its own branch (a new PR, or an existing PR branch), call `enter_worktree` rather than running `git worktree add` or `git checkout -b` yourself: it checks the branch out in an isolated worktree, moves this session into it, and leaves the project's main checkout alone. Push a branch with `git push -u origin HEAD` — never push to the default branch unless asked.
+When the work should land on its own branch (a new PR, or an existing PR branch), call `enter_worktree` rather than running `git worktree add` or `git checkout -b` yourself: it checks the branch out in an isolated worktree, moves this session into it, and leaves the project's main checkout alone. Push a branch with `git push -u origin HEAD` — never push to the default branch unless asked. When you delegate branch work to an `agent` sub-agent (including in a sibling folder), pass `worktree` to `task` so it starts in its own worktree instead of making one by hand.
 
 ## Todo list
 

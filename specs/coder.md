@@ -2126,6 +2126,14 @@ already exists. The routing applies from the next tool call of the
 same turn, and the base prompt steers agents to it instead of a hand-
 rolled `git worktree add` / `git checkout -b`.
 
+The parent's `task` tool takes the same `{ name, base } | { branch }`
+shape as an optional `worktree` argument (`agent` mode only,
+[ADR 0098](decisions/0098-task-subagent-worktrees.md)). The worktree is
+created in the _target_ folder's project before the sub-agent starts,
+and the sub-agent is scoped to it. This is how branch work in a sibling
+folder gets isolated, since `enter_worktree` only covers the parent's
+own project.
+
 Created on opt-in (`git worktree add`), re-bound at startup (the
 folder's `origin` rides `session.json`, with disk adoption as the
 backstop — see ADR 0079 below), and **pruned** by the

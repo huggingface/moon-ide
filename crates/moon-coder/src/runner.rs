@@ -5915,27 +5915,24 @@ async fn add_project_worktree(
 	Ok(entry)
 }
 
-/// `enter_worktree` (ADR 0096): move this session into a worktree of
-/// its project — a fresh `moon/<name>` branch, or an existing branch
-/// (attaching to its IDE-managed worktree when it already has one).
-/// Stamps the routing on the session header like the panel's
-/// move-into-worktree button does, and returns the worktree's folder
-/// so the dispatcher can re-point the rest of the turn at it.
-async fn handle_enter_worktree(
+/// Find or create the worktree `target` names in the project that owns
+/// `folder` (bound folder path, or a worktree of one). Returns the bound
+/// worktree entry, whether it was newly created, and the project path.
+/// Shared by `enter_worktree` and the `task` tool's `worktree` arg.
+async fn resolve_project_worktree(
 	state: &Arc<CoderState>,
-	rt: &Arc<SessionRuntime>,
-	sink: &FolderEventSink,
-	args: &Value,
-) -> Result<(Value, Arc<WorkspaceFolderEntry>), CoderError> {
-	use crate::worktree_tool::{EnterWorktreeTarget, ENTER_WORKTREE};
+	folder: &str,
+	target: crate::worktree_tool::EnterWorktreeTarget,
+	tool: &str,
+) -> Result<(Arc<WorkspaceFolderEntry>, bool, String), CoderError> {
+	use crate::worktree_tool::EnterWorktreeTarget;
 	use moon_core::host::WorktreeBranch;
 	use moon_protocol::workspace::FolderOrigin;
 
-	let target = crate::worktree_tool::parse_enter_worktree_args(args)?;
-	let Some(folder) = state.workspaces.folder_for_path(sink.folder()).await else {
+	let Some(folder) = state.workspaces.folder_for_path(folder).await else {
 		return Err(CoderError::invalid_args(
-			ENTER_WORKTREE,
-			"this session isn't filed under a bound project folder, so there is no repository to branch",
+			tool,
+			"the folder isn't a bound project folder, so there is no repository to branch",
 		));
 	};
 	let project = state.coder_root_of(folder).await;
@@ -5944,7 +5941,7 @@ async fn handle_enter_worktree(
 		EnterWorktreeTarget::New { name, base } => {
 			let Some(slug) = worker_branch_slug(&name) else {
 				return Err(CoderError::invalid_args(
-					ENTER_WORKTREE,
+					tool,
 					"name must contain at least one letter or digit — it becomes the branch name",
 				));
 			};
@@ -5975,6 +5972,31 @@ async fn handle_enter_worktree(
 			}
 		}
 	};
+	if !matches!(entry.folder.origin, FolderOrigin::Worktree { .. }) {
+		return Err(CoderError::Internal(
+			"worktree folder bound without a worktree origin".into(),
+		));
+	}
+	Ok((entry, created, project_path))
+}
+
+/// `enter_worktree` (ADR 0096): move this session into a worktree of
+/// its project — a fresh `moon/<name>` branch, or an existing branch
+/// (attaching to its IDE-managed worktree when it already has one).
+/// Stamps the routing on the session header like the panel's
+/// move-into-worktree button does, and returns the worktree's folder
+/// so the dispatcher can re-point the rest of the turn at it.
+async fn handle_enter_worktree(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<(Value, Arc<WorkspaceFolderEntry>), CoderError> {
+	use crate::worktree_tool::ENTER_WORKTREE;
+	use moon_protocol::workspace::FolderOrigin;
+
+	let target = crate::worktree_tool::parse_enter_worktree_args(args)?;
+	let (entry, created, project_path) = resolve_project_worktree(state, sink.folder(), target, ENTER_WORKTREE).await?;
 	let FolderOrigin::Worktree { branch, .. } = &entry.folder.origin else {
 		return Err(CoderError::Internal(
 			"worktree folder bound without a worktree origin".into(),
@@ -7685,11 +7707,38 @@ async fn handle_task(
 		// sub-agents run their bash where the parent's runs.
 		rt.force_host_bash.clone(),
 	)?;
+	let worktree = match args.get("worktree") {
+		None | Some(Value::Null) => None,
+		Some(raw) => Some(crate::worktree_tool::parse_worktree_target("task", raw)?),
+	};
+	let mut worktree_note = None;
+	if let Some(target) = worktree {
+		if spec.mode != CoderMode::Agent {
+			return Err(CoderError::invalid_args(
+				"task",
+				"`worktree` needs `mode: \"agent\"` — a research sub-agent doesn't edit, so it has no branch to land",
+			));
+		}
+		let (entry, created, project_path) =
+			resolve_project_worktree(state, &spec.folder.folder.path, target, "task").await?;
+		sink.send(CoderEvent::WorkspaceFoldersChanged);
+		let mut note = json!({ "worktree_path": entry.folder.path, "created": created });
+		if let moon_protocol::workspace::FolderOrigin::Worktree { branch, .. } = &entry.folder.origin {
+			note["branch"] = json!(branch);
+		}
+		attach_container_mount_note(state, &project_path, &mut note).await;
+		spec.folder = entry;
+		worktree_note = Some(note);
+	}
 	// Every parent `task` runs in the background (ADR 0091): register,
 	// spawn, return a handle. The report reaches the parent through
 	// the completion callback or `task_collect`.
 	spec.detach = true;
-	handle_task_detached(state, sink, tool_call_id, spec).await
+	let mut result = handle_task_detached(state, sink, tool_call_id, spec).await?;
+	if let Some(note) = worktree_note {
+		result["worktree"] = note;
+	}
+	Ok(result)
 }
 
 /// First non-empty trimmed line of `result`, capped at 512 chars,
@@ -13919,5 +13968,90 @@ mod tests {
 			rt2.session.lock().await.header.worktree_root.as_deref(),
 			Some(expected.as_str())
 		);
+	}
+
+	#[tokio::test]
+	async fn task_worktree_starts_the_subagent_in_a_sibling_projects_worktree() {
+		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+
+		let init_repo = |dir: &tempfile::TempDir| {
+			let repo = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+			for args in [
+				&["init", "-q", "-b", "main"][..],
+				&[
+					"-c",
+					"user.name=t",
+					"-c",
+					"user.email=t@t",
+					"commit",
+					"-q",
+					"--allow-empty",
+					"-m",
+					"init",
+				],
+			] {
+				let ok = std::process::Command::new("git")
+					.args(args)
+					.current_dir(repo.as_std_path())
+					.status()
+					.unwrap()
+					.success();
+				assert!(ok, "git {args:?} failed");
+			}
+			repo
+		};
+		let parent_dir = tempfile::TempDir::new().unwrap();
+		let sibling_dir = tempfile::TempDir::new().unwrap();
+		let parent_repo = init_repo(&parent_dir);
+		let sibling_repo = init_repo(&sibling_dir);
+
+		let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		let parent_entry = registry.add_folder(parent_repo.clone()).await.unwrap();
+		registry.add_folder(sibling_repo.clone()).await.unwrap();
+		let data_dir = tempfile::TempDir::new().unwrap();
+		let coder = CoderHandle::new(
+			registry.clone(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("workspaces")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("coder-sessions")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("folder-summaries")).unwrap(),
+			CoderModels::default(),
+			Arc::new(moon_terminal::TerminalRegistry::default()),
+		)
+		.unwrap();
+		let state = coder.state.clone();
+		let blank = Session::new_blank();
+		let sink = FolderEventSink::new(state.events.clone(), parent_repo.to_string(), blank.header.id.clone());
+		let rt = Arc::new(SessionRuntime::new(blank));
+		let cx = ToolContext::new(parent_entry, CoderMode::Agent);
+		let sibling_name = sibling_repo.file_name().unwrap();
+
+		let err = handle_task(
+			&state,
+			&rt,
+			&sink,
+			&cx,
+			"call-research",
+			&json!({ "task": "look", "folder": sibling_name, "mode": "research", "worktree": { "name": "x" } }),
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("mode"), "{err}");
+
+		let result = handle_task(
+			&state,
+			&rt,
+			&sink,
+			&cx,
+			"call-agent",
+			&json!({ "task": "fix it", "folder": sibling_name, "mode": "agent", "worktree": { "name": "Strip header" } }),
+		)
+		.await
+		.unwrap();
+		let expected = sibling_repo.join(".worktrees").join("moon-strip-header");
+		assert_eq!(result["worktree"]["branch"], "moon/strip-header");
+		assert_eq!(result["worktree"]["worktree_path"], expected.as_str());
+		assert!(registry.folder_for_path(expected.as_str()).await.is_some());
+		let subagent_id = result["subagent_id"].as_str().unwrap().to_owned();
+		coder.abort_subagent(&subagent_id);
 	}
 }
