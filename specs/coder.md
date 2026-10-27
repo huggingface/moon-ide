@@ -256,6 +256,19 @@ route with exponential backoff (2 s doubling to a 2 min ceiling,
 honouring a longer numeric `Retry-After`) before surfacing; the wait
 is cancel-aware so Esc still aborts immediately.
 
+Responses are compressed via standard `Accept-Encoding`. Request bodies
+of 16 kB or more are gzipped where the origin accepts it. No provider
+documents this, so support is learned per origin and cached for the
+process lifetime: an RFC 7694 `Accept-Encoding` response hint wins;
+otherwise a 2xx means supported, and a 415 / 400 / 422 on a compressed
+request triggers one uncompressed resend, which marks the origin
+unsupported if it gets a different result. The resend also applies to
+origins already marked supported, because a proxy can decode the body
+itself yet forward `Content-Encoding` to one backend that then chokes.
+The HF router does this today: deepinfra rejects, groq accepts. A 4xx never reaches the
+model, so the resend can't double-bill. Persisting the verdict was
+rejected: the worst case is one extra round trip per origin per run.
+
 `kind` discriminates the wire shape:
 
 - `custom` — free-form OpenAI-compatible endpoint (vLLM, Ollama,

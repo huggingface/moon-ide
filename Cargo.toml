@@ -52,7 +52,19 @@ ignore = "0.4"
 globset = "0.4"
 ec4rs = "1.2"
 trash = "5.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# `gzip` / `brotli` / `zstd` make every client advertise `Accept-Encoding`
+# and decode transparently, including mid-stream for SSE. Request-side
+# compression is negotiated separately in `moon-coder/src/request_compression.rs`.
+reqwest = { version = "0.12", default-features = false, features = [
+	"brotli",
+	"gzip",
+	"json",
+	"rustls-tls",
+	"stream",
+	"zstd",
+] }
+# Gzips large LLM request bodies; see `moon-coder/src/request_compression.rs`.
+flate2 = "1.1"
 # Pulled in transitively via reqwest's `stream` feature already; named
 # explicitly here so the coder's SSE consumer can lean on `StreamExt`
 # without a hidden cross-crate dependency.

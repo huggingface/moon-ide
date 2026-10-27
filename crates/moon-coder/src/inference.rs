@@ -100,6 +100,9 @@ fn retry_after_of(response: &reqwest::Response) -> Option<Duration> {
 /// `try_clone` always succeeds; the `None` arm is a defensive
 /// single-shot for a hypothetical streaming body that can't be
 /// replayed.
+///
+/// Large bodies are gzipped where the origin accepts it — see
+/// [`crate::request_compression`].
 pub(crate) async fn send_with_rate_limit_retry(
 	endpoint: &str,
 	model: &str,
@@ -117,7 +120,9 @@ pub(crate) async fn send_with_rate_limit_retry(
 				resp = send => resp.map_err(CoderError::from),
 			};
 		};
-		let send = this_try.send();
+		let (client, request) = this_try.build_split();
+		let request = request.map_err(CoderError::from)?;
+		let send = crate::request_compression::execute(&client, request);
 		let response = tokio::select! {
 			biased;
 			_ = cancel.cancelled() => return Err(CoderError::Aborted),

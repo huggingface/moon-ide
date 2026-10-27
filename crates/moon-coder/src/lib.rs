@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod models;
 pub mod prompts;
 pub mod providers;
+mod request_compression;
 pub mod runner;
 pub mod sessions;
 pub mod subagent;
