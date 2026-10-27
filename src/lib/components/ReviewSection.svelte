@@ -3,14 +3,7 @@
 	import { Compartment, EditorState, type Extension } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
-	import {
-		addCursorAbove,
-		addCursorBelow,
-		defaultKeymap,
-		history,
-		historyKeymap,
-		indentWithTab,
-	} from '@codemirror/commands';
+	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
@@ -18,6 +11,7 @@
 	import { ipc } from '../ipc';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
+	import { multiCursorKeymap } from '../editor/multiCursor';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
@@ -482,14 +476,11 @@
 					ecB.of(editorConfigExtensions(ec)),
 					keymap.of([
 						...closeBracketsKeymap,
+						...multiCursorKeymap,
 						...defaultKeymap,
 						...historyKeymap,
 						...searchKeymap,
 						indentWithTab,
-						// Multi-cursor: Ctrl+Shift+Up/Down aliases
-						// `addCursorAbove` / `addCursorBelow`.
-						{ key: 'Mod-Shift-ArrowUp', run: addCursorAbove },
-						{ key: 'Mod-Shift-ArrowDown', run: addCursorBelow },
 						// Ctrl+S inside a review section saves the
 						// underlying file, not the synthetic
 						// `review://` buffer that `saveActive` would

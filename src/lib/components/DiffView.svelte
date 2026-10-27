@@ -2,14 +2,7 @@
 	import { onMount } from 'svelte';
 	import { Compartment, EditorSelection, EditorState, Prec, type Extension } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
-	import {
-		addCursorAbove,
-		addCursorBelow,
-		defaultKeymap,
-		history,
-		historyKeymap,
-		indentWithTab,
-	} from '@codemirror/commands';
+	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { stickyScrollExtension } from '../editor/stickyScroll';
@@ -19,6 +12,7 @@
 	import { ipc } from '../ipc';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
+	import { multiCursorKeymap } from '../editor/multiCursor';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { gitChangesExtension, headTextFacet, overviewMountFacet } from '../editor/gitChanges';
@@ -506,16 +500,11 @@
 				// surfaces. Alt+Up / Alt+Down is left to CM's
 				// native `moveLineUp` / `moveLineDown`.
 				...closeBracketsKeymap,
+				...multiCursorKeymap,
 				...defaultKeymap,
 				...historyKeymap,
 				...searchKeymap,
 				indentWithTab,
-				// Multi-cursor: Ctrl+Shift+Up/Down aliases the
-				// `addCursorAbove` / `addCursorBelow` commands
-				// that `defaultKeymap` binds to Ctrl+Alt+Up/Down,
-				// for the VS Code / IntelliJ muscle memory.
-				{ key: 'Mod-Shift-ArrowUp', run: addCursorAbove },
-				{ key: 'Mod-Shift-ArrowDown', run: addCursorBelow },
 				// F7 / Shift-F7 mirror the CodeMirror reference
 				// merge example. Quick way to hop between hunks
 				// without leaving the keyboard.
