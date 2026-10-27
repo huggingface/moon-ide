@@ -12,7 +12,7 @@
 	import { ipc } from '../ipc';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
-	import { multiCursorKeymap } from '../editor/multiCursor';
+	import { multiCursorExtension, multiCursorKeymap } from '../editor/multiCursor';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { gitChangesExtension, headTextFacet, overviewMountFacet } from '../editor/gitChanges';
@@ -467,6 +467,7 @@
 			// AZERTY-layout reason as the regular editor).
 			foldGutter(),
 			highlightActiveLine(),
+			multiCursorExtension,
 			highlightActiveLineGutter(),
 			bracketMatching(),
 			closeBrackets(),

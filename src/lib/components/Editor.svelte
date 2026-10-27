@@ -4,7 +4,7 @@
 	import { EditorState, Compartment, EditorSelection, Prec, Transaction } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { highlightTabs } from '../editor/highlightTabs';
-	import { multiCursorKeymap } from '../editor/multiCursor';
+	import { multiCursorExtension, multiCursorKeymap } from '../editor/multiCursor';
 	import { defaultKeymap, history, historyField, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
@@ -588,6 +588,7 @@
 			// `Ctrl+K` leader sequence à la VS Code).
 			foldGutter(),
 			highlightActiveLine(),
+			multiCursorExtension,
 			highlightActiveLineGutter(),
 			bracketMatching(),
 			closeBrackets(),

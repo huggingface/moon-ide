@@ -11,7 +11,7 @@
 	import { ipc } from '../ipc';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
-	import { multiCursorKeymap } from '../editor/multiCursor';
+	import { multiCursorExtension, multiCursorKeymap } from '../editor/multiCursor';
 	import { languageFor } from '../editor/language';
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
@@ -567,6 +567,7 @@
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightActiveLine(),
+			multiCursorExtension,
 			highlightSelectionMatches(),
 			searchAsYouType(),
 			highlightTabs(),
