@@ -2412,6 +2412,10 @@ resolved off the owning assistant`s tool_calls for synthesized
   untouched, and reload also upconverts stored WebP→PNG so
   already-stuck sessions recover. The byte budget elision still
   guards the HF wire independently.
+- **Images fit 2000 px**: capture and reload downscale any attachment
+  whose longest edge exceeds 2000 px (ADR 0099). Anthropic 400s the
+  whole request past 20 images if any one is larger, so a single HiDPI
+  paste would otherwise wedge a long session.
 - **Sessions-list fold is payload-free**: the summary fold
   classifies each line from the raw `Value` (role / customType /
   title / has-toolCalls) instead of running `pi_wire_to_records`,

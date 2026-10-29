@@ -984,10 +984,10 @@ fn parse_pi_user(msg: &serde_json::Value) -> Option<SessionRecord> {
 					.and_then(|v| v.as_str())
 					.unwrap_or("image/png")
 					.to_string();
-				images.push(crate::inference::ImageAttachment {
+				images.push(crate::images::fit_attachment(crate::inference::ImageAttachment {
 					data_url: format!("data:{mime};base64,{data}"),
 					mime,
-				});
+				}));
 			}
 			_ => {}
 		}
@@ -1134,7 +1134,7 @@ fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
 						data_url: format!("data:{mime};base64,{data}"),
 						mime,
 					});
-					images.push(att);
+					images.push(crate::images::fit_attachment(att));
 				}
 				_ => {}
 			}

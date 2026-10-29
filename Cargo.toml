@@ -88,6 +88,10 @@ dirs = "6.0.0"
 # out — we only need the libwebp encoder, fed by `png`'s decoder.
 webp = { version = "0.3", default-features = false }
 png = "0.18"
+# Downscaling oversized image attachments (ADR 0099). Already in the
+# tree via arboard; we only add the decoders for the formats a
+# screenshot or paste arrives in. Encoding to WebP stays on libwebp.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 ts-rs = { version = "12.0", features = ["serde-compat", "serde-json-impl"] }
 lsp-types = "0.97"
 which = "8.0"

@@ -25,6 +25,7 @@ moon-container = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 png = { workspace = true }
+image = { workspace = true }
 camino = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }

@@ -47,17 +47,73 @@ const REENCODE_TO: Option<&str> = Some("image/webp");
 
 const PNG_MIME: &str = "image/png";
 
-/// Build an attachment from raw image bytes, re-encoding PNG
-/// sources as lossless WebP when that comes out smaller.
+/// Longest edge, in pixels, an attachment may have (ADR 0099).
+/// Anthropic rejects the *whole* request once it carries more than
+/// 20 images and any one of them exceeds 2000 px on a side, so a
+/// single HiDPI screenshot poisons every later turn of a long
+/// session. Vision models downscale to ~1568 px internally anyway.
+const MAX_EDGE: u32 = 2000;
+
+/// Build an attachment from raw image bytes: downscale anything
+/// over [`MAX_EDGE`], then re-encode PNG sources as lossless WebP
+/// when that comes out smaller.
 ///
 /// CPU-bound (~0.2 s for a 1440x900 frame): call it from
 /// [`tokio::task::spawn_blocking`], not straight off an async task.
 pub(crate) fn attachment_from_bytes(bytes: &[u8], mime: &str) -> ImageAttachment {
+	let fitted = fit_to_max_edge(bytes, mime);
+	let (bytes, mime) = match &fitted {
+		Some((fitted_bytes, fitted_mime)) => (fitted_bytes.as_slice(), *fitted_mime),
+		None => (bytes, mime),
+	};
 	let shrunk = shrink(bytes, mime);
 	let (payload, mime) = match (shrunk.as_deref(), REENCODE_TO) {
 		(Some(webp), Some(webp_mime)) => (webp, webp_mime),
 		_ => (bytes, mime),
 	};
+	to_attachment(payload, mime)
+}
+
+/// Downscale an attachment already in `data:` URL form if it is
+/// over [`MAX_EDGE`], leaving the format alone otherwise. Used on
+/// session reload, so histories captured before the cap existed
+/// stop 400ing; the JSONL keeps the original pixels.
+pub(crate) fn fit_attachment(attachment: ImageAttachment) -> ImageAttachment {
+	let Some((_, payload)) = attachment.data_url.split_once(";base64,") else {
+		return attachment;
+	};
+	// Reload and session search run this over every stored image;
+	// the header alone usually settles it without decoding megabytes.
+	let head = &payload[..payload.len().min(HEADER_PROBE_CHARS)];
+	let probed = base64::engine::general_purpose::STANDARD
+		.decode(head)
+		.ok()
+		.and_then(|head_bytes| dimensions(&head_bytes, &attachment.mime));
+	if probed.is_some_and(|(width, height)| width.max(height) <= MAX_EDGE) {
+		return attachment;
+	}
+	let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) else {
+		return attachment;
+	};
+	let Some((fitted, mime)) = fit_to_max_edge(&bytes, &attachment.mime) else {
+		return attachment;
+	};
+	to_attachment(&fitted, mime)
+}
+
+/// Base64 prefix (a multiple of 4) decoded to probe dimensions: PNG
+/// and WebP put them in the first 30 bytes, JPEG after its EXIF/APP
+/// segments, which 3 kB covers for screenshots.
+const HEADER_PROBE_CHARS: usize = 4096;
+
+fn dimensions(bytes: &[u8], mime: &str) -> Option<(u32, u32)> {
+	let format = image::ImageFormat::from_mime_type(mime)?;
+	image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+		.into_dimensions()
+		.ok()
+}
+
+fn to_attachment(payload: &[u8], mime: &str) -> ImageAttachment {
 	ImageAttachment {
 		data_url: format!(
 			"data:{mime};base64,{}",
@@ -65,6 +121,37 @@ pub(crate) fn attachment_from_bytes(bytes: &[u8], mime: &str) -> ImageAttachment
 		),
 		mime: mime.to_string(),
 	}
+}
+
+/// `Some((bytes, mime))` when the image decodes and its longest edge
+/// exceeds [`MAX_EDGE`]: resized to fit, aspect preserved. JPEG stays
+/// JPEG (a photo re-encoded losslessly would balloon); everything
+/// else comes out as PNG, which [`shrink`] then turns into WebP on
+/// the capture path.
+fn fit_to_max_edge(bytes: &[u8], mime: &str) -> Option<(Vec<u8>, &'static str)> {
+	let format = image::ImageFormat::from_mime_type(mime)?;
+	let (width, height) = dimensions(bytes, mime)?;
+	if width.max(height) <= MAX_EDGE {
+		return None;
+	}
+	let resized = image::load_from_memory_with_format(bytes, format).ok()?.resize(
+		MAX_EDGE,
+		MAX_EDGE,
+		image::imageops::FilterType::Lanczos3,
+	);
+	tracing::debug!(width, height, "downscaled oversized image attachment");
+	let mut out = Vec::new();
+	if format == image::ImageFormat::Jpeg {
+		let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+		image::DynamicImage::ImageRgb8(resized.into_rgb8())
+			.write_with_encoder(encoder)
+			.ok()?;
+		return Some((out, "image/jpeg"));
+	}
+	resized
+		.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+		.ok()?;
+	Some((out, PNG_MIME))
 }
 
 /// Same, for a payload that already arrived base64-encoded (MCP
@@ -83,15 +170,12 @@ pub(crate) fn attachment_from_base64(data: &str, mime: &str) -> ImageAttachment 
 }
 
 /// Re-encode an attachment that's already in `data:` URL form,
-/// passing it through untouched when it isn't a decodable PNG.
+/// passing it through untouched when it isn't base64.
 pub(crate) fn reencode(attachment: ImageAttachment) -> ImageAttachment {
-	if attachment.mime != PNG_MIME {
-		return attachment;
-	}
 	let Some((_, payload)) = attachment.data_url.split_once(";base64,") else {
 		return attachment;
 	};
-	attachment_from_base64(payload, PNG_MIME)
+	attachment_from_base64(payload, &attachment.mime)
 }
 
 /// Re-encode a batch off the async runtime. Empty in, empty out
@@ -551,6 +635,33 @@ mod tests {
 			mime: "image/webp".to_string(),
 		};
 		assert_eq!(reencode(webp_already.clone()), webp_already);
+	}
+
+	fn decoded_dimensions(attachment: &ImageAttachment) -> (u32, u32) {
+		let payload = attachment.data_url.split_once(";base64,").unwrap().1;
+		let bytes = base64::engine::general_purpose::STANDARD.decode(payload).unwrap();
+		dimensions(&bytes, &attachment.mime).expect("attachment decodes")
+	}
+
+	#[test]
+	fn oversized_captures_are_downscaled_to_the_max_edge() {
+		let (png, _) = sample_png(3062, 1461);
+		let attachment = attachment_from_bytes(&png, PNG_MIME);
+		assert_eq!(attachment.mime, "image/webp");
+		assert_eq!(decoded_dimensions(&attachment), (2000, 954));
+	}
+
+	#[test]
+	fn fit_attachment_downscales_stored_oversized_images_only() {
+		let (tall, _) = sample_png(1920, 4313);
+		let stored = to_attachment(&tall, PNG_MIME);
+		let fitted = fit_attachment(stored);
+		assert_eq!(fitted.mime, PNG_MIME);
+		assert_eq!(decoded_dimensions(&fitted), (890, 2000));
+
+		let (small, _) = sample_png(1440, 900);
+		let within = to_attachment(&small, PNG_MIME);
+		assert_eq!(fit_attachment(within.clone()), within);
 	}
 
 	#[tokio::test]
