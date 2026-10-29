@@ -38,6 +38,7 @@ mod workspace;
 
 pub use catalog::bump_last_active;
 pub use events::{emit, EventSink};
+pub use fs::refuse_switching_owned_worktree;
 
 /// State every dispatched command runs against. Grows as command
 /// groups move out of `src-tauri` (Phase 16.2).

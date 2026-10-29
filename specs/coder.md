@@ -2096,6 +2096,14 @@ machinery of its own. The branch defaults to `moon/agent-<short-id>`
 at creation (no diff to summarise yet) and is renameable; an AI
 suggestion can replace it after the first turn.
 
+The directory is only derived from the branch, not tied to it: a
+checkout can be switched in place, so creation takes the first free
+`<slug>-2`, `<slug>-3`, … when the derived path is taken. Switching
+in place is what the IDE refuses for a worktree a session runs in
+(branch switcher, companion), and a session whose worktree changed
+branch between its turns gets a `[moon-ide]` notice before its next
+round-trip ([ADR 0100](decisions/0100-worktree-branch-guards.md)).
+
 A **coordinator-spawned worker** skips that default: `spawn_worker`
 requires a `name` and the branch is `moon/<name-slug>`
 ([ADR 0042](decisions/0042-named-worker-branches.md)), so the branch,
@@ -2254,8 +2262,11 @@ resolved live rather than from which field set it:
 - the branch is checked out in a bound worktree → focus that worktree
   folder (the file tree / SCM follow; the per-project session list
   stays put, so nothing about the conversation is lost);
-- otherwise → `git switch` the active folder to it (git's own refusal
-  on a dirty tree is surfaced as-is).
+- otherwise → `git switch` the project's **main checkout** to it
+  (focusing it first if a worktree was active; git's own refusal on a
+  dirty tree is surfaced as-is). A worktree is never switched: its
+  session would silently find another branch's code
+  ([ADR 0100](decisions/0100-worktree-branch-guards.md)).
 
 So after juggling several agents across several branches off `main`,
 you return to a past session and land on its branch — or its

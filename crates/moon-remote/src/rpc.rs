@@ -906,6 +906,9 @@ impl BridgeRpcHandler for BridgeRpc {
 			"workspace_scm_switch_branch" => {
 				let p: SwitchBranchParams = parse_params(params)?;
 				let folder = self.resolve_folder(&FolderParams { folder: p.folder }).await?;
+				moon_app::refuse_switching_owned_worktree(&self.coder, &folder)
+					.await
+					.map_err(|e| e.to_string())?;
 				folder
 					.host
 					.branch_switch(&moon_protocol::git::BranchSwitchTarget::Local { name: p.name })

@@ -2407,19 +2407,24 @@
 	// Click on a session's branch chip: go to wherever the branch
 	// lives. If it's checked out in a worktree, focus that worktree
 	// folder (the file tree / SCM follow; the per-project session list
-	// stays put). Otherwise `git switch` the active folder to it (git
-	// refuses + flashes on a dirty tree).
-	function onSessionBranchChip(session: CoderSessionSummary): void {
+	// stays put). Otherwise `git switch` the project's main checkout to
+	// it (git refuses + flashes on a dirty tree) — never a worktree,
+	// whose session would silently find another branch's code.
+	async function onSessionBranchChip(session: CoderSessionSummary): Promise<void> {
 		const branch = sessionBranch(session);
 		if (branch === null) {
 			return;
 		}
 		const worktreePath = worktreeFolderForBranch(branch);
 		if (worktreePath !== null) {
-			void workspace.setActiveFolder(worktreePath);
-		} else {
-			void workspace.switchToBranch({ kind: 'local', name: branch });
+			await workspace.setActiveFolder(worktreePath);
+			return;
 		}
+		const origin = workspace.activeFolder?.origin;
+		if (origin?.kind === 'worktree') {
+			await workspace.setActiveFolder(origin.parentPath);
+		}
+		await workspace.switchToBranch({ kind: 'local', name: branch });
 	}
 
 	/** Disconnect the visible session from its coordinator (ADR
@@ -3001,9 +3006,11 @@
 										type="button"
 										class="session-branch-chip"
 										class:worktree={inWorktree}
-										title={inWorktree ? `Go to the worktree on ${branch}` : `Switch this folder to ${branch}`}
+										title={inWorktree
+											? `Go to the worktree on ${branch}`
+											: `Switch the project's main checkout to ${branch}`}
 										aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
-										onclick={() => onSessionBranchChip(session)}
+										onclick={() => void onSessionBranchChip(session)}
 									>
 										<BranchIcon size={11} />
 										<span class="chip-name">{branch}</span>
@@ -3124,9 +3131,9 @@
 						class:plain={!inWorktree}
 						title={inWorktree
 							? `Runs in a git worktree on ${branch} — click to open that checkout`
-							: `This session's work is on ${branch} — click to switch this folder to it`}
+							: `This session's work is on ${branch} — click to switch the project's main checkout to it`}
 						aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
-						onclick={() => onSessionBranchChip(summary)}
+						onclick={() => void onSessionBranchChip(summary)}
 					>
 						<BranchIcon size={12} />
 						<span class="wt-branch">{branch}</span>

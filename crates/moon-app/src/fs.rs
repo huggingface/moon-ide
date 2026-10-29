@@ -619,7 +619,32 @@ pub async fn fs_git_existing_pr_url(app: &AppCore) -> Result<Option<String>, Moo
 /// re-wrapping it.
 pub async fn fs_branch_switch(app: &AppCore, target: BranchSwitchTarget) -> Result<(), MoonError> {
 	let entry = app.workspaces.require_active_folder().await?;
+	refuse_switching_owned_worktree(&app.coder, &entry).await?;
 	entry.host.branch_switch(&target).await
+}
+
+/// Refuse a branch switch in a worktree folder a coder session runs
+/// in. The switch would leave that session's checkout on another
+/// branch's code with nothing telling it — the IDE-side half of the
+/// "don't swap branches under an agent" guard. Agents themselves are
+/// steered to `enter_worktree` instead; project folders are never
+/// refused.
+pub async fn refuse_switching_owned_worktree(
+	coder: &moon_coder::CoderHandle,
+	entry: &moon_core::WorkspaceFolderEntry,
+) -> Result<(), MoonError> {
+	if !matches!(
+		entry.folder.origin,
+		moon_protocol::workspace::FolderOrigin::Worktree { .. }
+	) {
+		return Ok(());
+	}
+	let Some(owner) = coder.worktree_owner(&entry.folder.path).await else {
+		return Ok(());
+	};
+	Err(MoonError::invalid(format!(
+		"this worktree belongs to the session \"{owner}\"; switching its branch would put another branch's code under it. Switch the project's main checkout instead, or start an isolated agent on the branch."
+	)))
 }
 
 /// `git fetch --quiet --no-tags` against the configured upstream

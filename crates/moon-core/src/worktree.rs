@@ -24,6 +24,22 @@ pub const WORKTREES_DIR_NAME: &str = ".worktrees";
 /// container (`/workspace/<folder-basename>`).
 const CONTAINER_MOUNT_ROOT: &str = "/workspace";
 
+/// `<worktrees_dir>/<slug>`, or the first free `<slug>-2`, `<slug>-3`,
+/// … when that directory already exists. The slug derives from the
+/// branch name, but a checkout can be switched to another branch in
+/// place, leaving the derived directory occupied by a different branch;
+/// re-checking out the original branch must still find a home.
+pub fn free_worktree_dir(worktrees_dir: &Utf8Path, slug: &str) -> Utf8PathBuf {
+	let first = worktrees_dir.join(slug);
+	if !first.exists() {
+		return first;
+	}
+	(2u32..)
+		.map(|n| worktrees_dir.join(format!("{slug}-{n}")))
+		.find(|candidate| !candidate.exists())
+		.unwrap_or(first)
+}
+
 /// Map a worktree's absolute **host** path to its in-container path.
 /// The worktree lives at `<parent>/.worktrees/<rel>`; the parent repo
 /// is bind-mounted at `/workspace/<parent-basename>`, so the worktree
@@ -273,6 +289,16 @@ pub async fn discard_checkout(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn free_worktree_dir_skips_taken_directories() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let dir = Utf8Path::from_path(tmp.path()).unwrap();
+		assert_eq!(free_worktree_dir(dir, "moon-zod"), dir.join("moon-zod"));
+		std::fs::create_dir(dir.join("moon-zod")).unwrap();
+		std::fs::create_dir(dir.join("moon-zod-2")).unwrap();
+		assert_eq!(free_worktree_dir(dir, "moon-zod"), dir.join("moon-zod-3"));
+	}
 
 	#[test]
 	fn maps_worktree_under_parent_mount() {

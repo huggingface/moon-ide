@@ -792,13 +792,13 @@ pub async fn coder_move_session_to_worktree(app: &AppCore) -> Result<NewWorktree
 		}
 	};
 	let branch = spec.name().to_string();
-	let branch_slug = branch.replace('/', "-");
 
 	// `<parent>/.worktrees/<branch-slug>` — inside the parent repo so it
 	// rides the parent's bind mount (ADR 0029).
-	let worktree_path = camino::Utf8Path::new(&parent_path)
-		.join(moon_core::WORKTREES_DIR_NAME)
-		.join(&branch_slug);
+	let worktree_path = moon_core::worktree::free_worktree_dir(
+		&camino::Utf8Path::new(&parent_path).join(moon_core::WORKTREES_DIR_NAME),
+		&branch.replace('/', "-"),
+	);
 	if let Some(dir) = worktree_path.parent() {
 		std::fs::create_dir_all(dir.as_std_path()).map_err(MoonError::from)?;
 	}

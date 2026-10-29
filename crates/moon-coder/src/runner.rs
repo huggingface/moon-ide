@@ -876,6 +876,12 @@ struct Session {
 	/// re-deciding from scratch costs nothing and a raised budget
 	/// takes effect on reload.
 	elided_images: std::collections::HashSet<u64>,
+	/// The worktree branch this session last saw at a turn boundary.
+	/// A different branch at the next turn start means the checkout
+	/// was switched between turns by someone else (a terminal, another
+	/// tool), and the session is told before it acts. In-memory only:
+	/// a remount falls back to the header's entered branch.
+	observed_worktree_branch: Option<String>,
 }
 
 /// One queued steer waiting to be drained into `session.messages`
@@ -972,6 +978,7 @@ impl Session {
 			pending_steers: Vec::new(),
 			last_turn_diff: None,
 			elided_images: std::collections::HashSet::new(),
+			observed_worktree_branch: None,
 		}
 	}
 
@@ -2683,6 +2690,46 @@ impl CoderHandle {
 		)
 	}
 
+	/// Title (or id, when untitled) of a session whose tools run in
+	/// the worktree at `worktree_root` — persisted, or mounted but not
+	/// yet persisted. `None` when no session is routed there. Branch
+	/// switches refuse such a worktree: swapping its branch would put
+	/// another branch's code under that session.
+	pub async fn worktree_owner(&self, worktree_root: &str) -> Option<String> {
+		let label = |title: &str, id: &str| {
+			if title.is_empty() {
+				id.to_string()
+			} else {
+				title.to_string()
+			}
+		};
+		let folders: Vec<Arc<FolderSession>> = self.state.sessions_by_folder.read().await.values().cloned().collect();
+		for fs in folders {
+			let runtimes: Vec<Arc<SessionRuntime>> = fs.runtimes.read().await.values().cloned().collect();
+			for rt in runtimes {
+				let session = rt.session.lock().await;
+				if session.header.worktree_root.as_deref() == Some(worktree_root) {
+					return Some(label(&session.header.title, &session.header.id));
+				}
+			}
+		}
+		let summaries = match self.list_sessions_in(Some(worktree_root)).await {
+			Ok(summaries) => summaries,
+			Err(err) => {
+				tracing::warn!(
+					?err,
+					worktree = worktree_root,
+					"could not list sessions for worktree owner check"
+				);
+				return None;
+			}
+		};
+		summaries
+			.into_iter()
+			.find(|s| s.worktree_root.as_deref() == Some(worktree_root))
+			.map(|s| label(&s.title, &s.id))
+	}
+
 	/// Clear `worktree_root` + `worktree_branch` on every mounted
 	/// runtime whose header points at `worktree_root`, persist the
 	/// header rewrite, and emit `SessionWorktreeChanged` so the
@@ -3947,6 +3994,7 @@ impl CoderHandle {
 				pending_steers: Vec::new(),
 				last_turn_diff: None,
 				elided_images: std::collections::HashSet::new(),
+				observed_worktree_branch: None,
 			};
 			let rt = Arc::new(SessionRuntime::new(session));
 			fs.insert_runtime(id.clone(), rt).await;
@@ -5901,9 +5949,10 @@ async fn add_project_worktree(
 	spec: moon_core::host::WorktreeBranch,
 ) -> Result<Arc<WorkspaceFolderEntry>, CoderError> {
 	let branch = spec.name().to_string();
-	let worktree_path = Utf8Path::new(&project.folder.path)
-		.join(moon_core::WORKTREES_DIR_NAME)
-		.join(branch.replace('/', "-"));
+	let worktree_path = moon_core::worktree::free_worktree_dir(
+		&Utf8Path::new(&project.folder.path).join(moon_core::WORKTREES_DIR_NAME),
+		&branch.replace('/', "-"),
+	);
 	if let Some(dir) = worktree_path.parent() {
 		std::fs::create_dir_all(dir.as_std_path())?;
 	}
@@ -6603,6 +6652,7 @@ fn spawn_turn_loop(
 				// adoption is disk-based (ADR 0079) and repairs
 				// container-path links (ADR 0080). Both announce through the
 				// same event; the folder bar re-reads the snapshot either way.
+				record_worktree_branch(&state, &rt_for_turn).await;
 				let pruned = prune_missing_worktrees(&state).await;
 				let bound_before = state.workspaces.folders().await.len();
 				state.workspaces.adopt_disk_worktrees().await;
@@ -6851,6 +6901,8 @@ async fn run_turn(
 	// and its "no folders bound" section is written from the
 	// scratch root instead.
 	refresh_system_prompt(state, rt, &routing_path, scratch, force_host_bash, mode).await;
+	// Before the first round-trip, so the model reads it before acting.
+	notice_worktree_branch_drift(state, rt, sink).await;
 	// Schedule background regeneration for any bound folder whose
 	// summary cache is missing or stale. Detached tokio tasks; we
 	// don't block the turn waiting for them to land. The next
@@ -10687,6 +10739,76 @@ async fn park_coordinator_notice(rt: &Arc<SessionRuntime>, sink: &FolderEventSin
 	});
 }
 
+/// The branch a worktree session's checkout is on right now, or
+/// `None` when the session isn't in a bound worktree (or HEAD is
+/// detached / git can't say).
+async fn live_worktree_branch(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>) -> Option<(String, String)> {
+	let root = rt.session.lock().await.header.worktree_root.clone()?;
+	let entry = state.workspaces.folder_for_path(&root).await?;
+	let name = entry.host.git_branch().await.ok()?.name?;
+	Some((root, name))
+}
+
+/// Turn-end half of the worktree drift check: remember the branch
+/// the checkout is on, so the agent's own switches during the turn
+/// never read as drift at the next turn start.
+async fn record_worktree_branch(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>) {
+	let live = live_worktree_branch(state, rt).await.map(|(_, branch)| branch);
+	rt.session.lock().await.observed_worktree_branch = live;
+}
+
+/// Turn-start half: when the session's worktree is on a different
+/// branch than the one it last saw (or entered on), queue a notice
+/// so the agent learns about it before its first tool call instead
+/// of discovering foreign code mid-edit. The queued notice is
+/// drained by the loop like any steer.
+async fn notice_worktree_branch_drift(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>, sink: &FolderEventSink) {
+	let Some((root, live)) = live_worktree_branch(state, rt).await else {
+		return;
+	};
+	let (expected, committed) = {
+		let mut session = rt.session.lock().await;
+		let expected = session
+			.observed_worktree_branch
+			.clone()
+			.or_else(|| session.header.worktree_branch.clone());
+		session.observed_worktree_branch = Some(live.clone());
+		(expected, session.header.committed_branch.clone())
+	};
+	let Some(expected) = expected else {
+		return;
+	};
+	// A commit-on-new-branch made with this session open moved the
+	// branch on purpose and already stamped it on the header.
+	if expected == live || committed.as_deref() == Some(live.as_str()) {
+		return;
+	}
+	let notice = worktree_drift_notice(&root, &expected, &live);
+	let steer_id = new_message_id();
+	let queued_at_ms = current_time_ms();
+	rt.session.lock().await.pending_steers.push(PendingSteer {
+		id: steer_id.clone(),
+		text: notice.clone(),
+		images: Vec::new(),
+		queued_at_ms,
+		from_coordinator: false,
+	});
+	sink.send(CoderEvent::UserMessage {
+		id: steer_id,
+		text: notice,
+		images: Vec::new(),
+		queued: true,
+		created_at_ms: Some(queued_at_ms),
+		from_coordinator: false,
+	});
+}
+
+fn worktree_drift_notice(root: &str, expected: &str, live: &str) -> String {
+	format!(
+		"[moon-ide] Your worktree `{root}` was on branch `{expected}` but is now checked out on `{live}` — something switched it since your last turn. Unless you expected this, its files are another branch's, not your work: don't edit or commit there, and don't switch it back (whoever switched it may be using it). To continue on `{expected}`, call `enter_worktree` with `branch: \"{expected}\"`; if unsure, ask the user."
+	)
+}
+
 async fn drain_pending_steers(rt: &Arc<SessionRuntime>, sink: &FolderEventSink) {
 	let (steers, dir, header) = {
 		let mut session = rt.session.lock().await;
@@ -13968,6 +14090,86 @@ mod tests {
 			rt2.session.lock().await.header.worktree_root.as_deref(),
 			Some(expected.as_str())
 		);
+	}
+
+	/// A worktree switched to another branch in place: its session owns
+	/// it (so IDE branch switches refuse it), learns about the switch at
+	/// its next turn start, and can re-enter its branch even though the
+	/// derived directory is taken.
+	#[tokio::test]
+	async fn worktree_switched_in_place_is_owned_noticed_and_reenterable() {
+		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+
+		let git = |dir: &Utf8Path, args: &[&str]| {
+			let ok = std::process::Command::new("git")
+				.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+				.args(args)
+				.current_dir(dir.as_std_path())
+				.status()
+				.unwrap()
+				.success();
+			assert!(ok, "git {args:?} failed");
+		};
+		let repo_dir = tempfile::TempDir::new().unwrap();
+		let repo = Utf8PathBuf::from_path_buf(repo_dir.path().canonicalize().unwrap()).unwrap();
+		git(&repo, &["init", "-q", "-b", "main"]);
+		git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+
+		let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		registry.add_folder(repo.clone()).await.unwrap();
+		let data_dir = tempfile::TempDir::new().unwrap();
+		let coder = CoderHandle::new(
+			registry.clone(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("workspaces")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("coder-sessions")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("folder-summaries")).unwrap(),
+			CoderModels::default(),
+			Arc::new(moon_terminal::TerminalRegistry::default()),
+		)
+		.unwrap();
+		let state = coder.state.clone();
+		let session = || {
+			let blank = Session::new_blank();
+			let sink = FolderEventSink::new(state.events.clone(), repo.to_string(), blank.header.id.clone());
+			(Arc::new(SessionRuntime::new(blank)), sink)
+		};
+
+		let (rt, sink) = session();
+		handle_enter_worktree(&state, &rt, &sink, &json!({ "name": "zod" }))
+			.await
+			.unwrap();
+		let wt = repo.join(".worktrees").join("moon-zod");
+		let id = rt.session.lock().await.header.id.clone();
+		state
+			.folder_session_for(&repo)
+			.await
+			.insert_runtime(id, rt.clone())
+			.await;
+		assert!(coder.worktree_owner(wt.as_str()).await.is_some());
+		assert!(coder.worktree_owner(repo.as_str()).await.is_none());
+
+		// A turn boundary, then someone switches the checkout.
+		record_worktree_branch(&state, &rt).await;
+		notice_worktree_branch_drift(&state, &rt, &sink).await;
+		assert!(rt.session.lock().await.pending_steers.is_empty());
+		git(&wt, &["switch", "-q", "-c", "moon/other"]);
+		registry.set_worktree_branch(wt.as_str(), "moon/other").await;
+		notice_worktree_branch_drift(&state, &rt, &sink).await;
+		let steers = rt.session.lock().await.pending_steers.clone();
+		assert_eq!(steers.len(), 1);
+		assert!(steers[0].text.contains("`moon/zod`") && steers[0].text.contains("`moon/other`"));
+		// Told once, not every turn.
+		notice_worktree_branch_drift(&state, &rt, &sink).await;
+		assert_eq!(rt.session.lock().await.pending_steers.len(), 1);
+
+		// `moon/zod` is checked out nowhere, and its derived directory
+		// now holds `moon/other`: re-entering lands in a `-2` sibling.
+		let (rt2, sink2) = session();
+		let (result, entry) = handle_enter_worktree(&state, &rt2, &sink2, &json!({ "branch": "moon/zod" }))
+			.await
+			.unwrap();
+		assert_eq!(result["created"], true);
+		assert_eq!(entry.folder.path, repo.join(".worktrees").join("moon-zod-2").as_str());
 	}
 
 	#[tokio::test]
