@@ -439,6 +439,32 @@
 		void coder.loadModelSettings();
 	});
 
+	// The composer's reasoning picker reads levels off the active
+	// provider's catalog; fetch it once if nothing else has.
+	$effect(() => {
+		const id = coder.modelSettings?.active_provider ?? null;
+		if (id !== null && coder.providerModels[id] === undefined) {
+			void coder.loadProviderModels(id);
+		}
+	});
+
+	const reasoningChoices = $derived(coder.reasoningChoices);
+	const reasoningEffort = $derived(coder.modelSettings?.reasoning_effort ?? null);
+	// A saved effort the current model doesn't take stays listed so
+	// the select shows it; the backend leaves it off the wire.
+	const reasoningOptions = $derived(
+		reasoningEffort !== null && !reasoningChoices.levels.includes(reasoningEffort)
+			? [...reasoningChoices.levels, reasoningEffort]
+			: reasoningChoices.levels,
+	);
+
+	function onReasoningChange(e: Event): void {
+		const value = (e.currentTarget as HTMLSelectElement).value;
+		coder.setReasoningEffort(value === '' ? null : value).catch(() => {
+			// `saveModelSettings` already records the error in `modelsError`.
+		});
+	}
+
 	function hubRowState(sessionId: string): 'idle' | 'syncing' | 'synced' | 'failed' {
 		const s = coder.hubSyncState[sessionId];
 		if (!s) {
@@ -3467,6 +3493,23 @@
 				onpaste={onComposerPaste}
 				onblur={onComposerBlur}
 			></textarea>
+			{#if coder.modelSettings !== null && reasoningChoices.sent && reasoningChoices.levels.length > 0}
+				<div class="composer-meta">
+					<label class="reasoning-pick" title="Reasoning effort for the next turn (also in model settings)">
+						<span>Reasoning</span>
+						<select value={reasoningEffort ?? ''} onchange={onReasoningChange}>
+							<option value=""
+								>default{reasoningChoices.defaultLevel ? ` (${reasoningChoices.defaultLevel})` : ''}</option
+							>
+							{#each reasoningOptions as lvl (lvl)}
+								<option value={lvl}
+									>{lvl}{reasoningChoices.levels.includes(lvl) ? '' : ' (not supported, not sent)'}</option
+								>
+							{/each}
+						</select>
+					</label>
+				</div>
+			{/if}
 		</div>
 	{:else if coder.view === 'subagent'}
 		<!-- Sub-agent pop-out: full transcript of one sub-agent, with
@@ -5936,6 +5979,34 @@
 		flex-direction: column;
 		gap: 6px;
 		position: relative;
+	}
+	.composer-meta {
+		display: flex;
+		justify-content: flex-end;
+		margin-top: -2px;
+	}
+	.reasoning-pick {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+	}
+	.reasoning-pick select {
+		background: transparent;
+		color: var(--m-fg-muted);
+		border: 1px solid transparent;
+		border-radius: 4px;
+		font: inherit;
+		padding: 0 2px;
+		cursor: pointer;
+	}
+	.reasoning-pick select:hover {
+		border-color: var(--m-border);
+	}
+	.reasoning-pick option {
+		background: var(--m-bg);
+		color: var(--m-fg);
 	}
 	.mention-menu {
 		position: absolute;

@@ -36,7 +36,7 @@
 	// "Bill to" is unchanged: dropdown sourced from `identity.orgs`,
 	// `slug ?? name` as the wire value, `name` as the display label.
 
-	import { coder } from '../coder.svelte';
+	import { coder, FIXED_REASONING_EFFORTS } from '../coder.svelte';
 	import { workspace } from '../state.svelte';
 	import { formatError } from '../protocol';
 	import { openUrl } from '@tauri-apps/plugin-opener';
@@ -659,9 +659,8 @@
 	// lists levels (ChatGPT) or says "no reasoning" (OpenRouter) wins;
 	// otherwise the fixed list. A saved effort the model doesn't take
 	// stays visible, flagged, because the backend drops it on the wire.
-	const FIXED_EFFORTS: readonly string[] = ['medium', 'high', 'xhigh', 'max'];
 	const standardCatalogRow = $derived(providerCatalog?.find((r) => r.id === standardModel.trim()) ?? null);
-	const effortLevels = $derived<readonly string[]>(standardCatalogRow?.reasoning_levels ?? FIXED_EFFORTS);
+	const effortLevels = $derived<readonly string[]>(standardCatalogRow?.reasoning_levels ?? FIXED_REASONING_EFFORTS);
 	const effortChips = $derived(
 		reasoningEffort !== null && !effortLevels.includes(reasoningEffort)
 			? [...effortLevels, reasoningEffort]

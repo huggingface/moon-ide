@@ -48,6 +48,9 @@ import { frontendLog } from './logs.svelte';
 
 const CODER_EVENT_CHANNEL = 'coder:event';
 
+/** Effort levels offered when a provider catalog doesn't list them. */
+export const FIXED_REASONING_EFFORTS: readonly string[] = ['medium', 'high', 'xhigh', 'max'];
+
 /** One row rendered in the panel transcript. The `kind` matches the
  *  loop event that produced it; the `id` is stable so the runner's
  *  `tool_call` → `tool_result` pair update the same DOM node when
@@ -67,6 +70,7 @@ const CODER_EVENT_CHANNEL = 'coder:event';
  *  time once the call settles — useful for spotting slow tools
  *  (multi-second `bash` tail, multi-megabyte `read_file`) at a
  *  glance. */
+
 export type CoderRow =
 	| {
 			kind: 'user';
@@ -791,6 +795,34 @@ export class CoderPanelState {
 			this.modelsError = formatError(err);
 			throw err;
 		}
+	}
+
+	/** Reasoning-effort choices for the model the next turn uses:
+	 *  the provider catalog's levels when it lists them, else the
+	 *  fixed list. `sent: false` on the Anthropic route, which
+	 *  ignores the setting. */
+	get reasoningChoices(): { levels: readonly string[]; defaultLevel: string | null; sent: boolean } {
+		const settings = this.modelSettings;
+		const active = settings?.providers.find((p) => p.id === settings.active_provider) ?? null;
+		const row =
+			active === null
+				? null
+				: (this.providerModels[active.id]?.find((r) => r.id === settings?.resolved_standard_model) ?? null);
+		return {
+			levels: row?.reasoning_levels ?? FIXED_REASONING_EFFORTS,
+			defaultLevel: row?.default_reasoning_level ?? null,
+			sent: active?.kind !== 'anthropic',
+		};
+	}
+
+	/** Change only the reasoning effort, through the normal settings
+	 *  round-trip. `null` = provider default. */
+	async setReasoningEffort(effort: string | null): Promise<void> {
+		const settings = this.modelSettings;
+		if (settings === null) {
+			return;
+		}
+		await this.saveModelSettings({ ...settings, reasoning_effort: effort });
 	}
 
 	/** Short display name of the model the next turn will use —

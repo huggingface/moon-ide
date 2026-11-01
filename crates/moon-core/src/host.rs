@@ -6093,9 +6093,9 @@ fn run_git_default_branch_diff(root: &Utf8Path) -> Option<BranchDiffStatus> {
 	// `git diff --name-status -z --no-renames <merge-base>`
 	// compares the working tree (committed + uncommitted) against
 	// `merge-base`. Untracked files are absent from `git diff`
-	// against a tree-ish — that matches the user's "modified /
-	// added / deleted vs main" mental model so we don't need to
-	// merge in porcelain output here.
+	// against a tree-ish, so they're appended below from
+	// `ls-files --others`: a new file the user hasn't staged yet is
+	// still part of "what this branch changes".
 	//
 	// `--no-renames` keeps the parser flat: a rename comes through
 	// as `D <old>\0A <new>` instead of the two-path `R<NN>` record,
@@ -6116,7 +6116,29 @@ fn run_git_default_branch_diff(root: &Utf8Path) -> Option<BranchDiffStatus> {
 		);
 		return None;
 	}
-	let entries = parse_diff_name_status_z(&diff.stdout);
+	let mut entries = parse_diff_name_status_z(&diff.stdout);
+	let untracked = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
+		.args(["ls-files", "--others", "--exclude-standard", "-z"])
+		.output();
+	match untracked {
+		Ok(out) if out.status.success() => {
+			entries.extend(
+				out
+					.stdout
+					.split(|&b| b == 0)
+					.filter_map(|raw| std::str::from_utf8(raw).ok())
+					.filter(|path| !path.is_empty())
+					.map(|path| GitStatusEntry {
+						path: path.to_owned(),
+						status: GitFileStatus::Untracked,
+					}),
+			);
+		}
+		_ => tracing::debug!("git ls-files --others failed; vs-main view omits untracked files"),
+	}
 	Some(BranchDiffStatus {
 		merge_base,
 		default_branch_ref: default_ref,
@@ -10609,6 +10631,11 @@ mod tests {
 		run_git(&git, &clone, &["add", "-A"]);
 		run_git(&git, &clone, &["commit", "-q", "-m", "rm b.rs"]);
 		std::fs::write(clone.join("a.rs"), "fn a() { todo!() }\n").unwrap();
+		// Never-added files in a new directory, plus an ignored one.
+		std::fs::create_dir_all(clone.join("fresh")).unwrap();
+		std::fs::write(clone.join("fresh/one.rs"), "\n").unwrap();
+		std::fs::write(clone.join(".gitignore"), "*.log\n").unwrap();
+		std::fs::write(clone.join("debug.log"), "\n").unwrap();
 
 		let utf8 = Utf8PathBuf::from_path_buf(clone.canonicalize().unwrap()).unwrap();
 		let result = LocalHost::new(utf8).git_default_branch_diff().await.unwrap();
@@ -10623,7 +10650,9 @@ mod tests {
 		assert_eq!(by_path.get("new.rs"), Some(&GitFileStatus::Added));
 		assert_eq!(by_path.get("b.rs"), Some(&GitFileStatus::Deleted));
 		assert_eq!(by_path.get("a.rs"), Some(&GitFileStatus::Modified));
-		assert_eq!(by_path.len(), 3, "no untracked / unrelated rows expected: {by_path:?}");
+		assert_eq!(by_path.get("fresh/one.rs"), Some(&GitFileStatus::Untracked));
+		assert_eq!(by_path.get(".gitignore"), Some(&GitFileStatus::Untracked));
+		assert_eq!(by_path.len(), 5, "ignored files must stay out: {by_path:?}");
 	}
 
 	#[tokio::test]
