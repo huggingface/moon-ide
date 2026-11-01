@@ -2921,7 +2921,7 @@ class CompanionState {
 			}
 			case 'background_process_exited': {
 				// Live-only settlement notice for a detached `bash`
-				// process (ADR 0075): natural exit, `stop_process`
+				// process (ADR 0075): natural exit, `stop`
 				// kill, or the turn-end cleanup reaping a
 				// still-running child.
 				const callId = str(ev, 'tool_call_id');

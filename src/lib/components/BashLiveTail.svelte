@@ -2,7 +2,7 @@
 	// Live tail of a detached background process (ADR 0085), rendered
 	// inside the spawning `bash` row's expanded body. Polls
 	// `coder_read_background_process` — the same registry the model's
-	// `read_process` reads — every 1.2s while the process runs, and
+	// `wait` reads — every 1.2s while the process runs, and
 	// fetches once for a settled one (the registry retains settled
 	// entries and their logs for the session's lifetime). Degrades to
 	// nothing when the registry can't answer (IDE restarted since the

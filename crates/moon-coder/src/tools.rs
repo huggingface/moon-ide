@@ -207,8 +207,8 @@ pub struct ToolContext {
 	pub mode: CoderMode,
 	pub format_queue: Arc<FormatQueue>,
 	/// Per-turn registry of detached background processes (ADR 0034).
-	/// `bash` with `detach: true` spawns into here; `read_process`
-	/// and `stop_process` read/kill from here; the runner calls
+	/// `bash` with `detach: true` spawns into here; `wait`
+	/// and `stop` read/kill from here; the runner calls
 	/// `cleanup()` at turn end.
 	pub background: Arc<BackgroundProcessRegistry>,
 	/// When true, the `bash` tool routes to the host machine even
@@ -271,8 +271,8 @@ impl ToolContext {
 
 	/// Builder-style setter for the per-turn background-process
 	/// registry (ADR 0034). The runner creates one `Arc` and shares
-	/// it across the turn so `bash` (spawn), `read_process` (poll),
-	/// `stop_process` (kill), and the turn-end `cleanup()` all reach
+	/// it across the turn so `bash` (spawn), `wait` (poll),
+	/// `stop` (kill), and the turn-end `cleanup()` all reach
 	/// the same registry.
 	pub fn with_background(mut self, background: Arc<BackgroundProcessRegistry>) -> Self {
 		self.background = background;
@@ -367,15 +367,15 @@ impl FormatQueue {
 
 /// Per-turn registry of detached background processes spawned by
 /// `bash` with `detach: true` (ADR 0034). Each entry holds the child
-/// handle and the host-side log file path; `read_process` tails the
-/// log and `stop_process` kills + reaps. At turn end
+/// handle and the host-side log file path; `wait` tails the
+/// log and `stop` kills + reaps. At turn end
 /// Registry of detached background processes (ADR 0034, lifetime
 /// revised by ADR 0085).
 ///
 /// **Session-scoped for top-level sessions**: the registry lives on
 /// the `SessionRuntime` and processes survive turn boundaries —
 /// including a user abort (Esc), which ends the *turn* but not the
-/// *conversation*. `read_process` therefore works across turns: the
+/// *conversation*. `wait` therefore works across turns: the
 /// model can launch a long build, get interrupted, and pick the
 /// handle back up on the next turn. Settled entries (and their log
 /// files) are retained for the same reason. Processes die with the
@@ -387,7 +387,7 @@ impl FormatQueue {
 /// the pre-ADR-0085 behaviour.
 ///
 /// When a sink is attached ([`Self::set_event_sink`]), every
-/// settlement — natural exit observed by a poll, a `stop_process`
+/// settlement — natural exit observed by a poll, a `stop`
 /// kill, or a cleanup kill — emits a live-only
 /// [`CoderEvent::BackgroundProcessExited`] so the panel can flip the
 /// spawning `bash` row out of its "detached, still running" state.
@@ -396,12 +396,37 @@ impl FormatQueue {
 /// `SubagentEvent` so the pop-out sees the same updates).
 type BgEventSink = Arc<dyn Fn(crate::event::CoderEvent) + Send + Sync>;
 
+/// Wake callback for `notify` processes (ADR 0102): the runner turns
+/// the notice into a `<background_result>` message for the session.
+pub type BgWakeSink = Arc<dyn Fn(ProcessNotice) + Send + Sync>;
+
+/// A `notify` process that exited on its own, with nobody waiting on
+/// it.
+#[derive(Debug, Clone)]
+pub struct ProcessNotice {
+	pub id: String,
+	pub cmd: String,
+	pub exit_code: Option<i32>,
+	pub tail: String,
+}
+
+/// A running `notify` process, for the session's active-work strip.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActiveProcess {
+	pub id: String,
+	pub tool_call_id: String,
+	pub cmd: String,
+}
+
 #[derive(Default)]
 pub struct BackgroundProcessRegistry {
 	entries: Mutex<Vec<BackgroundProcess>>,
 	/// Event sink for settlement notifications. Set by the runner
 	/// right after construction.
 	event_sink: Mutex<Option<BgEventSink>>,
+	/// Session wake for `notify` processes. Unset in sub-agent runs,
+	/// which have no idle session to wake.
+	wake: Mutex<Option<BgWakeSink>>,
 }
 
 struct BackgroundProcess {
@@ -410,7 +435,7 @@ struct BackgroundProcess {
 	/// The spawning `bash` tool call's id — carried onto the
 	/// settlement event so the panel can find the row.
 	tool_call_id: String,
-	/// The original command string — echoed back in `read_process`
+	/// The original command string — echoed back in `wait`
 	/// results so the model doesn't have to track it separately.
 	cmd: String,
 	/// Where the command ran — `"host"` or `"container"`, same
@@ -419,15 +444,22 @@ struct BackgroundProcess {
 	/// Host-side log file collecting the process's stdout + stderr.
 	log_path: PathBuf,
 	/// The child handle. `None` once the process has been reaped
-	/// (either naturally, via `stop_process`, or via `cleanup`).
+	/// (either naturally, via `stop`, or via `cleanup`).
 	child: Option<tokio::process::Child>,
 	/// Exit code captured when the process was reaped, so subsequent
-	/// `read_process` calls after completion can still report it.
+	/// `wait` calls after completion can still report it.
 	exit_code: Option<i32>,
 	/// Settlement event already emitted. Guards against
-	/// double-reporting when `cleanup` follows a `read_process`
+	/// double-reporting when `cleanup` follows a `wait`
 	/// that already observed the exit.
 	notified: bool,
+	/// Wake the session when the process exits (ADR 0102).
+	notify: bool,
+	/// `wait` calls currently parked on this process. A natural exit
+	/// seen while one is parked goes to that call, not a wake.
+	waiters: usize,
+	/// Stopped on purpose (`stop`, the UI, a second Esc): never wakes.
+	stopped: bool,
 }
 
 impl BackgroundProcessRegistry {
@@ -437,6 +469,13 @@ impl BackgroundProcessRegistry {
 	pub fn set_event_sink(&self, sink: BgEventSink) {
 		if let Ok(mut guard) = self.event_sink.lock() {
 			*guard = Some(sink);
+		}
+	}
+
+	/// Attach the session wake used by `notify` processes.
+	pub fn set_wake(&self, wake: BgWakeSink) {
+		if let Ok(mut guard) = self.wake.lock() {
+			*guard = Some(wake);
 		}
 	}
 
@@ -456,7 +495,7 @@ impl BackgroundProcessRegistry {
 
 	/// Emit the settlement event for `proc` if not already sent.
 	/// Callers must hold the `entries` lock. `killed` distinguishes
-	/// `stop_process` / turn-end-cleanup kills from natural exits.
+	/// `stop` / turn-end-cleanup kills from natural exits.
 	fn notify_exit_locked(&self, proc: &mut BackgroundProcess, killed: bool) {
 		if proc.notified {
 			return;
@@ -472,6 +511,74 @@ impl BackgroundProcessRegistry {
 				killed,
 				exit_code: proc.exit_code,
 			});
+		}
+		drop(sink_guard);
+		if killed || proc.stopped || !proc.notify || proc.waiters > 0 {
+			return;
+		}
+		let Ok(wake_guard) = self.wake.lock() else {
+			return;
+		};
+		if let Some(wake) = wake_guard.as_ref() {
+			wake(ProcessNotice {
+				id: proc.id.clone(),
+				cmd: proc.cmd.clone(),
+				exit_code: proc.exit_code,
+				tail: read_tail(&proc.log_path, BG_DEFAULT_TAIL_BYTES),
+			});
+		}
+	}
+
+	/// Watch a `notify` process so its exit is seen (and wakes the
+	/// session) even when nothing polls it. Holds only a weak
+	/// reference: dropping the registry still kills the child.
+	fn watch(self: &Arc<Self>, id: String) {
+		let weak = Arc::downgrade(self);
+		tokio::spawn(async move {
+			loop {
+				tokio::time::sleep(Duration::from_millis(BG_WATCH_INTERVAL_MS)).await;
+				let Some(registry) = weak.upgrade() else {
+					return;
+				};
+				if registry.exited(&id) != Some(false) {
+					return;
+				}
+			}
+		});
+	}
+
+	/// `Some(true)` once the process has exited (reaping it),
+	/// `Some(false)` while it runs, `None` for an unknown id.
+	fn exited(&self, id: &str) -> Option<bool> {
+		let known = self.entries.lock().ok()?.iter().any(|p| p.id == id);
+		known.then(|| self.try_reap(id))
+	}
+
+	/// Running `notify` processes, for the active-work strip.
+	pub fn active_notify(&self) -> Vec<ActiveProcess> {
+		let Ok(mut guard) = self.entries.lock() else {
+			return Vec::new();
+		};
+		guard
+			.iter_mut()
+			.filter(|p| p.notify && !p.stopped)
+			.filter_map(|p| {
+				let running = matches!(p.child.as_mut()?.try_wait(), Ok(None));
+				running.then_some(p)
+			})
+			.map(|p| ActiveProcess {
+				id: p.id.clone(),
+				tool_call_id: p.tool_call_id.clone(),
+				cmd: p.cmd.clone(),
+			})
+			.collect()
+	}
+
+	/// Stop every running `notify` process (the second Esc). Plain
+	/// detached processes keep running.
+	pub async fn stop_notifying(&self) {
+		for proc in self.active_notify() {
+			let _ = self.stop(&proc.id).await;
 		}
 	}
 
@@ -489,16 +596,17 @@ impl BackgroundProcessRegistry {
 	/// Spawn a detached process: the child's stdout+stderr are
 	/// redirected to a host-side log file, the handle is stored, and
 	/// the opaque id + log path are returned for the tool result.
-	/// The process runs until it exits, `stop_process` (or the UI's
+	/// The process runs until it exits, `stop` (or the UI's
 	/// stop affordance) kills it, or the registry itself goes away
 	/// (session deletion, sub-agent settle, IDE shutdown — ADR 0085).
 	fn spawn(
-		&self,
+		self: &Arc<Self>,
 		id: String,
 		tool_call_id: String,
 		mut command: tokio::process::Command,
 		cmd: String,
 		target: &'static str,
+		notify: bool,
 	) -> Result<(String, PathBuf, Option<u32>), CoderError> {
 		let log_path = background_log_path(&id);
 		if let Some(parent) = log_path.parent() {
@@ -534,7 +642,14 @@ impl BackgroundProcessRegistry {
 			child: Some(child),
 			exit_code: None,
 			notified: false,
+			notify,
+			waiters: 0,
+			stopped: false,
 		});
+		drop(guard);
+		if notify {
+			self.watch(id.clone());
+		}
 		Ok((id, log_path, pid))
 	}
 
@@ -549,13 +664,14 @@ impl BackgroundProcessRegistry {
 		wait_ms: u64,
 		tail_bytes: usize,
 		cancel: &CancellationToken,
+		take_result: bool,
 	) -> Result<Value, CoderError> {
 		// Scope the mutex guard so we drop it before any await —
 		// `try_wait` and `tokio::time::sleep` would otherwise hold
 		// it across a yield point.
 		let snapshot = {
 			let Ok(guard) = self.entries.lock() else {
-				return Err(CoderError::tool_failed("read_process", "registry lock poisoned"));
+				return Err(CoderError::tool_failed("wait", "registry lock poisoned"));
 			};
 			guard
 				.iter()
@@ -564,11 +680,15 @@ impl BackgroundProcessRegistry {
 		};
 		let Some((cmd, target, log_path)) = snapshot else {
 			return Err(CoderError::tool_failed(
-				"read_process",
-				format!("no background process with id '{id}'"),
+				"wait",
+				format!("no background process or sub-agent with id '{id}'"),
 			));
 		};
 
+		// The model's `wait` takes a `notify` process's result, so an
+		// exit it observes doesn't also wake the session. The panel's
+		// live tail reads without taking it.
+		let _parked = take_result.then(|| ParkedWait::new(self, id));
 		// If a wait was requested, poll until exit or timeout.
 		if wait_ms > 0 {
 			let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
@@ -614,14 +734,15 @@ impl BackgroundProcessRegistry {
 		// can't span the await.
 		let (cmd, target, mut child) = {
 			let Ok(mut guard) = self.entries.lock() else {
-				return Err(CoderError::tool_failed("stop_process", "registry lock poisoned"));
+				return Err(CoderError::tool_failed("stop", "registry lock poisoned"));
 			};
 			let Some(proc) = guard.iter_mut().find(|p| p.id == id) else {
 				return Err(CoderError::tool_failed(
-					"stop_process",
+					"stop",
 					format!("no background process with id '{id}'"),
 				));
 			};
+			proc.stopped = true;
 			(proc.cmd.clone(), proc.target, proc.child.take())
 		};
 
@@ -652,13 +773,13 @@ impl BackgroundProcessRegistry {
 			exit_code = self.stored_exit_code(id);
 		}
 
-		// Store the exit code for future `read_process` calls, then
+		// Store the exit code for future `wait` calls, then
 		// report the settlement — same flip a natural exit or the
 		// turn-end cleanup produces.
 		self.store_exit_code(id, exit_code);
 		{
 			let Ok(mut guard) = self.entries.lock() else {
-				return Err(CoderError::tool_failed("stop_process", "registry lock poisoned"));
+				return Err(CoderError::tool_failed("stop", "registry lock poisoned"));
 			};
 			if let Some(proc) = guard.iter_mut().find(|p| p.id == id) {
 				self.notify_exit_locked(proc, killed);
@@ -734,7 +855,7 @@ impl BackgroundProcessRegistry {
 
 	/// Try to reap a process non-destructively. Returns `true` if the
 	/// process has exited (and was reaped). Does not remove the entry
-	/// — `read_process` still needs to report exit_code + tail after
+	/// — `wait` still needs to report exit_code + tail after
 	/// the process finishes.
 	fn try_reap(&self, id: &str) -> bool {
 		let Ok(mut guard) = self.entries.lock() else {
@@ -748,7 +869,7 @@ impl BackgroundProcessRegistry {
 				Ok(Some(status)) => {
 					// Process exited — store the exit code and drop
 					// the handle so we stop polling it. The entry
-					// stays so `read_process` can still report.
+					// stays so `wait` can still report.
 					proc.exit_code = status.code();
 					proc.child = None;
 					self.notify_exit_locked(proc, false);
@@ -789,6 +910,19 @@ impl BackgroundProcessRegistry {
 		}
 	}
 
+	fn adjust_waiters(&self, id: &str, park: bool) {
+		let Ok(mut guard) = self.entries.lock() else {
+			return;
+		};
+		if let Some(proc) = guard.iter_mut().find(|p| p.id == id) {
+			proc.waiters = if park {
+				proc.waiters + 1
+			} else {
+				proc.waiters.saturating_sub(1)
+			};
+		}
+	}
+
 	/// Read the stored exit code for a reaped process.
 	fn stored_exit_code(&self, id: &str) -> Option<i32> {
 		let Ok(guard) = self.entries.lock() else {
@@ -797,8 +931,8 @@ impl BackgroundProcessRegistry {
 		guard.iter().find(|p| p.id == id).and_then(|p| p.exit_code)
 	}
 
-	/// Store the exit code for a process (after `stop_process` reaps
-	/// it) so subsequent `read_process` calls can still report it.
+	/// Store the exit code for a process (after `stop` reaps
+	/// it) so subsequent `wait` calls can still report it.
 	fn store_exit_code(&self, id: &str, code: Option<i32>) {
 		let Ok(mut guard) = self.entries.lock() else {
 			return;
@@ -809,15 +943,38 @@ impl BackgroundProcessRegistry {
 	}
 }
 
-/// Poll interval for `read_process`'s `wait_ms` loop. Short enough
+/// Poll interval for `wait`'s `wait_ms` loop. Short enough
 /// to feel responsive, long enough to not hammer the OS.
 const BG_POLL_INTERVAL_MS: u64 = 200;
 
-/// Default + cap for `read_process`'s `tail_bytes` parameter.
+/// How often a `notify` process's watcher checks for its exit. A
+/// wake a second late is fine; these are long jobs.
+const BG_WATCH_INTERVAL_MS: u64 = 1_000;
+
+/// Marks a `wait` parked on a process for as long as it lives.
+struct ParkedWait<'a> {
+	registry: &'a BackgroundProcessRegistry,
+	id: &'a str,
+}
+
+impl<'a> ParkedWait<'a> {
+	fn new(registry: &'a BackgroundProcessRegistry, id: &'a str) -> Self {
+		registry.adjust_waiters(id, true);
+		Self { registry, id }
+	}
+}
+
+impl Drop for ParkedWait<'_> {
+	fn drop(&mut self) {
+		self.registry.adjust_waiters(self.id, false);
+	}
+}
+
+/// Default + cap for `wait`'s `tail_bytes` parameter.
 const BG_DEFAULT_TAIL_BYTES: usize = 8_000;
 const BG_MAX_TAIL_BYTES: usize = 64_000;
 
-/// Default + cap for `read_process`'s `wait_ms` parameter.
+/// Default + cap for `wait`'s `wait_ms` parameter.
 const BG_DEFAULT_WAIT_MS: u64 = 0;
 const BG_MAX_WAIT_MS: u64 = 600_000;
 
@@ -1339,7 +1496,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"bash",
-				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default; a timeout (or a user interrupt) kills the command but still returns the partial output it produced, flagged `timed_out` / `interrupted`. For long-running commands, pass `detach: true` — the process keeps running and you get back an `id` to poll with `read_process`.",
+				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default; a timeout (or a user interrupt) kills the command but still returns the partial output it produced, flagged `timed_out` / `interrupted`. For long-running commands, pass `detach: true` — the process keeps running and you get back an `id` for `wait` / `stop`; add `notify: true` to be woken with the result when it exits instead of waiting.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -1353,43 +1510,47 @@ impl ToolRegistry {
 						},
 						"detach": {
 							"type": "boolean",
-							"description": "When true, spawn the command as a detached background process. Returns immediately with `{ detached, id, pid, log_path }` instead of waiting for completion. Use `read_process(id)` to poll status and tail output, and `stop_process(id)` to kill it. The process survives turn boundaries — including an interrupted turn — so an id from an earlier turn still works; it is killed when the session is deleted or the IDE quits."
+							"description": "When true, spawn the command as a detached background process. Returns immediately with `{ detached, id, pid, log_path }` instead of waiting for completion. Use `wait(id)` to check on it or block for it, and `stop(id)` to kill it. The process survives turn boundaries — including an interrupted turn — so an id from an earlier turn still works; it is killed when the session is deleted or the IDE quits."
+						},
+						"notify": {
+							"type": "boolean",
+							"description": "With `detach: true`: when the process exits, you receive a `<background_result>` message with its exit code and output tail — mid-turn, or by waking you after your turn ended. Use it for long jobs you'd otherwise poll (test suites, CI runs, deploys); end your turn and pick up from the result. A condition to wait for is just a command that exits when it holds (`gh run watch <id> --exit-status`, `until curl -sf <url>; do sleep 10; done`, `timeout 2h …`). Leave it off for dev servers and watchers. Ignored inside sub-agents."
 						}
 					},
 					"required": ["cmd"]
 				}),
 			),
 			ToolDefinition::function(
-				"read_process",
-				"Poll a detached background process spawned by `bash` with `detach: true`. Returns its running status, exit code (if finished), and the tail of its stdout+stderr log. Works across turns: ids from earlier turns of this session stay valid, and settled processes keep reporting their exit code and log tail. Pass `wait_ms` to block until the process exits (avoids busy-polling) — the call returns as soon as the process finishes or the wait elapses.",
+				"wait",
+				"Check on, or block for, background work: a detached process (`bg_…` id from `bash`) or a sub-agent (`subagent_id` from `task`). For a process: running status, exit code once finished, and the tail of its output. For a sub-agent: its report once done. Ids from earlier turns of this session stay valid. A result you take here is not delivered to you again as a `<background_result>` message.",
 				json!({
 					"type": "object",
 					"properties": {
 						"id": {
 							"type": "string",
-							"description": "The process id returned by `bash` with `detach: true`."
+							"description": "A process id from `bash` with `detach: true`, or a sub-agent id from `task`."
 						},
 						"wait_ms": {
 							"type": "integer",
-							"description": "If > 0, block up to this many milliseconds waiting for the process to exit before returning (capped at 600000 = 10 minutes). One `read_process(id, wait_ms=600000)` per ten minutes beats hundreds of instant polls."
+							"description": "If > 0, block up to this many milliseconds for the work to finish (capped at 600000 = 10 minutes). Only block when you can't do anything else until it finishes; otherwise use `notify` / the automatic sub-agent report and end your turn."
 						},
 						"tail_bytes": {
 							"type": "integer",
-							"description": "Maximum bytes of log output to return (from the end of the log). Defaults to 8000, capped at 64000."
+							"description": "Processes only: maximum bytes of log output to return (from the end of the log). Defaults to 8000, capped at 64000."
 						}
 					},
 					"required": ["id"]
 				}),
 			),
 			ToolDefinition::function(
-				"stop_process",
-				"Kill a detached background process if it is still running, then reap it. No-op (returns `killed: false`) if the process already exited. Returns the exit code.",
+				"stop",
+				"Stop background work: kill a detached process (returns its exit code; `killed: false` if it had already exited), or cancel a running sub-agent (its partial work is discarded, files it wrote stay). Stopped work never sends a `<background_result>`.",
 				json!({
 					"type": "object",
 					"properties": {
 						"id": {
 							"type": "string",
-							"description": "The process id returned by `bash` with `detach: true`."
+							"description": "A process id from `bash` with `detach: true`, or a sub-agent id from `task`."
 						}
 					},
 					"required": ["id"]
@@ -2305,8 +2466,8 @@ impl ToolRegistry {
 			// "don't mutate" half is enforced via the sub-agent's
 			// system prompt — see Phase C's `run_subagent`.
 			"bash" => self.bash(args, cx, cancel, tool_call_id).await,
-			"read_process" => self.read_process(args, cx, cancel).await,
-			"stop_process" => self.stop_process(args, cx).await,
+			"wait" => self.read_process(args, cx, cancel).await,
+			"stop" => self.stop_process(args, cx).await,
 			// Reading a terminal is read-only against the user's own
 			// screen, so it isn't mode-gated — a Research sub-agent
 			// checking why the dev server is unhappy is the point.
@@ -2815,6 +2976,8 @@ impl ToolRegistry {
 			timeout_ms: Option<u64>,
 			#[serde(default)]
 			detach: bool,
+			#[serde(default)]
+			notify: bool,
 		}
 		let parsed: BashArgs =
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("bash", err.to_string()))?;
@@ -2823,16 +2986,23 @@ impl ToolRegistry {
 			.build_bash_command(folder, &parsed.cmd, cx.force_host_bash())
 			.await?;
 
-		// Detached path (ADR 0034): spawn into the per-turn registry,
+		// Detached path (ADR 0034): spawn into the session registry,
 		// redirect output to a log file, return immediately. The
-		// model polls via `read_process` and kills via `stop_process`.
+		// model checks via `wait`, kills via `stop`, or with `notify`
+		// gets woken by the exit (ADR 0102).
 		if parsed.detach {
 			let id = cx.background.next_id();
-			let (id, log_path, pid) =
-				cx.background
-					.spawn(id, tool_call_id.to_string(), command, parsed.cmd.clone(), target_kind)?;
+			let (id, log_path, pid) = cx.background.spawn(
+				id,
+				tool_call_id.to_string(),
+				command,
+				parsed.cmd.clone(),
+				target_kind,
+				parsed.notify,
+			)?;
 			return Ok(json!({
 				"detached": true,
+				"notify": parsed.notify,
 				"id": id,
 				"pid": pid,
 				"log_path": log_path.to_string_lossy(),
@@ -2979,13 +3149,13 @@ impl ToolRegistry {
 			tail_bytes: Option<usize>,
 		}
 		let parsed: ReadProcessArgs =
-			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("read_process", err.to_string()))?;
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("wait", err.to_string()))?;
 		let wait_ms = parsed.wait_ms.unwrap_or(BG_DEFAULT_WAIT_MS).min(BG_MAX_WAIT_MS);
 		let tail_bytes = parsed
 			.tail_bytes
 			.unwrap_or(BG_DEFAULT_TAIL_BYTES)
 			.min(BG_MAX_TAIL_BYTES);
-		cx.background.read(&parsed.id, wait_ms, tail_bytes, cancel).await
+		cx.background.read(&parsed.id, wait_ms, tail_bytes, cancel, true).await
 	}
 
 	/// Kill a detached background process if still running (ADR 0034).
@@ -2995,7 +3165,7 @@ impl ToolRegistry {
 			id: String,
 		}
 		let parsed: StopProcessArgs =
-			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("stop_process", err.to_string()))?;
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("stop", err.to_string()))?;
 		cx.background.stop(&parsed.id).await
 	}
 
@@ -5943,16 +6113,16 @@ mod tests {
 
 		#[tokio::test]
 		async fn natural_exit_notifies_with_exit_code() {
-			let registry = BackgroundProcessRegistry::default();
+			let registry = Arc::new(BackgroundProcessRegistry::default());
 			let (sink, events) = collector();
 			registry.set_event_sink(sink);
 			let command = tokio::process::Command::new("true");
 			let (id, _log, _pid) = registry
-				.spawn("bg_0".into(), "call-1".into(), command, "true".into(), "host")
+				.spawn("bg_0".into(), "call-1".into(), command, "true".into(), "host", false)
 				.unwrap();
 			assert_eq!(id, "bg_0");
 			// Wait for the child to exit, then observe it via the
-			// registry's poll path (the same one `read_process` uses).
+			// registry's poll path (the same one `wait` uses).
 			for _ in 0..50 {
 				if registry.try_reap("bg_0") {
 					break;
@@ -5968,13 +6138,20 @@ mod tests {
 
 		#[tokio::test]
 		async fn turn_end_cleanup_reports_kill_for_still_running() {
-			let registry = BackgroundProcessRegistry::default();
+			let registry = Arc::new(BackgroundProcessRegistry::default());
 			let (sink, events) = collector();
 			registry.set_event_sink(sink);
 			let mut command = tokio::process::Command::new("sleep");
 			command.arg("30");
 			registry
-				.spawn("bg_0".into(), "call-9".into(), command, "sleep 30".into(), "host")
+				.spawn(
+					"bg_0".into(),
+					"call-9".into(),
+					command,
+					"sleep 30".into(),
+					"host",
+					false,
+				)
 				.unwrap();
 			registry.cleanup().await;
 			let got = events.lock().unwrap().clone();
@@ -5985,13 +6162,20 @@ mod tests {
 
 		#[tokio::test]
 		async fn stop_process_reports_kill() {
-			let registry = BackgroundProcessRegistry::default();
+			let registry = Arc::new(BackgroundProcessRegistry::default());
 			let (sink, events) = collector();
 			registry.set_event_sink(sink);
 			let mut command = tokio::process::Command::new("sleep");
 			command.arg("30");
 			registry
-				.spawn("bg_0".into(), "call-5".into(), command, "sleep 30".into(), "host")
+				.spawn(
+					"bg_0".into(),
+					"call-5".into(),
+					command,
+					"sleep 30".into(),
+					"host",
+					false,
+				)
 				.unwrap();
 			let result = registry.stop("bg_0").await.unwrap();
 			assert_eq!(result["killed"], true);
@@ -5999,6 +6183,100 @@ mod tests {
 			assert_eq!(got.len(), 1);
 			assert_eq!(got[0].0, "call-5");
 			assert!(got[0].1, "expected killed=true, got {got:?}");
+		}
+
+		/// Collect the wake notices a registry sends.
+		fn wake_collector() -> (crate::tools::BgWakeSink, Arc<Mutex<Vec<crate::tools::ProcessNotice>>>) {
+			let notices = Arc::new(Mutex::new(Vec::new()));
+			let notices_clone = notices.clone();
+			let wake = Arc::new(move |notice| notices_clone.lock().unwrap().push(notice));
+			(wake, notices)
+		}
+
+		fn shell(cmd: &str) -> tokio::process::Command {
+			let mut command = tokio::process::Command::new("sh");
+			command.args(["-c", cmd]);
+			command
+		}
+
+		async fn wait_until(pred: impl Fn() -> bool) {
+			for _ in 0..60 {
+				if pred() {
+					return;
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			}
+		}
+
+		#[tokio::test]
+		async fn notify_process_wakes_on_exit_without_polling() {
+			let registry = Arc::new(BackgroundProcessRegistry::default());
+			let (wake, notices) = wake_collector();
+			registry.set_wake(wake);
+			// Fixed ids, not `next_id`: other tests hardcode `bg_0`
+			// and share the log directory.
+			let id = "bg_notify_exit".to_string();
+			registry
+				.spawn(
+					id.clone(),
+					"call-n".into(),
+					shell("echo hello; exit 3"),
+					"probe".into(),
+					"host",
+					true,
+				)
+				.unwrap();
+			wait_until(|| !notices.lock().unwrap().is_empty()).await;
+			let got = notices.lock().unwrap().clone();
+			assert_eq!(got.len(), 1);
+			assert_eq!(got[0].id, id);
+			assert_eq!(got[0].exit_code, Some(3));
+			assert!(got[0].tail.contains("hello"));
+			assert!(registry.active_notify().is_empty());
+		}
+
+		#[tokio::test]
+		async fn waited_or_stopped_notify_process_does_not_wake() {
+			let registry = Arc::new(BackgroundProcessRegistry::default());
+			let (wake, notices) = wake_collector();
+			registry.set_wake(wake);
+
+			// A parked `wait` takes the result.
+			let waited = "bg_notify_waited".to_string();
+			registry
+				.spawn(
+					waited.clone(),
+					"call-w".into(),
+					shell("sleep 0.3"),
+					"w".into(),
+					"host",
+					true,
+				)
+				.unwrap();
+			let result = registry
+				.read(&waited, 5_000, 1_000, &tokio_util::sync::CancellationToken::new(), true)
+				.await
+				.unwrap();
+			assert_eq!(result["running"], false);
+
+			// A stopped one never reports.
+			let stopped = "bg_notify_stopped".to_string();
+			registry
+				.spawn(
+					stopped.clone(),
+					"call-s".into(),
+					shell("sleep 30"),
+					"s".into(),
+					"host",
+					true,
+				)
+				.unwrap();
+			assert_eq!(registry.active_notify().len(), 1);
+			registry.stop_notifying().await;
+			assert!(registry.active_notify().is_empty());
+
+			tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+			assert!(notices.lock().unwrap().is_empty(), "{:?}", notices.lock().unwrap());
 		}
 	}
 

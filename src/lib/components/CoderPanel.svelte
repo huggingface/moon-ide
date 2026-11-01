@@ -23,7 +23,7 @@
 	import ToolBodyWebFetch from './ToolBodyWebFetch.svelte';
 	import ToolBodyOpenBrowser from './ToolBodyOpenBrowser.svelte';
 	import ToolBodyOpenTerminal from './ToolBodyOpenTerminal.svelte';
-	import { parseSubagentReport } from '../subagentReport';
+	import { parseBackgroundResult, type BackgroundResultMessage } from '../backgroundResult';
 	import { splitTextLinks } from '../textLinks';
 	import { hintFor, isHuggingFaceHost, parseHttpError } from '../coderError';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
@@ -446,6 +446,14 @@
 		if (id !== null && coder.providerModels[id] === undefined) {
 			void coder.loadProviderModels(id);
 		}
+	});
+
+	// The active strip's process list: refetched when the session
+	// changes or a detached process starts / settles.
+	$effect(() => {
+		void coder.activeSession?.id;
+		void coder.backgroundVersion;
+		void coder.refreshActiveProcesses();
 	});
 
 	const reasoningChoices = $derived(coder.reasoningChoices);
@@ -1421,6 +1429,13 @@
 			await coder.abort();
 			return;
 		}
+		// Staged Esc (ADR 0102): the first one stopped the turn; with
+		// no turn running, the next one stops the background work.
+		if (event.key === 'Escape' && coder.hasBackgroundWork) {
+			event.preventDefault();
+			await coder.stopBackground();
+			return;
+		}
 		if (
 			event.key === 'ArrowUp' &&
 			!event.shiftKey &&
@@ -1794,7 +1809,7 @@
 		};
 	}
 
-	/** Parse `read_process` result — `{ id, running, exit_code, tail, cmd, target }`. */
+	/** Parse a process `wait` result — `{ id, running, exit_code, tail, cmd, target }`. */
 	function parseReadProcessResult(result: unknown): {
 		id: string;
 		running: boolean;
@@ -1820,7 +1835,14 @@
 		};
 	}
 
-	/** Parse `stop_process` result — `{ id, killed, exit_code, cmd, target }`. */
+	function backgroundResultLabel(result: BackgroundResultMessage): string {
+		if (result.kind === 'subagent') {
+			return result.status === 'error' ? 'sub-agent failed' : 'sub-agent report';
+		}
+		return result.status === 'error' ? `process exit ${result.exitCode ?? '?'}` : 'process done';
+	}
+
+	/** Parse a process `stop` result — `{ id, killed, exit_code, cmd, target }`. */
 	function parseStopProcessResult(result: unknown): {
 		id: string;
 		killed: boolean;
@@ -1973,8 +1995,8 @@
 			case 'respond_to_worker_prompt': {
 				return typeof o.worker_id === 'string' ? firstLine(o.worker_id) : null;
 			}
-			case 'read_process':
-			case 'stop_process': {
+			case 'wait':
+			case 'stop': {
 				return typeof o.id === 'string' ? o.id : null;
 			}
 			default:
@@ -3335,6 +3357,48 @@
 			{/if}
 		</div>
 		<div class="composer">
+			{#if coder.hasBackgroundWork}
+				<!-- Background work that will wake this session (ADR 0102). -->
+				<div class="background-strip" aria-label="Running in the background">
+					<span class="background-strip-label">Background</span>
+					{#each coder.backgroundSubagents as sub (sub.id)}
+						<span class="background-item" title={`Sub-agent ${sub.id} · ${sub.targetFolder}`}>
+							<span class="background-dot" aria-hidden="true"></span>
+							<span class="background-kind">{sub.mode}</span>
+							<span class="background-name">{baseName(sub.targetFolder)}</span>
+							<button
+								type="button"
+								class="background-stop"
+								title="Stop this sub-agent"
+								aria-label="Stop sub-agent"
+								onclick={() => void coder.abortSubagent(sub.id)}>×</button
+							>
+						</span>
+					{/each}
+					{#each coder.activeProcesses as proc (proc.id)}
+						<span class="background-item" title={`${proc.id}: ${proc.cmd}`}>
+							<span class="background-dot" aria-hidden="true"></span>
+							<span class="background-kind">$</span>
+							<span class="background-name">{proc.cmd}</span>
+							<button
+								type="button"
+								class="background-stop"
+								title="Stop this process"
+								aria-label="Stop process"
+								onclick={() => void coder.stopActiveProcess(proc.id)}>×</button
+							>
+						</span>
+					{/each}
+					{#if !coder.busy}
+						<button
+							type="button"
+							class="background-stop-all"
+							title="Stop all background work (Esc)"
+							onclick={() => void coder.stopBackground()}>stop all</button
+						>
+					{/if}
+				</div>
+			{/if}
 			{#if coder.attachments.length > 0}
 				<!-- Attached selections / images. Selection chips
 					 click through to the file at the captured
@@ -3727,22 +3791,26 @@
 {/snippet}
 
 {#snippet rowMarkup(row: CoderRow, inParentTranscript: boolean)}
-	{@const subagentReport = row.kind === 'user' ? parseSubagentReport(row.text) : null}
-	{#if subagentReport !== null}
-		<!-- A background sub-agent's completion callback (ADR 0091):
-			 sent as a user-role message, but it's the sub-agent
+	{@const backgroundResult = row.kind === 'user' ? parseBackgroundResult(row.text) : null}
+	{#if backgroundResult !== null}
+		<!-- Background work's completion message (ADR 0102): sent as
+			 a user-role message, but it's the sub-agent / process
 			 speaking, so it gets its own collapsed card. -->
 		<div class="row subagent-report">
 			<details>
 				<summary>
-					<span class="subagent-report-tag" class:error={subagentReport.status === 'error'}
-						>{subagentReport.status === 'error' ? 'sub-agent failed' : 'sub-agent report'}</span
+					<span class="subagent-report-tag" class:error={backgroundResult.status === 'error'}
+						>{backgroundResultLabel(backgroundResult)}</span
 					>
-					<span class="subagent-report-id">{subagentReport.subagentId}</span>
+					<span class="subagent-report-id">{backgroundResult.id}</span>
 				</summary>
-				<div class="bubble user-md">
-					<CoderMarkdown text={subagentReport.body} />
-				</div>
+				{#if backgroundResult.kind === 'process'}
+					<pre class="bubble background-process-output">{backgroundResult.body}</pre>
+				{:else}
+					<div class="bubble user-md">
+						<CoderMarkdown text={backgroundResult.body} />
+					</div>
+				{/if}
 			</details>
 		</div>
 	{:else if row.kind === 'user'}
@@ -4074,7 +4142,7 @@
 							<!-- Detached result (ADR 0034): the command was
 							 spawned as a background process. Show the
 							 command + the process id the model uses to
-							 poll via `read_process`, plus the live
+							 poll via `wait`, plus the live
 							 settlement state when the row is fresh (the
 							 `background_process_exited` event is live-only,
 							 so a replayed row shows no live claim). -->
@@ -4158,7 +4226,7 @@
 								<pre class="block">{fmtArgs(row.result)}</pre>
 							{/if}
 						{/if}
-					{:else if row.name === 'read_process'}
+					{:else if row.name === 'wait'}
 						{@const rpResult = row.hasResult ? parseReadProcessResult(row.result) : null}
 						{#if rpResult !== null}
 							<div class="bash-block">
@@ -4186,7 +4254,7 @@
 								<pre class="block">{fmtArgs(row.result)}</pre>
 							{/if}
 						{/if}
-					{:else if row.name === 'stop_process'}
+					{:else if row.name === 'stop'}
 						{@const spResult = row.hasResult ? parseStopProcessResult(row.result) : null}
 						{#if spResult !== null}
 							<div class="bash-block">
@@ -5431,6 +5499,13 @@
 	.row.subagent-report .bubble {
 		margin-top: 4px;
 	}
+	.background-process-output {
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		white-space: pre-wrap;
+		max-height: 320px;
+		overflow: auto;
+	}
 	.row.user.from-coordinator .bubble {
 		background: color-mix(in srgb, var(--m-accent) 6%, transparent);
 		border-left: 2px solid color-mix(in srgb, var(--m-accent) 45%, var(--m-border));
@@ -5979,6 +6054,75 @@
 		flex-direction: column;
 		gap: 6px;
 		position: relative;
+	}
+	.background-strip {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 4px;
+		font-size: 11px;
+		color: var(--m-fg-subtle);
+	}
+	.background-strip-label {
+		font-size: 10px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		margin-right: 2px;
+	}
+	.background-item {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		max-width: 240px;
+		padding: 1px 2px 1px 6px;
+		border: 1px solid var(--m-border);
+		border-radius: 999px;
+		color: var(--m-fg-muted);
+	}
+	.background-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--m-accent);
+		flex-shrink: 0;
+		animation: background-pulse 1.6s ease-in-out infinite;
+	}
+	@keyframes background-pulse {
+		50% {
+			opacity: 0.35;
+		}
+	}
+	.background-kind {
+		color: var(--m-fg-subtle);
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+	}
+	.background-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+	}
+	.background-stop,
+	.background-stop-all {
+		appearance: none;
+		background: transparent;
+		border: none;
+		color: var(--m-fg-subtle);
+		font: inherit;
+		cursor: pointer;
+		border-radius: 999px;
+	}
+	.background-stop {
+		padding: 0 5px;
+	}
+	.background-stop-all {
+		padding: 1px 6px;
+	}
+	.background-stop:hover,
+	.background-stop-all:hover {
+		color: var(--m-danger);
+		background: var(--m-bg-2);
 	}
 	.composer-meta {
 		display: flex;

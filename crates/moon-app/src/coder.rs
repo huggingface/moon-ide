@@ -229,6 +229,22 @@ pub async fn coder_abort(app: &AppCore) -> Result<(), MoonError> {
 	Ok(())
 }
 
+/// Stop the background work that would wake a session — running
+/// sub-agents and `notify` processes. The second Esc and the active
+/// strip's "stop all" (ADR 0102). `None` = the visible session.
+pub async fn coder_stop_background(app: &AppCore, session_id: Option<String>) -> Result<(), MoonError> {
+	app.coder.stop_background(session_id.as_deref()).await;
+	Ok(())
+}
+
+/// A session's running `notify` processes, for the active strip.
+pub async fn coder_active_background_processes(
+	app: &AppCore,
+	session_id: String,
+) -> Result<Vec<moon_coder::tools::ActiveProcess>, MoonError> {
+	Ok(app.coder.active_background_processes(&session_id).await)
+}
+
 /// "Go now" on a previously-queued steer — the button on the
 /// muted "queued" row in the transcript. Cancels the running turn
 /// and lets the spawn loop drain the steer into a fresh turn.
@@ -473,7 +489,7 @@ pub async fn coder_attached_workers(app: &AppCore, coordinator_id: String) -> Re
 /// Live snapshot of a session's detached background process (ADR
 /// 0085): running status, exit code, log tail. The panel's live
 /// tail polls this while the row is expanded — same registry the
-/// model's `read_process` reads.
+/// model's `wait` reads.
 pub async fn coder_read_background_process(
 	app: &AppCore,
 	session_id: String,
@@ -490,7 +506,7 @@ pub async fn coder_read_background_process(
 
 /// Kill a session's detached background process — the panel's stop
 /// affordance (ADR 0085). Same semantics as the model's
-/// `stop_process` tool; the settlement event flips the row.
+/// `stop` tool; the settlement event flips the row.
 pub async fn coder_stop_background_process(
 	app: &AppCore,
 	session_id: String,
@@ -1578,6 +1594,8 @@ crate::commands! {
 	coder_suggest_commit_message([app] message: String),
 	coder_suggest_terminal_command([app] request: String, target_kind: String, cwd: String),
 	coder_abort([app]),
+	coder_stop_background([app] session_id: Option<String>),
+	coder_active_background_processes([app] session_id: String),
 	coder_drain_steer_now([app] id: String),
 	coder_unqueue_steer([app] id: String),
 	coder_continue_subagent([app] subagent_id: String, text: String),

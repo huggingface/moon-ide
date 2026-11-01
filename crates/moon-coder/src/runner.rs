@@ -348,7 +348,7 @@ impl CoordinatorRegistry {
 }
 
 /// Whether a detached sub-agent run has settled, and how.
-/// `Aborted` is split from `Failed` so `task_collect` can say
+/// `Aborted` is split from `Failed` so `wait` can say
 /// "you aborted it" instead of surfacing a generic error.
 #[derive(Debug, Clone)]
 enum DetachedFinish {
@@ -358,9 +358,9 @@ enum DetachedFinish {
 }
 
 /// One in-flight (or settled, cached) detached sub-agent run.
-/// `notify` fires exactly once when the run settles; `task_collect`'s
+/// `notify` fires exactly once when the run settles; `wait`'s
 /// `wait_ms` blocks on it instead of busy-polling. `collectors`
-/// counts parent `task_collect` calls parked on it: a run that
+/// counts parent `wait` calls parked on it: a run that
 /// settles while one is waiting hands its report to that call and
 /// skips the completion callback (ADR 0091).
 struct DetachedEntry {
@@ -373,7 +373,7 @@ struct DetachedEntry {
 /// In-memory parent → detached-sub-agent registry ([ADR 0053]).
 /// Maps each parent session id to the detached sub-agents it
 /// spawned, so the finish feeder can tell which `SubagentFinished`
-/// events belong to which parent, `task_collect` / `task_abort`
+/// events belong to which parent, `wait` / `stop`
 /// can find a run by id, and the user-level abort can cascade to
 /// a session's live detached runs. Not persisted: a process
 /// restart loses the live runs the same way a coordinator's
@@ -385,7 +385,7 @@ struct DetachedTaskRegistry {
 	/// subscription lifetime and the abort cascade.
 	by_parent: HashMap<String, HashSet<String>>,
 	/// Sub-agent id → its run entry. Lives past `settle` so a
-	/// later `task_collect` still returns the cached report.
+	/// later `wait` still returns the cached report.
 	entries: HashMap<String, Arc<DetachedEntry>>,
 }
 
@@ -417,15 +417,15 @@ impl DetachedTaskRegistry {
 	}
 
 	/// The run entry for `subagent_id`, if it's a registered
-	/// detached run (live or settled-cached). `task_collect` /
-	/// `task_abort` look runs up here; ids that were never detached
+	/// detached run (live or settled-cached). `wait` /
+	/// `stop` look runs up here; ids that were never detached
 	/// (or were lost to a restart) miss.
 	fn entry(&self, subagent_id: &str) -> Option<Arc<DetachedEntry>> {
 		self.entries.get(subagent_id).cloned()
 	}
 
 	/// Record a run's terminal state and wake any parked
-	/// `task_collect(wait_ms)`. The entry stays in `entries` (and
+	/// `wait(wait_ms)`. The entry stays in `entries` (and
 	/// the parent's set) so a later collect returns the cached
 	/// report instantly.
 	async fn settle(entry: &DetachedEntry, finish: DetachedFinish) {
@@ -463,7 +463,7 @@ impl DetachedTaskRegistry {
 	/// their parent session) is what keeps a long-lived process
 	/// from accumulating one map entry per detached run forever.
 	/// Settled entries must NOT be pruned any earlier: the parent
-	/// may still `task_collect` a report several turns later.
+	/// may still `wait` a report several turns later.
 	fn prune_parent(&mut self, parent_session_id: &str) {
 		let Some(ids) = self.by_parent.remove(parent_session_id) else {
 			return;
@@ -506,7 +506,7 @@ struct SessionRuntime {
 	/// Detached background processes launched by this session's
 	/// turns (ADR 0085). Session-scoped — not per-turn — so an
 	/// interrupted turn doesn't kill the model's long build and
-	/// `read_process` ids stay valid across turns. Children die
+	/// `wait` ids stay valid across turns. Children die
 	/// with the runtime (`kill_on_drop`) or at IDE shutdown via
 	/// [`CoderHandle::kill_all_background_processes`].
 	background: Arc<crate::tools::BackgroundProcessRegistry>,
@@ -4636,16 +4636,49 @@ impl CoderHandle {
 		let Some(rt) = fs.runtime(&id).await else {
 			return;
 		};
-		// Stop means stop everything: the session's background
-		// sub-agents go too (ADR 0091). Aborted runs send no report,
-		// so this doesn't wake the session straight back up.
-		for token in self.state.detached_tasks.read().await.live_tokens_of(&id) {
-			token.cancel();
-		}
+		// The turn only: background sub-agents and `notify`
+		// processes keep running and still report (ADR 0102). A
+		// second Esc stops them via `stop_background`.
 		let turn = rt.turn.lock().await;
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
 		}
+	}
+
+	/// Stop a session's background work that would wake it: running
+	/// sub-agents and `notify` processes (the second Esc, ADR 0102).
+	/// Plain detached processes keep running. `None` targets the
+	/// active folder's visible session. Stopped work sends no result,
+	/// so this never wakes the session.
+	pub async fn stop_background(&self, session_id: Option<&str>) {
+		let id = match session_id {
+			Some(id) => id.to_owned(),
+			None => {
+				let Ok((fs, _)) = self.state.active_folder_session().await else {
+					return;
+				};
+				let Some(id) = fs.visible_session_id().await else {
+					return;
+				};
+				id
+			}
+		};
+		for token in self.state.detached_tasks.read().await.live_tokens_of(&id) {
+			token.cancel();
+		}
+		if let Some((rt, _)) = self.state.runtime_for_session(&id).await {
+			rt.background.stop_notifying().await;
+		}
+	}
+
+	/// A session's running `notify` processes, for the panel's
+	/// active-work strip. Sub-agents come from the panel's own
+	/// sub-agent state.
+	pub async fn active_background_processes(&self, session_id: &str) -> Vec<crate::tools::ActiveProcess> {
+		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
+			return Vec::new();
+		};
+		rt.background.active_notify()
 	}
 
 	/// "Go now" on a queued steer: the user typed a message mid-
@@ -5345,10 +5378,7 @@ impl CoderHandle {
 		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
 			return;
 		};
-		// Same cascade as `abort` (ADR 0091).
-		for token in self.state.detached_tasks.read().await.live_tokens_of(session_id) {
-			token.cancel();
-		}
+		// The turn only, like `abort` (ADR 0102).
 		let turn = rt.turn.lock().await;
 		if let Some(token) = turn.cancel.as_ref() {
 			token.cancel();
@@ -5695,7 +5725,7 @@ impl CoderHandle {
 	/// Live snapshot of one of a session's detached background
 	/// processes (ADR 0085): running status, exit code, log tail.
 	/// The panel's real-time view reads the same registry
-	/// `read_process` does, so the two can never disagree.
+	/// `wait` does, so the two can never disagree.
 	pub async fn read_background_process(
 		&self,
 		session_id: &str,
@@ -5708,13 +5738,13 @@ impl CoderHandle {
 			)));
 		};
 		rt.background
-			.read(id, 0, tail_bytes.clamp(1, 64_000), &CancellationToken::new())
+			.read(id, 0, tail_bytes.clamp(1, 64_000), &CancellationToken::new(), false)
 			.await
 	}
 
 	/// Kill one of a session's detached background processes — the
 	/// panel's stop affordance (ADR 0085). Same semantics as the
-	/// model's `stop_process` tool.
+	/// model's `stop` tool.
 	pub async fn stop_background_process(&self, session_id: &str, id: &str) -> Result<Value, CoderError> {
 		let Some((rt, _)) = self.state.runtime_for_session(session_id).await else {
 			return Err(CoderError::Internal(format!(
@@ -6593,7 +6623,7 @@ fn spawn_turn_loop(
 					// Session-scoped background-process registry (ADR
 					// 0085): survives turn boundaries — an interrupted
 					// turn keeps the model's detached builds running
-					// and its `read_process` ids valid.
+					// and its `wait` ids valid.
 					let background = rt_for_turn.background.clone();
 					// Live settlement notices for detached background
 					// processes (ADR 0034): the panel flips the spawning
@@ -6603,6 +6633,19 @@ fn spawn_turn_loop(
 					{
 						let sink = sink_for_turn.clone();
 						background.set_event_sink(Arc::new(move |event| sink.send(event)));
+						// `notify` processes wake the session (ADR 0102).
+						let state = state.clone();
+						let session_id = sink_for_turn.session_id.clone();
+						background.set_wake(Arc::new(move |notice| {
+							let handle = CoderHandle { state: state.clone() };
+							let session_id = session_id.clone();
+							tokio::spawn(async move {
+								// Best-effort: the session may have been deleted.
+								let _ = handle
+									.send_to(&session_id, process_result_message(&notice), Vec::new())
+									.await;
+							});
+						}));
 					}
 					// Capture the baseline SHA at turn start for per-turn
 					// diff attribution (ADR 0030) — a snapshot of the
@@ -6768,6 +6811,10 @@ async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &
 			return;
 		}
 	}
+	// Same for `notify` processes (ADR 0102).
+	if !rt.background.active_notify().is_empty() {
+		return;
+	}
 	let outcome = match result {
 		Ok(()) => TurnOutcome::Complete {
 			last_assistant: session
@@ -6900,12 +6947,9 @@ async fn run_turn(
 	tool_defs.extend(state.tools.terminal_definitions(&cx).await);
 	if mode.allows_task_tool() {
 		tool_defs.push(task_tool_definition());
-		// Detached-sub-agent companions ([ADR 0053]): advertised to
-		// the same `Agent` mode that sees `task`, so sub-agents and
-		// coordinators never see them.
-		tool_defs.push(crate::subagent::task_collect_tool_definition());
+		// Sub-agents are waited on / stopped through the registry's
+		// `wait` / `stop` (ADR 0102); steering is theirs alone.
 		tool_defs.push(crate::subagent::task_steer_tool_definition());
-		tool_defs.push(crate::subagent::task_abort_tool_definition());
 	}
 	if mode.allows_ask_user() {
 		tool_defs.push(ask_user_tool_definition());
@@ -7688,13 +7732,14 @@ async fn dispatch_tool_calls(
 		let dispatched_at = std::time::Instant::now();
 		let outcome = if call.function.name == "task" {
 			handle_task(state, rt, sink, &*cx, &call.id, &args).await
-		} else if call.function.name == "task_collect" {
-			// Detached-sub-agent report fetch ([ADR 0053]).
+		} else if call.function.name == "wait" && names_own_subagent(state, rt, &args).await {
+			// `wait` / `stop` on a sub-agent id (ADR 0102); process
+			// ids fall through to the registry.
 			handle_task_collect(state, rt, &args, cancel).await
+		} else if call.function.name == "stop" && names_own_subagent(state, rt, &args).await {
+			handle_task_abort(state, rt, &args).await
 		} else if call.function.name == "task_steer" {
 			handle_task_steer(state, rt, &args).await
-		} else if call.function.name == "task_abort" {
-			handle_task_abort(state, rt, &args).await
 		} else if call.function.name == "ask_user" {
 			// Bidirectional: parks a oneshot on the session's
 			// prompt registry and blocks the turn until the user
@@ -7827,7 +7872,7 @@ async fn handle_task(
 	}
 	// Every parent `task` runs in the background (ADR 0091): register,
 	// spawn, return a handle. The report reaches the parent through
-	// the completion callback or `task_collect`.
+	// the completion callback or `wait`.
 	spec.detach = true;
 	let mut result = handle_task_detached(state, sink, tool_call_id, spec).await?;
 	if let Some(note) = worktree_note {
@@ -7970,7 +8015,7 @@ async fn persist_worker_detached(
 /// the run, spawns it on a fresh root token, and returns a handle
 /// immediately — the parent keeps working. When the run settles its
 /// report goes to the parent as a message (the completion callback)
-/// unless a parked `task_collect` takes it; `task_abort`, the
+/// unless a parked `wait` takes it; `stop`, the
 /// pop-out's stop button, Esc, or a coordinator's `abort_worker`
 /// cancel it.
 async fn handle_task_detached(
@@ -8038,7 +8083,7 @@ async fn handle_task_detached(
 		DetachedTaskRegistry::settle(&entry, finish.clone()).await;
 		// The completion callback (ADR 0091): hand the report to the
 		// parent as a message — queued into its running turn, or
-		// waking it. Skipped when a parked `task_collect` already
+		// waking it. Skipped when a parked `wait` already
 		// takes it (`settle` stored the finish before this read, and
 		// a collector registers before re-checking the finish, so at
 		// least one of the two sees the other), and for aborts —
@@ -8076,13 +8121,13 @@ async fn handle_task_detached(
 		"detached": true,
 		"subagent_id": subagent_id,
 		"status": "running",
-		"hint": "its report will be delivered to you as a <subagent_report> message when it finishes — keep working, or call task_collect(subagent_id, wait_ms) if you need it before you can continue",
+		"hint": "its report will be delivered to you as a <background_result kind=\"subagent\"> message when it finishes — keep working, or call wait(id, wait_ms) if you need it before you can continue",
 	}))
 }
 
 /// The completion callback's text for a settled run, or `None` for
 /// an aborted one. Tagged so the model can tell it from something
-/// the user typed, and the panel can render it as a report card.
+/// the user typed, and the panel can render it as a result card.
 fn subagent_report_message(subagent_id: &str, finish: &DetachedFinish) -> Option<String> {
 	let (status, body) = match finish {
 		DetachedFinish::Done(report) => ("done", report.result.trim().to_owned()),
@@ -8090,13 +8135,37 @@ fn subagent_report_message(subagent_id: &str, finish: &DetachedFinish) -> Option
 		DetachedFinish::Aborted => return None,
 	};
 	Some(format!(
-		"<subagent_report subagent_id=\"{subagent_id}\" status=\"{status}\">\n{body}\n</subagent_report>"
+		"<background_result kind=\"subagent\" id=\"{subagent_id}\" status=\"{status}\">\n{body}\n</background_result>"
 	))
 }
 
+/// The wake text for a `notify` process that exited (ADR 0102).
+fn process_result_message(notice: &crate::tools::ProcessNotice) -> String {
+	let status = if notice.exit_code == Some(0) { "done" } else { "error" };
+	let exit_code = notice
+		.exit_code
+		.map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+	format!(
+		"<background_result kind=\"process\" id=\"{}\" status=\"{status}\" exit_code=\"{exit_code}\">\n$ {}\n{}\n</background_result>",
+		notice.id,
+		notice.cmd,
+		notice.tail.trim_end()
+	)
+}
+
+/// Whether a `wait` / `stop` call's `id` names one of this session's
+/// background sub-agents (rather than a process).
+async fn names_own_subagent(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>, args: &Value) -> bool {
+	let Some(id) = args.get("id").and_then(Value::as_str) else {
+		return false;
+	};
+	let parent_session_id = rt.session.lock().await.header.id.clone();
+	state.detached_tasks.read().await.is_detached_of(&parent_session_id, id)
+}
+
 /// Resolve `subagent_id` to one of the calling session's detached
-/// runs ([ADR 0053]) — the shared ownership gate of `task_collect` /
-/// `task_steer` / `task_abort`. `register` / `prune_parent` keep
+/// runs ([ADR 0053]) — the shared ownership gate of `wait` /
+/// `task_steer` / `stop`. `register` / `prune_parent` keep
 /// `by_parent` and `entries` in lockstep, so an ownership hit
 /// implies a live entry — one miss branch covers both "never yours"
 /// and "lost to a restart".
@@ -8121,7 +8190,7 @@ async fn own_detached_entry(
 	))
 }
 
-/// `task_collect` — return a detached run's report, optionally
+/// `wait` — return a detached run's report, optionally
 /// blocking up to `wait_ms` for it to settle. Only the parent that
 /// spawned the run may collect it.
 async fn handle_task_collect(
@@ -8132,13 +8201,13 @@ async fn handle_task_collect(
 ) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct CollectArgs {
-		subagent_id: String,
+		id: String,
 		#[serde(default)]
 		wait_ms: Option<u64>,
 	}
 	let parsed: CollectArgs =
-		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_collect", err.to_string()))?;
-	let entry = own_detached_entry(state, rt, "task_collect", &parsed.subagent_id).await?;
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("wait", err.to_string()))?;
+	let entry = own_detached_entry(state, rt, "wait", &parsed.id).await?;
 	// Already settled → return the cached finish immediately.
 	if let Some(value) = detached_collect_value(&entry).await {
 		return Ok(value);
@@ -8179,11 +8248,11 @@ async fn handle_task_collect(
 	Ok(json!({ "status": "running" }))
 }
 
-/// Cap on `task_collect`'s `wait_ms` — same 10 minutes as a blocking
+/// Cap on `wait`'s `wait_ms` — same 10 minutes as a blocking
 /// `bash` call.
 const TASK_COLLECT_MAX_WAIT_MS: u64 = 600_000;
 
-/// Map a settled [`DetachedEntry`] to the `task_collect` result
+/// Map a settled [`DetachedEntry`] to the `wait` result
 /// payload, or `None` while it's still running.
 async fn detached_collect_value(entry: &DetachedEntry) -> Option<Value> {
 	match entry.finish.lock().await.clone() {
@@ -8206,7 +8275,7 @@ async fn detached_collect_value(entry: &DetachedEntry) -> Option<Value> {
 /// ([`crate::subagent::queue_subagent_steer`]), tagged
 /// `from_coordinator` so the transcript shows the row as agent-sent.
 /// Only the parent that spawned the run may steer it, mirroring
-/// `task_collect` / `task_abort` ownership.
+/// `wait` / `stop` ownership.
 async fn handle_task_steer(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
@@ -8228,13 +8297,13 @@ async fn handle_task_steer(
 	if !crate::subagent::queue_subagent_steer(&parsed.subagent_id, parsed.text, true) {
 		return Ok(json!({
 			"status": "not_running",
-			"hint": "the run already settled; call `task_collect` for its report",
+			"hint": "the run already settled; call `wait` for its report",
 		}));
 	}
 	Ok(json!({ "status": "steered" }))
 }
 
-/// `task_abort` — cancel a running detached sub-agent's own token.
+/// `stop` — cancel a running detached sub-agent's own token.
 /// Scoped to the one run; never touches the parent turn or its
 /// sibling sub-agents.
 async fn handle_task_abort(
@@ -8244,11 +8313,11 @@ async fn handle_task_abort(
 ) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
 	struct AbortArgs {
-		subagent_id: String,
+		id: String,
 	}
 	let parsed: AbortArgs =
-		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("task_abort", err.to_string()))?;
-	let entry = own_detached_entry(state, rt, "task_abort", &parsed.subagent_id).await?;
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("stop", err.to_string()))?;
+	let entry = own_detached_entry(state, rt, "stop", &parsed.id).await?;
 	if entry.finish.lock().await.is_some() {
 		return Ok(json!({ "status": "not_running" }));
 	}
@@ -8922,6 +8991,7 @@ async fn handle_abort_worker(state: &Arc<CoderState>, args: &Value) -> Result<Va
 	ensure_worker_still_attached(state, "abort_worker", &parsed.worker_id).await?;
 	let handle = CoderHandle { state: state.clone() };
 	handle.abort_session(&parsed.worker_id).await;
+	handle.stop_background(Some(&parsed.worker_id)).await;
 	Ok(json!({ "status": "aborted" }))
 }
 
@@ -12307,6 +12377,20 @@ pub(crate) fn new_message_id() -> String {
 #[cfg(test)]
 mod tests {
 	#[test]
+	fn process_result_message_names_status_exit_code_and_tail() {
+		let notice = crate::tools::ProcessNotice {
+			id: "bg_4".into(),
+			cmd: "pnpm test".into(),
+			exit_code: Some(1),
+			tail: "2 failed\n".into(),
+		};
+		assert_eq!(
+			super::process_result_message(&notice),
+			"<background_result kind=\"process\" id=\"bg_4\" status=\"error\" exit_code=\"1\">\n$ pnpm test\n2 failed\n</background_result>"
+		);
+	}
+
+	#[test]
 	fn subagent_report_message_carries_the_report_and_skips_aborts() {
 		let report = crate::subagent::SubagentReport {
 			result: "  Found 3 callsites.\n".into(),
@@ -12317,7 +12401,9 @@ mod tests {
 		};
 		assert_eq!(
 			super::subagent_report_message("sub-1", &super::DetachedFinish::Done(report)).as_deref(),
-			Some("<subagent_report subagent_id=\"sub-1\" status=\"done\">\nFound 3 callsites.\n</subagent_report>")
+			Some(
+				"<background_result kind=\"subagent\" id=\"sub-1\" status=\"done\">\nFound 3 callsites.\n</background_result>"
+			)
 		);
 		let failed = super::subagent_report_message("sub-2", &super::DetachedFinish::Failed("boom".into()));
 		assert!(failed.is_some_and(|text| text.contains("status=\"error\"") && text.contains("boom")));
@@ -12672,7 +12758,7 @@ mod tests {
 
 		/// Regression: the finish feeder used to prune settled
 		/// entries right after sending the wake, so the parent's
-		/// later `task_collect` found nothing. The report must
+		/// later `wait` found nothing. The report must
 		/// stay collectable until the parent session is deleted.
 		#[tokio::test]
 		async fn settled_runs_stay_collectable_until_the_parent_is_pruned() {

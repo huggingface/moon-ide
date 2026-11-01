@@ -353,10 +353,10 @@
 				return 'update todo';
 			case 'ask_user':
 				return 'ask user';
-			case 'read_process':
-				return `poll ${p('id') || 'process'}`;
-			case 'stop_process':
-				return `stop ${p('id') || 'process'}`;
+			case 'wait':
+				return `wait ${p('id') || ''}`.trim();
+			case 'stop':
+				return `stop ${p('id') || ''}`.trim();
 			case 'spawn_worker':
 				return p('name') ? `spawn worker ${p('name')}` : 'spawn worker';
 			case 'observe_worker':

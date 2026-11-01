@@ -184,13 +184,13 @@ pub enum CoderEvent {
 
 	/// A detached background process (a `bash` call with
 	/// `detach: true`, ADR 0034) settled: it exited on its own,
-	/// `stop_process` killed it, or the turn-end cleanup reaped it.
+	/// `stop` killed it, or the turn-end cleanup reaped it.
 	/// Live-only — never persisted or replayed; a reopened session
 	/// shows the persisted spawn row and no live process state.
 	/// `tool_call_id` is the spawning `bash` call's id so the panel
 	/// can flip that row's status without pattern-matching the
 	/// opaque process id. `killed` is `true` when the settle was a
-	/// kill (`stop_process` or turn-end cleanup) rather than a
+	/// kill (`stop` or turn-end cleanup) rather than a
 	/// natural exit; `exit_code` is whatever status was collected,
 	/// `None` when the kill couldn't reap one.
 	BackgroundProcessExited {

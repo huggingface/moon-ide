@@ -1758,8 +1758,16 @@ export type FleetMember = { id: string; title: string };
 /**
  * Snapshot of a detached background process (ADR 0085), as returned
  * by `coder_read_background_process` — the same shape the model's
- * `read_process` tool sees.
+ * `wait` tool sees.
  */
+/** A running `notify` process (ADR 0102), as listed by
+ *  `coder_active_background_processes` for the active strip. */
+export type ActiveBackgroundProcess = {
+	id: string;
+	tool_call_id: string;
+	cmd: string;
+};
+
 export type BackgroundProcessSnapshot = {
 	id: string;
 	running: boolean;
@@ -1877,7 +1885,7 @@ export type CoderEvent =
 	  }
 	/** A detached background process (a `bash` call with
 	 *  `detach: true`, ADR 0034) settled: natural exit, a
-	 *  `stop_process` kill, or the turn-end cleanup. Live-only —
+	 *  `stop` kill, or the turn-end cleanup. Live-only —
 	 *  never persisted or replayed. `tool_call_id` is the spawning
 	 *  `bash` call's row id; `killed` distinguishes a kill from a
 	 *  natural exit; `exit_code` is whatever status was collected

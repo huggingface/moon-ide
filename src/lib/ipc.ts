@@ -50,6 +50,7 @@ import type {
 	RevertedMessage,
 	RerunToolOutcome,
 	AttachWorkerOutcome,
+	ActiveBackgroundProcess,
 	BackgroundProcessSnapshot,
 	DisconnectWorkerOutcome,
 	FleetMember,
@@ -474,6 +475,9 @@ export const ipc = {
 			call<BackgroundProcessSnapshot>('coder_read_background_process', { sessionId, id }),
 		stopBackgroundProcess: (sessionId: string, id: string) =>
 			call<unknown>('coder_stop_background_process', { sessionId, id }),
+		stopBackground: (sessionId: string | null) => call<void>('coder_stop_background', { sessionId }),
+		activeBackgroundProcesses: (sessionId: string) =>
+			call<ActiveBackgroundProcess[]>('coder_active_background_processes', { sessionId }),
 		newWorktreeSession: (baseBranch?: string) =>
 			call<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
 		discardWorktree: (path: string, force: boolean) => call<Workspace>('coder_discard_worktree', { path, force }),

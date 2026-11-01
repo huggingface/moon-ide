@@ -28,6 +28,7 @@ import {
 	type ChatGptAccount,
 	type ChatGptDeviceCode,
 	type CoderProviderConfig,
+	type ActiveBackgroundProcess,
 	type CoderSessionSummary,
 	type CoderStatus,
 	type DeviceCode,
@@ -3174,6 +3175,63 @@ export class CoderPanelState {
 		}
 	}
 
+	/** Running `notify` processes of the visible session (ADR 0102),
+	 *  refreshed by [`refreshActiveProcesses`]. Sub-agents come from
+	 *  [`backgroundSubagents`]. */
+	activeProcesses = $state<ActiveBackgroundProcess[]>([]);
+	/** Bumped whenever a detached process may have started or
+	 *  settled, so the panel knows to refresh `activeProcesses`. */
+	backgroundVersion = $state(0);
+
+	async refreshActiveProcesses(): Promise<void> {
+		const id = this.activeSession?.id ?? null;
+		if (id === null) {
+			this.activeProcesses = [];
+			return;
+		}
+		try {
+			const list = await ipc.coder.activeBackgroundProcesses(id);
+			if (this.activeSession?.id === id) {
+				this.activeProcesses = list;
+			}
+		} catch {
+			this.activeProcesses = [];
+		}
+	}
+
+	/** The visible session's running background sub-agents. */
+	get backgroundSubagents(): SubagentSummary[] {
+		return [...this.subagentSummaries.values()].filter((s) => s.status === 'running' && !s.worker);
+	}
+
+	/** Whether anything would still wake the visible session. */
+	get hasBackgroundWork(): boolean {
+		return this.activeProcesses.length > 0 || this.backgroundSubagents.length > 0;
+	}
+
+	/** Stop everything that would wake the visible session — the
+	 *  second Esc and the strip's "stop all" (ADR 0102). */
+	async stopBackground(): Promise<void> {
+		try {
+			await ipc.coder.stopBackground(this.activeSession?.id ?? null);
+		} finally {
+			await this.refreshActiveProcesses();
+		}
+	}
+
+	/** Stop one `notify` process from the strip. */
+	async stopActiveProcess(processId: string): Promise<void> {
+		const sessionId = this.activeSession?.id ?? null;
+		if (sessionId === null) {
+			return;
+		}
+		try {
+			await ipc.coder.stopBackgroundProcess(sessionId, processId);
+		} finally {
+			await this.refreshActiveProcesses();
+		}
+	}
+
 	/** "Go now" on a queued steer — the button on the muted
 	 *  "queued" row. The message is already in the backend's
 	 *  `pending_steers` (queued by a `send` issued while a turn
@@ -3665,6 +3723,7 @@ export class CoderPanelState {
 					// `background_process_exited` event settles it.
 					if (toolRow.name === 'bash' && isDetachedBashResult(event.result)) {
 						toolRow.bgStatus = { state: 'running' };
+						this.backgroundVersion += 1;
 					}
 					// The parked `ask_user` prompt just resolved
 					// (answered or skipped) — drop the "needs input"
@@ -3694,7 +3753,7 @@ export class CoderPanelState {
 			}
 			case 'background_process_exited': {
 				// Live-only settlement notice for a detached `bash`
-				// process (ADR 0034): natural exit, `stop_process`
+				// process (ADR 0034): natural exit, `stop`
 				// kill, or the turn-end cleanup reaping a
 				// still-running child.
 				const toolRow = findRowById(session.rows, event.tool_call_id);
@@ -3703,6 +3762,7 @@ export class CoderPanelState {
 						? { state: 'killed' }
 						: { state: 'exited', exitCode: event.exit_code ?? null };
 				}
+				this.backgroundVersion += 1;
 				return;
 			}
 			case 'tool_output_delta':

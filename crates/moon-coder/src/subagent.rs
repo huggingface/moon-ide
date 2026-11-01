@@ -326,7 +326,7 @@ pub struct Subagent {
 	/// Whether this run is a background run of a top-level parent
 	/// (every parent `task` is, ADR 0091): the tool call returns a
 	/// handle immediately and the report arrives via the completion
-	/// callback or `task_collect`. `false` for nested (blocking)
+	/// callback or `wait`. `false` for nested (blocking)
 	/// runs and user-driven resumes.
 	pub detach: bool,
 	/// Folder the sub-agent's tools operate against. May differ
@@ -348,7 +348,7 @@ pub struct Subagent {
 /// metadata the UI uses to render the collapsed card / pop-out.
 ///
 /// `Serialize` so a detached run ([ADR 0053]) can stash the
-/// finished report in the registry and have `task_collect`
+/// finished report in the registry and have `wait`
 /// return it verbatim.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SubagentReport {
@@ -384,7 +384,7 @@ pub fn task_tool_definition() -> ToolDefinition {
 		"task",
 		"Delegate a self-contained task to a sub-agent that runs in the background. Sub-agents run in their own context — you spend tokens on the task description and the final report, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
 \
-The call returns at once with a `subagent_id`. When the sub-agent finishes, its report is delivered to you automatically as a `<subagent_report>` message — mid-turn, or by waking you if your turn already ended — so never poll for it. If you need the report before you can do anything else, call `task_collect(subagent_id, wait_ms)` to block on it (it then isn't delivered a second time); otherwise keep working. Several `task` calls run concurrently. Use `task_steer` to redirect a running sub-agent and `task_abort` to stop one. \
+The call returns at once with a `subagent_id`. When the sub-agent finishes, its report is delivered to you automatically as a `<background_result>` message — mid-turn, or by waking you if your turn already ended — so never poll for it. If you need the report before you can do anything else, call `wait(subagent_id, wait_ms)` to block on it (it then isn't delivered a second time); otherwise keep working. Several `task` calls run concurrently. Use `task_steer` to redirect a running sub-agent and `stop(subagent_id)` to cancel one. \
 \
 The sub-agent has no access to your conversation history — describe the task self-containedly. An `agent`-mode sub-agent can itself delegate read-only investigations to nested `research` sub-agents; `research` sub-agents cannot delegate further.",
 		json!({
@@ -443,36 +443,12 @@ The sub-agent has no access to your conversation history — describe the task s
 	)
 }
 
-/// `task_collect` — fetch a detached sub-agent's report ([ADR
-/// 0053]). Lives outside `ToolRegistry::definitions()` alongside
-/// `task_tool_definition` so sub-agents never see it.
-pub fn task_collect_tool_definition() -> ToolDefinition {
-	ToolDefinition::function(
-			"task_collect",
-			"Block on a sub-agent's report when you need it before continuing (reports are otherwise delivered to you automatically when the run finishes). Returns `{ status: \"done\", result, tokens_used_estimate, iterations_used }` once it settles, `{ status: \"error\", error }` on failure, `{ status: \"aborted\" }`, or `{ status: \"running\" }` if `wait_ms` elapsed first. A report collected while you were waiting on it is not delivered again. Only ids your own session's `task` calls returned are collectable.",
-			json!({
-				"type": "object",
-				"properties": {
-					"subagent_id": {
-						"type": "string",
-						"description": "The `subagent_id` a `task` call returned."
-					},
-					"wait_ms": {
-						"type": "integer",
-						"description": "Block up to this many milliseconds for the run to settle (capped at 600000 = 10 minutes). Omit to return immediately with the current status."
-					}
-				},
-				"required": ["subagent_id"]
-			}),
-		)
-}
-
 /// `task_steer` — queue a steering message into a running detached
 /// sub-agent (ADR 0071). Rides the same steer channel as the
 /// pop-out composer, so delivery semantics are identical: queued
 /// now, drained at the top of the sub-agent's next iteration.
-/// Advertised alongside `task_collect` / `task_abort` to `Agent`
-/// mode only.
+/// Advertised to `Agent` mode only; waiting on and stopping a
+/// sub-agent go through `wait` / `stop` (ADR 0102).
 pub fn task_steer_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 			"task_steer",
@@ -490,26 +466,6 @@ pub fn task_steer_tool_definition() -> ToolDefinition {
 					}
 				},
 				"required": ["subagent_id", "text"]
-			}),
-		)
-}
-
-/// `task_abort` — cancel a running detached sub-agent ([ADR
-/// 0053]). Scoped to the one sub-agent; never touches the parent
-/// turn or sibling sub-agents.
-pub fn task_abort_tool_definition() -> ToolDefinition {
-	ToolDefinition::function(
-			"task_abort",
-			"Cancel a running sub-agent. Its partial work is discarded (files it already wrote stay), and no report is delivered for it. Returns `{ status: \"aborted\" }` when it was running, `{ status: \"not_running\" }` when it had already settled. Never affects your own turn or other sub-agents.",
-			json!({
-				"type": "object",
-				"properties": {
-					"subagent_id": {
-						"type": "string",
-						"description": "The `subagent_id` a `task` call returned."
-					}
-				},
-				"required": ["subagent_id"]
 			}),
 		)
 }
@@ -1883,7 +1839,7 @@ async fn handle_subagent_todo_write(
 
 const RESEARCH_SYSTEM_PROMPT: &str = r#"You are a research sub-agent inside moon-ide. You have been spawned by a parent agent to gather information from a workspace folder and report back. Your job is investigation, not editing.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `read_process`, and `stop_process`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `wait`, and `stop`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
 
 The shell is for read-only inspection only — `git log`, `git diff --stat`, `cargo check`, `pytest --collect-only`, `ls -la`, `cat`, `wc`, and similar. Do **not** run commands that mutate the filesystem, network state, or remote services. No `git commit`, `git push`, `cargo build` (it writes to `target/`), `mv`, `rm`, `npm install`, `pip install`, redirection-to-file (`> path`, `>> path`), or anything that would change persistent state.
 
@@ -1892,7 +1848,7 @@ Return your findings as a single coherent text result when you finish. The paren
 
 const AGENT_SYSTEM_PROMPT: &str = r#"You are an agent sub-agent inside moon-ide. You have been spawned by a parent agent to perform a focused task in a workspace folder. Your capabilities are the same as the parent's — you can read, search, run commands, and edit files freely.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `read_process`, `stop_process`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `wait`, `stop`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it.
 
 You can delegate self-contained read-only investigations to nested research sub-agents via the `task` tool — useful when the answer is much smaller than the inputs (grep-then-read sweeps, "find every callsite of X"). Nested sub-agents are research-only, run synchronously, and cannot delegate further.
 
