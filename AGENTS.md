@@ -82,7 +82,8 @@ These are enforced by reviewers and CI; breaking them is a real bug:
 
 ## Commit/PR hygiene
 
-- **Commit straight to `main` and push.** This is a small, non-collaborative repo: no feature branches, no PRs, and **no worktrees** (`enter_worktree`, `task` with `worktree`, `git worktree add`) unless the human explicitly asks for one.
+- **Work in the main checkout; don't create worktrees** (`enter_worktree`, `task` with `worktree`, `git worktree add`) or feature branches unless the human explicitly asks. This is a small, non-collaborative repo.
+- **Don't commit or push unless asked.** The human commits and pushes.
 - Commits should be atomic and tell a story; no "wip" or "fix" alone.
 - A change that touches both Rust and TS for the same feature lands in one commit.
 - Reference the spec/ADR you're implementing in the commit body when relevant.
