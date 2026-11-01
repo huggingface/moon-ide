@@ -8,6 +8,10 @@
 //! on a background tokio task and re-broadcast each change as a
 //! Tauri event, which the frontend picks up to repaint.
 //!
+//! The same value is pushed into GTK as the app theme, which is what
+//! WebKitGTK derives `prefers-color-scheme` from: pages in the IDE's
+//! browser tabs then render dark on a dark desktop.
+//!
 //! macOS and Windows don't need this — the webview's own
 //! `onThemeChanged` event fires there — so the watcher compiles
 //! down to a no-op shim on those platforms.
@@ -73,11 +77,36 @@ async fn run(app: AppHandle) {
 		}
 	};
 	tracing::info!("system theme watcher: subscribed to XDG color-scheme changes");
+	match settings.color_scheme().await {
+		Ok(scheme) => apply_to_webviews(&app, scheme_to_system_theme(scheme)),
+		Err(err) => tracing::warn!(error = %err, "system theme watcher: could not read the color scheme"),
+	}
 	while let Some(scheme) = stream.next().await {
 		let payload = scheme_to_system_theme(scheme);
+		apply_to_webviews(&app, payload);
 		if let Err(err) = app.emit(SYSTEM_THEME_EVENT, &payload) {
 			tracing::warn!(error = %err, "failed to emit {SYSTEM_THEME_EVENT}");
 		}
 	}
 	tracing::info!("system theme watcher: stream ended");
+}
+
+/// GTK's app-wide dark preference, which WebKitGTK maps onto
+/// `prefers-color-scheme`. An unset portal preference counts as dark,
+/// matching how the IDE's own theme resolves it.
+#[cfg(any(
+	target_os = "linux",
+	target_os = "freebsd",
+	target_os = "dragonfly",
+	target_os = "netbsd",
+	target_os = "openbsd",
+))]
+fn apply_to_webviews(app: &AppHandle, theme: moon_protocol::theme::SystemTheme) {
+	use moon_protocol::theme::SystemTheme;
+
+	let theme = match theme {
+		SystemTheme::Light => tauri::Theme::Light,
+		SystemTheme::Dark | SystemTheme::Unspecified => tauri::Theme::Dark,
+	};
+	app.set_theme(Some(theme));
 }
