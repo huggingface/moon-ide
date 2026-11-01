@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { Compartment, EditorState, type Extension } from '@codemirror/state';
 	import { EditorView, lineNumbers } from '@codemirror/view';
-	import { foldGutter } from '@codemirror/language';
+	import { foldGutter, indentUnit } from '@codemirror/language';
 	import { highlightSelectionMatches } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { MergeView, diff as rawDiff } from '@codemirror/merge';
@@ -14,7 +14,7 @@
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import { diffCollapseContextExtension } from '../editor/diffCollapseContext';
-	import type { GitFileStatus } from '../protocol';
+	import type { EditorConfig, GitFileStatus } from '../protocol';
 
 	type Props = {
 		path: string;
@@ -46,6 +46,16 @@
 	const themeB = new Compartment();
 	const wrapA = new Compartment();
 	const wrapB = new Compartment();
+	// `tabSize` decides how wide a literal `\t` renders, so both
+	// read-only panes still need the repo's editorconfig; without it
+	// CodeMirror falls back to 4.
+	const ecA = new Compartment();
+	const ecB = new Compartment();
+
+	function editorConfigExtensions(ec: EditorConfig): Extension {
+		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
+		return [EditorState.tabSize.of(Math.max(1, ec.tab_width)), indentUnit.of(unit)];
+	}
 
 	function fileName(p: string): string {
 		const slash = p.lastIndexOf('/');
@@ -102,10 +112,11 @@
 			return;
 		}
 		const firstLine = after.length > 0 ? firstLineOf(after) : firstLineOf(base);
-		const lang = await languageFor(path, firstLine);
+		const [lang] = await Promise.all([languageFor(path, firstLine), workspace.ensureEditorConfig(path)]);
 		if (token !== buildToken || !host) {
 			return;
 		}
+		const ec = editorConfigExtensions(workspace.editorConfigFor(path));
 
 		const readOnly: Extension[] = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
 
@@ -138,6 +149,7 @@
 			...commonExts,
 			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
 			langA.of(lang),
+			ecA.of(ec),
 			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			selectionPublish,
 			...readOnly,
@@ -154,6 +166,7 @@
 			highlightTabs(),
 			themeB.of(moonEditorTheme(workspace.effectiveTheme)),
 			langB.of(lang),
+			ecB.of(ec),
 			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			selectionPublish,
 			...readOnly,
@@ -244,6 +257,15 @@
 			workspace.setActiveSelection(null);
 		}
 	}
+
+	$effect(() => {
+		const ec = editorConfigExtensions(workspace.editorConfigFor(path));
+		if (!merge) {
+			return;
+		}
+		merge.a.dispatch({ effects: ecA.reconfigure(ec) });
+		merge.b.dispatch({ effects: ecB.reconfigure(ec) });
+	});
 
 	onMount(() => {
 		registerSection(path, sectionEl ?? null);

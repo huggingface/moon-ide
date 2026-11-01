@@ -422,7 +422,7 @@
 			return;
 		}
 		const firstLine = working.length > 0 ? firstLineOf(working) : firstLineOf(base);
-		const lang = await languageFor(path, firstLine);
+		const [lang] = await Promise.all([languageFor(path, firstLine), workspace.ensureEditorConfig(path)]);
 		if (token !== buildToken || !host) {
 			return;
 		}
