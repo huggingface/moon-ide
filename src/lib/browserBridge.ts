@@ -16,6 +16,8 @@ const MARK = 'moonIdeBridge';
 const QUEUE_TTL_MS = 30_000;
 
 type Frame = {
+	/** The tab's `<iframe>`, measured for screenshots. */
+	element: HTMLIFrameElement;
 	target: Window;
 	/** `http://127.0.0.1:<proxy>` the iframe actually loads. */
 	proxiedOrigin: string;
@@ -42,10 +44,32 @@ export function toOriginalUrl(href: string, proxiedOrigin: string, originalOrigi
 }
 
 function send(frame: Frame, request: BrowserPageRequest) {
+	if (request.op === 'screenshot') {
+		void capture(frame, request.request_id);
+		return;
+	}
 	frame.target.postMessage(
 		{ [MARK]: 1, kind: 'request', id: request.request_id, op: request.op, args: request.args },
 		'*',
 	);
+}
+
+/** Screenshots are taken by the IDE, not the page: a native snapshot
+ *  of the window's webview cropped to the iframe (ADR 0103). */
+async function capture(frame: Frame, requestId: number): Promise<void> {
+	// Let a just-focused tab lay out and paint before measuring.
+	await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+	const rect = frame.element.getBoundingClientRect();
+	try {
+		const png = await ipc.browser.capture(rect.left, rect.top, rect.width, rect.height, window.innerWidth);
+		await ipc.browser.respond(
+			requestId,
+			{ png_base64: png, width: Math.round(rect.width), height: Math.round(rect.height) },
+			null,
+		);
+	} catch (err) {
+		await ipc.browser.respond(requestId, null, err instanceof Error ? err.message : String(err));
+	}
 }
 
 function flush(tabId: number, frame: Frame) {

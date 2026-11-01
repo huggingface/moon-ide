@@ -80,6 +80,12 @@ libc = "0.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 ashpd = "0.10"
+# Browser-tab screenshots (ADR 0103): WebKitGTK's own snapshot of the
+# window's webview, cropped with cairo. Versions match what tauri's
+# wry pulls in, so no second copy of the GTK stack.
+webkit2gtk = "2.0"
+gio = "0.18"
+cairo-rs = { version = "0.18", features = ["png"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

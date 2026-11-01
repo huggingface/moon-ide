@@ -32,16 +32,11 @@ use crate::AppCore;
 /// refused.
 pub async fn browser_resolve_url(app: &AppCore, url: String, in_container: bool) -> Result<String, MoonError> {
 	let mut parsed = Url::parse(url.trim()).map_err(|err| MoonError::invalid(format!("invalid url: {err}")))?;
-	match (parsed.scheme(), in_container) {
-		("http", _) => {}
-		("https", false) => return Ok(parsed.into()),
-		("https", true) => {
-			return Err(MoonError::invalid(
-				"https URLs inside the container aren't supported; use the dev server's http port",
-			));
-		}
+	let tls = match parsed.scheme() {
+		"http" => false,
+		"https" => true,
 		_ => return Err(MoonError::invalid("only http/https URLs can be opened")),
-	}
+	};
 	let dial_host = match parsed.host() {
 		Some(Host::Ipv4(ip)) if ip.is_unspecified() => "localhost".to_owned(),
 		Some(Host::Ipv6(ip)) if ip.is_unspecified() => "localhost".to_owned(),
@@ -76,9 +71,14 @@ pub async fn browser_resolve_url(app: &AppCore, url: String, in_container: bool)
 	};
 	let local_port = app
 		.preview_tunnels
-		.ensure(sides, &dial_host, port)
+		.ensure(sides, &dial_host, port, tls)
 		.await
 		.map_err(MoonError::io)?;
+	// The frame always loads the proxy over plain http; TLS is the
+	// proxy's business upstream.
+	parsed
+		.set_scheme("http")
+		.map_err(|()| MoonError::internal("could not switch the proxied URL to http"))?;
 	parsed
 		.set_host(Some("127.0.0.1"))
 		.map_err(|err| MoonError::internal(err.to_string()))?;

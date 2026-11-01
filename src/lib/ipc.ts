@@ -311,6 +311,10 @@ export const ipc = {
 		focus: (id: number) => call<void>('browser_tab_focus', { id }),
 		close: (id: number) => call<void>('browser_tab_close', { id }),
 		location: (id: number, url: string) => call<void>('browser_tab_location', { id, url }),
+		/** Native snapshot of this window's webview, cropped to a CSS-px
+		 *  rect; base64 PNG. Desktop-local (ADR 0103). */
+		capture: (x: number, y: number, width: number, height: number, viewportWidth: number) =>
+			local<string>('browser_capture', { x, y, width, height, viewportWidth }),
 		/** Answer a `browser:page_request` (`error` non-null = failed). */
 		respond: (requestId: number, value: unknown, error: string | null) =>
 			call<void>('browser_page_respond', { requestId, value, error }),

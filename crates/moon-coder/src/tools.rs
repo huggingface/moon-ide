@@ -1661,14 +1661,14 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"browser_page",
-				"Read and drive the page inside an IDE browser tab (`tab_id` from `open_browser` / `list_browser_tabs`) — for checking your UI work the way the user sees it. Actions:\n- `snapshot`: page URL, title, and a text outline of what's visible; interactive elements carry refs like `[e12]`.\n- `click` (`ref` or CSS `selector`), `type` (`ref`/`selector`, `text`, optional `submit: true` to submit the form, `clear: false` to append), `select` (`ref`/`selector`, option `value` or label), `press` (`key`, e.g. `Enter`, dispatched to the focused element). These return a fresh snapshot, so you rarely need a separate one; refs from older snapshots go stale.\n- `eval`: run a JS `expression` in the page (awaited if it returns a promise); returns the JSON-serialised result.\n- `console`: the page's recent console output and uncaught errors (`clear: true` to reset).\n- `wait_for`: wait until a `selector` or `text` appears (`timeout_ms`, max 15000).\nEvents are synthetic (`isTrusted` false): fine for app logic, but native behaviours like a real key's default action don't happen. Only works on http pages loaded through the IDE; the tab is brought to front if needed (which reloads it if it wasn't visible).",
+				"Read and drive the page inside an IDE browser tab (`tab_id` from `open_browser` / `list_browser_tabs`) — for checking your UI work the way the user sees it. Actions:\n- `snapshot`: page URL, title, and a text outline of what's visible; interactive elements carry refs like `[e12]`.\n- `screenshot`: an image of the tab as rendered (its visible area) — for layout, styling and anything visual the outline can't show.\n- `click` (`ref` or CSS `selector`), `type` (`ref`/`selector`, `text`, optional `submit: true` to submit the form, `clear: false` to append), `select` (`ref`/`selector`, option `value` or label), `press` (`key`, e.g. `Enter`, dispatched to the focused element). These return a fresh snapshot, so you rarely need a separate one; refs from older snapshots go stale.\n- `eval`: run a JS `expression` in the page (awaited if it returns a promise); returns the JSON-serialised result.\n- `console`: the page's recent console output and uncaught errors (`clear: true` to reset).\n- `wait_for`: wait until a `selector` or `text` appears (`timeout_ms`, max 15000).\nEvents are synthetic (`isTrusted` false): fine for app logic, but native behaviours like a real key's default action don't happen. Works on any http(s) page the tab loaded; the tab is brought to front if needed (which reloads it if it wasn't visible).",
 				json!({
 					"type": "object",
 					"properties": {
 						"tab_id": { "type": "integer" },
 						"action": {
 							"type": "string",
-							"enum": ["snapshot", "click", "type", "select", "press", "eval", "console", "wait_for"]
+							"enum": ["snapshot", "screenshot", "click", "type", "select", "press", "eval", "console", "wait_for"]
 						},
 						"ref": { "type": "string", "description": "Element ref from the latest snapshot, e.g. `e12`." },
 						"selector": { "type": "string", "description": "CSS selector, alternative to `ref`." },
@@ -2919,7 +2919,7 @@ impl ToolRegistry {
 			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("browser_page", err.to_string()))?;
 		let action = parsed.action.as_str();
 		let acts = matches!(action, "click" | "type" | "select" | "press" | "eval");
-		if !matches!(action, "snapshot" | "console" | "wait_for") && !acts {
+		if !matches!(action, "snapshot" | "screenshot" | "console" | "wait_for") && !acts {
 			return Err(CoderError::invalid_args(
 				"browser_page",
 				format!("unknown action `{action}`"),
@@ -2939,10 +2939,21 @@ impl ToolRegistry {
 		let request = self
 			.browser_tabs
 			.page_request(parsed.tab_id, action, bridge_args, timeout);
+		if action == "screenshot" && !self.images_supported().await {
+			return Err(CoderError::tool_failed(
+				"browser_page",
+				"the active model does not accept image input — use `snapshot` instead",
+			));
+		}
 		let value = tokio::select! {
 			result = request => result.map_err(|msg| CoderError::tool_failed("browser_page", msg))?,
 			() = cancel.cancelled() => return Err(CoderError::Aborted),
 		};
+		if action == "screenshot" {
+			return tokio::task::spawn_blocking(move || screenshot_result(value))
+				.await
+				.map_err(|err| CoderError::tool_failed("browser_page", format!("screenshot encoding failed: {err}")))?;
+		}
 		if !matches!(action, "click" | "type" | "select" | "press") {
 			return Ok(value);
 		}
@@ -3636,6 +3647,22 @@ fn image_mime_for(path: &str) -> Option<&'static str> {
 		"webp" => "image/webp",
 		_ => return None,
 	})
+}
+
+/// Turn the frontend's capture (`{ png_base64, width, height }`, CSS px)
+/// into a tool result carrying the image the model sees.
+fn screenshot_result(value: Value) -> Result<Value, CoderError> {
+	let Some(data) = value.get("png_base64").and_then(Value::as_str) else {
+		return Err(CoderError::tool_failed("browser_page", "screenshot returned no image"));
+	};
+	let attachment = crate::images::attachment_from_base64(data, "image/png");
+	Ok(json!({
+		"action": "screenshot",
+		"width": value.get("width"),
+		"height": value.get("height"),
+		"content": "[screenshot of the tab's visible area, attached]",
+		"images": [attachment],
+	}))
 }
 
 /// Same null-byte heuristic as `moon_core`'s `looks_binary`: a NUL
@@ -6022,6 +6049,17 @@ mod tests {
 				.await
 				.expect_err("non-image binary still errors");
 			assert!(err.to_string().contains("binary file"), "got: {err}");
+		}
+
+		#[test]
+		fn screenshot_result_attaches_the_png() {
+			// 1x1 transparent PNG.
+			let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+			let result =
+				super::super::screenshot_result(serde_json::json!({ "png_base64": png, "width": 800, "height": 600 })).unwrap();
+			assert_eq!(result["width"], 800);
+			assert_eq!(result["images"].as_array().map(Vec::len), Some(1));
+			assert!(super::super::screenshot_result(serde_json::json!({})).is_err());
 		}
 
 		#[test]

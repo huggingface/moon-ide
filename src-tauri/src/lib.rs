@@ -172,6 +172,7 @@ pub fn run() {
 			commands::companion::companion_e2e_devices,
 			commands::companion::companion_e2e_revoke,
 			commands::ui::ui_set_right_panel,
+			commands::browser::browser_capture,
 			transfer::transfer_upload,
 			transfer::transfer_download,
 			transfer::transfer_cancel,

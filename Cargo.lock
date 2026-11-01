@@ -3588,12 +3588,15 @@ dependencies = [
  "hyper",
  "hyper-util",
  "moon-protocol",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
  "which",
 ]
 
@@ -3638,9 +3641,11 @@ dependencies = [
  "ashpd",
  "async-trait",
  "base64 0.22.1",
+ "cairo-rs",
  "camino",
  "dirs",
  "futures-util",
+ "gio",
  "hostname",
  "keyring",
  "libc",
@@ -3674,6 +3679,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webkit2gtk",
 ]
 
 [[package]]

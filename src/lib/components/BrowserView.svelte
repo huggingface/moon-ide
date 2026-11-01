@@ -64,6 +64,7 @@
 		}
 		const id = tabId;
 		const unregister = registerFrame(id, {
+			element: node,
 			target,
 			proxiedOrigin: new URL(resolved.src).origin,
 			originalOrigin: resolved.originalOrigin,
