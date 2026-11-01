@@ -303,11 +303,16 @@ fn build_body(model: &str, messages: &[ChatMessage], tools: &[ToolDefinition], e
 			tools
 				.iter()
 				.map(|t| {
+					// The Responses API defaults function tools to
+					// `strict: true`, which makes every property required:
+					// the model then fills optional ones with placeholders
+					// (`timeout_ms: 1000`, `occurrence: 1`, empty objects).
 					json!({
 						"type": "function",
 						"name": t.function.name,
 						"description": t.function.description,
 						"parameters": t.function.parameters,
+						"strict": false,
 					})
 				})
 				.collect(),
@@ -715,6 +720,20 @@ mod tests {
 			}
 		}
 		state.finalize("gpt-x")
+	}
+
+	#[test]
+	fn tools_are_sent_non_strict() {
+		let tool = ToolDefinition {
+			kind: "function",
+			function: crate::inference::FunctionDef {
+				name: "bash".into(),
+				description: "run".into(),
+				parameters: json!({ "type": "object", "properties": { "timeout_ms": { "type": "integer" } } }),
+			},
+		};
+		let body = build_body("gpt-x", &[ChatMessage::user("hi")], &[tool], None);
+		assert_eq!(body["tools"][0]["strict"], false);
 	}
 
 	#[test]

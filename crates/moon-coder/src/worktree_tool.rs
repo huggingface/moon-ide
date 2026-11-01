@@ -60,6 +60,28 @@ pub fn parse_enter_worktree_args(args: &Value) -> Result<EnterWorktreeTarget, Co
 	parse_worktree_target(ENTER_WORKTREE, args)
 }
 
+/// The `task` tool's optional `worktree`: `None` when absent, `null`, or
+/// an object whose fields are all blank. Some models fill every
+/// optional field with `""` rather than leaving it out, and an empty
+/// `worktree` means "no worktree", not a malformed one.
+pub fn parse_optional_worktree_target(
+	tool: &str,
+	raw: Option<&Value>,
+) -> Result<Option<EnterWorktreeTarget>, CoderError> {
+	let Some(raw) = raw.filter(|v| !v.is_null()) else {
+		return Ok(None);
+	};
+	let all_blank = raw.as_object().is_some_and(|fields| {
+		fields
+			.values()
+			.all(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()))
+	});
+	if all_blank {
+		return Ok(None);
+	}
+	parse_worktree_target(tool, raw).map(Some)
+}
+
 /// Validate a [`worktree_target_schema`] object; errors are attributed
 /// to `tool` so the model knows which call to fix.
 pub fn parse_worktree_target(tool: &str, args: &Value) -> Result<EnterWorktreeTarget, CoderError> {
@@ -137,6 +159,11 @@ mod tests {
 	#[test]
 	fn rejects_ambiguous_or_empty_args() {
 		assert!(parse_enter_worktree_args(&json!({})).is_err());
+		// `task`'s optional form: blank means absent.
+		let blank = json!({ "name": "", "branch": " ", "base": "" });
+		assert_eq!(parse_optional_worktree_target("task", Some(&blank)).unwrap(), None);
+		assert_eq!(parse_optional_worktree_target("task", None).unwrap(), None);
+		assert!(parse_optional_worktree_target("task", Some(&json!({ "base": "main" }))).is_err());
 		assert!(parse_enter_worktree_args(&json!({ "name": "  " })).is_err());
 		assert!(parse_enter_worktree_args(&json!({ "name": "a", "branch": "b" })).is_err());
 		assert!(parse_enter_worktree_args(&json!({ "branch": "b", "base": "main" })).is_err());

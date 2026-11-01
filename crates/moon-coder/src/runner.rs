@@ -6121,6 +6121,13 @@ async fn resolve_project_worktree(
 	Ok((entry, created, project_path))
 }
 
+/// The branch checked out in `folder`'s project main checkout.
+async fn main_checkout_branch(state: &Arc<CoderState>, folder: &str) -> Option<String> {
+	let folder = state.workspaces.folder_for_path(folder).await?;
+	let project = state.coder_root_of(folder).await;
+	project.host.git_branch().await.ok()?.name
+}
+
 /// `enter_worktree` (ADR 0096): move this session into a worktree of
 /// its project — a fresh `moon/<name>` branch, or an existing branch
 /// (attaching to its IDE-managed worktree when it already has one).
@@ -6137,6 +6144,16 @@ async fn handle_enter_worktree(
 	use moon_protocol::workspace::FolderOrigin;
 
 	let target = crate::worktree_tool::parse_enter_worktree_args(args)?;
+	if let crate::worktree_tool::EnterWorktreeTarget::Existing(branch) = &target {
+		if main_checkout_branch(state, sink.folder()).await.as_deref() == Some(branch.as_str()) {
+			return Err(CoderError::invalid_args(
+				ENTER_WORKTREE,
+				format!(
+					"`{branch}` is the project's main checkout — keep working there (no worktree needed), or pass `name` for a new branch"
+				),
+			));
+		}
+	}
 	let (entry, created, project_path) = resolve_project_worktree(state, sink.folder(), target, ENTER_WORKTREE).await?;
 	let FolderOrigin::Worktree { branch, .. } = &entry.folder.origin else {
 		return Err(CoderError::Internal(
@@ -7866,11 +7883,21 @@ async fn handle_task(
 		// sub-agents run their bash where the parent's runs.
 		rt.force_host_bash.clone(),
 	)?;
-	let worktree = match args.get("worktree") {
-		None | Some(Value::Null) => None,
-		Some(raw) => Some(crate::worktree_tool::parse_worktree_target("task", raw)?),
-	};
+	let mut worktree = crate::worktree_tool::parse_optional_worktree_target("task", args.get("worktree"))?;
 	let mut worktree_note = None;
+	// Asking for the branch the project's main checkout already has
+	// means "work there": git can't check one branch out twice, and
+	// the caller wants the current checkout, not a copy.
+	if let Some(crate::worktree_tool::EnterWorktreeTarget::Existing(branch)) = &worktree {
+		if main_checkout_branch(state, &spec.folder.folder.path).await.as_deref() == Some(branch.as_str()) {
+			worktree_note = Some(json!({
+				"in_place": true,
+				"branch": branch,
+				"note": "that branch is the project's main checkout, so the sub-agent works there directly",
+			}));
+			worktree = None;
+		}
+	}
 	if let Some(target) = worktree {
 		if spec.mode != CoderMode::Agent {
 			return Err(CoderError::invalid_args(

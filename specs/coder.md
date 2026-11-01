@@ -292,7 +292,11 @@ rejected: the worst case is one extra round trip per origin per run.
   holds an OAuth bundle from the Codex device-code sign-in, run by the
   workspace process so it works the same for remote workspaces. Usage
   counts against the plan's limits; a usage-limit 429 is not retried.
-  Encrypted reasoning is replayed between turns (`store: false`). Why
+  Encrypted reasoning is replayed between turns (`store: false`).
+  Tools go out with `strict: false`: the Responses API's strict
+  default makes every optional parameter required, and the model
+  fills them with placeholders (`timeout_ms: 1000`, an empty
+  `worktree`). Why
   ChatGPT and not a Claude subscription:
   [ADR 0101](decisions/0101-chatgpt-subscription-provider.md).
 
