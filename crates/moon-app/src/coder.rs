@@ -237,6 +237,13 @@ pub async fn coder_stop_background(app: &AppCore, session_id: Option<String>) ->
 	Ok(())
 }
 
+/// An image a coder reply embeds (`![](path)`), as a data URL —
+/// resolved where the agent's `bash` runs, so container `/tmp` paths
+/// work too.
+pub async fn coder_read_image(app: &AppCore, path: String) -> Result<String, MoonError> {
+	app.coder.read_image_data_url(&path).await.map_err(MoonError::from)
+}
+
 /// A session's running `notify` processes, for the active strip.
 pub async fn coder_active_background_processes(
 	app: &AppCore,
@@ -1595,6 +1602,7 @@ crate::commands! {
 	coder_suggest_terminal_command([app] request: String, target_kind: String, cwd: String),
 	coder_abort([app]),
 	coder_stop_background([app] session_id: Option<String>),
+	coder_read_image([app] path: String),
 	coder_active_background_processes([app] session_id: String),
 	coder_drain_steer_now([app] id: String),
 	coder_unqueue_steer([app] id: String),

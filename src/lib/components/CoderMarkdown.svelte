@@ -5,6 +5,7 @@
 		handleMarkdownCopyClick,
 		openExternalMarkdownLink,
 		renderMarkdownBlocks,
+		resolveCoderImages,
 		type MarkdownBlock,
 	} from '../markdown';
 	import { workspace } from '../state.svelte';
@@ -36,6 +37,17 @@
 	let renderInFlight = false;
 	let mounted = true;
 	let visible = $state(false);
+	let article: HTMLElement | undefined = $state();
+
+	// Workspace images in the reply (`![](path)`): rewritten on the
+	// live DOM after each render, since the block cache is shared
+	// across folders. Already-resolved images are skipped.
+	$effect(() => {
+		void blocks;
+		if (article !== undefined) {
+			void resolveCoderImages(article);
+		}
+	});
 
 	// Flip `mounted` false on component destruction so an in-flight
 	// `renderMarkdownBlocks` promise that resolves after unmount skips
@@ -140,6 +152,10 @@
 			return;
 		}
 		const anchor = target.closest('a');
+		if (anchor === null && target instanceof HTMLImageElement && target.dataset.workspacePath) {
+			void workspace.openFile(target.dataset.workspacePath);
+			return;
+		}
 		if (!anchor) {
 			return;
 		}
@@ -179,6 +195,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <article
+	bind:this={article}
 	class="markdown-body coder-md"
 	onclick={onArticleClick}
 	use:visibleOnce={() => {
@@ -226,6 +243,14 @@
 	.coder-md :global(pre) {
 		max-width: 100%;
 		overflow: auto;
+	}
+	.coder-md :global(img) {
+		max-width: 100%;
+		max-height: 420px;
+		border-radius: 4px;
+	}
+	.coder-md :global(img[data-workspace-path]) {
+		cursor: zoom-in;
 	}
 	/* Plain-text placeholder shown while a cache-miss row is still
 	   off-screen. Keeps `Ctrl+F` working by leaving the raw text in

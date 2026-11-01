@@ -3394,6 +3394,25 @@ impl CoderHandle {
 		Ok(RerunToolOutcome { tool_name, result })
 	}
 
+	/// An image the visible session's model referenced in a reply
+	/// (`![](path)`), as a data URL. Resolved with the session's own
+	/// routing (worktree folder, force-host flag), so container
+	/// paths like `/tmp/shot.png` load from the container.
+	pub async fn read_image_data_url(&self, path: &str) -> Result<String, CoderError> {
+		let (rt, _, _) = self.state.active_visible_runtime().await?;
+		let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+		let worktree_folder = match worktree_root {
+			Some(root) => self.state.workspaces.folder_for_path(&root).await,
+			None => None,
+		};
+		let cx = match worktree_folder {
+			Some(folder) => ToolContext::new(folder, CoderMode::Research),
+			None => self.state.tools.context_for_active(CoderMode::Research).await?,
+		}
+		.with_force_host_bash(rt.force_host_bash.clone());
+		self.state.tools.read_image_data_url(path, &cx).await
+	}
+
 	/// Make the persisted session identified by `id` the visible
 	/// one under the active workspace folder. Replays the JSONL
 	/// records as live events so the panel's existing event

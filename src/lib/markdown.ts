@@ -994,6 +994,75 @@ export async function resolveMarkdownImages(
 	return doc.body.innerHTML;
 }
 
+/**
+ * Point `<img>`s in a rendered coder reply at loadable URLs (the chat
+ * counterpart of `resolveMarkdownImages`). A reply has no document
+ * directory, so `src` is a workspace-relative path or an absolute
+ * path. Workspace files load through the asset protocol and are
+ * tagged `data-workspace-path` (what a click opens). Other absolute
+ * paths (`/tmp/shot.png`) are read by the coder where its `bash` runs
+ * — the container, when it's up — and inlined as a data URL. A
+ * leading `/` that resolves nowhere falls back to
+ * workspace-root-relative, like coder links. Works on the live DOM so
+ * the per-block render cache stays path-free; handled images carry
+ * `data-image-path` and are skipped on later passes. Unresolvable
+ * paths keep their `src` and show as broken, with the alt text.
+ */
+export async function resolveCoderImages(
+	root: ParentNode,
+	toUrl: (workspacePath: string) => Promise<string | null> = workspaceImageUrl,
+	readImage: (absolutePath: string) => Promise<string | null> = coderImageDataUrl,
+): Promise<void> {
+	const images = Array.from(root.querySelectorAll<HTMLImageElement>('img[src]:not([data-image-path])'));
+	await Promise.all(
+		images.map(async (img) => {
+			const src = img.getAttribute('src') ?? '';
+			if (src === '' || src.startsWith('//') || isAbsoluteUrl(src)) {
+				return;
+			}
+			let path: string;
+			try {
+				path = decodeURIComponent(src.split('#')[0]?.split('?')[0] ?? '');
+			} catch {
+				return;
+			}
+			path = path.replace(/^\.\//, '');
+			if (path === '') {
+				return;
+			}
+			img.dataset.imagePath = path;
+			const workspaceUrl = await toUrl(path);
+			if (workspaceUrl !== null) {
+				img.dataset.workspacePath = path;
+				img.setAttribute('src', workspaceUrl);
+				return;
+			}
+			if (!path.startsWith('/')) {
+				return;
+			}
+			const dataUrl = await readImage(path);
+			if (dataUrl !== null) {
+				img.setAttribute('src', dataUrl);
+				return;
+			}
+			const rootRelative = path.replace(/^\/+/, '');
+			const rootUrl = await toUrl(rootRelative);
+			if (rootUrl !== null) {
+				img.dataset.workspacePath = rootRelative;
+				img.setAttribute('src', rootUrl);
+			}
+		}),
+	);
+}
+
+async function coderImageDataUrl(absolutePath: string): Promise<string | null> {
+	try {
+		return await ipc.coder.readImage(absolutePath);
+	} catch {
+		return null;
+	}
+}
+
 async function workspaceImageUrl(workspacePath: string): Promise<string | null> {
 	try {
 		const absolute = await ipc.fs.absolutePath(workspacePath);

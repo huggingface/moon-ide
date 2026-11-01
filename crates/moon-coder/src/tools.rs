@@ -68,6 +68,10 @@ const READ_FILE_MAX_BYTES: usize = 200_000;
 /// budget then has to drop behind its back.
 const IMAGE_MAX_BYTES: usize = 3_000_000;
 
+/// Cap on an image the panel displays from a reply. Higher than what
+/// the model may ingest: it only goes to the webview.
+const DISPLAY_IMAGE_MAX_BYTES: usize = 20_000_000;
+
 /// `bash` stdout/stderr cap. Same rationale as `READ_FILE_MAX_BYTES`
 /// — the model doesn't need megabytes of output to reason about a
 /// command's outcome.
@@ -1514,7 +1518,7 @@ impl ToolRegistry {
 						},
 						"notify": {
 							"type": "boolean",
-							"description": "With `detach: true`: when the process exits, you receive a `<background_result>` message with its exit code and output tail — mid-turn, or by waking you after your turn ended. Use it for long jobs you'd otherwise poll (test suites, CI runs, deploys); end your turn and pick up from the result. A condition to wait for is just a command that exits when it holds (`gh run watch <id> --exit-status`, `until curl -sf <url>; do sleep 10; done`, `timeout 2h …`). Leave it off for dev servers and watchers. Ignored inside sub-agents."
+							"description": "With `detach: true`: when the process exits, its exit code and output tail arrive as a `<background_result>` message (mid-turn, or waking you after your turn ended), so you can end your turn instead of waiting. For long jobs whose outcome you need; not for dev servers or watchers. Ignored inside sub-agents."
 						}
 					},
 					"required": ["cmd"]
@@ -3309,6 +3313,71 @@ impl ToolRegistry {
 	/// bytes and the file tools already run host-side per
 	/// `ContainerHost`. Out-of-workspace reads mirror
 	/// [`Self::oow_read_file`]'s container `cat` path.
+	/// Raw bytes of a resolved path, read where the agent's `bash`
+	/// would see it: host-direct inside a bound folder, through the
+	/// workspace container for other paths while it runs (ADR 0025).
+	async fn read_target_bytes(
+		&self,
+		resolved: &ResolvedTarget,
+		path: &str,
+		cx: &ToolContext,
+		tool: &'static str,
+	) -> Result<Vec<u8>, CoderError> {
+		match resolved {
+			ResolvedTarget::InWorkspace { folder, relative } => {
+				let abs = Utf8Path::new(&folder.folder.path).join(relative);
+				tokio::fs::read(abs.as_std_path())
+					.await
+					.map_err(|err| CoderError::tool_failed(tool, format!("{path}: {err}")))
+			}
+			ResolvedTarget::OutOfWorkspace { abs_path } => {
+				if !self.oow_target_is_container(cx).await {
+					return tokio::fs::read(abs_path.as_std_path())
+						.await
+						.map_err(|err| CoderError::tool_failed(tool, format!("{path}: {err}")));
+				}
+				let mut cat = self.container_exec("cat", &["--", abs_path.as_str()]).await;
+				let output = run_capturing(&mut cat, tool).await?;
+				if !output.status.success() {
+					return Err(CoderError::tool_failed(
+						tool,
+						container_io_error(abs_path, &output.stderr),
+					));
+				}
+				Ok(output.stdout)
+			}
+		}
+	}
+
+	/// An image the model referenced in its reply (`![](path)`), as a
+	/// data URL for the panel. Resolved like `read_file`, so `/tmp`
+	/// paths come from the container when `bash` runs there. Image
+	/// extensions only.
+	pub async fn read_image_data_url(&self, path: &str, cx: &ToolContext) -> Result<String, CoderError> {
+		const TOOL: &str = "read_image";
+		let Some(mime) = image_mime_for(path) else {
+			return Err(CoderError::invalid_args(
+				TOOL,
+				format!("{path} is not a png / jpeg / gif / webp image"),
+			));
+		};
+		let resolved = self.resolve_target(path, cx, TOOL).await?;
+		let bytes = self.read_target_bytes(&resolved, path, cx, TOOL).await?;
+		if bytes.len() > DISPLAY_IMAGE_MAX_BYTES {
+			return Err(CoderError::tool_failed(
+				TOOL,
+				format!(
+					"{path}: image is {:.1} MB, over the display limit",
+					bytes.len() as f64 / 1_000_000.0
+				),
+			));
+		}
+		Ok(format!(
+			"data:{mime};base64,{}",
+			base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+		))
+	}
+
 	async fn read_image_result(
 		&self,
 		resolved: &ResolvedTarget,
@@ -3316,31 +3385,7 @@ impl ToolRegistry {
 		mime: &str,
 		cx: &ToolContext,
 	) -> Result<Value, CoderError> {
-		let bytes = match resolved {
-			ResolvedTarget::InWorkspace { folder, relative } => {
-				let abs = Utf8Path::new(&folder.folder.path).join(relative);
-				tokio::fs::read(abs.as_std_path())
-					.await
-					.map_err(|err| CoderError::tool_failed("read_file", format!("{path}: {err}")))?
-			}
-			ResolvedTarget::OutOfWorkspace { abs_path } => {
-				if self.oow_target_is_container(cx).await {
-					let mut cat = self.container_exec("cat", &["--", abs_path.as_str()]).await;
-					let output = run_capturing(&mut cat, "read_file").await?;
-					if !output.status.success() {
-						return Err(CoderError::tool_failed(
-							"read_file",
-							container_io_error(abs_path, &output.stderr),
-						));
-					}
-					output.stdout
-				} else {
-					tokio::fs::read(abs_path.as_std_path())
-						.await
-						.map_err(|err| CoderError::tool_failed("read_file", format!("{path}: {err}")))?
-				}
-			}
-		};
+		let bytes = self.read_target_bytes(resolved, path, cx, "read_file").await?;
 		if bytes.len() > IMAGE_MAX_BYTES {
 			return Err(CoderError::tool_failed(
 				"read_file",

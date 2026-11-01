@@ -1928,6 +1928,15 @@ links or code spans are
 untouched, and the render caches key off the repo URL so a folder
 swap can't serve another repo's links. Same rule as the companion.
 
+Images in transcript markdown (`![alt](path)`) load from a
+workspace-relative path or any absolute path. Workspace files load
+directly and open in the editor on click; other absolute paths go
+through `coder_read_image`, which reads them where the agent's `bash`
+runs (the workspace container for paths outside the bind mount, ADR 0025) and returns a data URL. png / jpeg / gif / webp only, 20 MB
+cap. The system prompt tells the model to
+show screenshots and generated images this way rather than only
+naming the path.
+
 The pop-out has a composer (`coder_continue_subagent`) with two
 behaviours keyed off the run state:
 

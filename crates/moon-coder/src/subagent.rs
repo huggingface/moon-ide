@@ -384,7 +384,7 @@ pub fn task_tool_definition() -> ToolDefinition {
 		"task",
 		"Delegate a self-contained task to a sub-agent that runs in the background. Sub-agents run in their own context — you spend tokens on the task description and the final report, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
 \
-The call returns at once with a `subagent_id`. When the sub-agent finishes, its report is delivered to you automatically as a `<background_result>` message — mid-turn, or by waking you if your turn already ended — so never poll for it. If you need the report before you can do anything else, call `wait(subagent_id, wait_ms)` to block on it (it then isn't delivered a second time); otherwise keep working. Several `task` calls run concurrently. Use `task_steer` to redirect a running sub-agent and `stop(subagent_id)` to cancel one. \
+The call returns at once with a `subagent_id`; several `task` calls run concurrently. The report arrives on its own as a `<background_result>` message (see \"Background work\" in your instructions) — don't poll. `wait` blocks on it, `task_steer` redirects the run, `stop` cancels it. \
 \
 The sub-agent has no access to your conversation history — describe the task self-containedly. An `agent`-mode sub-agent can itself delegate read-only investigations to nested `research` sub-agents; `research` sub-agents cannot delegate further.",
 		json!({

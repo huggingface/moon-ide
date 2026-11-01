@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from 'vitest';
 
-import { resolveMarkdownImages } from './markdown';
+import { resolveCoderImages, resolveMarkdownImages } from './markdown';
 
 // `resolveMarkdownImages` runs on sanitised HTML, so the fixtures
 // here are plain markdown-it-shaped output. The `toUrl` resolver is
@@ -42,5 +42,27 @@ describe('resolveMarkdownImages', () => {
 		const html = '<p><img src="../../etc/passwd"><img src="broken.png"></p>';
 		const out = await resolveMarkdownImages(html, 'docs/readme.md', async () => null);
 		expect(out).toBe(html);
+	});
+});
+
+describe('resolveCoderImages', () => {
+	const resolve = async (path: string) => (path.startsWith('/') ? null : `asset://localhost/root/${path}`);
+
+	const read = async (path: string) => (path.startsWith('/tmp/') ? `data:image/png;base64,${btoa(path)}` : null);
+
+	it('resolves workspace, outside, and root-relative paths, and skips URLs', async () => {
+		const root = document.createElement('div');
+		root.innerHTML =
+			'<img src="./out/shot.png" alt="a"><img src="/charts/x.png" alt="b"><img src="https://e.com/y.png" alt="c"><img src="/tmp/s.png" alt="d">';
+		await resolveCoderImages(root, resolve, read);
+		const [a, b, c, d] = Array.from(root.querySelectorAll('img'));
+		expect(d?.getAttribute('src')).toBe(`data:image/png;base64,${btoa('/tmp/s.png')}`);
+		expect(d?.dataset.workspacePath).toBeUndefined();
+		expect(a?.getAttribute('src')).toBe('asset://localhost/root/out/shot.png');
+		expect(a?.dataset.workspacePath).toBe('out/shot.png');
+		expect(b?.getAttribute('src')).toBe('asset://localhost/root/charts/x.png');
+		expect(b?.dataset.workspacePath).toBe('charts/x.png');
+		expect(c?.getAttribute('src')).toBe('https://e.com/y.png');
+		expect(c?.dataset.workspacePath).toBeUndefined();
 	});
 });

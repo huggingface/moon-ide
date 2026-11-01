@@ -476,6 +476,7 @@ export const ipc = {
 		stopBackgroundProcess: (sessionId: string, id: string) =>
 			call<unknown>('coder_stop_background_process', { sessionId, id }),
 		stopBackground: (sessionId: string | null) => call<void>('coder_stop_background', { sessionId }),
+		readImage: (path: string) => call<string>('coder_read_image', { path }),
 		activeBackgroundProcesses: (sessionId: string) =>
 			call<ActiveBackgroundProcess[]>('coder_active_background_processes', { sessionId }),
 		newWorktreeSession: (baseBranch?: string) =>
