@@ -1,88 +1,32 @@
 <script lang="ts">
 	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { untrack } from 'svelte';
 	import type { Attachment } from 'svelte/attachments';
-	import { handleFrameMessage, registerFrame, toOriginalUrl } from '../browserBridge';
+	import { toOriginalUrl } from '../browserBridge';
+	import { browserFrameStatus, registerSlot } from '../browserFrames.svelte';
 	import { ipc } from '../ipc';
 	import { workspace } from '../state.svelte';
 
-	// In-IDE browser tab (ADR 0088). An iframe on a preview-proxy URL;
-	// the proxy injects the page bridge, which this view relays to the
-	// coder (`browserBridge.ts`) and which reports in-page navigation
-	// back into the tab's URL.
+	// In-IDE browser tab (ADR 0088): the URL bar, plus a slot the tab's
+	// iframe covers. The iframe itself lives in the app-level frame
+	// layer (`BrowserFrames`, ADR 0105) so the page survives this view
+	// being unmounted by a tab or folder switch.
 	type Props = { path: string };
 	let { path }: Props = $props();
 
 	const tab = $derived(workspace.browserTabs[path]);
-	// Primitive deriveds so the resolve effect only re-runs on a real
-	// reload / side switch, not on every tab-object replacement (a
-	// location report replaces the object without wanting a reload).
 	const tabId = $derived(tab?.id ?? null);
-	const reloadToken = $derived(tab?.reloadToken ?? 0);
-	const inContainer = $derived(tab?.inContainer ?? false);
-
-	let resolved = $state<{ src: string; originalOrigin: string } | null>(null);
-	let error = $state<string | null>(null);
+	const status = $derived(tabId === null ? undefined : browserFrameStatus.get(tabId));
+	const resolved = $derived(status !== undefined && 'src' in status ? status : null);
+	const error = $derived(status !== undefined && 'error' in status ? status.error : null);
 	// Writable derived: typing overrides it, a navigation (new
 	// `tab.url`) resets it.
 	let draft = $derived(tab?.url ?? '');
 
-	// Resolution is async IPC (it may start a proxy), so it can't be a
-	// `$derived`. The `cancelled` guard drops a stale answer when the
-	// user navigates again before the previous one lands.
-	$effect(() => {
+	const slot: Attachment<HTMLElement> = (node) => {
 		if (tabId === null) {
 			return;
 		}
-		void reloadToken;
-		const side = inContainer;
-		const url = untrack(() => tab?.url ?? '');
-		let cancelled = false;
-		error = null;
-		ipc.browser
-			.resolveUrl(url, side)
-			.then((src) => {
-				if (!cancelled) {
-					resolved = { src, originalOrigin: new URL(url).origin };
-				}
-			})
-			.catch((err: unknown) => {
-				if (!cancelled) {
-					resolved = null;
-					error = err instanceof Error ? err.message : String(err);
-				}
-			});
-		return () => {
-			cancelled = true;
-		};
-	});
-
-	const frameBridge: Attachment<HTMLIFrameElement> = (node) => {
-		const target = node.contentWindow;
-		if (tabId === null || resolved === null || target === null) {
-			return;
-		}
-		const id = tabId;
-		const unregister = registerFrame(id, {
-			element: node,
-			target,
-			proxiedOrigin: new URL(resolved.src).origin,
-			originalOrigin: resolved.originalOrigin,
-		});
-		const onMessage = (event: MessageEvent) => {
-			if (event.source === target) {
-				handleFrameMessage(
-					id,
-					event.data,
-					untrack(() => tab?.url ?? ''),
-				);
-			}
-		};
-		window.addEventListener('message', onMessage);
-		return () => {
-			window.removeEventListener('message', onMessage);
-			unregister();
-		};
+		return registerSlot(tabId, node);
 	};
 
 	function submit(event: SubmitEvent) {
@@ -129,15 +73,13 @@
 			onclick={openExternally}>↗</button
 		>
 	</form>
-	<div class="frame">
-		{#if error !== null}
+	{#if error !== null}
+		<div class="frame">
 			<p class="error">{error}</p>
-		{:else if resolved !== null && tab}
-			{#key `${resolved.src}#${reloadToken}`}
-				<iframe src={resolved.src} title={tab.url} {@attach frameBridge}></iframe>
-			{/key}
-		{/if}
-	</div>
+		</div>
+	{:else}
+		<div class="frame" {@attach slot}></div>
+	{/if}
 </div>
 
 <style>
@@ -198,10 +140,6 @@
 		min-height: 0;
 		display: flex;
 		background: white;
-	}
-	iframe {
-		flex: 1;
-		border: none;
 	}
 	.error {
 		margin: auto;

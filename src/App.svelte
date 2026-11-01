@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Sidebar from './lib/components/Sidebar.svelte';
+	import BrowserFrames from './lib/components/BrowserFrames.svelte';
 	import EditorPane from './lib/components/EditorPane.svelte';
 	import StatusBar from './lib/components/StatusBar.svelte';
 	import Splash from './lib/components/Splash.svelte';
@@ -619,6 +620,7 @@
 			</aside>
 		{/if}
 	</div>
+	<BrowserFrames />
 	<StatusBar />
 	<CommandPalette />
 	<BranchSwitcher />

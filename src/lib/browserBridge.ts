@@ -3,10 +3,11 @@
 //
 // Backend -> `browser:page_request` event -> the tab's iframe via
 // postMessage -> the injected bridge answers -> `browser_page_respond`.
-// A request for a tab whose iframe isn't mounted (tab not visible)
-// focuses the tab and waits in a queue until the freshly loaded page
-// says hello.
+// Every tab's iframe stays mounted (ADR 0105), so a request only
+// waits in a queue until the page's bridge says hello (first load,
+// reload, navigation).
 
+import { browserCapture } from './browserFrames.svelte';
 import { subscribe } from './transport';
 import { ipc } from './ipc';
 import type { BrowserPageRequest } from './protocol';
@@ -45,7 +46,7 @@ export function toOriginalUrl(href: string, proxiedOrigin: string, originalOrigi
 
 function send(frame: Frame, request: BrowserPageRequest) {
 	if (request.op === 'screenshot') {
-		void capture(frame, request.request_id);
+		void capture(frame, request.tab_id, request.request_id);
 		return;
 	}
 	frame.target.postMessage(
@@ -54,22 +55,36 @@ function send(frame: Frame, request: BrowserPageRequest) {
 	);
 }
 
+/** Paint settles within a couple of frames; a window on another
+ *  desktop or minimized gets no animation frames, so cap the wait. */
+function settle(): Promise<unknown> {
+	return Promise.race([
+		new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+		new Promise((resolve) => setTimeout(resolve, 200)),
+	]);
+}
+
 /** Screenshots are taken by the IDE, not the page: a native snapshot
- *  of the window's webview cropped to the iframe (ADR 0103). */
-async function capture(frame: Frame, requestId: number): Promise<void> {
-	// Let a just-focused tab lay out and paint before measuring.
-	await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-	const rect = frame.element.getBoundingClientRect();
+ *  of the window's webview cropped to the iframe (ADR 0103). A tab
+ *  that isn't on screen is raised on top for the capture and dropped
+ *  back right after — a brief flash instead of a tab switch. */
+async function capture(frame: Frame, tabId: number, requestId: number): Promise<void> {
+	browserCapture.tabId = tabId;
+	let shot: { png: string; width: number; height: number };
 	try {
+		await settle();
+		const rect = frame.element.getBoundingClientRect();
 		const png = await ipc.browser.capture(rect.left, rect.top, rect.width, rect.height, window.innerWidth);
-		await ipc.browser.respond(
-			requestId,
-			{ png_base64: png, width: Math.round(rect.width), height: Math.round(rect.height) },
-			null,
-		);
+		shot = { png, width: Math.round(rect.width), height: Math.round(rect.height) };
 	} catch (err) {
 		await ipc.browser.respond(requestId, null, err instanceof Error ? err.message : String(err));
+		return;
+	} finally {
+		if (browserCapture.tabId === tabId) {
+			browserCapture.tabId = null;
+		}
 	}
+	await ipc.browser.respond(requestId, { png_base64: shot.png, width: shot.width, height: shot.height }, null);
 }
 
 function flush(tabId: number, frame: Frame) {
@@ -150,9 +165,5 @@ export async function wireBrowserBridge(): Promise<void> {
 		const list = queued.get(payload.tab_id) ?? [];
 		list.push({ request: payload, at: Date.now() });
 		queued.set(payload.tab_id, list);
-		if (!frame) {
-			// Not mounted: bring it up; its bridge hello flushes the queue.
-			void ipc.browser.focus(payload.tab_id);
-		}
 	});
 }

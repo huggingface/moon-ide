@@ -42,7 +42,7 @@ problems ADR 0088 rejected them for.
 
 ## Known limits
 
-- It captures what is on screen: an IDE popover over the tab is in
-  the shot, and a mounted-but-hidden tab errors as not visible.
+- It captures painted pixels: a hidden tab is briefly raised on top
+  for the shot (ADR 0105).
 - Needs the page bridge's hello like every other action (https tabs
   have it since ADR 0104).
