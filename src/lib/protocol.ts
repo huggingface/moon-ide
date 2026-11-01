@@ -1063,9 +1063,28 @@ export type CoderAppState = {
  * `custom` and `open_router` is identical (OpenAI-compat
  * `/chat/completions`); `anthropic` triggers the native
  * `/v1/messages` translator on the backend with different auth
- * headers, content blocks, and SSE event grammar.
+ * headers, content blocks, and SSE event grammar. `chat_gpt` is a
+ * ChatGPT plan via the Codex backend: no API key, the keyring slot
+ * holds a device-code sign-in and `has_api_key` means "signed in"
+ * (ADR 0101).
  */
-export type ProviderKind = 'custom' | 'open_router' | 'anthropic';
+export type ProviderKind = 'custom' | 'open_router' | 'anthropic' | 'chat_gpt';
+
+/** A started ChatGPT device-code sign-in. Mirrors `moon_protocol::coder_models::ChatGptDeviceCode`. */
+export type ChatGptDeviceCode = {
+	device_auth_id: string;
+	user_code: string;
+	verification_uri: string;
+	/** Poll interval in seconds. */
+	interval: number;
+};
+
+/** Who a `chat_gpt` provider is signed in as. Mirrors `moon_protocol::coder_models::ChatGptAccount`. */
+export type ChatGptAccount = {
+	email?: string | null;
+	/** `plus` / `pro` / `team` / …, as ChatGPT reports it. */
+	plan_type?: string | null;
+};
 
 export type CoderProviderConfig = {
 	id: string;

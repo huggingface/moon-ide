@@ -1556,6 +1556,34 @@ impl CoderHandle {
 		result
 	}
 
+	/// Start a ChatGPT (Codex) device-code sign-in. The picker shows
+	/// the code, then waits on [`Self::chatgpt_finish_login`].
+	pub async fn chatgpt_start_login(&self) -> Result<moon_protocol::coder_models::ChatGptDeviceCode, CoderError> {
+		self.state.inference.chatgpt_start_login().await
+	}
+
+	/// Wait for the user to approve `code`, then store the tokens in
+	/// provider `id`'s keyring slot and flag it signed in.
+	pub async fn chatgpt_finish_login(
+		&self,
+		id: &str,
+		code: &moon_protocol::coder_models::ChatGptDeviceCode,
+	) -> Result<moon_protocol::coder_models::ChatGptAccount, CoderError> {
+		let account = self.state.inference.chatgpt_finish_login(id, code).await?;
+		let mut m = self.state.models.write().await;
+		for p in &mut m.providers {
+			if p.id == id {
+				p.has_api_key = true;
+			}
+		}
+		Ok(account)
+	}
+
+	/// Who ChatGPT provider `id` is signed in as; `None` when signed out.
+	pub fn chatgpt_account(&self, id: &str) -> Option<moon_protocol::coder_models::ChatGptAccount> {
+		self.state.inference.chatgpt_account(id)
+	}
+
 	/// Probe a `(base_url, api_key)` combination before the
 	/// picker commits. See [`providers::probe_provider`] for the
 	/// fallback order. Builds a fresh `reqwest::Client` for the
@@ -1631,7 +1659,8 @@ impl CoderHandle {
 			},
 			ResolvedProvider::Custom { id, .. }
 			| ResolvedProvider::OpenRouter { id, .. }
-			| ResolvedProvider::Anthropic { id, .. } => {
+			| ResolvedProvider::Anthropic { id, .. }
+			| ResolvedProvider::ChatGpt { id, .. } => {
 				match self.list_provider_models(&id).await {
 					Ok(_) => {
 						// `list_provider_models` already merged the fresh
@@ -1779,12 +1808,16 @@ impl CoderHandle {
 		let base_url = entry.base_url.clone();
 		let kind = entry.kind;
 		drop(snapshot);
-		let api_key = self.state.provider_keys.get(provider_id);
-		let catalog = self
-			.state
-			.inference
-			.list_provider_models(&base_url, api_key.as_deref(), kind)
-			.await?;
+		let catalog = if kind == moon_protocol::coder_models::ProviderKind::ChatGpt {
+			self.state.inference.list_chatgpt_models(provider_id, &base_url).await?
+		} else {
+			let api_key = self.state.provider_keys.get(provider_id);
+			self
+				.state
+				.inference
+				.list_provider_models(&base_url, api_key.as_deref(), kind)
+				.await?
+		};
 		let windows = models::context_windows_from_provider_catalog(&catalog);
 		let vision = models::vision_from_provider_catalog(&catalog);
 		if !windows.is_empty() || !vision.is_empty() {
@@ -1838,6 +1871,7 @@ impl CoderHandle {
 		let route = self.state.models.read().await.resolve_route();
 		let signed_in = match &route {
 			ResolvedProvider::HuggingFace => identity.is_some(),
+			ResolvedProvider::ChatGpt { id, .. } => self.state.provider_keys.has_key(id),
 			ResolvedProvider::Custom { id, base_url }
 			| ResolvedProvider::OpenRouter { id, base_url }
 			| ResolvedProvider::Anthropic { id, base_url } => {
@@ -3289,6 +3323,13 @@ impl CoderHandle {
 			ResolvedProvider::HuggingFace => {
 				if !self.state.auth.has_valid_session().await {
 					return Err(CoderError::NotSignedIn);
+				}
+			}
+			ResolvedProvider::ChatGpt { id, .. } => {
+				if !self.state.provider_keys.has_key(id) {
+					return Err(CoderError::Internal(
+						"ChatGPT provider is not signed in. Sign in from the model settings.".into(),
+					));
 				}
 			}
 			ResolvedProvider::Custom { id, base_url }

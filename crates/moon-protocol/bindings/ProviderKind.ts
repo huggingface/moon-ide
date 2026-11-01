@@ -20,5 +20,9 @@
  *   shape via `tool_use` / `tool_result` blocks, native `cache_control`
  *   on prompt-cache markers, separate streaming SSE event grammar).
  *   Picker pre-fills the URL and locks the field.
+ * - [`Self::ChatGpt`] — a ChatGPT Plus/Pro plan through the Codex
+ *   backend (OpenAI Responses shape). No API key: the keyring slot
+ *   holds an OAuth bundle from the Codex device-code sign-in
+ *   (ADR 0101).
  */
-export type ProviderKind = "custom" | "open_router" | "anthropic";
+export type ProviderKind = "custom" | "open_router" | "anthropic" | "chat_gpt";

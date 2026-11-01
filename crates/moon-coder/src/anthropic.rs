@@ -257,18 +257,21 @@ fn keep_thinking_block(block: &ThinkingBlock) -> bool {
 	match block {
 		ThinkingBlock::Thinking { signature, .. } => !signature.is_empty(),
 		ThinkingBlock::RedactedThinking { data } => !data.is_empty(),
+		ThinkingBlock::ResponsesOutput { .. } => false,
 	}
 }
 
 /// Project a stored [`ThinkingBlock`] back onto its Anthropic wire
-/// shape for replay on the next round-trip.
-fn thinking_block_to_wire(block: &ThinkingBlock) -> Block<'_> {
+/// shape for replay on the next round-trip. `None` for another
+/// route's reasoning (a session that switched off ChatGPT).
+fn thinking_block_to_wire(block: &ThinkingBlock) -> Option<Block<'_>> {
 	match block {
-		ThinkingBlock::Thinking { thinking, signature } => Block::Thinking {
+		ThinkingBlock::Thinking { thinking, signature } => Some(Block::Thinking {
 			thinking: thinking.as_str(),
 			signature: signature.as_str(),
-		},
-		ThinkingBlock::RedactedThinking { data } => Block::RedactedThinking { data: data.as_str() },
+		}),
+		ThinkingBlock::RedactedThinking { data } => Some(Block::RedactedThinking { data: data.as_str() }),
+		ThinkingBlock::ResponsesOutput { .. } => None,
 	}
 }
 
@@ -390,9 +393,7 @@ fn translate<'a>(messages: &'a [ChatMessage], mark_system_cache: bool, mark_last
 				// precede the `tool_use` blocks in the assistant turn
 				// that a `tool_result` answers, or the next round-trip
 				// 400s. See `ThinkingBlock`.
-				for tb in thinking_blocks {
-					blocks.push(thinking_block_to_wire(tb));
-				}
+				blocks.extend(thinking_blocks.iter().filter_map(thinking_block_to_wire));
 				if let Some(text) = content.as_deref() {
 					if !text.trim().is_empty() {
 						blocks.push(Block::Text {

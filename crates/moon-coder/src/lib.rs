@@ -18,6 +18,8 @@
 pub mod anthropic;
 pub mod auth;
 pub mod browser_tabs;
+mod chatgpt;
+mod chatgpt_auth;
 pub mod compaction;
 pub mod coordinator;
 pub mod defaults;

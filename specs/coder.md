@@ -238,7 +238,7 @@ team uses. Other providers are additive.
 struct CoderProviderConfig {
     id: String,           // opaque "prov-<unix-ms>-<rand>"
     label: String,
-    kind: ProviderKind,   // custom | open_router | anthropic
+    kind: ProviderKind,   // custom | open_router | anthropic | chat_gpt
     base_url: String,     // OpenAI-compat /v1 root, or API host for anthropic
     standard_model: String,
     cheap_model: String,
@@ -286,6 +286,15 @@ rejected: the worst case is one extra round trip per origin per run.
   system prompt as a top-level field, `tool_use` / `tool_result`
   content blocks, its own SSE grammar, and adjacent same-role
   messages merged (the API rejects consecutive same-role turns).
+- `chat_gpt` — a ChatGPT Plus/Pro plan through the Codex backend
+  (`chatgpt.com/backend-api/codex/responses`, OpenAI Responses shape)
+  via `crates/moon-coder/src/chatgpt.rs`. No API key: the keyring slot
+  holds an OAuth bundle from the Codex device-code sign-in, run by the
+  workspace process so it works the same for remote workspaces. Usage
+  counts against the plan's limits; a usage-limit 429 is not retried.
+  Encrypted reasoning is replayed between turns (`store: false`). Why
+  ChatGPT and not a Claude subscription:
+  [ADR 0101](decisions/0101-chatgpt-subscription-provider.md).
 
 For the built-in presets the picker locks `base_url` and requires a
 `standard_model` pick before saving (there's no per-preset hardcoded

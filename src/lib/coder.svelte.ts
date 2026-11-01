@@ -25,6 +25,8 @@ import {
 	type CoderEventEnvelope,
 	type CoderHubBucket,
 	type CoderModelSettings,
+	type ChatGptAccount,
+	type ChatGptDeviceCode,
 	type CoderProviderConfig,
 	type CoderSessionSummary,
 	type CoderStatus,
@@ -1097,6 +1099,25 @@ export class CoderPanelState {
 			this.modelsError = formatError(err);
 			throw err;
 		}
+	}
+
+	/** Start a ChatGPT device-code sign-in (ADR 0101). The caller
+	 *  shows the code, then awaits [`chatgptFinishLogin`]. */
+	async chatgptStartLogin(): Promise<ChatGptDeviceCode> {
+		return await ipc.coder.chatgptStartLogin();
+	}
+
+	/** Wait for the user to approve `code`, then refresh
+	 *  [`modelSettings`] so the provider reads as signed in. */
+	async chatgptFinishLogin(id: string, code: ChatGptDeviceCode): Promise<ChatGptAccount> {
+		const account = await ipc.coder.chatgptFinishLogin(id, code);
+		await this.loadModelSettings();
+		return account;
+	}
+
+	/** Who a `chat_gpt` provider is signed in as; `null` when signed out. */
+	async chatgptAccount(id: string): Promise<ChatGptAccount | null> {
+		return await ipc.coder.chatgptAccount(id);
 	}
 
 	/** Allocate a fresh opaque provider id from the runner. The

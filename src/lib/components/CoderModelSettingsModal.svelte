@@ -39,7 +39,10 @@
 	import { coder } from '../coder.svelte';
 	import { workspace } from '../state.svelte';
 	import { formatError } from '../protocol';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import type {
+		ChatGptAccount,
+		ChatGptDeviceCode,
 		CoderModelSettings,
 		CoderProviderConfig,
 		CoderProviderLock,
@@ -55,31 +58,40 @@
 	// right wire shape, and links to the upstream key dashboard.
 	// The list lives next to the modal because it's pure UI
 	// chrome — the runner-side code is keyed off
-	// `CoderProviderConfig.kind`, not these labels.
+	// `CoderProviderConfig.kind`, not these labels. `key` is null
+	// for ChatGPT, which signs in instead (ADR 0101).
 	type BuiltinPreset = {
 		kind: ProviderKind;
 		label: string;
 		base_url: string;
-		api_key_placeholder: string;
-		api_key_dashboard_url: string;
-		api_key_dashboard_label: string;
+		key: { placeholder: string; dashboard_url: string; dashboard_label: string } | null;
 	};
 	const BUILTIN_PRESETS: readonly BuiltinPreset[] = [
 		{
 			kind: 'open_router',
 			label: 'OpenRouter',
 			base_url: 'https://openrouter.ai/api/v1',
-			api_key_placeholder: 'sk-or-...',
-			api_key_dashboard_url: 'https://openrouter.ai/settings/keys',
-			api_key_dashboard_label: 'openrouter.ai/settings/keys',
+			key: {
+				placeholder: 'sk-or-...',
+				dashboard_url: 'https://openrouter.ai/settings/keys',
+				dashboard_label: 'openrouter.ai/settings/keys',
+			},
 		},
 		{
 			kind: 'anthropic',
 			label: 'Anthropic',
 			base_url: 'https://api.anthropic.com',
-			api_key_placeholder: 'sk-ant-...',
-			api_key_dashboard_url: 'https://console.anthropic.com/settings/keys',
-			api_key_dashboard_label: 'console.anthropic.com/settings/keys',
+			key: {
+				placeholder: 'sk-ant-...',
+				dashboard_url: 'https://console.anthropic.com/settings/keys',
+				dashboard_label: 'console.anthropic.com/settings/keys',
+			},
+		},
+		{
+			kind: 'chat_gpt',
+			label: 'ChatGPT',
+			base_url: 'https://chatgpt.com/backend-api/codex',
+			key: null,
 		},
 	];
 
@@ -155,6 +167,11 @@
 		is_new: boolean;
 	};
 	let providerDraft = $state<ProviderDraft | null>(null);
+	// ChatGPT sign-in for the open draft: the code being shown while
+	// the backend waits for approval, and who each provider is
+	// signed in as (`null` = signed out, absent = not loaded).
+	let chatgptCode = $state<ChatGptDeviceCode | null>(null);
+	let chatgptAccounts = $state<Record<string, ChatGptAccount | null>>({});
 	let probing = $state(false);
 	let probeMessage = $state<string | null>(null);
 	let probeError = $state<string | null>(null);
@@ -407,6 +424,11 @@
 		};
 		probeMessage = null;
 		probeError = null;
+		if (entry.kind === 'chat_gpt') {
+			void coder.chatgptAccount(entry.id).then((account) => {
+				chatgptAccounts = { ...chatgptAccounts, [entry.id]: account };
+			});
+		}
 	}
 
 	function closeProviderDraft(): void {
@@ -456,25 +478,13 @@
 			return;
 		}
 		const cleanedKey = draft.api_key.trim();
-		const capMb = parseInt(draft.payload_cap, 10);
 		try {
 			// Persist the key first so the runner's `has_api_key`
 			// flips to true at the moment the config lands.
 			if (cleanedKey.length > 0) {
 				await coder.setProviderApiKey(draft.id, cleanedKey);
 			}
-			const existing = providers.find((p) => p.id === draft.id);
-			const next: CoderProviderConfig = {
-				id: draft.id,
-				label,
-				kind: draft.kind,
-				base_url: baseUrl,
-				standard_model: existing?.standard_model ?? '',
-				cheap_model: existing?.cheap_model ?? '',
-				payload_cap_mb: Number.isFinite(capMb) && capMb > 0 ? capMb : null,
-				has_api_key: cleanedKey.length > 0 || (existing?.has_api_key ?? false),
-			};
-			await coder.saveProvider(next);
+			await coder.saveProvider(draftConfig(draft, label, baseUrl));
 			// Re-sync local working copy from the refreshed
 			// settings so the segmented control + `has_api_key`
 			// flags are right.
@@ -496,6 +506,59 @@
 		}
 	}
 
+	function draftConfig(draft: ProviderDraft, label: string, baseUrl: string): CoderProviderConfig {
+		const existing = providers.find((p) => p.id === draft.id);
+		const capMb = parseInt(draft.payload_cap, 10);
+		return {
+			id: draft.id,
+			label,
+			kind: draft.kind,
+			base_url: baseUrl,
+			standard_model: existing?.standard_model ?? '',
+			cheap_model: existing?.cheap_model ?? '',
+			payload_cap_mb: Number.isFinite(capMb) && capMb > 0 ? capMb : null,
+			has_api_key: draft.api_key.trim().length > 0 || (existing?.has_api_key ?? false),
+		};
+	}
+
+	// Saves the draft (sign-in needs the provider to exist), shows
+	// the device code, opens the verification page, and waits for
+	// approval. On success the new provider becomes active so its
+	// model catalog loads.
+	async function onChatGptSignIn(): Promise<void> {
+		if (providerDraft === null || chatgptCode !== null) {
+			return;
+		}
+		const draft = providerDraft;
+		probeError = null;
+		probeMessage = null;
+		try {
+			await coder.saveProvider(draftConfig(draft, draft.label.trim() || 'ChatGPT', draft.base_url.trim()));
+			const code = await coder.chatgptStartLogin();
+			chatgptCode = code;
+			openUrl(code.verification_uri).catch(() => {
+				// The link stays visible in the form.
+			});
+			const account = await coder.chatgptFinishLogin(draft.id, code);
+			chatgptAccounts = { ...chatgptAccounts, [draft.id]: account };
+			if (coder.modelSettings) {
+				providers = cloneProviders(coder.modelSettings.providers);
+			}
+			coder.forgetProviderModels(draft.id);
+			if (providerDraft?.id !== draft.id) {
+				return;
+			}
+			if (draft.is_new) {
+				switchActiveProvider(draft.id);
+			}
+			closeProviderDraft();
+		} catch (err) {
+			probeError = formatError(err);
+		} finally {
+			chatgptCode = null;
+		}
+	}
+
 	async function onClearDraftKey(): Promise<void> {
 		if (providerDraft === null) {
 			return;
@@ -505,8 +568,12 @@
 			if (coder.modelSettings) {
 				providers = cloneProviders(coder.modelSettings.providers);
 			}
+			const wasChatGpt = providerDraft.kind === 'chat_gpt';
+			if (wasChatGpt) {
+				chatgptAccounts = { ...chatgptAccounts, [providerDraft.id]: null };
+			}
 			providerDraft = { ...providerDraft, api_key: '' };
-			probeMessage = 'API key cleared.';
+			probeMessage = wasChatGpt ? 'Signed out.' : 'API key cleared.';
 		} catch (err) {
 			probeError = formatError(err);
 		}
@@ -918,16 +985,14 @@
 	// below) is always available regardless of org consent.
 	const orgs = $derived((coder.status?.identity?.orgs ?? []).filter((o) => o.role_in_org !== null));
 
-	// Built-in providers (OpenRouter, Anthropic) require an
+	// Built-in providers (OpenRouter, Anthropic, ChatGPT) require an
 	// explicit standard-model pick from the catalog before Save
 	// can fire — there's no sensible hardcoded default per
 	// preset, and an empty slug would 404 on the first turn. The
 	// HF route and free-form Custom providers stay loose: HF has
 	// a backend-side default; Custom is intentionally hand-edit
 	// territory.
-	const requiresStandardPick = $derived(
-		activeProvider !== null && (activeProvider.kind === 'open_router' || activeProvider.kind === 'anthropic'),
-	);
+	const requiresStandardPick = $derived(activeProvider !== null && activeProvider.kind !== 'custom');
 	const standardModelSelected = $derived(standardModel.trim().length > 0);
 	const saveBlockedBecauseNoStandard = $derived(requiresStandardPick && !standardModelSelected);
 
@@ -1077,7 +1142,9 @@
 					title={p.base_url}
 				>
 					{p.label}
-					{#if !p.has_api_key && !isLocalUrl(p.base_url)}
+					{#if p.kind === 'chat_gpt' && !p.has_api_key}
+						<span class="provider-tab-flag" title="Not signed in to ChatGPT">signed out</span>
+					{:else if !p.has_api_key && !isLocalUrl(p.base_url)}
 						<span class="provider-tab-flag" title="No API key configured">no key</span>
 					{/if}
 				</button>
@@ -1161,60 +1228,100 @@
 							</span>
 						{/if}
 					</label>
-					<label class="field draft-key">
-						<span class="label-row">
-							<span class="label-name">API key</span>
-							{#if !providerDraft.is_new}
-								{@const existing = providers.find((p) => p.id === providerDraft?.id)}
-								{#if existing?.has_api_key}
-									<span class="key-status configured">key configured</span>
+					{#if providerDraft.kind === 'chat_gpt'}
+						{@const account = chatgptAccounts[providerDraft.id]}
+						{@const signedIn = providers.find((p) => p.id === providerDraft?.id)?.has_api_key ?? false}
+						<div class="field draft-key">
+							<span class="label-row">
+								<span class="label-name">ChatGPT account</span>
+								{#if signedIn}
+									<span class="key-status configured">signed in</span>
 								{:else}
-									<span class="key-status missing">no key</span>
+									<span class="key-status missing">signed out</span>
 								{/if}
+							</span>
+							{#if chatgptCode !== null}
+								<span class="hint">
+									Enter <strong class="chatgpt-code">{chatgptCode.user_code}</strong> at
+									<a href={chatgptCode.verification_uri} target="_blank" rel="noreferrer noopener"
+										>{chatgptCode.verification_uri}</a
+									>. Waiting for approval…
+								</span>
+							{:else if signedIn && account}
+								<span class="hint">
+									{account.email ?? 'Signed in'}{account.plan_type ? ` · ${account.plan_type} plan` : ''}
+								</span>
 							{/if}
-						</span>
-						<input
-							type="password"
-							bind:value={providerDraft.api_key}
-							placeholder={providerDraft.is_new
-								? (preset?.api_key_placeholder ?? 'sk-...')
-								: 'Paste a new key to replace'}
-							spellcheck="false"
-							autocomplete="off"
-						/>
-						<span class="hint">
-							{#if preset !== null}
-								Get a key at <a href={preset.api_key_dashboard_url} target="_blank" rel="noreferrer noopener">
-									{preset.api_key_dashboard_label}
-								</a>.
-							{/if}
-							Stored in your OS keyring, never read back into this dialog. Leave blank for keyless local servers (<code
-								>localhost</code
-							>, <code>*.local</code>).
-						</span>
-					</label>
-					<label class="field">
-						<span class="label-row"><span class="label-name">Payload cap (MB)</span></span>
-						<input
-							type="text"
-							inputmode="numeric"
-							bind:value={providerDraft.payload_cap}
-							placeholder="uncapped"
-							spellcheck="false"
-							autocomplete="off"
-						/>
-						<span class="hint">
-							Max request-body size the endpoint accepts. Past ~85 % of it, the oldest screenshots are elided from
-							outgoing requests (never from the session). Leave empty for uncapped.
-						</span>
-					</label>
+							<span class="hint">
+								Uses your ChatGPT Plus/Pro plan's Codex allowance instead of API billing. Sign-in runs on the machine
+								hosting this workspace and is stored in its OS keyring. If ChatGPT refuses, enable device code login for
+								Codex in ChatGPT's security settings.
+							</span>
+						</div>
+					{:else}
+						<label class="field draft-key">
+							<span class="label-row">
+								<span class="label-name">API key</span>
+								{#if !providerDraft.is_new}
+									{@const existing = providers.find((p) => p.id === providerDraft?.id)}
+									{#if existing?.has_api_key}
+										<span class="key-status configured">key configured</span>
+									{:else}
+										<span class="key-status missing">no key</span>
+									{/if}
+								{/if}
+							</span>
+							<input
+								type="password"
+								bind:value={providerDraft.api_key}
+								placeholder={providerDraft.is_new
+									? (preset?.key?.placeholder ?? 'sk-...')
+									: 'Paste a new key to replace'}
+								spellcheck="false"
+								autocomplete="off"
+							/>
+							<span class="hint">
+								{#if preset?.key}
+									Get a key at <a href={preset.key.dashboard_url} target="_blank" rel="noreferrer noopener">
+										{preset.key.dashboard_label}
+									</a>.
+								{/if}
+								Stored in your OS keyring, never read back into this dialog. Leave blank for keyless local servers (<code
+									>localhost</code
+								>, <code>*.local</code>).
+							</span>
+						</label>
+						<label class="field">
+							<span class="label-row"><span class="label-name">Payload cap (MB)</span></span>
+							<input
+								type="text"
+								inputmode="numeric"
+								bind:value={providerDraft.payload_cap}
+								placeholder="uncapped"
+								spellcheck="false"
+								autocomplete="off"
+							/>
+							<span class="hint">
+								Max request-body size the endpoint accepts. Past ~85 % of it, the oldest screenshots are elided from
+								outgoing requests (never from the session). Leave empty for uncapped.
+							</span>
+						</label>
+					{/if}
 				</div>
 				<div class="draft-actions">
-					<button type="button" class="secondary" onclick={onProbeDraft} disabled={probing}>
-						{probing ? 'Probing…' : 'Verify'}
-					</button>
+					{#if providerDraft.kind === 'chat_gpt'}
+						<button type="button" class="secondary" onclick={onChatGptSignIn} disabled={chatgptCode !== null}>
+							{chatgptCode !== null ? 'Waiting…' : 'Sign in with ChatGPT'}
+						</button>
+					{:else}
+						<button type="button" class="secondary" onclick={onProbeDraft} disabled={probing}>
+							{probing ? 'Probing…' : 'Verify'}
+						</button>
+					{/if}
 					{#if !providerDraft.is_new}
-						<button type="button" class="secondary" onclick={onClearDraftKey}>Clear key</button>
+						<button type="button" class="secondary" onclick={onClearDraftKey}>
+							{providerDraft.kind === 'chat_gpt' ? 'Sign out' : 'Clear key'}
+						</button>
 						<button type="button" class="danger" onclick={onDeleteDraft}>Delete provider</button>
 					{/if}
 					<span class="flex-spacer"></span>
@@ -2579,6 +2686,11 @@
 		margin: 0;
 		font-size: 11px;
 		color: var(--m-success, #38a169);
+	}
+	.chatgpt-code {
+		font-family: var(--m-font-mono, monospace);
+		letter-spacing: 0.08em;
+		user-select: all;
 	}
 	.flat-catalog {
 		list-style: none;

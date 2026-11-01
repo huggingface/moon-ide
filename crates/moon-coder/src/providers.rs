@@ -167,6 +167,23 @@ impl ProviderKeyring {
 		Ok(())
 	}
 
+	/// Re-read `id` from the OS keyring, bypassing (and refreshing)
+	/// the cache. For credentials another process may have rotated.
+	pub fn reload(&self, id: &str) -> Result<Option<String>, CoderError> {
+		let stored = self.store.load(id)?;
+		if let Ok(mut cache) = self.cache.write() {
+			match &stored {
+				Some(value) => {
+					cache.insert(id.to_owned(), value.clone());
+				}
+				None => {
+					cache.remove(id);
+				}
+			}
+		}
+		Ok(stored)
+	}
+
 	/// Drop the keyring entry + cache slot. Idempotent.
 	pub fn clear(&self, id: &str) -> Result<(), CoderError> {
 		self.store.clear(id)?;

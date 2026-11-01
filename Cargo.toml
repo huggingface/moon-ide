@@ -65,6 +65,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 # Gzips large LLM request bodies; see `moon-coder/src/request_compression.rs`.
 flate2 = "1.1"
+# zstd request bodies for the ChatGPT (Codex) backend, which rejects
+# uncompressed bodies past ~1 MB. Already in the tree via reqwest.
+zstd = "0.14"
 # Pulled in transitively via reqwest's `stream` feature already; named
 # explicitly here so the coder's SSE consumer can lean on `StreamExt`
 # without a hidden cross-crate dependency.

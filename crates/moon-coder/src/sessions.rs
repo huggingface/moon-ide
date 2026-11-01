@@ -656,7 +656,10 @@ fn pi_assistant_message(
 	// the round-trip survives reload and we can replay it verbatim.
 	// Otherwise fall back to the plain `thinking` summary string the
 	// non-Anthropic providers produce.
-	if thinking_blocks.is_empty() {
+	let signed_thinking = thinking_blocks
+		.iter()
+		.any(|b| !matches!(b, crate::inference::ThinkingBlock::ResponsesOutput { .. }));
+	if !signed_thinking {
 		if let Some(thinking) = thinking {
 			if !thinking.is_empty() {
 				blocks.push(serde_json::json!({
@@ -729,6 +732,14 @@ fn pi_thinking_block(block: &crate::inference::ThinkingBlock) -> serde_json::Val
 		ThinkingBlock::RedactedThinking { data } => serde_json::json!({
 			"type": "redacted_thinking",
 			"data": data,
+		}),
+		// Its own block type rather than a `thinking` block: the
+		// summary already rides in the plain `thinking` block, and
+		// the viewer skips types it doesn't know.
+		ThinkingBlock::ResponsesOutput { model, items } => serde_json::json!({
+			"type": "responses_output",
+			"model": model,
+			"items": items,
 		}),
 	}
 }
@@ -1024,6 +1035,11 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 					thinkings.push(t.to_string());
 				}
 				if let Some(parsed) = parse_pi_thinking_block(block) {
+					thinking_blocks.push(parsed);
+				}
+			}
+			"responses_output" => {
+				if let Ok(parsed) = serde_json::from_value(block.clone()) {
 					thinking_blocks.push(parsed);
 				}
 			}

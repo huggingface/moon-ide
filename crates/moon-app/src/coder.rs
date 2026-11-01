@@ -11,8 +11,8 @@ use moon_core::session as core_session;
 use moon_protocol::coder_hub::{CoderHubBucket, HubNamespace, HubUploadAllSummary};
 use moon_protocol::coder_mcp::{McpServerConfig, McpServerStatus};
 use moon_protocol::coder_models::{
-	CoderModelSettings, CoderProviderConfig, CoderProviderLock, OpenRouterCredits, ProviderModelSummary,
-	ProviderProbeResult, RouterModel,
+	ChatGptAccount, ChatGptDeviceCode, CoderModelSettings, CoderProviderConfig, CoderProviderLock, OpenRouterCredits,
+	ProviderModelSummary, ProviderProbeResult, RouterModel,
 };
 use moon_protocol::MoonError;
 use serde::Deserialize;
@@ -1148,6 +1148,32 @@ pub async fn coder_list_provider_models(app: &AppCore, id: String) -> Result<Vec
 	app.coder.list_provider_models(&id).await.map_err(MoonError::from)
 }
 
+/// Start a ChatGPT (Codex) device-code sign-in for a `chat_gpt`
+/// provider (ADR 0101). Runs in the workspace process, so a remote
+/// workspace signs in on the server.
+pub async fn coder_chatgpt_start_login(app: &AppCore) -> Result<ChatGptDeviceCode, MoonError> {
+	app.coder.chatgpt_start_login().await.map_err(MoonError::from)
+}
+
+/// Block until the user approves `code` (or it expires), then store
+/// the tokens in provider `id`'s keyring slot.
+pub async fn coder_chatgpt_finish_login(
+	app: &AppCore,
+	id: String,
+	code: ChatGptDeviceCode,
+) -> Result<ChatGptAccount, MoonError> {
+	app
+		.coder
+		.chatgpt_finish_login(&id, &code)
+		.await
+		.map_err(MoonError::from)
+}
+
+/// Who a `chat_gpt` provider is signed in as; `None` when signed out.
+pub async fn coder_chatgpt_account(app: &AppCore, id: String) -> Result<Option<ChatGptAccount>, MoonError> {
+	Ok(app.coder.chatgpt_account(&id))
+}
+
 /// OpenRouter credit status for a provider: account balance from
 /// `/credits`, per-key usage + optional spend cap from `/key`.
 /// The picker shows it on the OpenRouter tab when a key is
@@ -1594,6 +1620,9 @@ crate::commands! {
 	coder_clear_provider_api_key([app] id: String),
 	coder_list_provider_models([app] id: String),
 	coder_openrouter_credits([app] id: String),
+	coder_chatgpt_start_login([app]),
+	coder_chatgpt_finish_login([app] id: String, code: ChatGptDeviceCode),
+	coder_chatgpt_account([app] id: String),
 	coder_save_provider([app] config: CoderProviderConfig),
 	coder_delete_provider([app] id: String),
 	coder_web_search_configured([app]),

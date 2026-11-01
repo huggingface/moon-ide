@@ -75,7 +75,7 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 		|| status == reqwest::StatusCode::GATEWAY_TIMEOUT
 }
 
-fn rate_limit_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+pub(crate) fn rate_limit_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 	let backoff = Duration::from_secs(2u64 << attempt.min(6));
 	retry_after
 		.map_or(backoff, |ra| ra.max(backoff))
@@ -86,7 +86,7 @@ fn rate_limit_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 /// http-date form is rare on inference providers and not worth a
 /// date parser — an unparseable value just falls back to the
 /// exponential schedule.
-fn retry_after_of(response: &reqwest::Response) -> Option<Duration> {
+pub(crate) fn retry_after_of(response: &reqwest::Response) -> Option<Duration> {
 	let raw = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
 	raw.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
@@ -228,6 +228,17 @@ pub enum ThinkingBlock {
 	RedactedThinking {
 		#[serde(default)]
 		data: String,
+	},
+	/// The ChatGPT route's Responses output items for this turn
+	/// (ADR 0101): reasoning items verbatim (their
+	/// `encrypted_content` is the only copy, since requests go out
+	/// with `store: false`), message and function-call items reduced to
+	/// their ids, all in output order. Replayed only to the same
+	/// `model`; every other route ignores it.
+	ResponsesOutput {
+		model: String,
+		#[serde(default)]
+		items: Vec<serde_json::Value>,
 	},
 }
 
@@ -844,7 +855,7 @@ fn set_sticky_model(original: &str, fallback: &str) {
 /// nibbles are forced to `4`/`8`. `None` outside a turn scope
 /// (title passes, probes) — the router then falls back to the
 /// requester id, which is fine for one-off calls.
-fn session_affinity_uuid() -> Option<String> {
+pub(crate) fn session_affinity_uuid() -> Option<String> {
 	let hint = SESSION_HINT.try_with(|s| s.clone()).ok()?;
 	use std::hash::{Hash, Hasher};
 	let mut h1 = std::collections::hash_map::DefaultHasher::new();
@@ -1132,6 +1143,7 @@ pub struct InferenceClient {
 	hf_base_url: String,
 	models: SharedCoderModels,
 	provider_keys: ProviderKeyring,
+	chatgpt: crate::chatgpt_auth::ChatGptAuth,
 }
 
 /// Resolved request routing for one round-trip.
@@ -1148,6 +1160,8 @@ pub(crate) struct ResolvedRoute {
 	pub(crate) auth_token: Option<String>,
 	pub(crate) bill_to: Option<String>,
 	pub(crate) kind: RouteKind,
+	/// Keyring id of the user provider; `None` on the HF route.
+	pub(crate) provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1156,6 +1170,7 @@ pub(crate) enum RouteKind {
 	Custom,
 	OpenRouter,
 	Anthropic,
+	ChatGpt,
 }
 
 impl ResolvedRoute {
@@ -1266,6 +1281,7 @@ impl InferenceClient {
 			auth,
 			hf_base_url: HF_ROUTER_BASE.to_string(),
 			models,
+			chatgpt: crate::chatgpt_auth::ChatGptAuth::new(provider_keys.clone()),
 			provider_keys,
 		})
 	}
@@ -1301,6 +1317,7 @@ impl InferenceClient {
 				auth_token: Some(access),
 				bill_to: snapshot.bill_to().map(str::to_owned),
 				kind: RouteKind::HuggingFace,
+				provider_id: None,
 			});
 		}
 		let (kind, id, base_url) = match resolved {
@@ -1308,6 +1325,7 @@ impl InferenceClient {
 			ResolvedProvider::Custom { id, base_url } => (RouteKind::Custom, id, base_url),
 			ResolvedProvider::OpenRouter { id, base_url } => (RouteKind::OpenRouter, id, base_url),
 			ResolvedProvider::Anthropic { id, base_url } => (RouteKind::Anthropic, id, base_url),
+			ResolvedProvider::ChatGpt { id, base_url } => (RouteKind::ChatGpt, id, base_url),
 		};
 		if base_url.trim().is_empty() {
 			return Err(CoderError::Internal(format!(
@@ -1315,12 +1333,19 @@ impl InferenceClient {
 			)));
 		}
 		let trimmed = base_url.trim_end_matches('/').to_owned();
-		let auth_token = self.provider_keys.get(&id);
+		// The ChatGPT slot holds an OAuth bundle, not a bearer key;
+		// `crate::chatgpt` resolves (and refreshes) it per request.
+		let auth_token = if kind == RouteKind::ChatGpt {
+			None
+		} else {
+			self.provider_keys.get(&id)
+		};
 		Ok(ResolvedRoute {
 			base_url: trimmed,
 			auth_token,
 			bill_to: None,
 			kind,
+			provider_id: Some(id),
 		})
 	}
 
@@ -1340,7 +1365,8 @@ impl InferenceClient {
 			ResolvedProvider::HuggingFace => return Some(crate::images::HF_IMAGE_WIRE_BUDGET),
 			ResolvedProvider::Custom { id, .. }
 			| ResolvedProvider::OpenRouter { id, .. }
-			| ResolvedProvider::Anthropic { id, .. } => id,
+			| ResolvedProvider::Anthropic { id, .. }
+			| ResolvedProvider::ChatGpt { id, .. } => id,
 		};
 		// User providers: budget only when the user configured a
 		// payload cap (local endpoints don't care). Ceiling at 85 %
@@ -1565,6 +1591,52 @@ impl InferenceClient {
 		Ok(raw.into_models().into_iter().map(provider_catalog::flatten).collect())
 	}
 
+	/// The ChatGPT plan's model catalog for provider `id`.
+	pub async fn list_chatgpt_models(
+		&self,
+		id: &str,
+		base_url: &str,
+	) -> Result<Vec<moon_protocol::coder_models::ProviderModelSummary>, CoderError> {
+		crate::chatgpt::list_models(&self.http, &self.chatgpt, id, base_url).await
+	}
+
+	/// Start a Codex device-code sign-in (ADR 0101).
+	pub async fn chatgpt_start_login(&self) -> Result<moon_protocol::coder_models::ChatGptDeviceCode, CoderError> {
+		crate::chatgpt_auth::start_device_login(&self.http).await
+	}
+
+	/// Wait for the user to approve `code`, then store the tokens in
+	/// provider `id`'s keyring slot.
+	pub async fn chatgpt_finish_login(
+		&self,
+		id: &str,
+		code: &moon_protocol::coder_models::ChatGptDeviceCode,
+	) -> Result<moon_protocol::coder_models::ChatGptAccount, CoderError> {
+		let tokens = crate::chatgpt_auth::poll_device_login(&self.http, code).await?;
+		self.chatgpt.save(id, &tokens)?;
+		Ok(tokens.account())
+	}
+
+	/// Who provider `id` is signed in as, from the cached bundle.
+	pub fn chatgpt_account(&self, id: &str) -> Option<moon_protocol::coder_models::ChatGptAccount> {
+		self.chatgpt.account(id)
+	}
+
+	async fn chatgpt_request<'a>(
+		&'a self,
+		route: &'a ResolvedRoute,
+		model: &'a str,
+	) -> crate::chatgpt::ChatGptRequest<'a> {
+		crate::chatgpt::ChatGptRequest {
+			http: &self.http,
+			auth: &self.chatgpt,
+			route,
+			provider_id: route.provider_id.as_deref().unwrap_or_default(),
+			model,
+			reasoning_effort: self.models.read().await.reasoning_effort.clone(),
+		}
+	}
+
 	/// OpenRouter credit status: `GET {base_url}/key` (per-key
 	/// usage + optional spend cap) plus `GET {base_url}/credits`
 	/// (account balance). Both authenticate with the inference
@@ -1642,6 +1714,10 @@ impl InferenceClient {
 		let route = self.resolve_route_or_abort(cancel).await?;
 		if route.kind == RouteKind::Anthropic {
 			return crate::anthropic::chat_completion(&self.http, &route, model, messages, tools, cancel).await;
+		}
+		if route.kind == RouteKind::ChatGpt {
+			let req = self.chatgpt_request(&route, model).await;
+			return crate::chatgpt::chat_completion(req, messages, tools, cancel).await;
 		}
 		let mut route = route;
 		let endpoint = format!("{}/chat/completions", route.base_url);
@@ -1736,6 +1812,11 @@ impl InferenceClient {
 				&self.http, &route, model, messages, tools, max_tokens, cancel, on_event,
 			)
 			.await;
+		}
+		if route.kind == RouteKind::ChatGpt {
+			// No `max_tokens`: the Codex backend rejects an output cap.
+			let req = self.chatgpt_request(&route, model).await;
+			return crate::chatgpt::chat_completion_stream(req, messages, tools, cancel, on_event).await;
 		}
 		let mut route = route;
 		let endpoint = format!("{}/chat/completions", route.base_url);
@@ -2914,6 +2995,7 @@ mod tests {
 			auth_token: None,
 			bill_to: None,
 			kind: RouteKind::HuggingFace,
+			provider_id: None,
 		};
 		let messages = vec![ChatMessage::System { content: "sys".into() }, ChatMessage::user("hi")];
 		assert!(cache_breakpoint_indexes(&messages, &route, "anthropic/claude-sonnet-4.5").is_empty());
@@ -2928,6 +3010,7 @@ mod tests {
 			auth_token: None,
 			bill_to: None,
 			kind: RouteKind::Custom,
+			provider_id: None,
 		};
 		assert!(cache_breakpoint_indexes(&messages, &route, "anthropic/claude-sonnet-4.5").is_empty());
 
@@ -2937,6 +3020,7 @@ mod tests {
 			auth_token: None,
 			bill_to: None,
 			kind: RouteKind::OpenRouter,
+			provider_id: None,
 		};
 		assert!(cache_breakpoint_indexes(&messages, &route, "openai/gpt-4o").is_empty());
 	}
@@ -2948,6 +3032,7 @@ mod tests {
 			auth_token: None,
 			bill_to: None,
 			kind: RouteKind::OpenRouter,
+			provider_id: None,
 		};
 		let model = "anthropic/claude-sonnet-4.5";
 

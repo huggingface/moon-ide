@@ -261,6 +261,10 @@ pub struct CoderModelSettings {
 ///   shape via `tool_use` / `tool_result` blocks, native `cache_control`
 ///   on prompt-cache markers, separate streaming SSE event grammar).
 ///   Picker pre-fills the URL and locks the field.
+/// - [`Self::ChatGpt`] — a ChatGPT Plus/Pro plan through the Codex
+///   backend (OpenAI Responses shape). No API key: the keyring slot
+///   holds an OAuth bundle from the Codex device-code sign-in
+///   (ADR 0101).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
@@ -275,6 +279,34 @@ pub enum ProviderKind {
 	/// Anthropic native built-in. Triggers the `/v1/messages` code
 	/// path in [`moon_coder::inference`].
 	Anthropic,
+	/// ChatGPT subscription via the Codex backend. `has_api_key`
+	/// means "signed in" for this kind.
+	ChatGpt,
+}
+
+/// A started Codex device-code sign-in for a `chat_gpt` provider.
+/// The picker shows `user_code` and opens `verification_uri`; the
+/// whole struct goes back verbatim on `coder_chatgpt_finish_login`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ChatGptDeviceCode {
+	pub device_auth_id: String,
+	pub user_code: String,
+	pub verification_uri: String,
+	/// Poll interval in seconds.
+	pub interval: u32,
+}
+
+/// Who a `chat_gpt` provider is signed in as, read off the ID
+/// token's claims after a successful sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ChatGptAccount {
+	#[ts(optional, type = "string | null")]
+	pub email: Option<String>,
+	/// `plus` / `pro` / `team` / …, as ChatGPT reports it.
+	#[ts(optional, type = "string | null")]
+	pub plan_type: Option<String>,
 }
 
 /// One user-added provider — OpenRouter, Anthropic, a local

@@ -171,6 +171,9 @@ pub enum ResolvedProvider {
 	/// system prompt as a top-level field, native `cache_control`
 	/// blocks, separate streaming SSE event grammar.
 	Anthropic { id: String, base_url: String },
+	/// ChatGPT subscription via the Codex backend (Responses API,
+	/// OAuth bundle in the keyring slot). See [`crate::chatgpt`].
+	ChatGpt { id: String, base_url: String },
 }
 
 impl ResolvedProvider {
@@ -180,7 +183,9 @@ impl ResolvedProvider {
 	pub fn provider_id(&self) -> Option<&str> {
 		match self {
 			Self::HuggingFace => None,
-			Self::Custom { id, .. } | Self::OpenRouter { id, .. } | Self::Anthropic { id, .. } => Some(id.as_str()),
+			Self::Custom { id, .. } | Self::OpenRouter { id, .. } | Self::Anthropic { id, .. } | Self::ChatGpt { id, .. } => {
+				Some(id.as_str())
+			}
 		}
 	}
 
@@ -189,9 +194,10 @@ impl ResolvedProvider {
 	pub fn base_url(&self) -> Option<&str> {
 		match self {
 			Self::HuggingFace => None,
-			Self::Custom { base_url, .. } | Self::OpenRouter { base_url, .. } | Self::Anthropic { base_url, .. } => {
-				Some(base_url.as_str())
-			}
+			Self::Custom { base_url, .. }
+			| Self::OpenRouter { base_url, .. }
+			| Self::Anthropic { base_url, .. }
+			| Self::ChatGpt { base_url, .. } => Some(base_url.as_str()),
 		}
 	}
 
@@ -205,6 +211,7 @@ impl ResolvedProvider {
 			Self::HuggingFace => "huggingface",
 			Self::Anthropic { .. } => "anthropic",
 			Self::OpenRouter { .. } => "openrouter",
+			Self::ChatGpt { .. } => "openai-codex",
 			Self::Custom { id, .. } => id.as_str(),
 		}
 	}
@@ -296,6 +303,10 @@ impl CoderModels {
 					base_url: entry.base_url.clone(),
 				},
 				ProviderKind::OpenRouter => ResolvedProvider::OpenRouter {
+					id: entry.id.clone(),
+					base_url: entry.base_url.clone(),
+				},
+				ProviderKind::ChatGpt => ResolvedProvider::ChatGpt {
 					id: entry.id.clone(),
 					base_url: entry.base_url.clone(),
 				},
