@@ -1932,6 +1932,14 @@ links or code spans are
 untouched, and the render caches key off the repo URL so a folder
 swap can't serve another repo's links. Same rule as the companion.
 
+Consecutive tool calls fold into one summary row: two or more file
+calls (`read_file` / `edit_file` / `write_file`) show the files touched
+and `+added −removed` line totals (edit totals ignore the unchanged
+context lines in `find` / `replace`; `write_file` counts its content
+as added); two or more `bash` calls show the commands and how many
+failed. Assistant rows with no text (tool-only turns, reasoning) don't
+break a run. Clicking the row expands it to the individual calls.
+
 Images in transcript markdown (`![alt](path)`) load from a
 workspace-relative path or any absolute path. Workspace files load
 directly and open in the editor on click; other absolute paths go

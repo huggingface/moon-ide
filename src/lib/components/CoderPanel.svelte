@@ -6,6 +6,9 @@
 	import { readImage, writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { coder, compactionProgressLabel, type CoderRow } from '../coder.svelte';
+	import { groupToolRows, type TranscriptItem } from '../toolGroups';
+
+	type ToolGroupItem = Extract<TranscriptItem, { kind: 'group' }>;
 	import { frontendLog } from '../logs.svelte';
 	import { workspace } from '../state.svelte';
 	import CoderConnectModal from './CoderConnectModal.svelte';
@@ -669,6 +672,7 @@
 	const windowEnd = $derived(Math.max(0, coder.rows.length - bottomClip));
 	const windowStart = $derived(Math.max(0, windowEnd - visibleCount));
 	const windowedRows = $derived(coder.rows.slice(windowStart, windowEnd));
+	const windowedItems = $derived(groupToolRows(windowedRows));
 	const hiddenAbove = $derived(windowStart);
 	const hiddenBelow = $derived(coder.rows.length - windowEnd);
 
@@ -950,6 +954,7 @@
 			// but clearing keeps the set from growing unbounded
 			// across many session swaps.
 			openedToolRows.clear();
+			expandedToolGroups.clear();
 			// A shrink within the same session (revert-to-message,
 			// sub-agent → main pop) invalidates the floating
 			// window's offsets — snap it back to the live tail so
@@ -2185,6 +2190,75 @@
 	// highlighter on the next open). Cleared on session swap via
 	// the row-count reset below so a fresh transcript starts cold.
 	let openedToolRows = $state(new SvelteSet<string>());
+	// Runs of file / bash calls folded into one summary row
+	// (`groupToolRows`); ids of the groups the user expanded.
+	let expandedToolGroups = $state(new SvelteSet<string>());
+
+	function toggleToolGroup(id: string): void {
+		if (expandedToolGroups.has(id)) {
+			expandedToolGroups.delete(id);
+		} else {
+			expandedToolGroups.add(id);
+		}
+	}
+
+	function plural(n: number, word: string): string {
+		return `${n} ${word}${n === 1 ? '' : 's'}`;
+	}
+
+	function toolGroupTitle(item: ToolGroupItem): string {
+		if (item.group === 'bash') {
+			return `Ran ${plural(item.summary.calls, 'command')}`;
+		}
+		const files = item.summary.files;
+		const changed = files.filter((f) => f.edited || f.written).length;
+		const readOnly = files.filter((f) => f.read && !f.edited && !f.written).length;
+		const parts: string[] = [];
+		if (changed > 0) {
+			parts.push(`Edited ${plural(changed, 'file')}`);
+		}
+		if (readOnly > 0) {
+			parts.push(`${parts.length > 0 ? 'read' : 'Read'} ${plural(readOnly, 'file')}`);
+		}
+		if (parts.length === 0) {
+			return `${plural(item.summary.calls, 'file call')}`;
+		}
+		return parts.join(', ');
+	}
+
+	function toolGroupHint(item: ToolGroupItem): string {
+		if (item.group === 'files') {
+			return item.summary.files.map((f) => f.path.split('/').pop() ?? f.path).join(', ');
+		}
+		return item.rows
+			.flatMap((row) => (row.kind === 'tool' ? [toolHint(row.name, row.args) ?? ''] : []))
+			.filter((cmd) => cmd.length > 0)
+			.join(' ; ');
+	}
+
+	function toolGroupStatus(item: ToolGroupItem): string {
+		const s = item.summary;
+		if (s.running > 0) {
+			return 'running…';
+		}
+		if (s.errors > 0) {
+			return plural(s.errors, 'error');
+		}
+		if (s.failedCommands > 0) {
+			return `${s.failedCommands} failed`;
+		}
+		return 'ok';
+	}
+
+	function toolGroupElapsed(item: ToolGroupItem): number {
+		let total = item.summary.durationMs;
+		for (const row of item.rows) {
+			if (row.kind === 'tool' && !row.hasResult) {
+				total += Math.max(0, nowTick - row.startedAt);
+			}
+		}
+		return total;
+	}
 
 	function onToolToggle(event: Event, rowId: string): void {
 		const details = event.currentTarget;
@@ -3298,10 +3372,16 @@
 					{hiddenAbove === 1 ? 'message' : 'messages'} ({hiddenAbove} hidden)
 				</button>
 			{/if}
-			{#each windowedRows as row (row.id)}
-				{@const doomed = pendingRevertFromIndex !== -1 && coder.rows.indexOf(row) >= pendingRevertFromIndex}
+			{#each windowedItems as item (item.kind === 'row' ? item.row.id : `group:${item.id}`)}
+				{@const first = item.kind === 'row' ? item.row : item.rows[0]}
+				{@const doomed =
+					pendingRevertFromIndex !== -1 && first !== undefined && coder.rows.indexOf(first) >= pendingRevertFromIndex}
 				<div class="row-wrap" class:doomed>
-					{@render rowMarkup(row, true)}
+					{#if item.kind === 'row'}
+						{@render rowMarkup(item.row, true)}
+					{:else}
+						{@render toolGroupMarkup(item, true)}
+					{/if}
 				</div>
 			{/each}
 			{#if coder.pendingRevertRowId}
@@ -3636,8 +3716,12 @@
 			{:else if transcript.rows.length === 0}
 				<p class="hint">Sub-agent starting…</p>
 			{:else}
-				{#each transcript.rows as row (row.id)}
-					{@render rowMarkup(row, false)}
+				{#each groupToolRows(transcript.rows) as item (item.kind === 'row' ? item.row.id : `group:${item.id}`)}
+					{#if item.kind === 'row'}
+						{@render rowMarkup(item.row, false)}
+					{:else}
+						{@render toolGroupMarkup(item, false)}
+					{/if}
 				{/each}
 			{/if}
 		</div>
@@ -3788,6 +3872,59 @@
 		onkeydown={onRenameKeydown}
 		onblur={() => void commitRename()}
 	/>
+{/snippet}
+
+{#snippet toolGroupMarkup(item: ToolGroupItem, inParentTranscript: boolean)}
+	{@const s = item.summary}
+	{@const open = expandedToolGroups.has(item.id)}
+	{@const hint = toolGroupHint(item)}
+	<div class="tool-group" class:open>
+		<button
+			type="button"
+			class="tool-group-summary"
+			class:err={s.errors > 0 || s.failedCommands > 0}
+			aria-expanded={open}
+			onclick={() => toggleToolGroup(item.id)}
+		>
+			<span
+				class="tool-dot"
+				class:running={s.running > 0}
+				class:err={s.running === 0 && (s.errors > 0 || s.failedCommands > 0)}
+				aria-hidden="true"
+			></span>
+			<span class="tool-name">{toolGroupTitle(item)}</span>
+			<span class="tool-hint" title={item.group === 'files' ? s.files.map((f) => f.path).join('\n') : hint}>{hint}</span
+			>
+			{#if s.added > 0 || s.removed > 0}
+				<span class="tool-group-diff"><span class="add">+{s.added}</span> <span class="del">−{s.removed}</span></span>
+			{/if}
+			<span class="tool-status">{toolGroupStatus(item)}</span>
+			<span class="tool-elapsed" class:running={s.running > 0}>{fmtElapsed(toolGroupElapsed(item), s.running > 0)}</span
+			>
+			<span class="tool-group-chevron" aria-hidden="true">{open ? '▾' : '▸'}</span>
+		</button>
+		{#if open}
+			{#if item.group === 'files' && s.files.length > 1}
+				<ul class="tool-group-files">
+					{#each s.files as file (file.path)}
+						<li>
+							<span class="tool-group-file" title={file.path}>{file.path}</span>
+							{#if file.added > 0 || file.removed > 0}
+								<span class="add">+{file.added}</span> <span class="del">−{file.removed}</span>
+							{:else if file.read && !file.edited && !file.written}
+								<span class="tool-group-read">read</span>
+							{/if}
+						</li>
+					{/each}
+				</ul>
+			{/if}
+			<div class="tool-group-rows">
+				{#each item.rows as row (row.id)}
+					{@render rowMarkup(row, inParentTranscript)}
+				{/each}
+			</div>
+		{/if}
+	</div>
 {/snippet}
 
 {#snippet rowMarkup(row: CoderRow, inParentTranscript: boolean)}
@@ -5838,6 +5975,111 @@
 	}
 	.row.tool .tool-elapsed.running {
 		color: var(--m-accent);
+	}
+	/* Folded run of file / bash calls: one summary line shaped like
+	   a collapsed tool row; the member rows render below when open. */
+	.tool-group {
+		font-size: 12px;
+		background: var(--m-bg-overlay);
+		border-radius: 6px;
+	}
+	.tool-group-summary {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		width: 100%;
+		min-height: 26px;
+		padding: 4px 8px;
+		border: none;
+		background: none;
+		color: var(--m-fg-muted);
+		font: inherit;
+		line-height: 1.2;
+		text-align: left;
+		cursor: pointer;
+	}
+	.tool-group-summary.err {
+		background: color-mix(in srgb, var(--m-danger) 12%, transparent);
+		border-radius: 6px;
+	}
+	.tool-group .tool-dot {
+		flex: 0 0 auto;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--m-fg-subtle);
+	}
+	.tool-group .tool-dot.running {
+		background: var(--m-accent);
+	}
+	.tool-group .tool-dot.err {
+		background: var(--m-danger);
+	}
+	.tool-group-summary .tool-name {
+		flex: 0 0 auto;
+		color: var(--m-fg);
+		font-weight: 500;
+	}
+	.tool-group-summary .tool-hint {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+	}
+	.tool-group-summary .tool-status,
+	.tool-group-diff,
+	.tool-group-chevron {
+		flex: 0 0 auto;
+	}
+	.tool-group-summary .tool-elapsed {
+		flex: 0 0 auto;
+		color: var(--m-fg-subtle);
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+	}
+	.tool-group-summary .tool-elapsed.running {
+		color: var(--m-accent);
+	}
+	.tool-group-diff,
+	.tool-group-files {
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+	}
+	.tool-group .add {
+		color: var(--m-success);
+	}
+	.tool-group .del {
+		color: var(--m-danger);
+	}
+	.tool-group-files {
+		list-style: none;
+		margin: 0;
+		padding: 2px 8px 6px 21px;
+		color: var(--m-fg-muted);
+	}
+	.tool-group-files li {
+		display: flex;
+		gap: 6px;
+	}
+	.tool-group-file {
+		min-width: 0;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		direction: rtl;
+		text-align: left;
+	}
+	.tool-group-read {
+		color: var(--m-fg-subtle);
+	}
+	.tool-group-rows {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		padding: 0 6px 6px;
 	}
 	.row.tool .block-label {
 		margin-top: 6px;
