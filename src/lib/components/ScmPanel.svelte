@@ -1310,27 +1310,37 @@
 	{#if commits.length > 0}
 		{@const visibleCommits = showAllCommits ? commits : commits.slice(0, VISIBLE_COMMITS)}
 		<div class="commit-list" aria-label="Recent commits">
-			<div class="commit-list-header">Recent commits</div>
-			{#each visibleCommits as commit (commit.sha)}
-				<button
-					type="button"
-					class="commit-list-row"
-					title={`${commit.subject}\n${commit.author} • ${commit.dateRelative}\n${commit.sha}`}
-					disabled={busy}
-					onclick={() => workspace.openCommitTab(commit.sha, commit.subject)}
-				>
-					<span class="commit-sha">{commit.shortSha}</span>
-					<span class="commit-subject">{commit.subject}</span>
-					<span class="commit-date">{commit.dateRelative}</span>
-				</button>
-			{/each}
+			<div class="commit-list-header">
+				<span>Recent commits</span>
+				{#if showAllCommits && commits.length > VISIBLE_COMMITS}
+					<button
+						type="button"
+						class="commit-collapse"
+						title="Show only the latest {VISIBLE_COMMITS} commits"
+						onclick={() => (showAllCommits = false)}>Show less ▴</button
+					>
+				{/if}
+			</div>
+			<!-- Expanded, the list scrolls inside a capped box so the
+			     file list below stays on screen. -->
+			<div class="commit-rows" class:expanded={showAllCommits}>
+				{#each visibleCommits as commit (commit.sha)}
+					<button
+						type="button"
+						class="commit-list-row"
+						title={`${commit.subject}\n${commit.author} • ${commit.dateRelative}\n${commit.sha}`}
+						disabled={busy}
+						onclick={() => workspace.openCommitTab(commit.sha, commit.subject)}
+					>
+						<span class="commit-sha">{commit.shortSha}</span>
+						<span class="commit-subject">{commit.subject}</span>
+						<span class="commit-date">{commit.dateRelative}</span>
+					</button>
+				{/each}
+			</div>
 			{#if commits.length > VISIBLE_COMMITS && !showAllCommits}
 				<button type="button" class="commit-more" disabled={busy} onclick={() => (showAllCommits = true)}>
 					{commits.length - VISIBLE_COMMITS} more commit{commits.length - VISIBLE_COMMITS === 1 ? '' : 's'}…
-				</button>
-			{:else if showAllCommits && commits.length > VISIBLE_COMMITS}
-				<button type="button" class="commit-more" disabled={busy} onclick={() => (showAllCommits = false)}>
-					Show less
 				</button>
 			{/if}
 		</div>
@@ -2035,12 +2045,45 @@
 		gap: 1px;
 	}
 	.commit-list-header {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
 		font-size: 10px;
 		font-weight: 600;
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
 		color: var(--m-fg-subtle);
 		padding: 2px 0 3px;
+	}
+	.commit-collapse {
+		appearance: none;
+		background: transparent;
+		border: none;
+		color: var(--m-fg-subtle);
+		font: inherit;
+		text-transform: none;
+		letter-spacing: normal;
+		font-weight: 500;
+		padding: 0 4px;
+		border-radius: 4px;
+		cursor: pointer;
+	}
+	.commit-collapse:hover {
+		color: var(--m-fg);
+		background: var(--m-bg-2);
+	}
+	.commit-rows {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+	.commit-rows.expanded {
+		max-height: 30vh;
+		overflow-x: hidden;
+		overflow-y: auto;
+		/* Room for the rows' -4px hover bleed inside the scroll box. */
+		margin: 0 -4px;
+		padding: 0 4px;
 	}
 	.commit-list-row {
 		display: flex;
