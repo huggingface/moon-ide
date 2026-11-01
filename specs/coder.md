@@ -2403,7 +2403,13 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
 - **Reasoning depth pick** (modal + companion): medium / high /
   xhigh / max, or cleared. Cleared is the default and sends
   `reasoning_effort` **not at all** — provider default; a set
-  value rides the OpenAI-compatible request verbatim. Persisted in
+  value rides the OpenAI-compatible request verbatim
+  (`reasoning.effort` on ChatGPT). When a provider catalog says
+  which levels a model takes (ChatGPT's `supported_reasoning_levels`
+  and `default_reasoning_level`; OpenRouter's `supported_parameters`
+  lacking any reasoning knob = none), the modal offers those instead
+  of the fixed list, labels the default, and the runner drops an
+  effort the model doesn't accept rather than sending a 400. Persisted in
   `state.json` alongside the picks; CLI:
   `moon-remote model --reasoning xhigh` (empty string clears).
   Anthropic native route ignores it (its thinking config is

@@ -102,6 +102,10 @@ pub struct CoderModels {
 	/// wrongly stripping pixels from a capable model is worse than
 	/// an explainable provider error.
 	pub vision: Arc<HashMap<String, bool>>,
+	/// Model-id → accepted reasoning efforts, for catalogs that say
+	/// (ChatGPT lists them; OpenRouter only flags "none"). Absent
+	/// slug = unknown, so the user's effort is sent as-is.
+	pub reasoning_levels: Arc<HashMap<String, Vec<String>>>,
 	/// User-set per-slug context-window caps. Mirrors
 	/// [`moon_protocol::app_state::CoderAppState::context_window_overrides`]
 	/// at runtime. [`Self::context_window`] applies the cap with
@@ -133,6 +137,7 @@ impl Default for CoderModels {
 			active_provider: None,
 			context_windows: Arc::new(HashMap::new()),
 			vision: Arc::new(HashMap::new()),
+			reasoning_levels: Arc::new(HashMap::new()),
 			context_window_overrides: Arc::new(HashMap::new()),
 			rotation: Arc::new(Vec::new()),
 			reasoning_effort: None,
@@ -439,6 +444,21 @@ impl CoderModels {
 		None
 	}
 
+	/// The user's reasoning effort as it should go on the wire for
+	/// `slug`: dropped when the catalog says the model doesn't accept
+	/// it (a level picked for another provider's model would 400).
+	pub fn effort_for(&self, slug: &str) -> Option<String> {
+		let effort = self.reasoning_effort.clone()?;
+		let levels = self
+			.reasoning_levels
+			.get(slug)
+			.or_else(|| self.reasoning_levels.get(strip_provider_suffix(slug)));
+		match levels {
+			Some(levels) if !levels.contains(&effort) => None,
+			_ => Some(effort),
+		}
+	}
+
 	/// [`supports_images`](Self::supports_images) for the active
 	/// standard model, short-circuiting the Anthropic route to
 	/// `Some(true)` — every current Claude is vision-capable and
@@ -527,6 +547,23 @@ pub fn vision_from_provider_catalog(catalog: &[ProviderModelSummary]) -> HashMap
 	out
 }
 
+/// Slug → accepted reasoning efforts for the catalog rows that say.
+pub fn reasoning_levels_from_provider_catalog(catalog: &[ProviderModelSummary]) -> HashMap<String, Vec<String>> {
+	catalog
+		.iter()
+		.filter_map(|m| Some((m.id.clone(), m.reasoning_levels.clone()?)))
+		.collect()
+}
+
+/// Merge `incoming` slug→efforts pairs into `base` — same semantics
+/// as [`merge_context_windows`].
+pub fn merge_reasoning_levels(
+	base: &HashMap<String, Vec<String>>,
+	incoming: HashMap<String, Vec<String>>,
+) -> Arc<HashMap<String, Vec<String>>> {
+	merge_slug_map(base, incoming)
+}
+
 /// Merge `incoming` slug→vision pairs into `base` — same semantics
 /// as [`merge_context_windows`].
 pub fn merge_vision(base: &HashMap<String, bool>, incoming: HashMap<String, bool>) -> Arc<HashMap<String, bool>> {
@@ -569,6 +606,8 @@ mod tests {
 			pricing_out_per_million: None,
 			supports_image_input: None,
 			description: None,
+			reasoning_levels: None,
+			default_reasoning_level: None,
 		}
 	}
 
@@ -614,6 +653,26 @@ mod tests {
 		assert_eq!(models.supports_images("Qwen/Qwen3-VL:fastest"), Some(true));
 		// Not in the catalog → unknown, not false.
 		assert_eq!(models.supports_images("mystery/model"), None);
+	}
+
+	#[test]
+	fn effort_for_drops_levels_the_catalog_rules_out() {
+		let mut models = CoderModels {
+			reasoning_effort: Some("max".into()),
+			..CoderModels::default()
+		};
+		let mut listed = provider_summary("gpt-x", None);
+		listed.reasoning_levels = Some(vec!["low".into(), "max".into()]);
+		let mut capped = provider_summary("gpt-old", None);
+		capped.reasoning_levels = Some(vec!["low".into(), "high".into()]);
+		let mut none = provider_summary("plain", None);
+		none.reasoning_levels = Some(Vec::new());
+		let catalog = [listed, capped, none, provider_summary("unknown", None)];
+		models.reasoning_levels = Arc::new(reasoning_levels_from_provider_catalog(&catalog));
+		assert_eq!(models.effort_for("gpt-x").as_deref(), Some("max"));
+		assert_eq!(models.effort_for("gpt-old"), None);
+		assert_eq!(models.effort_for("plain"), None);
+		assert_eq!(models.effort_for("unknown").as_deref(), Some("max"));
 	}
 
 	#[test]

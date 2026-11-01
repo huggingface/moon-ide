@@ -149,6 +149,14 @@ pub(crate) async fn list_models(
 		visibility: Option<String>,
 		#[serde(default)]
 		input_modalities: Option<Vec<String>>,
+		#[serde(default)]
+		supported_reasoning_levels: Option<Vec<ReasoningLevel>>,
+		#[serde(default)]
+		default_reasoning_level: Option<String>,
+	}
+	#[derive(Deserialize)]
+	struct ReasoningLevel {
+		effort: String,
 	}
 	let endpoint = format!(
 		"{}/models?client_version={CODEX_CLIENT_VERSION}",
@@ -181,6 +189,10 @@ pub(crate) async fn list_models(
 				pricing_out_per_million: None,
 				supports_image_input: m.input_modalities.map(|mods| mods.iter().any(|x| x == "image")),
 				description: m.description,
+				reasoning_levels: m
+					.supported_reasoning_levels
+					.map(|levels| levels.into_iter().map(|l| l.effort).collect()),
+				default_reasoning_level: m.default_reasoning_level,
 			})
 			.collect(),
 	)

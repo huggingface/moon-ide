@@ -66,4 +66,17 @@ supports_image_input?: boolean | null,
  * that ships a multi-paragraph README per model doesn't blow
  * the picker UI. `None` when absent.
  */
-description?: string | null, };
+description?: string | null, 
+/**
+ * Reasoning-effort values the model accepts, when the catalog
+ * says. `None` = unknown (the picker offers its fixed list);
+ * `Some([])` = the model takes no effort setting. ChatGPT's
+ * catalog lists them; OpenRouter only says whether reasoning is
+ * supported at all.
+ */
+reasoning_levels?: string[] | null, 
+/**
+ * The effort the provider applies when none is sent, when the
+ * catalog says (ChatGPT's `default_reasoning_level`).
+ */
+default_reasoning_level?: string | null, };

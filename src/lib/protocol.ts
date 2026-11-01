@@ -2264,6 +2264,10 @@ export type ProviderModelSummary = {
 	 */
 	supports_image_input?: boolean | null;
 	description?: string | null;
+	/** Reasoning efforts the model accepts. `null` = unknown (picker shows its fixed list); `[]` = takes none. */
+	reasoning_levels?: string[] | null;
+	/** Effort applied when none is sent, when the catalog says. */
+	default_reasoning_level?: string | null;
 };
 
 /**

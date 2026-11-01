@@ -1229,6 +1229,8 @@ pub async fn list_models(
 			// current Claude is vision-capable.
 			supports_image_input: Some(true),
 			description: None,
+			reasoning_levels: None,
+			default_reasoning_level: None,
 		})
 		.collect();
 	Ok(out)
@@ -1746,6 +1748,8 @@ mod tests {
 				pricing_out_per_million: None,
 				supports_image_input: Some(true),
 				description: None,
+				reasoning_levels: None,
+				default_reasoning_level: None,
 			})
 			.collect();
 

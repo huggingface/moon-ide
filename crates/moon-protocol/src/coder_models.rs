@@ -486,4 +486,17 @@ pub struct ProviderModelSummary {
 	#[serde(default)]
 	#[ts(optional, type = "string | null")]
 	pub description: Option<String>,
+	/// Reasoning-effort values the model accepts, when the catalog
+	/// says. `None` = unknown (the picker offers its fixed list);
+	/// `Some([])` = the model takes no effort setting. ChatGPT's
+	/// catalog lists them; OpenRouter only says whether reasoning is
+	/// supported at all.
+	#[serde(default)]
+	#[ts(optional, type = "string[] | null")]
+	pub reasoning_levels: Option<Vec<String>>,
+	/// The effort the provider applies when none is sent, when the
+	/// catalog says (ChatGPT's `default_reasoning_level`).
+	#[serde(default)]
+	#[ts(optional, type = "string | null")]
+	pub default_reasoning_level: Option<String>,
 }

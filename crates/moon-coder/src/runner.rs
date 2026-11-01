@@ -1820,10 +1820,12 @@ impl CoderHandle {
 		};
 		let windows = models::context_windows_from_provider_catalog(&catalog);
 		let vision = models::vision_from_provider_catalog(&catalog);
-		if !windows.is_empty() || !vision.is_empty() {
+		let efforts = models::reasoning_levels_from_provider_catalog(&catalog);
+		if !windows.is_empty() || !vision.is_empty() || !efforts.is_empty() {
 			let mut m = self.state.models.write().await;
 			m.context_windows = models::merge_context_windows(&m.context_windows, windows);
 			m.vision = models::merge_vision(&m.vision, vision);
+			m.reasoning_levels = models::merge_reasoning_levels(&m.reasoning_levels, efforts);
 		}
 		Ok(catalog)
 	}

@@ -1633,7 +1633,7 @@ impl InferenceClient {
 			route,
 			provider_id: route.provider_id.as_deref().unwrap_or_default(),
 			model,
-			reasoning_effort: self.models.read().await.reasoning_effort.clone(),
+			reasoning_effort: self.models.read().await.effort_for(model),
 		}
 	}
 
@@ -1731,7 +1731,7 @@ impl InferenceClient {
 			max_tokens: None,
 			stream: false,
 			stream_options: None,
-			reasoning_effort: self.models.read().await.reasoning_effort.clone(),
+			reasoning_effort: self.models.read().await.effort_for(model),
 		};
 
 		let mut response = self.send_once(&endpoint, &route, &body, cancel).await?;
@@ -1836,7 +1836,7 @@ impl InferenceClient {
 			// `AssistantResponse.usage` to drive the context-usage
 			// indicator and the auto-compaction trigger.
 			stream_options: Some(StreamOptions { include_usage: true }),
-			reasoning_effort: self.models.read().await.reasoning_effort.clone(),
+			reasoning_effort: self.models.read().await.effort_for(model),
 		};
 
 		let mut response = self.send_once_stream(&endpoint, &route, &body, cancel).await?;
@@ -2485,6 +2485,10 @@ mod provider_catalog {
 		/// there.
 		#[serde(default)]
 		architecture: Option<RawArchitecture>,
+		/// OpenRouter: request parameters the model honours. Says
+		/// whether reasoning is supported at all, not which levels.
+		#[serde(default)]
+		supported_parameters: Option<Vec<String>>,
 	}
 
 	#[derive(Deserialize)]
@@ -2570,6 +2574,12 @@ mod provider_catalog {
 		let supports_image_input = raw
 			.architecture
 			.map(|a| a.input_modalities.iter().any(|m| m == "image"));
+		// A parameter list without any reasoning knob means the
+		// model ignores (or rejects) an effort; otherwise unknown.
+		let reasoning_levels = raw
+			.supported_parameters
+			.filter(|params| !params.iter().any(|p| p == "reasoning" || p == "reasoning_effort"))
+			.map(|_| Vec::new());
 		ProviderModelSummary {
 			id: raw.id,
 			owned_by: raw.owned_by,
@@ -2579,6 +2589,8 @@ mod provider_catalog {
 			pricing_out_per_million,
 			supports_image_input,
 			description: description.filter(|s| !s.is_empty()),
+			reasoning_levels,
+			default_reasoning_level: None,
 		}
 	}
 

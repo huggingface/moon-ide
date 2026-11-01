@@ -655,6 +655,21 @@
 		);
 	});
 
+	// Reasoning-effort chips for the standard model. A catalog that
+	// lists levels (ChatGPT) or says "no reasoning" (OpenRouter) wins;
+	// otherwise the fixed list. A saved effort the model doesn't take
+	// stays visible, flagged, because the backend drops it on the wire.
+	const FIXED_EFFORTS: readonly string[] = ['medium', 'high', 'xhigh', 'max'];
+	const standardCatalogRow = $derived(providerCatalog?.find((r) => r.id === standardModel.trim()) ?? null);
+	const effortLevels = $derived<readonly string[]>(standardCatalogRow?.reasoning_levels ?? FIXED_EFFORTS);
+	const effortChips = $derived(
+		reasoningEffort !== null && !effortLevels.includes(reasoningEffort)
+			? [...effortLevels, reasoningEffort]
+			: effortLevels,
+	);
+	const effortDefault = $derived(standardCatalogRow?.default_reasoning_level ?? null);
+	const effortNotSent = $derived(activeProvider?.kind === 'anthropic');
+
 	async function onSaveWebKey(): Promise<void> {
 		const trimmed = webKeyDraft.trim();
 		if (trimmed.length === 0) {
@@ -1556,21 +1571,33 @@
 							type="button"
 							class="effort-chip"
 							class:selected={reasoningEffort === null}
-							title="Provider default — no reasoning_effort field is sent"
-							onclick={() => (reasoningEffort = null)}>default</button
+							title="Provider default — no effort is sent"
+							onclick={() => (reasoningEffort = null)}
+							>default{effortDefault !== null ? ` (${effortDefault})` : ''}</button
 						>
-						{#each ['medium', 'high', 'xhigh', 'max'] as lvl (lvl)}
+						{#each effortChips as lvl (lvl)}
+							{@const unsupported = !effortLevels.includes(lvl)}
 							<button
 								type="button"
 								class="effort-chip"
 								class:selected={reasoningEffort === lvl}
+								class:unsupported
+								title={unsupported ? `${standardModel.trim()} doesn't accept this; nothing is sent` : undefined}
 								onclick={() => (reasoningEffort = lvl)}>{lvl}</button
 							>
 						{/each}
 					</span>
 					<span class="hint">
-						Sent verbatim as <code>reasoning_effort</code> on OpenAI-compatible routes (HF router, custom providers). Default
-						sends nothing — the provider's own default applies. Applied on save.
+						{#if effortNotSent}
+							Not sent on the Anthropic route: thinking is configured per model there. The setting still applies to
+							other providers.
+						{:else if standardCatalogRow?.reasoning_levels?.length === 0}
+							This model takes no reasoning effort, so nothing is sent. The setting still applies to other models.
+						{:else}
+							Sent as <code>reasoning_effort</code> (<code>reasoning.effort</code> on ChatGPT).
+							{standardCatalogRow?.reasoning_levels ? 'Levels from the provider catalog.' : ''} Default sends nothing, so
+							the provider's own default applies. Applied on save.
+						{/if}
 					</span>
 				</div>
 			</section>
@@ -2072,6 +2099,10 @@
 		border-color: var(--accent, #7aa2f7);
 		color: var(--bg, #1a1b26);
 		font-weight: 600;
+	}
+	.effort-chip.unsupported {
+		text-decoration: line-through;
+		border-style: dashed;
 	}
 	.rotation-row {
 		display: flex;
