@@ -638,6 +638,13 @@ pub trait WorkspaceHost: Send + Sync {
 	/// exist, isn't a repo, or git is unavailable.
 	async fn git_commit_diff(&self, sha: &str) -> MoonResult<Option<CommitDiff>>;
 
+	/// `git revert --no-edit <sha>`: commit the inverse of `sha` on
+	/// top of `HEAD` (mainline 1 for a merge commit). Like
+	/// [`Self::git_merge_default_branch`], a conflicting revert is
+	/// aborted before returning so the tree is left as it was, and
+	/// git's stderr surfaces verbatim. Nothing is pushed.
+	async fn git_revert(&self, sha: &str) -> MoonResult<()>;
+
 	/// Recent branches + open PRs for the active folder, formatted
 	/// for the branch-switcher palette. Two sections in the
 	/// returned [`BranchList`]:
@@ -2415,6 +2422,23 @@ impl WorkspaceHost for LocalHost {
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_commit_diff join error: {e}")))?
+	}
+
+	async fn git_revert(&self, sha: &str) -> MoonResult<()> {
+		if !is_safe_rev(sha) {
+			return Err(MoonError::invalid(format!(
+				"git_revert rejects rev: {sha:?} (expected \"HEAD\" or 40-char hex SHA)"
+			)));
+		}
+		let guard = self.git_lock().await;
+		let root = self.root.clone();
+		let sha = sha.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let _guard = guard;
+			run_git_revert(&root, &sha)
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_revert join error: {e}")))?
 	}
 
 	async fn git_snapshot_baseline(&self) -> MoonResult<Option<String>> {
@@ -4293,6 +4317,32 @@ fn run_git_log(root: &Utf8Path, limit: u32) -> Vec<CommitEntry> {
 /// `parse_diff_name_status_z`. Root commits (no parent) produce an empty
 /// `parent_sha`; every file reads as a pure addition. Returns `None`
 /// when the commit doesn't exist, isn't a repo, or git is unavailable.
+fn run_git_revert(root: &Utf8Path, sha: &str) -> MoonResult<()> {
+	use std::process::Command;
+
+	// `rev-list --parents` prints the commit followed by its parents;
+	// a merge commit needs `-m 1` to say which side to undo.
+	let parents = Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["rev-list", "--parents", "-n", "1", sha])
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git rev-list failed to launch: {e}")))?;
+	let is_merge = String::from_utf8_lossy(&parents.stdout).split_whitespace().count() > 2;
+	let mut args = vec!["revert", "--no-edit"];
+	if is_merge {
+		args.extend(["-m", "1"]);
+	}
+	args.push(sha);
+	let result = run_git_simple(root, &args, &format!("git revert {}", &sha[..sha.len().min(7)]));
+	if result.is_err() {
+		// Best-effort: errors when no revert is in flight (dirty-tree
+		// refusal), which is fine — the original error still surfaces.
+		let _ = run_git_simple(root, &["revert", "--abort"], "git revert --abort");
+	}
+	result
+}
+
 fn run_git_commit_diff(root: &Utf8Path, sha: &str) -> Option<CommitDiff> {
 	use std::process::Command;
 
@@ -9495,6 +9545,53 @@ mod tests {
 			"expected default_branch_behind to drop to 0 after merge, got {post:?}"
 		);
 		assert_eq!(post.name.as_deref(), Some("feature"));
+	}
+
+	fn git_rev_parse(git: &std::path::Path, dir: &std::path::Path, rev: &str) -> String {
+		let out = std::process::Command::new(git)
+			.arg("-C")
+			.arg(dir)
+			.args(["rev-parse", rev])
+			.output()
+			.unwrap();
+		String::from_utf8_lossy(&out.stdout).trim().to_owned()
+	}
+
+	#[tokio::test]
+	async fn git_revert_commits_the_inverse_and_aborts_on_conflict() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping revert test");
+			return;
+		};
+		let tmp = TempDir::new().unwrap();
+		let dir = tmp.path();
+		run_git(&git, dir, &["init", "-q", "-b", "main"]);
+		run_git(&git, dir, &["config", "user.email", "r@example.com"]);
+		run_git(&git, dir, &["config", "user.name", "Reverter"]);
+		std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+		run_git(&git, dir, &["add", "."]);
+		run_git(&git, dir, &["commit", "-q", "-m", "initial"]);
+		std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
+		run_git(&git, dir, &["commit", "-q", "-am", "second"]);
+		let second = git_rev_parse(&git, dir, "HEAD");
+		std::fs::write(dir.join("a.txt"), "v3\n").unwrap();
+		run_git(&git, dir, &["commit", "-q", "-am", "third"]);
+		let third = git_rev_parse(&git, dir, "HEAD");
+		let root = Utf8PathBuf::from_path_buf(dir.canonicalize().unwrap()).unwrap();
+		let host = LocalHost::new(root);
+
+		// `second` is buried under `third`'s edit to the same line.
+		host
+			.git_revert(&second)
+			.await
+			.expect_err("conflicting revert must error");
+		assert_eq!(git_rev_parse(&git, dir, "HEAD"), third);
+		assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v3\n");
+		assert!(!dir.join(".git").join("REVERT_HEAD").exists());
+
+		host.git_revert(&third).await.unwrap();
+		assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v2\n");
+		assert_eq!(git_rev_parse(&git, dir, "HEAD^"), third);
 	}
 
 	/// A conflicting `git_merge_default_branch` must abort the merge

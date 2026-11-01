@@ -3218,6 +3218,24 @@ class WorkspaceState {
 	}
 
 	/**
+	 * `git revert` a commit (commit view's Revert button). The revert
+	 * commit stays local; conflicts are aborted backend-side and
+	 * surface as a flash.
+	 */
+	async revertCommit(sha: string): Promise<boolean> {
+		try {
+			await ipc.fs.gitRevert(sha);
+			this.flash(`Reverted ${sha.slice(0, 7)}.`);
+			void this.refreshGitLog();
+			void this.refreshActiveFolder();
+			return true;
+		} catch (err) {
+			this.flash(`Revert failed: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
 	 * Refresh `gitMergeState` from `git_merge_state`. Best-effort:
 	 * a probe failure collapses to "no merge in progress" rather
 	 * than stranding the panel on a stale snapshot. Awaited by

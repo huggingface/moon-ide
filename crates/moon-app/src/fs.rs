@@ -690,6 +690,14 @@ pub async fn fs_git_commit_diff(app: &AppCore, sha: String) -> Result<Option<Com
 	entry.host.git_commit_diff(&sha).await
 }
 
+/// `git revert` a commit in the active folder: the commit view's
+/// "Revert" button. Creates the revert commit locally; a conflict
+/// is aborted and surfaces as an error.
+pub async fn fs_git_revert(app: &AppCore, sha: String) -> Result<(), MoonError> {
+	let entry = app.workspaces.require_active_folder().await?;
+	entry.host.git_revert(&sha).await
+}
+
 crate::commands! {
 	fs_browse(path: Option<String>),
 	fs_read_range(path: String, offset: u64, length: u64),
@@ -740,6 +748,7 @@ crate::commands! {
 	fs_git_head_commit_message([app]),
 	fs_git_log([app] limit: Option<u32>),
 	fs_git_commit_diff([app] sha: String),
+	fs_git_revert([app] sha: String),
 }
 
 #[cfg(test)]

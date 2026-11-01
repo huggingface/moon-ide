@@ -225,6 +225,7 @@ export const ipc = {
 		gitHeadCommitMessage: () => call<string>('fs_git_head_commit_message'),
 		gitLog: (limit?: number) => call<CommitEntry[]>('fs_git_log', { limit: limit ?? null }),
 		gitCommitDiff: (sha: string) => call<CommitDiff | null>('fs_git_commit_diff', { sha }),
+		gitRevert: (sha: string) => call<void>('fs_git_revert', { sha }),
 		branchList: (prScope: PrListScope) => call<BranchList>('fs_branch_list', { prScope }),
 		gitExistingPrUrl: () => call<string | null>('fs_git_existing_pr_url'),
 		branchSwitch: (target: BranchSwitchTarget) => call<void>('fs_branch_switch', { target }),

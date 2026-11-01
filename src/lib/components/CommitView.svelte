@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { confirm } from '@tauri-apps/plugin-dialog';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { ipc } from '../ipc';
 	import { shaFromCommitPath } from '../util/commitPath';
@@ -54,6 +55,28 @@
 		void loadDiff();
 	});
 
+	let reverting = $state(false);
+
+	async function revert() {
+		const current = diff;
+		if (current === null || reverting) {
+			return;
+		}
+		const ok = await confirm(
+			`Create a commit that reverts ${current.commitSha.slice(0, 7)} "${current.subject}"? It stays local until you push.`,
+			{ title: 'Revert commit', kind: 'warning' },
+		);
+		if (!ok) {
+			return;
+		}
+		reverting = true;
+		try {
+			await workspace.revertCommit(current.commitSha);
+		} finally {
+			reverting = false;
+		}
+	}
+
 	function registerSection(path: string, el: HTMLElement | null) {
 		if (el === null) {
 			sectionEls.delete(path);
@@ -86,6 +109,9 @@
 			<span class="title">{diff.subject}</span>
 			<span class="sha">{sha?.slice(0, 7) ?? ''}</span>
 			<span class="counts">{diff.entries.length} file{diff.entries.length === 1 ? '' : 's'}</span>
+			<button type="button" class="revert" onclick={revert} disabled={reverting} title="git revert this commit">
+				{reverting ? 'Reverting…' : 'Revert'}
+			</button>
 		</div>
 		<div class="stack">
 			{#each diff.entries as entry, i (`${entry.path}|${diff.commitSha}`)}
@@ -149,6 +175,24 @@
 	.counts {
 		margin-left: auto;
 		font-variant-numeric: tabular-nums;
+	}
+	.revert {
+		align-self: center;
+		padding: 3px 10px;
+		background: var(--m-bg);
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		color: var(--m-fg);
+		font-size: 11px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.revert:hover:not(:disabled) {
+		border-color: var(--m-fg-muted);
+	}
+	.revert:disabled {
+		cursor: default;
+		opacity: 0.6;
 	}
 	.empty {
 		padding: 24px;
