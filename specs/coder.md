@@ -1947,6 +1947,13 @@ as added); two or more `bash` calls show the commands and how many
 failed. Assistant rows with no text (tool-only turns, reasoning) don't
 break a run. Clicking the row expands it to the individual calls.
 
+Under the composer, a **Ship it** button (once the session has
+messages) sends a fixed message telling the agent to go ahead with
+what it held back — commit, push, publish, open or update the PR —
+with any composer text appended. Agents stop short of landing work
+unless told, so this is the one-click "go ahead". The reasoning
+picker sits at the other end of that row.
+
 Images in transcript markdown (`![alt](path)`) load from a
 workspace-relative path or any absolute path. Workspace files load
 directly and open in the editor on click; other absolute paths go

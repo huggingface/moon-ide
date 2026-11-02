@@ -37,6 +37,7 @@
 	import CoderPlanStrip from './CoderPlanStrip.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
+	import RocketIcon from './icons/RocketIcon.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -469,6 +470,21 @@
 			? [...reasoningChoices.levels, reasoningEffort]
 			: reasoningChoices.levels,
 	);
+
+	const showReasoningPick = $derived(
+		coder.modelSettings !== null && reasoningChoices.sent && reasoningChoices.levels.length > 0,
+	);
+
+	// Agents stop short of landing work ("not pushed yet", "not
+	// published yet") unless told; this is the one-click "go ahead".
+	const SHIP_IT_PROMPT =
+		'Ship it: go ahead with what you held back to land this work — commit, push, publish, open or update the PR, whatever it still needs.';
+
+	async function shipIt(): Promise<void> {
+		const extra = coder.draft.trim();
+		coder.draft = extra.length > 0 ? `${SHIP_IT_PROMPT}\n\n${extra}` : SHIP_IT_PROMPT;
+		await coder.send();
+	}
 
 	// Our own menu rather than a native `<select>`: WebKitGTK's select
 	// popup needs press-drag-release to pick a value.
@@ -3708,29 +3724,42 @@
 				onpaste={onComposerPaste}
 				onblur={onComposerBlur}
 			></textarea>
-			{#if coder.modelSettings !== null && reasoningChoices.sent && reasoningChoices.levels.length > 0}
+			{#if coder.rows.length > 0 || showReasoningPick}
 				<div class="composer-meta">
-					<span class="reasoning-pick">
-						<span>Reasoning</span>
+					{#if coder.rows.length > 0}
 						<button
 							type="button"
-							class="reasoning-button"
-							title="Reasoning effort for the next turn (also in model settings)"
-							aria-haspopup="menu"
-							aria-expanded={reasoningMenuAnchor !== null}
-							onpointerdown={(e) => e.stopPropagation()}
-							onclick={toggleReasoningMenu}
+							class="ship-it"
+							title="Tell the agent to land what it held back: commit, push, publish, open the PR (anything typed in the composer is sent along)"
+							onclick={() => void shipIt()}
 						>
-							{reasoningEffort ?? 'default'}
-							<span class="reasoning-caret" aria-hidden="true">▾</span>
+							<RocketIcon size={12} />
+							Ship it
 						</button>
-					</span>
-					{#if reasoningMenuAnchor !== null}
-						<ContextMenu
-							items={reasoningMenuItems}
-							anchorRect={reasoningMenuAnchor}
-							onClose={() => (reasoningMenuAnchor = null)}
-						/>
+					{/if}
+					{#if showReasoningPick}
+						<span class="reasoning-pick">
+							<span>Reasoning</span>
+							<button
+								type="button"
+								class="reasoning-button"
+								title="Reasoning effort for the next turn (also in model settings)"
+								aria-haspopup="menu"
+								aria-expanded={reasoningMenuAnchor !== null}
+								onpointerdown={(e) => e.stopPropagation()}
+								onclick={toggleReasoningMenu}
+							>
+								{reasoningEffort ?? 'default'}
+								<span class="reasoning-caret" aria-hidden="true">▾</span>
+							</button>
+						</span>
+						{#if reasoningMenuAnchor !== null}
+							<ContextMenu
+								items={reasoningMenuItems}
+								anchorRect={reasoningMenuAnchor}
+								onClose={() => (reasoningMenuAnchor = null)}
+							/>
+						{/if}
 					{/if}
 				</div>
 			{/if}
@@ -6433,8 +6462,29 @@
 	}
 	.composer-meta {
 		display: flex;
-		justify-content: flex-end;
+		align-items: center;
+		gap: 8px;
 		margin-top: -2px;
+	}
+	.composer-meta .reasoning-pick {
+		margin-left: auto;
+	}
+	.ship-it {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		padding: 1px 6px;
+		background: transparent;
+		color: var(--m-fg-subtle);
+		border: 1px solid transparent;
+		border-radius: 4px;
+		font: inherit;
+		font-size: 11px;
+		cursor: pointer;
+	}
+	.ship-it:hover {
+		color: var(--m-accent);
+		border-color: color-mix(in srgb, var(--m-accent) 40%, transparent);
 	}
 	.reasoning-pick {
 		display: inline-flex;
