@@ -36,6 +36,8 @@
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
 	import CoderPlanStrip from './CoderPlanStrip.svelte';
+	import ContextMenu from './ContextMenu.svelte';
+	import type { ContextMenuItem } from './contextMenu';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -469,12 +471,40 @@
 			: reasoningChoices.levels,
 	);
 
-	function onReasoningChange(e: Event): void {
-		const value = (e.currentTarget as HTMLSelectElement).value;
-		coder.setReasoningEffort(value === '' ? null : value).catch(() => {
+	// Our own menu rather than a native `<select>`: WebKitGTK's select
+	// popup needs press-drag-release to pick a value.
+	let reasoningMenuAnchor = $state<{ left: number; top: number; width: number; height: number } | null>(null);
+
+	function toggleReasoningMenu(e: MouseEvent): void {
+		if (reasoningMenuAnchor !== null) {
+			reasoningMenuAnchor = null;
+			return;
+		}
+		if (!(e.currentTarget instanceof HTMLElement)) {
+			return;
+		}
+		const r = e.currentTarget.getBoundingClientRect();
+		reasoningMenuAnchor = { left: r.left, top: r.top, width: r.width, height: r.height };
+	}
+
+	function setReasoning(value: string | null): void {
+		coder.setReasoningEffort(value).catch(() => {
 			// `saveModelSettings` already records the error in `modelsError`.
 		});
 	}
+
+	const reasoningMenuItems = $derived<ContextMenuItem[]>([
+		{
+			id: 'default',
+			label: `${reasoningEffort === null ? '✓ ' : ''}default${reasoningChoices.defaultLevel ? ` (${reasoningChoices.defaultLevel})` : ''}`,
+			onSelect: () => setReasoning(null),
+		},
+		...reasoningOptions.map((lvl) => ({
+			id: lvl,
+			label: `${reasoningEffort === lvl ? '✓ ' : ''}${lvl}${reasoningChoices.levels.includes(lvl) ? '' : ' (not supported, not sent)'}`,
+			onSelect: () => setReasoning(lvl),
+		})),
+	]);
 
 	function hubRowState(sessionId: string): 'idle' | 'syncing' | 'synced' | 'failed' {
 		const s = coder.hubSyncState[sessionId];
@@ -743,6 +773,41 @@
 		} else {
 			visibleCount += step;
 		}
+	}
+
+	/** Bring a tool row into view and open it: grow the render
+	 *  window to include it, expand the summary group it may be
+	 *  folded into, then scroll to it, open its body and flash it.
+	 *  Used by the background chips above the composer. */
+	async function revealToolRow(rowId: string): Promise<void> {
+		const index = coder.rows.findIndex((row) => row.id === rowId);
+		if (index < 0) {
+			return;
+		}
+		if (index < windowStart || index >= windowEnd) {
+			bottomClip = Math.max(0, coder.rows.length - index - 10);
+			visibleCount = INITIAL_WINDOW;
+		}
+		stickyBottom = false;
+		await tick();
+		const group = windowedItems.find((item) => item.kind === 'group' && item.rows.some((row) => row.id === rowId));
+		if (group?.kind === 'group') {
+			expandedToolGroups.add(group.id);
+			await tick();
+		}
+		const el = scrollEl?.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(rowId)}"]`);
+		if (!el) {
+			return;
+		}
+		const details = el.querySelector('details');
+		if (details && !details.open) {
+			details.open = true;
+		}
+		el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+		el.animate([{ outline: '1px solid var(--m-accent)' }, { outline: '1px solid transparent' }], {
+			duration: 1200,
+			easing: 'ease-out',
+		});
 	}
 
 	/** Snap the window back to the live tail and scroll to the
@@ -3435,10 +3500,17 @@
 				<!-- Background work that will wake this session (ADR 0102). -->
 				<div class="background-strip" aria-label="Running in the background">
 					{#each coder.backgroundSubagents as sub (sub.id)}
-						<span class="background-item" title={`Sub-agent ${sub.id} · ${sub.targetFolder}`}>
-							<span class="background-dot" aria-hidden="true"></span>
-							<span class="background-kind">{sub.mode}</span>
-							<span class="background-name">{baseName(sub.targetFolder)}</span>
+						<span class="background-item">
+							<button
+								type="button"
+								class="background-open"
+								title={`Open sub-agent ${sub.id} · ${sub.targetFolder}`}
+								onclick={() => coder.openSubagent(sub.id)}
+							>
+								<span class="background-dot" aria-hidden="true"></span>
+								<span class="background-kind">{sub.mode}</span>
+								<span class="background-name">{baseName(sub.targetFolder)}</span>
+							</button>
 							<button
 								type="button"
 								class="background-stop"
@@ -3449,10 +3521,17 @@
 						</span>
 					{/each}
 					{#each coder.activeProcesses as proc (proc.id)}
-						<span class="background-item" title={`${proc.id}: ${proc.cmd}`}>
-							<span class="background-dot" aria-hidden="true"></span>
-							<span class="background-kind">$</span>
-							<span class="background-name">{proc.cmd}</span>
+						<span class="background-item">
+							<button
+								type="button"
+								class="background-open"
+								title={`Show ${proc.id}: ${proc.cmd}`}
+								onclick={() => void revealToolRow(proc.tool_call_id)}
+							>
+								<span class="background-dot" aria-hidden="true"></span>
+								<span class="background-kind">$</span>
+								<span class="background-name">{proc.cmd}</span>
+							</button>
 							<button
 								type="button"
 								class="background-stop"
@@ -3632,19 +3711,28 @@
 			></textarea>
 			{#if coder.modelSettings !== null && reasoningChoices.sent && reasoningChoices.levels.length > 0}
 				<div class="composer-meta">
-					<label class="reasoning-pick" title="Reasoning effort for the next turn (also in model settings)">
+					<span class="reasoning-pick">
 						<span>Reasoning</span>
-						<select value={reasoningEffort ?? ''} onchange={onReasoningChange}>
-							<option value=""
-								>default{reasoningChoices.defaultLevel ? ` (${reasoningChoices.defaultLevel})` : ''}</option
-							>
-							{#each reasoningOptions as lvl (lvl)}
-								<option value={lvl}
-									>{lvl}{reasoningChoices.levels.includes(lvl) ? '' : ' (not supported, not sent)'}</option
-								>
-							{/each}
-						</select>
-					</label>
+						<button
+							type="button"
+							class="reasoning-button"
+							title="Reasoning effort for the next turn (also in model settings)"
+							aria-haspopup="menu"
+							aria-expanded={reasoningMenuAnchor !== null}
+							onpointerdown={(e) => e.stopPropagation()}
+							onclick={toggleReasoningMenu}
+						>
+							{reasoningEffort ?? 'default'}
+							<span class="reasoning-caret" aria-hidden="true">▾</span>
+						</button>
+					</span>
+					{#if reasoningMenuAnchor !== null}
+						<ContextMenu
+							items={reasoningMenuItems}
+							anchorRect={reasoningMenuAnchor}
+							onClose={() => (reasoningMenuAnchor = null)}
+						/>
+					{/if}
 				</div>
 			{/if}
 		</div>
@@ -4188,7 +4276,7 @@
 		{@const hint = toolHint(row.name, row.args)}
 		{@const workerId = inParentTranscript ? toolWorkerId(row.name, row.args) : null}
 		{@const workerTarget = workerId !== null ? coder.workerSessionTarget(workerId) : null}
-		<div class="row tool" class:err={row.isError}>
+		<div class="row tool" class:err={row.isError} data-row-id={row.id}>
 			<!-- One-line collapsed shape: status dot, tool name,
 				 status word, elapsed counter — chevron on the right
 				 from the native `<details>`. The standalone
@@ -6308,6 +6396,21 @@
 		border-radius: 999px;
 		color: var(--m-fg-muted);
 	}
+	.background-open {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		min-width: 0;
+		padding: 0;
+		border: none;
+		background: none;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+	}
+	.background-open:hover {
+		color: var(--m-fg);
+	}
 	.background-dot {
 		width: 6px;
 		height: 6px;
@@ -6364,21 +6467,25 @@
 		font-size: 11px;
 		color: var(--m-fg-subtle);
 	}
-	.reasoning-pick select {
+	.reasoning-button {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
 		background: transparent;
 		color: var(--m-fg-muted);
 		border: 1px solid transparent;
 		border-radius: 4px;
 		font: inherit;
-		padding: 0 2px;
+		padding: 1px 4px;
 		cursor: pointer;
 	}
-	.reasoning-pick select:hover {
+	.reasoning-button:hover,
+	.reasoning-button[aria-expanded='true'] {
 		border-color: var(--m-border);
-	}
-	.reasoning-pick option {
-		background: var(--m-bg);
 		color: var(--m-fg);
+	}
+	.reasoning-caret {
+		font-size: 9px;
 	}
 	.mention-menu {
 		position: absolute;
