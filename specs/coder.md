@@ -296,7 +296,12 @@ rejected: the worst case is one extra round trip per origin per run.
   Tools go out with `strict: false`: the Responses API's strict
   default makes every optional parameter required, and the model
   fills them with placeholders (`timeout_ms: 1000`, an empty
-  `worktree`). Why
+  `worktree`). Plan usage comes from ChatGPT's private
+  `/backend-api/wham/usage` (the numbers Codex's `/status` shows): a
+  gauge next to the context ring shows what's left of the tighter
+  window, and a click opens each window (5 h / weekly) with its
+  reset time, plus credits and banked resets. Refreshed on provider
+  change, after each turn, every 5 minutes and on open. Why
   ChatGPT and not a Claude subscription:
   [ADR 0101](decisions/0101-chatgpt-subscription-provider.md).
 

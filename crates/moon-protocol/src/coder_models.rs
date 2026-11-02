@@ -309,6 +309,43 @@ pub struct ChatGptAccount {
 	pub plan_type: Option<String>,
 }
 
+/// One rolling usage window of a ChatGPT plan (ADR 0101), from the
+/// Codex usage endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct ChatGptUsageWindow {
+	/// 0–100.
+	pub used_percent: f64,
+	/// Window length (5 h, 7 d, …).
+	#[ts(optional, type = "number | null")]
+	pub window_seconds: Option<u64>,
+	/// Unix seconds when the window resets.
+	#[ts(optional, type = "number | null")]
+	pub resets_at: Option<i64>,
+}
+
+/// Plan usage of a ChatGPT-signed-in provider: the short window
+/// (`primary`, 5 h) and the long one (`secondary`, weekly).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct ChatGptUsage {
+	#[ts(optional, type = "string | null")]
+	pub plan_type: Option<String>,
+	#[ts(optional, type = "ChatGptUsageWindow | null")]
+	pub primary: Option<ChatGptUsageWindow>,
+	#[ts(optional, type = "ChatGptUsageWindow | null")]
+	pub secondary: Option<ChatGptUsageWindow>,
+	/// A window is exhausted; requests fail until it resets.
+	pub limit_reached: bool,
+	/// Extra-usage credits left, when the account has any.
+	#[ts(optional, type = "string | null")]
+	pub credits_balance: Option<String>,
+	/// Banked rate-limit resets the user can spend (in ChatGPT /
+	/// Codex), when there are any.
+	#[ts(optional, type = "number | null")]
+	pub resets_available: Option<u32>,
+}
+
 /// One user-added provider — OpenRouter, Anthropic, a local
 /// llama.cpp / vLLM / Ollama, a hosted Anthropic-via-proxy, …
 /// Persisted into [`crate::app_state::CoderAppState::providers`];

@@ -15,6 +15,7 @@ import type {
 	ChatGptAccount,
 	ChatGptDeviceCode,
 	OpenRouterCredits,
+	ChatGptUsage,
 	ProviderKind,
 	ProviderModelSummary,
 	ProviderProbeResult,
@@ -500,6 +501,7 @@ export const ipc = {
 		listModels: () => call<RouterModel[]>('coder_list_models'),
 		listProviderModels: (id: string) => call<ProviderModelSummary[]>('coder_list_provider_models', { id }),
 		openrouterCredits: (id: string) => call<OpenRouterCredits>('coder_openrouter_credits', { id }),
+		chatgptUsage: (id: string) => call<ChatGptUsage>('coder_chatgpt_usage', { id }),
 		newProviderId: () => call<string>('coder_new_provider_id'),
 		probeProvider: (baseUrl: string, apiKey: string, kind: ProviderKind = 'custom') =>
 			call<ProviderProbeResult>('coder_probe_provider', {

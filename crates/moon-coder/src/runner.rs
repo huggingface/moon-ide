@@ -1852,6 +1852,29 @@ impl CoderHandle {
 		self.state.inference.openrouter_credits(&base_url, &api_key).await
 	}
 
+	/// Plan usage (5 h / weekly windows) of a ChatGPT provider
+	/// (ADR 0101).
+	pub async fn chatgpt_usage(
+		&self,
+		provider_id: &str,
+	) -> Result<moon_protocol::coder_models::ChatGptUsage, CoderError> {
+		let base_url = {
+			let snapshot = self.state.models.read().await;
+			let entry = snapshot
+				.providers
+				.iter()
+				.find(|p| p.id == provider_id)
+				.ok_or_else(|| CoderError::Internal(format!("unknown provider id: {provider_id}")))?;
+			if entry.kind != moon_protocol::coder_models::ProviderKind::ChatGpt {
+				return Err(CoderError::Internal(format!(
+					"provider {provider_id} is not a ChatGPT provider"
+				)));
+			}
+			entry.base_url.clone()
+		};
+		self.state.inference.chatgpt_usage(provider_id, &base_url).await
+	}
+
 	pub async fn status(&self) -> Result<CoderStatus, CoderError> {
 		let identity = self.state.auth.identity().await?;
 		// `signed_in` is route-aware: HF needs OAuth; a user

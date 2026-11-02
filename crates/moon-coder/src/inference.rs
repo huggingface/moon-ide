@@ -1600,6 +1600,15 @@ impl InferenceClient {
 		crate::chatgpt::list_models(&self.http, &self.chatgpt, id, base_url).await
 	}
 
+	/// Plan usage of ChatGPT provider `id` (ADR 0101).
+	pub async fn chatgpt_usage(
+		&self,
+		id: &str,
+		base_url: &str,
+	) -> Result<moon_protocol::coder_models::ChatGptUsage, CoderError> {
+		crate::chatgpt::usage(&self.http, &self.chatgpt, id, base_url).await
+	}
+
 	/// Start a Codex device-code sign-in (ADR 0101).
 	pub async fn chatgpt_start_login(&self) -> Result<moon_protocol::coder_models::ChatGptDeviceCode, CoderError> {
 		crate::chatgpt_auth::start_device_login(&self.http).await

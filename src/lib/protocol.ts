@@ -2235,6 +2235,26 @@ export type ProviderProbeResult = {
  *  All figures are US dollars; account balance remaining is
  *  `total_credits - total_usage`. `key_limit*` are null when the
  *  key has no per-key spend cap (the common case). */
+/** Mirrors `moon_protocol::coder_models::ChatGptUsageWindow`. */
+export type ChatGptUsageWindow = {
+	used_percent: number;
+	window_seconds?: number | null;
+	/** Unix seconds. */
+	resets_at?: number | null;
+};
+
+/** Mirrors `moon_protocol::coder_models::ChatGptUsage`: a ChatGPT
+ *  plan's 5 h (`primary`) and weekly (`secondary`) windows. */
+export type ChatGptUsage = {
+	plan_type?: string | null;
+	primary?: ChatGptUsageWindow | null;
+	secondary?: ChatGptUsageWindow | null;
+	limit_reached: boolean;
+	credits_balance?: string | null;
+	/** Banked rate-limit resets available. */
+	resets_available?: number | null;
+};
+
 export type OpenRouterCredits = {
 	total_credits: number;
 	total_usage: number;

@@ -1206,6 +1206,14 @@ pub async fn coder_openrouter_credits(app: &AppCore, id: String) -> Result<OpenR
 	app.coder.openrouter_credits(&id).await.map_err(MoonError::from)
 }
 
+/// Plan usage (5 h / weekly windows) of a ChatGPT provider.
+pub async fn coder_chatgpt_usage(
+	app: &AppCore,
+	id: String,
+) -> Result<moon_protocol::coder_models::ChatGptUsage, MoonError> {
+	app.coder.chatgpt_usage(&id).await.map_err(MoonError::from)
+}
+
 /// Side-channel persist of a brand-new provider entry. Used by
 /// the `Add provider` modal so the new provider lands in
 /// `AppState` and the runtime view *before* the user has had a
@@ -1646,6 +1654,7 @@ crate::commands! {
 	coder_clear_provider_api_key([app] id: String),
 	coder_list_provider_models([app] id: String),
 	coder_openrouter_credits([app] id: String),
+	coder_chatgpt_usage([app] id: String),
 	coder_chatgpt_start_login([app]),
 	coder_chatgpt_finish_login([app] id: String, code: ChatGptDeviceCode),
 	coder_chatgpt_account([app] id: String),

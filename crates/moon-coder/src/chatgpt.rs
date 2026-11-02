@@ -198,6 +198,111 @@ pub(crate) async fn list_models(
 	)
 }
 
+/// Plan usage from ChatGPT's usage endpoint (`GET …/wham/usage`, next
+/// to the Codex base), the same numbers Codex's `/status` shows. Private and unversioned:
+/// fields are all optional so a shape change degrades to "unknown".
+pub(crate) async fn usage(
+	http: &reqwest::Client,
+	auth: &ChatGptAuth,
+	provider_id: &str,
+	base_url: &str,
+) -> Result<moon_protocol::coder_models::ChatGptUsage, CoderError> {
+	let backend = base_url.trim_end_matches('/');
+	let endpoint = format!("{}/wham/usage", backend.strip_suffix("/codex").unwrap_or(backend));
+	let creds = auth.credentials(http, provider_id, false).await?;
+	let response = request_builder(http, reqwest::Method::GET, &endpoint, &creds)
+		.timeout(std::time::Duration::from_secs(15))
+		.send()
+		.await
+		.map_err(CoderError::from)?;
+	let status = response.status();
+	let request_id = request_id_of(&response);
+	let text = response.text().await.map_err(CoderError::from)?;
+	if !status.is_success() {
+		return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
+	}
+	usage_from_body(&endpoint, &text)
+}
+
+fn usage_from_body(endpoint: &str, text: &str) -> Result<moon_protocol::coder_models::ChatGptUsage, CoderError> {
+	#[derive(Deserialize)]
+	struct Body {
+		#[serde(default)]
+		plan_type: Option<String>,
+		#[serde(default)]
+		rate_limit: Option<RateLimit>,
+		#[serde(default)]
+		credits: Option<Credits>,
+		#[serde(default)]
+		rate_limit_reset_credits: Option<ResetCredits>,
+	}
+	#[derive(Deserialize)]
+	struct ResetCredits {
+		#[serde(default)]
+		available_count: Option<u32>,
+	}
+	#[derive(Deserialize)]
+	struct RateLimit {
+		#[serde(default)]
+		limit_reached: Option<bool>,
+		#[serde(default)]
+		primary_window: Option<Window>,
+		#[serde(default)]
+		secondary_window: Option<Window>,
+	}
+	#[derive(Deserialize)]
+	struct Window {
+		#[serde(default)]
+		used_percent: Option<f64>,
+		#[serde(default)]
+		limit_window_seconds: Option<u64>,
+		#[serde(default)]
+		reset_at: Option<i64>,
+	}
+	#[derive(Deserialize)]
+	struct Credits {
+		#[serde(default)]
+		has_credits: Option<bool>,
+		#[serde(default)]
+		balance: Option<serde_json::Value>,
+	}
+	let body: Body = crate::auth::decode_body(endpoint, text)?;
+	let window = |w: Window| {
+		Some(moon_protocol::coder_models::ChatGptUsageWindow {
+			used_percent: w.used_percent?.clamp(0.0, 100.0),
+			window_seconds: w.limit_window_seconds,
+			resets_at: w.reset_at,
+		})
+	};
+	let (limit_reached, primary, secondary) = match body.rate_limit {
+		Some(rl) => (
+			rl.limit_reached.unwrap_or(false),
+			rl.primary_window.and_then(window),
+			rl.secondary_window.and_then(window),
+		),
+		None => (false, None, None),
+	};
+	let credits_balance = body
+		.credits
+		.filter(|c| c.has_credits.unwrap_or(false))
+		.and_then(|c| c.balance)
+		.map(|b| match b {
+			serde_json::Value::String(s) => s,
+			other => other.to_string(),
+		});
+	Ok(moon_protocol::coder_models::ChatGptUsage {
+		plan_type: body.plan_type,
+		primary,
+		secondary,
+		limit_reached,
+		credits_balance,
+		resets_available: body
+			.rate_limit_reset_credits
+			.and_then(|r| r.available_count)
+			.filter(|n| *n > 0),
+	})
+}
+
 fn request_builder(
 	http: &reqwest::Client,
 	method: reqwest::Method,
@@ -720,6 +825,24 @@ mod tests {
 			}
 		}
 		state.finalize("gpt-x")
+	}
+
+	#[test]
+	fn usage_reads_windows_credits_and_banked_resets() {
+		let body = r#"{"plan_type":"prolite","rate_limit":{"allowed":true,"limit_reached":false,
+			"primary_window":{"used_percent":6,"limit_window_seconds":604800,"reset_after_seconds":602711,"reset_at":1794241169},
+			"secondary_window":null},"credits":{"has_credits":false,"balance":"0"},
+			"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":0}}"#;
+		let usage = usage_from_body("u", body).unwrap();
+		assert_eq!(usage.plan_type.as_deref(), Some("prolite"));
+		let primary = usage.primary.unwrap();
+		assert_eq!(primary.used_percent, 6.0);
+		assert_eq!(primary.window_seconds, Some(604_800));
+		assert_eq!(primary.resets_at, Some(1_794_241_169));
+		assert!(usage.secondary.is_none());
+		assert!(!usage.limit_reached);
+		assert_eq!(usage.credits_balance, None);
+		assert_eq!(usage.resets_available, Some(1));
 	}
 
 	#[test]

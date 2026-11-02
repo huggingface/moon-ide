@@ -40,6 +40,7 @@
 	import { workspace } from '../state.svelte';
 	import { formatError } from '../protocol';
 	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { confirm } from '@tauri-apps/plugin-dialog';
 	import type {
 		ChatGptAccount,
 		ChatGptDeviceCode,
@@ -998,6 +999,16 @@
 	// about it. The "Personal account" option (rendered separately
 	// below) is always available regardless of org consent.
 	const orgs = $derived((coder.status?.identity?.orgs ?? []).filter((o) => o.role_in_org !== null));
+	const hfIdentity = $derived(coder.status?.identity ?? null);
+
+	async function onHfSignOut(): Promise<void> {
+		const ok = await confirm('Sign out of Hugging Face?', { title: 'Sign out', kind: 'warning' });
+		if (!ok) {
+			return;
+		}
+		await coder.signOut();
+		onClose();
+	}
 
 	// Built-in providers (OpenRouter, Anthropic, ChatGPT) require an
 	// explicit standard-model pick from the catalog before Save
@@ -1558,6 +1569,19 @@
 							Tried in order when the active model stays rate-limited (or 502/503/504) through the whole backoff. A
 							rescue sticks for the rest of the turn; the next turn starts from your pick again. Applied on save.
 						</span>
+					</div>
+				{/if}
+
+				{#if hfIdentity}
+					<div class="field">
+						<span class="label-row">
+							<span class="label-name">Hugging Face account</span>
+						</span>
+						<div class="hf-account">
+							<span>Signed in as <strong>{hfIdentity.username}</strong></span>
+							<button type="button" class="secondary" onclick={onHfSignOut}>Sign out</button>
+						</div>
+						<span class="hint">Used for HF inference and trace sync.</span>
 					</div>
 				{/if}
 
@@ -2153,6 +2177,12 @@
 	.field select:focus {
 		outline: none;
 		border-color: var(--m-accent);
+	}
+	.hf-account {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 8px;
 	}
 	.hint {
 		font-size: 11px;

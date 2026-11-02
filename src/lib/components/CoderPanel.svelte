@@ -34,12 +34,12 @@
 	import { withoutToolImages } from './toolBodyHelpers';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
+	import PlanUsageMeter from './PlanUsageMeter.svelte';
 	import CoderPlanStrip from './CoderPlanStrip.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import RocketIcon from './icons/RocketIcon.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
-	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import BranchIcon from './icons/BranchIcon.svelte';
 	import CoordinatorIcon from './icons/CoordinatorIcon.svelte';
@@ -1804,13 +1804,6 @@
 		}
 	});
 
-	async function onSignOut() {
-		const ok = await confirm('Sign out of Hugging Face?', { title: 'Sign out', kind: 'warning' });
-		if (ok) {
-			await coder.signOut();
-		}
-	}
-
 	function fmtArgs(value: unknown): string {
 		if (value === null || value === undefined) {
 			return '';
@@ -3017,6 +3010,7 @@
 				 next round-trip's prompt grows, ticks into warning /
 				 danger before auto-compaction kicks in, and pulses
 				 while a compaction summary is being written. -->
+			<PlanUsageMeter />
 			<ContextRing usage={coder.tokenUsage} compaction={coder.compaction} />
 			{#if coder.busy}
 				<button type="button" class="stop" title="Stop turn (Esc)" onclick={() => coder.abort()}>stop</button>
@@ -3043,9 +3037,6 @@
 					onclick={() => (modelSettingsOpen = true)}
 				>
 					<SettingsIcon />
-				</button>
-				<button type="button" class="icon" title="Sign out" aria-label="Sign out" onclick={onSignOut}>
-					<SignOutIcon />
 				</button>
 			{/if}
 		</div>
