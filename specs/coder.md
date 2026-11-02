@@ -490,9 +490,11 @@ Semantics:
 
 UI: a plan strip at the top of the composer (parent list only): one
 dot per step, linked by connectors that fill in behind finished
-steps, the running step pulsing, followed by its text ("Done" once
-all are settled). Shown while the plan has open steps or a turn is
-running; a click expands the full checklist. Plus a per-call
+steps, the running step pulsing, followed by a `done/total` count
+and the running step's text (else the next pending one). Shown while
+the plan has open steps; a finished plan stays only until the user's
+next message, so an old plan doesn't reappear on later turns. A click
+expands the full checklist. Plus a per-call
 transcript body so the plan's evolution is visible. The agent owns the list — the user can't tick
 items by hand.
 

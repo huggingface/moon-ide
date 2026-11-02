@@ -2,20 +2,46 @@
 	// The agent's plan as a step chain above the composer, after
 	// chat-ui's ML assistant strip: one dot per todo (done filled,
 	// running pulsing, pending hollow), joined by connectors that fill
-	// in behind finished steps, then the running step's text. Click
-	// expands the full checklist. Shown while the plan has open steps
-	// or the turn is still running.
+	// in behind finished steps, then a count and the step that matters
+	// (running, else next). Click expands the full checklist. Shown
+	// while the plan has open steps; a finished plan only stays until
+	// the user's next message, so an old plan doesn't come back on
+	// every new turn.
 	import { coder } from '../coder.svelte';
-	import type { TodoItem } from '../coder.svelte';
+	import type { CoderRow, TodoItem } from '../coder.svelte';
 	import TodoList from './TodoList.svelte';
 
 	const todos = $derived<TodoItem[]>(coder.todos);
 	const settledCount = $derived(todos.filter(settled).length);
 	const complete = $derived(todos.length > 0 && settledCount === todos.length);
 	const current = $derived(todos.find((t) => t.status === 'in_progress'));
-	const visible = $derived(todos.length > 0 && (!complete || coder.busy));
-	const statusText = $derived(complete ? 'Done' : (current?.content ?? `${settledCount}/${todos.length} done`));
+	const next = $derived(todos.find((t) => t.status === 'pending'));
+	const visible = $derived(todos.length > 0 && (!complete || completedThisTurn(coder.rows)));
+	const statusText = $derived(
+		complete
+			? `All ${todos.length} steps done`
+			: current !== undefined
+				? current.content
+				: next !== undefined
+					? `Next: ${next.content}`
+					: '',
+	);
 	let open = $state(false);
+
+	/** Whether the latest plan update came after the latest user
+	 *  message — i.e. the plan was finished in the current turn. */
+	function completedThisTurn(rows: CoderRow[]): boolean {
+		for (let i = rows.length - 1; i >= 0; i--) {
+			const row = rows[i];
+			if (row?.kind === 'user' && !row.queued) {
+				return false;
+			}
+			if (row?.kind === 'tool' && row.name === 'todo_write') {
+				return true;
+			}
+		}
+		return false;
+	}
 
 	function settled(todo: TodoItem): boolean {
 		return todo.status === 'completed' || todo.status === 'cancelled';
@@ -65,7 +91,12 @@
 					</span>
 				{/each}
 			</span>
-			<span class="status" class:complete title={statusText}>{statusText}</span>
+			<span class="count">{settledCount}/{todos.length}</span>
+			{#if !complete && statusText !== ''}
+				<span class="status" title={statusText}>{statusText}</span>
+			{:else if complete}
+				<span class="status complete">{statusText}</span>
+			{/if}
 		</button>
 	</div>
 {/if}
@@ -85,7 +116,7 @@
 	.plan-strip-bar {
 		display: flex;
 		align-items: center;
-		gap: 12px;
+		gap: 8px;
 		min-width: 0;
 		padding: 0;
 		border: none;
@@ -175,6 +206,13 @@
 			opacity: 0.25;
 		}
 	}
+	.count {
+		flex: 0 0 auto;
+		font-family: var(--m-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+		color: var(--m-fg-subtle);
+	}
 	.status {
 		flex: 1 1 auto;
 		min-width: 0;
@@ -185,8 +223,7 @@
 		color: var(--m-fg-muted);
 	}
 	.status.complete {
-		color: var(--m-accent);
-		font-weight: 600;
+		color: var(--m-fg-subtle);
 	}
 	.plan-strip-bar:hover .status {
 		color: var(--m-fg);
