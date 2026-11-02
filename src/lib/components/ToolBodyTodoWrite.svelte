@@ -2,9 +2,9 @@
 	// Tool body for the `todo_write` tool. Renders the canonical
 	// post-merge list (lifted from `result.todos`, falling back to
 	// `args.todos` while the call is in flight) with status glyphs
-	// and strikethrough on completed / cancelled items. The header
-	// pill in `CoderPanel.svelte` reads the same payload from the
-	// per-folder `coder.todos` bucket; both surfaces stay in
+	// and strikethrough on completed / cancelled items. The plan
+	// strip above the composer reads the same payload from the
+	// per-session `coder.todos` bucket; both surfaces stay in
 	// lock-step because the runner re-emits the canonical list on
 	// every successful call.
 	import type { TodoItem } from '../coder.svelte';
@@ -164,7 +164,7 @@
 	}
 	/* In-progress accent matches the running-tool dot's accent so
 	   the agent's current focus reads as one visual identity
-	   regardless of which surface (todo body, header pill, tool
+	   regardless of which surface (todo body, plan strip, tool
 	   row dot) you're looking at. */
 	.todo-item.status-in_progress .todo-glyph,
 	.todo-item.status-in_progress .todo-content {

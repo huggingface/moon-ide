@@ -1518,9 +1518,8 @@ export class CoderPanelState {
 		return this.currentSession.compaction;
 	}
 
-	/** Per-session todo list. The header pill reads it directly
-	 *  via `coder.todos`; the popover renders the same list with
-	 *  status glyphs. Empty array when the agent hasn't called
+	/** Per-session todo list, read by the plan strip above the
+	 *  composer. Empty array when the agent hasn't called
 	 *  `todo_write` in the current session. */
 	get todos(): TodoItem[] {
 		return this.currentSession.todos;
@@ -3734,7 +3733,7 @@ export class CoderPanelState {
 				}
 				// Mirror the canonical post-merge list from a
 				// successful `todo_write` into the session so the
-				// header pill / popover stay in lock-step with the
+				// plan strip stays in lock-step with the
 				// model. Errored calls are skipped — the list
 				// hasn't actually changed in that case (the runner
 				// short-circuits before mutating

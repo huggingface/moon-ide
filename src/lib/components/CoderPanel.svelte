@@ -35,7 +35,7 @@
 	import { withoutToolImages } from './toolBodyHelpers';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
-	import CoderTodoPill from './CoderTodoPill.svelte';
+	import CoderPlanStrip from './CoderPlanStrip.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import SignOutIcon from './icons/SignOutIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -2014,8 +2014,8 @@
 	 *  is `in_progress`, show its content prefixed with `→` so
 	 *  the user sees what the agent is committing to right now;
 	 *  otherwise fall back to a `M / N done` count summary. The
-	 *  header pill is the always-visible at-rest indicator; this
-	 *  one's per-row context. Returns `null` when args don't
+	 *  plan strip above the composer is the always-visible
+	 *  indicator; this one's per-row context. Returns `null` when args don't
 	 *  parse so the chip just doesn't render. */
 	function todoWriteHint(o: Record<string, unknown>): string | null {
 		const todos = o.todos;
@@ -2933,13 +2933,6 @@
 			{/if}
 		</div>
 		<div class="actions">
-			<!-- At-a-glance pill for the agent's todo list: dominant
-				 status glyph + `done / total` count. Hidden when the
-				 list is empty; click expands a popover with the full
-				 list. Sits to the left of the context ring so the
-				 reading order is "what's the agent doing right now?"
-				 then "how much room is left in the window?". -->
-			<CoderTodoPill />
 			<!-- Rolling context-window indicator: arc fills as the
 				 next round-trip's prompt grows, ticks into warning /
 				 danger before auto-compaction kicks in, and pulses
@@ -3437,10 +3430,10 @@
 			{/if}
 		</div>
 		<div class="composer">
+			<CoderPlanStrip />
 			{#if coder.hasBackgroundWork}
 				<!-- Background work that will wake this session (ADR 0102). -->
 				<div class="background-strip" aria-label="Running in the background">
-					<span class="background-strip-label">Background</span>
 					{#each coder.backgroundSubagents as sub (sub.id)}
 						<span class="background-item" title={`Sub-agent ${sub.id} · ${sub.targetFolder}`}>
 							<span class="background-dot" aria-hidden="true"></span>
@@ -4476,10 +4469,10 @@
 					{:else if row.name === 'todo_write'}
 						<!-- Plan view: status glyph per item, in-
 						 progress accented, completed / cancelled
-						 struck through. The header pill renders the
-						 same bucket of todos; this row shows the
-						 history of plan mutations as the agent
-						 works. -->
+						 struck through. The plan strip above the
+						 composer renders the same bucket of todos;
+						 this row shows the history of plan mutations
+						 as the agent works. -->
 						<ToolBodyTodoWrite args={row.args} result={row.result} hasResult={row.hasResult} />
 					{:else}
 						<div class="block-label">args</div>
@@ -6304,13 +6297,6 @@
 		gap: 4px;
 		font-size: 11px;
 		color: var(--m-fg-subtle);
-	}
-	.background-strip-label {
-		font-size: 10px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		margin-right: 2px;
 	}
 	.background-item {
 		display: inline-flex;

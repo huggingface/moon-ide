@@ -488,9 +488,12 @@ Semantics:
   tool-enforced.
 - Available to sub-agents too, as their own separate scratchpads.
 
-UI: a `done / total` pill in the panel header (parent list only)
-expanding to a popover, plus a per-call transcript body so the plan's
-evolution is visible. The agent owns the list — the user can't tick
+UI: a plan strip at the top of the composer (parent list only): one
+dot per step, linked by connectors that fill in behind finished
+steps, the running step pulsing, followed by its text ("Done" once
+all are settled). Shown while the plan has open steps or a turn is
+running; a click expands the full checklist. Plus a per-call
+transcript body so the plan's evolution is visible. The agent owns the list — the user can't tick
 items by hand.
 
 ### Ask user tool
