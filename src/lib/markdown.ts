@@ -128,11 +128,11 @@ function applyIssueRefRule(md: MarkdownIt): void {
 	});
 }
 
-function buildMarkdownIt(linkify: boolean): MarkdownIt {
+function buildMarkdownIt(linkify: boolean, breaks = false): MarkdownIt {
 	const md = new MarkdownIt({
 		html: false,
 		linkify,
-		breaks: false,
+		breaks,
 		typographer: false,
 		// `highlight` must be synchronous. Callers preload grammars via
 		// `loadHighlighters` before invoking `renderMarkdown`; inside the
@@ -282,6 +282,23 @@ function applyFenceCopyRule(parser: MarkdownIt): void {
 
 const md = buildMarkdownIt(false);
 const mdLinkified = buildMarkdownIt(true);
+// User-typed chat text: a single newline is a line break, as typed.
+const mdLinkifiedBreaks = buildMarkdownIt(true, true);
+
+export type BlockRenderOptions = { linkify?: boolean; breaks?: boolean };
+
+/** Parser for a block render, plus a tag naming it in cache keys so
+ *  the parser modes never share cached HTML. */
+function blockParser(options: BlockRenderOptions): { parser: MarkdownIt; tag: string } {
+	if (options.linkify && options.breaks) {
+		return { parser: mdLinkifiedBreaks, tag: 'LB' };
+	}
+	return options.linkify ? { parser: mdLinkified, tag: 'L' } : { parser: md, tag: '_' };
+}
+
+function blockCacheKey(source: string, tag: string): string {
+	return tag + '\x00' + (activeRepoUrl ?? '') + '\x00' + source;
+}
 
 // Force every link to open in a new context and carry safe `rel`
 // attributes. Prevents `target="_blank"` reverse-tabnabbing for
@@ -641,11 +658,8 @@ function extractTokenText(openToken: MdToken, lines: string[]): string {
  * Used by `CoderMarkdown.svelte`'s fast path on folder swap /
  * re-mount, identical in spirit to `getCachedMarkdown`.
  */
-export function getCachedMarkdownBlocks(
-	source: string,
-	options: { linkify?: boolean } = {},
-): MarkdownBlock[] | undefined {
-	return blockArrayCache.get(markdownCacheKey(source, options.linkify ?? false));
+export function getCachedMarkdownBlocks(source: string, options: BlockRenderOptions = {}): MarkdownBlock[] | undefined {
+	return blockArrayCache.get(blockCacheKey(source, blockParser(options).tag));
 }
 
 /**
@@ -664,12 +678,9 @@ export function getCachedMarkdownBlocks(
  * the keyed `{#each}` in `CoderMarkdown.svelte` can treat it
  * uniformly with body blocks.
  */
-export async function renderMarkdownBlocks(
-	source: string,
-	options: { linkify?: boolean } = {},
-): Promise<MarkdownBlock[]> {
-	const linkify = options.linkify ?? false;
-	const arrayKey = markdownCacheKey(source, linkify);
+export async function renderMarkdownBlocks(source: string, options: BlockRenderOptions = {}): Promise<MarkdownBlock[]> {
+	const { parser, tag } = blockParser(options);
+	const arrayKey = blockCacheKey(source, tag);
 	const cachedArray = blockArrayCache.get(arrayKey);
 	if (cachedArray !== undefined) {
 		return cachedArray;
@@ -680,7 +691,6 @@ export async function renderMarkdownBlocks(
 		langs.push('yaml');
 	}
 	await loadHighlighters(langs);
-	const parser = linkify ? mdLinkified : md;
 	const tokens = parser.parse(body, {});
 	const rawBlocks = splitTopLevelBlocks(tokens, body);
 	const blocks: MarkdownBlock[] = [];
@@ -692,7 +702,7 @@ export async function renderMarkdownBlocks(
 		if (!raw) {
 			continue;
 		}
-		blocks.push(renderBlock(raw.tokens, raw.text, i + (frontmatter !== null ? 1 : 0), parser));
+		blocks.push(renderBlock(raw.tokens, raw.text, i + (frontmatter !== null ? 1 : 0), parser, tag));
 	}
 	blockArrayCache.set(arrayKey, blocks);
 	if (blockArrayCache.size > BLOCK_ARRAY_CACHE_MAX) {
@@ -712,8 +722,14 @@ export async function renderMarkdownBlocks(
  * whose `id` slugs are suffix-de-duplicated document-wide by the
  * heading-anchor rule).
  */
-function renderBlock(tokens: MdToken[], sourceText: string, index: number, parser: MarkdownIt): MarkdownBlock {
-	const key = `${index}\x00${activeRepoUrl ?? ''}\x00${sourceText}`;
+function renderBlock(
+	tokens: MdToken[],
+	sourceText: string,
+	index: number,
+	parser: MarkdownIt,
+	tag: string,
+): MarkdownBlock {
+	const key = `${tag}\x00${index}\x00${activeRepoUrl ?? ''}\x00${sourceText}`;
 	const cached = blockHtmlCache.get(key);
 	if (cached !== undefined) {
 		return { key, html: cached };

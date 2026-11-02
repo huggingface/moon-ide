@@ -11,8 +11,10 @@
 	import { workspace } from '../state.svelte';
 	import { visibleOnce } from '../actions/visibleOnce';
 
-	type Props = { text: string };
-	let { text }: Props = $props();
+	/** `breaks`: single newlines are line breaks — for user-typed
+	 *  text, which isn't written as markdown paragraphs. */
+	type Props = { text: string; breaks?: boolean };
+	let { text, breaks = false }: Props = $props();
 
 	// Block-level streaming render: instead of one `{@html html}` that
 	// rebuilds the entire markdown subtree on every chunk, we split the
@@ -69,7 +71,7 @@
 			const token = renderToken;
 			renderInFlight = true;
 			void (async () => {
-				const rendered = await renderMarkdownBlocks(source, { linkify: true });
+				const rendered = await renderMarkdownBlocks(source, { linkify: true, breaks });
 				renderInFlight = false;
 				if (!mounted) {
 					return;
@@ -99,7 +101,7 @@
 		// precomputed array is essentially free and matching the
 		// formatted layout on the first paint avoids a
 		// placeholder→content swap when the row is already on-screen.
-		const cached = getCachedMarkdownBlocks(source, { linkify: true });
+		const cached = getCachedMarkdownBlocks(source, { linkify: true, breaks });
 		if (cached !== undefined) {
 			pendingSource = source;
 			renderToken++;

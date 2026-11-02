@@ -27,7 +27,6 @@
 	import ToolBodyOpenBrowser from './ToolBodyOpenBrowser.svelte';
 	import ToolBodyOpenTerminal from './ToolBodyOpenTerminal.svelte';
 	import { parseBackgroundResult, type BackgroundResultMessage } from '../backgroundResult';
-	import { splitTextLinks } from '../textLinks';
 	import { hintFor, isHuggingFaceHost, parseHttpError } from '../coderError';
 	import ToolBodyWebSearch from './ToolBodyWebSearch.svelte';
 	import ToolBodyWriteFile from './ToolBodyWriteFile.svelte';
@@ -4088,31 +4087,13 @@
 				{/if}
 			</div>
 			{#if parsed.prose.trim().length > 0}
-				{#if inParentTranscript}
-					<!-- Plain text, but bare http(s) URLs become links that
-						 open in the OS browser (never navigate the webview). -->
-					<div class="bubble">
-						{#each splitTextLinks(parsed.prose) as seg, i (i)}{#if seg.kind === 'link'}<a
-									class="bubble-link"
-									href={seg.href}
-									title={seg.href}
-									onclick={(event) => {
-										event.preventDefault();
-										void openUrl(seg.href);
-									}}>{seg.text}</a
-								>{:else}{seg.text}{/if}{/each}
-					</div>
-				{:else}
-					<!-- Sub-agent user rows are usually model-authored
-						 markdown (the `task` instructions the parent
-						 wrote, the cap sentinel), so render them like
-						 assistant bubbles. Parent user rows stay plain
-						 pre-wrap — user-typed text with inline `@`
-						 tokens shouldn't be reinterpreted as markup. -->
-					<div class="bubble user-md">
-						<CoderMarkdown text={parsed.prose} />
-					</div>
-				{/if}
+				<!-- Markdown like assistant bubbles. User-typed text keeps
+					 its single line breaks (`breaks`); sub-agent user rows
+					 are model-authored markdown (the `task` instructions,
+					 the cap sentinel) and render as plain markdown. -->
+				<div class="bubble user-md">
+					<CoderMarkdown text={parsed.prose} breaks={inParentTranscript} />
+				</div>
 			{/if}
 			{#if row.images.length > 0}
 				<!-- Pasted images, rendered as thumbnails so the
@@ -5638,12 +5619,7 @@
 	.row.user .bubble {
 		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
 	}
-	.bubble-link {
-		color: var(--m-accent);
-		text-decoration: underline;
-		word-break: break-all;
-	}
-	/* Markdown-rendered user bubbles (sub-agent pop-out): same
+	/* Markdown-rendered user bubbles: same
 	   `pre-wrap` opt-out as `.assistant-bubble` — the markdown
 	   article emits real block-level HTML, so pre-wrap would turn
 	   the source's newlines into doubled spacing. */

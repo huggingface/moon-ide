@@ -1926,7 +1926,9 @@ sentinel, as wrapped `UserMessage` events — matching what replay
 reconstructs from the JSONL's `User` records), so the transcript
 always shows what the sub-agent was asked to do. Sub-agent user
 rows render as markdown (the task is model-authored prose with
-headings / bullets / fences); parent user rows stay plain text.
+headings / bullets / fences); parent user rows render as markdown
+too, but with single newlines kept as line breaks (`breaks`), since
+typed text isn't written as markdown paragraphs.
 
 Transcript markdown autolinks standalone `#123` issue/PR references
 to the active folder's remote (`fs_git_remote_web_url`, `/issues/N`
