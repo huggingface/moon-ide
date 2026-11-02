@@ -348,7 +348,7 @@ impl CoordinatorRegistry {
 }
 
 /// Whether a detached sub-agent run has settled, and how.
-/// `Aborted` is split from `Failed` so `wait` can say
+/// `Aborted` is split from `Failed` so `check` can say
 /// "you aborted it" instead of surfacing a generic error.
 #[derive(Debug, Clone)]
 enum DetachedFinish {
@@ -357,23 +357,18 @@ enum DetachedFinish {
 	Aborted,
 }
 
-/// One in-flight (or settled, cached) detached sub-agent run.
-/// `notify` fires exactly once when the run settles; `wait`'s
-/// `wait_ms` blocks on it instead of busy-polling. `collectors`
-/// counts parent `wait` calls parked on it: a run that
-/// settles while one is waiting hands its report to that call and
-/// skips the completion callback (ADR 0091).
+/// One in-flight (or settled, cached) detached sub-agent run. The
+/// finish is cached so `check` can still return the report after
+/// the completion callback delivered it (ADR 0091 / 0106).
 struct DetachedEntry {
 	cancel: CancellationToken,
-	notify: Arc<tokio::sync::Notify>,
 	finish: Mutex<Option<DetachedFinish>>,
-	collectors: std::sync::atomic::AtomicUsize,
 }
 
 /// In-memory parent → detached-sub-agent registry ([ADR 0053]).
 /// Maps each parent session id to the detached sub-agents it
 /// spawned, so the finish feeder can tell which `SubagentFinished`
-/// events belong to which parent, `wait` / `stop`
+/// events belong to which parent, `check` / `stop`
 /// can find a run by id, and the user-level abort can cascade to
 /// a session's live detached runs. Not persisted: a process
 /// restart loses the live runs the same way a coordinator's
@@ -385,7 +380,7 @@ struct DetachedTaskRegistry {
 	/// subscription lifetime and the abort cascade.
 	by_parent: HashMap<String, HashSet<String>>,
 	/// Sub-agent id → its run entry. Lives past `settle` so a
-	/// later `wait` still returns the cached report.
+	/// later `check` still returns the cached report.
 	entries: HashMap<String, Arc<DetachedEntry>>,
 }
 
@@ -395,9 +390,7 @@ impl DetachedTaskRegistry {
 	fn register(&mut self, parent_session_id: &str, subagent_id: &str, cancel: CancellationToken) -> Arc<DetachedEntry> {
 		let entry = Arc::new(DetachedEntry {
 			cancel,
-			notify: Arc::new(tokio::sync::Notify::new()),
 			finish: Mutex::new(None),
-			collectors: std::sync::atomic::AtomicUsize::new(0),
 		});
 		self
 			.by_parent
@@ -417,20 +410,18 @@ impl DetachedTaskRegistry {
 	}
 
 	/// The run entry for `subagent_id`, if it's a registered
-	/// detached run (live or settled-cached). `wait` /
+	/// detached run (live or settled-cached). `check` /
 	/// `stop` look runs up here; ids that were never detached
 	/// (or were lost to a restart) miss.
 	fn entry(&self, subagent_id: &str) -> Option<Arc<DetachedEntry>> {
 		self.entries.get(subagent_id).cloned()
 	}
 
-	/// Record a run's terminal state and wake any parked
-	/// `wait(wait_ms)`. The entry stays in `entries` (and
-	/// the parent's set) so a later collect returns the cached
-	/// report instantly.
+	/// Record a run's terminal state. The entry stays in `entries`
+	/// (and the parent's set) so a later `check` returns the cached
+	/// report.
 	async fn settle(entry: &DetachedEntry, finish: DetachedFinish) {
 		*entry.finish.lock().await = Some(finish);
-		entry.notify.notify_waiters();
 	}
 
 	/// Every run entry of `parent_session_id`, live or settled.
@@ -463,7 +454,7 @@ impl DetachedTaskRegistry {
 	/// their parent session) is what keeps a long-lived process
 	/// from accumulating one map entry per detached run forever.
 	/// Settled entries must NOT be pruned any earlier: the parent
-	/// may still `wait` a report several turns later.
+	/// may still `check` a report several turns later.
 	fn prune_parent(&mut self, parent_session_id: &str) {
 		let Some(ids) = self.by_parent.remove(parent_session_id) else {
 			return;
@@ -506,7 +497,7 @@ struct SessionRuntime {
 	/// Detached background processes launched by this session's
 	/// turns (ADR 0085). Session-scoped — not per-turn — so an
 	/// interrupted turn doesn't kill the model's long build and
-	/// `wait` ids stay valid across turns. Children die
+	/// `check` ids stay valid across turns. Children die
 	/// with the runtime (`kill_on_drop`) or at IDE shutdown via
 	/// [`CoderHandle::kill_all_background_processes`].
 	background: Arc<crate::tools::BackgroundProcessRegistry>,
@@ -5744,7 +5735,7 @@ impl CoderHandle {
 	/// Live snapshot of one of a session's detached background
 	/// processes (ADR 0085): running status, exit code, log tail.
 	/// The panel's real-time view reads the same registry
-	/// `wait` does, so the two can never disagree.
+	/// `check` does, so the two can never disagree.
 	pub async fn read_background_process(
 		&self,
 		session_id: &str,
@@ -5756,9 +5747,7 @@ impl CoderHandle {
 				"no mounted runtime for session {session_id}"
 			)));
 		};
-		rt.background
-			.read(id, 0, tail_bytes.clamp(1, 64_000), &CancellationToken::new(), false)
-			.await
+		rt.background.read(id, tail_bytes.clamp(1, 64_000))
 	}
 
 	/// Kill one of a session's detached background processes — the
@@ -6659,7 +6648,7 @@ fn spawn_turn_loop(
 					// Session-scoped background-process registry (ADR
 					// 0085): survives turn boundaries — an interrupted
 					// turn keeps the model's detached builds running
-					// and its `wait` ids valid.
+					// and its `check` ids valid.
 					let background = rt_for_turn.background.clone();
 					// Live settlement notices for detached background
 					// processes (ADR 0034): the panel flips the spawning
@@ -6984,7 +6973,7 @@ async fn run_turn(
 	if mode.allows_task_tool() {
 		tool_defs.push(task_tool_definition());
 		// Sub-agents are waited on / stopped through the registry's
-		// `wait` / `stop` (ADR 0102); steering is theirs alone.
+		// `check` / `stop` (ADR 0102); steering is theirs alone.
 		tool_defs.push(crate::subagent::task_steer_tool_definition());
 	}
 	if mode.allows_ask_user() {
@@ -7768,10 +7757,10 @@ async fn dispatch_tool_calls(
 		let dispatched_at = std::time::Instant::now();
 		let outcome = if call.function.name == "task" {
 			handle_task(state, rt, sink, &*cx, &call.id, &args).await
-		} else if call.function.name == "wait" && names_own_subagent(state, rt, &args).await {
-			// `wait` / `stop` on a sub-agent id (ADR 0102); process
+		} else if call.function.name == "check" && names_own_subagent(state, rt, &args).await {
+			// `check` / `stop` on a sub-agent id (ADR 0102); process
 			// ids fall through to the registry.
-			handle_task_collect(state, rt, &args, cancel).await
+			handle_subagent_check(state, rt, &args).await
 		} else if call.function.name == "stop" && names_own_subagent(state, rt, &args).await {
 			handle_task_abort(state, rt, &args).await
 		} else if call.function.name == "task_steer" {
@@ -7918,7 +7907,7 @@ async fn handle_task(
 	}
 	// Every parent `task` runs in the background (ADR 0091): register,
 	// spawn, return a handle. The report reaches the parent through
-	// the completion callback or `wait`.
+	// the completion callback or `check`.
 	spec.detach = true;
 	let mut result = handle_task_detached(state, sink, tool_call_id, spec).await?;
 	if let Some(note) = worktree_note {
@@ -8060,8 +8049,8 @@ async fn persist_worker_detached(
 /// `task` ([ADR 0053]; every parent call since ADR 0091). Registers
 /// the run, spawns it on a fresh root token, and returns a handle
 /// immediately — the parent keeps working. When the run settles its
-/// report goes to the parent as a message (the completion callback)
-/// unless a parked `wait` takes it; `stop`, the
+/// report goes to the parent as a message (the completion callback);
+/// `stop`, the
 /// pop-out's stop button, Esc, or a coordinator's `abort_worker`
 /// cancel it.
 async fn handle_task_detached(
@@ -8129,13 +8118,9 @@ async fn handle_task_detached(
 		DetachedTaskRegistry::settle(&entry, finish.clone()).await;
 		// The completion callback (ADR 0091): hand the report to the
 		// parent as a message — queued into its running turn, or
-		// waking it. Skipped when a parked `wait` already
-		// takes it (`settle` stored the finish before this read, and
-		// a collector registers before re-checking the finish, so at
-		// least one of the two sees the other), and for aborts —
-		// somebody stopped the run on purpose.
-		let collected = entry.collectors.load(std::sync::atomic::Ordering::SeqCst) > 0;
-		if let (false, Some(text)) = (collected, subagent_report_message(&subagent_id_for_run, &finish)) {
+		// waking it. Skipped for aborts: somebody stopped the run on
+		// purpose.
+		if let Some(text) = subagent_report_message(&subagent_id_for_run, &finish) {
 			let handle = CoderHandle {
 				state: state_for_run.clone(),
 			};
@@ -8167,7 +8152,7 @@ async fn handle_task_detached(
 		"detached": true,
 		"subagent_id": subagent_id,
 		"status": "running",
-		"hint": "its report will be delivered to you as a <background_result kind=\"subagent\"> message when it finishes — keep working, or call wait(id, wait_ms) if you need it before you can continue",
+		"hint": "its report will be delivered to you as a <background_result kind=\"subagent\"> message when it finishes, waking you if your turn has ended — keep working, or end your turn if you have nothing else to do until then",
 	}))
 }
 
@@ -8199,7 +8184,7 @@ fn process_result_message(notice: &crate::tools::ProcessNotice) -> String {
 	)
 }
 
-/// Whether a `wait` / `stop` call's `id` names one of this session's
+/// Whether a `check` / `stop` call's `id` names one of this session's
 /// background sub-agents (rather than a process).
 async fn names_own_subagent(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>, args: &Value) -> bool {
 	let Some(id) = args.get("id").and_then(Value::as_str) else {
@@ -8210,7 +8195,7 @@ async fn names_own_subagent(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>, a
 }
 
 /// Resolve `subagent_id` to one of the calling session's detached
-/// runs ([ADR 0053]) — the shared ownership gate of `wait` /
+/// runs ([ADR 0053]) — the shared ownership gate of `check` /
 /// `task_steer` / `stop`. `register` / `prune_parent` keep
 /// `by_parent` and `entries` in lockstep, so an ownership hit
 /// implies a live entry — one miss branch covers both "never yours"
@@ -8236,69 +8221,31 @@ async fn own_detached_entry(
 	))
 }
 
-/// `wait` — return a detached run's report, optionally
-/// blocking up to `wait_ms` for it to settle. Only the parent that
-/// spawned the run may collect it.
-async fn handle_task_collect(
+/// `check` on a sub-agent: its cached report once it settled, else
+/// `running` with a note. Never blocks (ADR 0106): the report wakes
+/// the parent by itself. Only the parent that spawned the run may
+/// check it.
+async fn handle_subagent_check(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
 	args: &Value,
-	cancel: &CancellationToken,
 ) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
-	struct CollectArgs {
+	struct CheckArgs {
 		id: String,
-		#[serde(default)]
-		wait_ms: Option<u64>,
 	}
-	let parsed: CollectArgs =
-		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("wait", err.to_string()))?;
-	let entry = own_detached_entry(state, rt, "wait", &parsed.id).await?;
-	// Already settled → return the cached finish immediately.
-	if let Some(value) = detached_collect_value(&entry).await {
-		return Ok(value);
-	}
-	// Still running. Either report `running` now, or park on the
-	// notify until it settles / the wait cap elapses / the user
-	// stops the turn.
-	let wait_ms = parsed.wait_ms.unwrap_or(0).min(TASK_COLLECT_MAX_WAIT_MS);
-	if wait_ms == 0 {
-		return Ok(json!({ "status": "running" }));
-	}
-	let notified = entry.notify.notified();
-	tokio::pin!(notified);
-	// Enable the notification *before* the re-check so a settle in
-	// between isn't lost.
-	notified.as_mut().enable();
-	// Registered before the re-check: the run's settle either sees
-	// this collector (and skips its callback) or set the finish
-	// before the re-check below reads it.
-	entry.collectors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-	let settled = match detached_collect_value(&entry).await {
-		Some(value) => Some(value),
-		None => {
-			tokio::select! {
-				() = cancel.cancelled() => {}
-				_ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), notified) => {}
-			}
-			detached_collect_value(&entry).await
-		}
-	};
-	entry.collectors.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-	if let Some(value) = settled {
-		return Ok(value);
-	}
-	if cancel.is_cancelled() {
-		return Err(CoderError::Aborted);
-	}
-	Ok(json!({ "status": "running" }))
+	let parsed: CheckArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("check", err.to_string()))?;
+	let entry = own_detached_entry(state, rt, "check", &parsed.id).await?;
+	Ok(detached_collect_value(&entry).await.unwrap_or_else(|| {
+		json!({
+			"status": "running",
+			"note": "Still running. Its report arrives on its own as a `<background_result>` message, waking you if your turn has ended: keep working on something else or end your turn.",
+		})
+	}))
 }
 
-/// Cap on `wait`'s `wait_ms` — same 10 minutes as a blocking
-/// `bash` call.
-const TASK_COLLECT_MAX_WAIT_MS: u64 = 600_000;
-
-/// Map a settled [`DetachedEntry`] to the `wait` result
+/// Map a settled [`DetachedEntry`] to the `check` result
 /// payload, or `None` while it's still running.
 async fn detached_collect_value(entry: &DetachedEntry) -> Option<Value> {
 	match entry.finish.lock().await.clone() {
@@ -8321,7 +8268,7 @@ async fn detached_collect_value(entry: &DetachedEntry) -> Option<Value> {
 /// ([`crate::subagent::queue_subagent_steer`]), tagged
 /// `from_coordinator` so the transcript shows the row as agent-sent.
 /// Only the parent that spawned the run may steer it, mirroring
-/// `wait` / `stop` ownership.
+/// `check` / `stop` ownership.
 async fn handle_task_steer(
 	state: &Arc<CoderState>,
 	rt: &Arc<SessionRuntime>,
@@ -8343,7 +8290,7 @@ async fn handle_task_steer(
 	if !crate::subagent::queue_subagent_steer(&parsed.subagent_id, parsed.text, true) {
 		return Ok(json!({
 			"status": "not_running",
-			"hint": "the run already settled; call `wait` for its report",
+			"hint": "the run already settled; its report was delivered to you (`check` returns it again)",
 		}));
 	}
 	Ok(json!({ "status": "steered" }))
@@ -12772,23 +12719,15 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn settle_caches_the_finish_and_wakes_collect() {
+		async fn settle_caches_the_finish() {
 			let (reg, _) = reg_with("sess-a", "sub-1");
 			let entry = reg.entry("sub-1").expect("entry registered");
 			assert!(entry.finish.lock().await.is_none());
-			// Mirror the collect path: park + enable the listener
-			// *before* the settle lands, so the wake can't be lost.
-			let notified = entry.notify.notified();
-			tokio::pin!(notified);
-			notified.as_mut().enable();
 			DetachedTaskRegistry::settle(&entry, DetachedFinish::Aborted).await;
 			assert!(matches!(
 				entry.finish.lock().await.as_ref(),
 				Some(DetachedFinish::Aborted)
 			));
-			assert!(tokio::time::timeout(std::time::Duration::from_millis(50), notified)
-				.await
-				.is_ok());
 		}
 
 		#[test]
@@ -12804,7 +12743,7 @@ mod tests {
 
 		/// Regression: the finish feeder used to prune settled
 		/// entries right after sending the wake, so the parent's
-		/// later `wait` found nothing. The report must
+		/// later `check` found nothing. The report must
 		/// stay collectable until the parent session is deleted.
 		#[tokio::test]
 		async fn settled_runs_stay_collectable_until_the_parent_is_pruned() {

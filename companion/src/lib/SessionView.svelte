@@ -353,8 +353,8 @@
 				return 'update todo';
 			case 'ask_user':
 				return 'ask user';
-			case 'wait':
-				return `wait ${p('id') || ''}`.trim();
+			case 'check':
+				return `check ${p('id') || ''}`.trim();
 			case 'stop':
 				return `stop ${p('id') || ''}`.trim();
 			case 'spawn_worker':

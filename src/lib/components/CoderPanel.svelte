@@ -1894,7 +1894,7 @@
 		};
 	}
 
-	/** Parse a process `wait` result — `{ id, running, exit_code, tail, cmd, target }`. */
+	/** Parse a process `check` result — `{ id, running, exit_code, tail, cmd, target }`. */
 	function parseReadProcessResult(result: unknown): {
 		id: string;
 		running: boolean;
@@ -2080,7 +2080,7 @@
 			case 'respond_to_worker_prompt': {
 				return typeof o.worker_id === 'string' ? firstLine(o.worker_id) : null;
 			}
-			case 'wait':
+			case 'check':
 			case 'stop': {
 				return typeof o.id === 'string' ? o.id : null;
 			}
@@ -4370,7 +4370,7 @@
 							<!-- Detached result (ADR 0034): the command was
 							 spawned as a background process. Show the
 							 command + the process id the model uses to
-							 poll via `wait`, plus the live
+							 poll via `check`, plus the live
 							 settlement state when the row is fresh (the
 							 `background_process_exited` event is live-only,
 							 so a replayed row shows no live claim). -->
@@ -4454,7 +4454,7 @@
 								<pre class="block">{fmtArgs(row.result)}</pre>
 							{/if}
 						{/if}
-					{:else if row.name === 'wait'}
+					{:else if row.name === 'check'}
 						{@const rpResult = row.hasResult ? parseReadProcessResult(row.result) : null}
 						{#if rpResult !== null}
 							<div class="bash-block">

@@ -1758,7 +1758,7 @@ export type FleetMember = { id: string; title: string };
 /**
  * Snapshot of a detached background process (ADR 0085), as returned
  * by `coder_read_background_process` — the same shape the model's
- * `wait` tool sees.
+ * `check` tool sees.
  */
 /** A running `notify` process (ADR 0102), as listed by
  *  `coder_active_background_processes` for the active strip. */

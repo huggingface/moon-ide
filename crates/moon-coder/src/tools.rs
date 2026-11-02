@@ -211,7 +211,7 @@ pub struct ToolContext {
 	pub mode: CoderMode,
 	pub format_queue: Arc<FormatQueue>,
 	/// Per-turn registry of detached background processes (ADR 0034).
-	/// `bash` with `detach: true` spawns into here; `wait`
+	/// `bash` with `detach: true` spawns into here; `check`
 	/// and `stop` read/kill from here; the runner calls
 	/// `cleanup()` at turn end.
 	pub background: Arc<BackgroundProcessRegistry>,
@@ -275,7 +275,7 @@ impl ToolContext {
 
 	/// Builder-style setter for the per-turn background-process
 	/// registry (ADR 0034). The runner creates one `Arc` and shares
-	/// it across the turn so `bash` (spawn), `wait` (poll),
+	/// it across the turn so `bash` (spawn), `check` (poll),
 	/// `stop` (kill), and the turn-end `cleanup()` all reach
 	/// the same registry.
 	pub fn with_background(mut self, background: Arc<BackgroundProcessRegistry>) -> Self {
@@ -371,7 +371,7 @@ impl FormatQueue {
 
 /// Per-turn registry of detached background processes spawned by
 /// `bash` with `detach: true` (ADR 0034). Each entry holds the child
-/// handle and the host-side log file path; `wait` tails the
+/// handle and the host-side log file path; `check` tails the
 /// log and `stop` kills + reaps. At turn end
 /// Registry of detached background processes (ADR 0034, lifetime
 /// revised by ADR 0085).
@@ -379,7 +379,7 @@ impl FormatQueue {
 /// **Session-scoped for top-level sessions**: the registry lives on
 /// the `SessionRuntime` and processes survive turn boundaries —
 /// including a user abort (Esc), which ends the *turn* but not the
-/// *conversation*. `wait` therefore works across turns: the
+/// *conversation*. `check` therefore works across turns: the
 /// model can launch a long build, get interrupted, and pick the
 /// handle back up on the next turn. Settled entries (and their log
 /// files) are retained for the same reason. Processes die with the
@@ -439,7 +439,7 @@ struct BackgroundProcess {
 	/// The spawning `bash` tool call's id — carried onto the
 	/// settlement event so the panel can find the row.
 	tool_call_id: String,
-	/// The original command string — echoed back in `wait`
+	/// The original command string — echoed back in `check`
 	/// results so the model doesn't have to track it separately.
 	cmd: String,
 	/// Where the command ran — `"host"` or `"container"`, same
@@ -451,17 +451,14 @@ struct BackgroundProcess {
 	/// (either naturally, via `stop`, or via `cleanup`).
 	child: Option<tokio::process::Child>,
 	/// Exit code captured when the process was reaped, so subsequent
-	/// `wait` calls after completion can still report it.
+	/// `check` calls after completion can still report it.
 	exit_code: Option<i32>,
 	/// Settlement event already emitted. Guards against
-	/// double-reporting when `cleanup` follows a `wait`
+	/// double-reporting when `cleanup` follows a `check`
 	/// that already observed the exit.
 	notified: bool,
 	/// Wake the session when the process exits (ADR 0102).
 	notify: bool,
-	/// `wait` calls currently parked on this process. A natural exit
-	/// seen while one is parked goes to that call, not a wake.
-	waiters: usize,
 	/// Stopped on purpose (`stop`, the UI, a second Esc): never wakes.
 	stopped: bool,
 }
@@ -517,7 +514,7 @@ impl BackgroundProcessRegistry {
 			});
 		}
 		drop(sink_guard);
-		if killed || proc.stopped || !proc.notify || proc.waiters > 0 {
+		if killed || proc.stopped || !proc.notify {
 			return;
 		}
 		let Ok(wake_guard) = self.wake.lock() else {
@@ -647,7 +644,6 @@ impl BackgroundProcessRegistry {
 			exit_code: None,
 			notified: false,
 			notify,
-			waiters: 0,
 			stopped: false,
 		});
 		drop(guard);
@@ -657,25 +653,14 @@ impl BackgroundProcessRegistry {
 		Ok((id, log_path, pid))
 	}
 
-	/// Poll a detached process: optionally wait up to `wait_ms` for
-	/// it to exit, then return its running status, exit code (if
-	/// finished), and the tail of its log file. `pub(crate)` so the
-	/// UI's live-tail command reads the same source of truth the
-	/// model does (ADR 0085).
-	pub(crate) async fn read(
-		&self,
-		id: &str,
-		wait_ms: u64,
-		tail_bytes: usize,
-		cancel: &CancellationToken,
-		take_result: bool,
-	) -> Result<Value, CoderError> {
-		// Scope the mutex guard so we drop it before any await —
-		// `try_wait` and `tokio::time::sleep` would otherwise hold
-		// it across a yield point.
+	/// A detached process's running status, exit code (if finished)
+	/// and the tail of its log file. Never blocks (ADR 0106).
+	/// `pub(crate)` so the UI's live-tail command reads the same
+	/// source of truth the model does (ADR 0085).
+	pub(crate) fn read(&self, id: &str, tail_bytes: usize) -> Result<Value, CoderError> {
 		let snapshot = {
 			let Ok(guard) = self.entries.lock() else {
-				return Err(CoderError::tool_failed("wait", "registry lock poisoned"));
+				return Err(CoderError::tool_failed("check", "registry lock poisoned"));
 			};
 			guard
 				.iter()
@@ -684,36 +669,10 @@ impl BackgroundProcessRegistry {
 		};
 		let Some((cmd, target, log_path)) = snapshot else {
 			return Err(CoderError::tool_failed(
-				"wait",
+				"check",
 				format!("no background process or sub-agent with id '{id}'"),
 			));
 		};
-
-		// The model's `wait` takes a `notify` process's result, so an
-		// exit it observes doesn't also wake the session. The panel's
-		// live tail reads without taking it.
-		let _parked = take_result.then(|| ParkedWait::new(self, id));
-		// If a wait was requested, poll until exit or timeout.
-		if wait_ms > 0 {
-			let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
-			loop {
-				if self.try_reap(id) {
-					break;
-				}
-				if cancel.is_cancelled() {
-					return Err(CoderError::Aborted);
-				}
-				if std::time::Instant::now() >= deadline {
-					break;
-				}
-				tokio::select! {
-					biased;
-					_ = cancel.cancelled() => return Err(CoderError::Aborted),
-					_ = tokio::time::sleep(Duration::from_millis(BG_POLL_INTERVAL_MS)) => {}
-				}
-			}
-		}
-
 		let (running, exit_code) = self.status(id);
 		let tail = read_tail(&log_path, tail_bytes);
 		Ok(json!({
@@ -777,7 +736,7 @@ impl BackgroundProcessRegistry {
 			exit_code = self.stored_exit_code(id);
 		}
 
-		// Store the exit code for future `wait` calls, then
+		// Store the exit code for future `check` calls, then
 		// report the settlement — same flip a natural exit or the
 		// turn-end cleanup produces.
 		self.store_exit_code(id, exit_code);
@@ -859,7 +818,7 @@ impl BackgroundProcessRegistry {
 
 	/// Try to reap a process non-destructively. Returns `true` if the
 	/// process has exited (and was reaped). Does not remove the entry
-	/// — `wait` still needs to report exit_code + tail after
+	/// — `check` still needs to report exit_code + tail after
 	/// the process finishes.
 	fn try_reap(&self, id: &str) -> bool {
 		let Ok(mut guard) = self.entries.lock() else {
@@ -873,7 +832,7 @@ impl BackgroundProcessRegistry {
 				Ok(Some(status)) => {
 					// Process exited — store the exit code and drop
 					// the handle so we stop polling it. The entry
-					// stays so `wait` can still report.
+					// stays so `check` can still report.
 					proc.exit_code = status.code();
 					proc.child = None;
 					self.notify_exit_locked(proc, false);
@@ -914,19 +873,6 @@ impl BackgroundProcessRegistry {
 		}
 	}
 
-	fn adjust_waiters(&self, id: &str, park: bool) {
-		let Ok(mut guard) = self.entries.lock() else {
-			return;
-		};
-		if let Some(proc) = guard.iter_mut().find(|p| p.id == id) {
-			proc.waiters = if park {
-				proc.waiters + 1
-			} else {
-				proc.waiters.saturating_sub(1)
-			};
-		}
-	}
-
 	/// Read the stored exit code for a reaped process.
 	fn stored_exit_code(&self, id: &str) -> Option<i32> {
 		let Ok(guard) = self.entries.lock() else {
@@ -936,7 +882,7 @@ impl BackgroundProcessRegistry {
 	}
 
 	/// Store the exit code for a process (after `stop` reaps
-	/// it) so subsequent `wait` calls can still report it.
+	/// it) so subsequent `check` calls can still report it.
 	fn store_exit_code(&self, id: &str, code: Option<i32>) {
 		let Ok(mut guard) = self.entries.lock() else {
 			return;
@@ -947,40 +893,13 @@ impl BackgroundProcessRegistry {
 	}
 }
 
-/// Poll interval for `wait`'s `wait_ms` loop. Short enough
-/// to feel responsive, long enough to not hammer the OS.
-const BG_POLL_INTERVAL_MS: u64 = 200;
-
 /// How often a `notify` process's watcher checks for its exit. A
 /// wake a second late is fine; these are long jobs.
 const BG_WATCH_INTERVAL_MS: u64 = 1_000;
 
-/// Marks a `wait` parked on a process for as long as it lives.
-struct ParkedWait<'a> {
-	registry: &'a BackgroundProcessRegistry,
-	id: &'a str,
-}
-
-impl<'a> ParkedWait<'a> {
-	fn new(registry: &'a BackgroundProcessRegistry, id: &'a str) -> Self {
-		registry.adjust_waiters(id, true);
-		Self { registry, id }
-	}
-}
-
-impl Drop for ParkedWait<'_> {
-	fn drop(&mut self) {
-		self.registry.adjust_waiters(self.id, false);
-	}
-}
-
-/// Default + cap for `wait`'s `tail_bytes` parameter.
+/// Default + cap for `check`'s `tail_bytes` parameter.
 const BG_DEFAULT_TAIL_BYTES: usize = 8_000;
 const BG_MAX_TAIL_BYTES: usize = 64_000;
-
-/// Default + cap for `wait`'s `wait_ms` parameter.
-const BG_DEFAULT_WAIT_MS: u64 = 0;
-const BG_MAX_WAIT_MS: u64 = 600_000;
 
 /// Live-stream callback for [`drain_pipe`]: receives decoded text
 /// chunks as the command prints them.
@@ -1500,7 +1419,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"bash",
-				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default; a timeout (or a user interrupt) kills the command but still returns the partial output it produced, flagged `timed_out` / `interrupted`. For long-running commands, pass `detach: true` — the process keeps running and you get back an `id` for `wait` / `stop`; add `notify: true` to be woken with the result when it exits instead of waiting.",
+				"Run a shell command in the active workspace folder. Returns stdout, stderr, exit_code. Times out after 120s by default; a timeout (or a user interrupt) kills the command but still returns the partial output it produced, flagged `timed_out` / `interrupted`. For long-running commands, pass `detach: true` — the process keeps running and you get back an `id` for `check` / `stop`; add `notify: true` to be woken with the result when it exits instead of waiting.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -1514,7 +1433,7 @@ impl ToolRegistry {
 						},
 						"detach": {
 							"type": "boolean",
-							"description": "When true, spawn the command as a detached background process. Returns immediately with `{ detached, id, pid, log_path }` instead of waiting for completion. Use `wait(id)` to check on it or block for it, and `stop(id)` to kill it. The process survives turn boundaries — including an interrupted turn — so an id from an earlier turn still works; it is killed when the session is deleted or the IDE quits."
+							"description": "When true, spawn the command as a detached background process. Returns immediately with `{ detached, id, pid, log_path }` instead of waiting for completion. Use `check(id)` to look at its status and output, and `stop(id)` to kill it. The process survives turn boundaries — including an interrupted turn — so an id from an earlier turn still works; it is killed when the session is deleted or the IDE quits."
 						},
 						"notify": {
 							"type": "boolean",
@@ -1525,18 +1444,14 @@ impl ToolRegistry {
 				}),
 			),
 			ToolDefinition::function(
-				"wait",
-				"Check on, or block for, background work: a detached process (`bg_…` id from `bash`) or a sub-agent (`subagent_id` from `task`). For a process: running status, exit code once finished, and the tail of its output. For a sub-agent: its report once done. Ids from earlier turns of this session stay valid. A result you take here is not delivered to you again as a `<background_result>` message.",
+				"check",
+				"Look at background work without waiting: a detached process (`bg_…` id from `bash`) or a sub-agent (`subagent_id` from `task`). For a process: running status, exit code once finished, and the tail of its output. For a sub-agent: its report once done. Never blocks: sub-agent reports and `notify` process results arrive on their own, so to wait for them, end your turn. Ids from earlier turns of this session stay valid.",
 				json!({
 					"type": "object",
 					"properties": {
 						"id": {
 							"type": "string",
 							"description": "A process id from `bash` with `detach: true`, or a sub-agent id from `task`."
-						},
-						"wait_ms": {
-							"type": "integer",
-							"description": "If > 0, block up to this many milliseconds for the work to finish (capped at 600000 = 10 minutes). Only block when you can't do anything else until it finishes; otherwise use `notify` / the automatic sub-agent report and end your turn."
 						},
 						"tail_bytes": {
 							"type": "integer",
@@ -2470,7 +2385,7 @@ impl ToolRegistry {
 			// "don't mutate" half is enforced via the sub-agent's
 			// system prompt — see Phase C's `run_subagent`.
 			"bash" => self.bash(args, cx, cancel, tool_call_id).await,
-			"wait" => self.read_process(args, cx, cancel).await,
+			"check" => self.read_process(args, cx),
 			"stop" => self.stop_process(args, cx).await,
 			// Reading a terminal is read-only against the user's own
 			// screen, so it isn't mode-gated — a Research sub-agent
@@ -3003,7 +2918,7 @@ impl ToolRegistry {
 
 		// Detached path (ADR 0034): spawn into the session registry,
 		// redirect output to a log file, return immediately. The
-		// model checks via `wait`, kills via `stop`, or with `notify`
+		// model checks via `check`, kills via `stop`, or with `notify`
 		// gets woken by the exit (ADR 0102).
 		if parsed.detach {
 			let id = cx.background.next_id();
@@ -3147,30 +3062,21 @@ impl ToolRegistry {
 		Ok(result)
 	}
 
-	/// Poll a detached background process (ADR 0034). Tails the log
-	/// file and optionally blocks until the process exits.
-	async fn read_process(
-		&self,
-		args: &Value,
-		cx: &ToolContext,
-		cancel: &CancellationToken,
-	) -> Result<Value, CoderError> {
+	/// Look at a detached background process (ADR 0034 / 0106).
+	fn read_process(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
 		#[derive(Deserialize)]
 		struct ReadProcessArgs {
 			id: String,
 			#[serde(default)]
-			wait_ms: Option<u64>,
-			#[serde(default)]
 			tail_bytes: Option<usize>,
 		}
 		let parsed: ReadProcessArgs =
-			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("wait", err.to_string()))?;
-		let wait_ms = parsed.wait_ms.unwrap_or(BG_DEFAULT_WAIT_MS).min(BG_MAX_WAIT_MS);
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("check", err.to_string()))?;
 		let tail_bytes = parsed
 			.tail_bytes
 			.unwrap_or(BG_DEFAULT_TAIL_BYTES)
 			.min(BG_MAX_TAIL_BYTES);
-		cx.background.read(&parsed.id, wait_ms, tail_bytes, cancel, true).await
+		cx.background.read(&parsed.id, tail_bytes)
 	}
 
 	/// Kill a detached background process if still running (ADR 0034).
@@ -6205,7 +6111,7 @@ mod tests {
 				.unwrap();
 			assert_eq!(id, "bg_0");
 			// Wait for the child to exit, then observe it via the
-			// registry's poll path (the same one `wait` uses).
+			// registry's poll path (the same one `check` uses).
 			for _ in 0..50 {
 				if registry.try_reap("bg_0") {
 					break;
@@ -6319,28 +6225,10 @@ mod tests {
 		}
 
 		#[tokio::test]
-		async fn waited_or_stopped_notify_process_does_not_wake() {
+		async fn stopped_notify_process_does_not_wake() {
 			let registry = Arc::new(BackgroundProcessRegistry::default());
 			let (wake, notices) = wake_collector();
 			registry.set_wake(wake);
-
-			// A parked `wait` takes the result.
-			let waited = "bg_notify_waited".to_string();
-			registry
-				.spawn(
-					waited.clone(),
-					"call-w".into(),
-					shell("sleep 0.3"),
-					"w".into(),
-					"host",
-					true,
-				)
-				.unwrap();
-			let result = registry
-				.read(&waited, 5_000, 1_000, &tokio_util::sync::CancellationToken::new(), true)
-				.await
-				.unwrap();
-			assert_eq!(result["running"], false);
 
 			// A stopped one never reports.
 			let stopped = "bg_notify_stopped".to_string();

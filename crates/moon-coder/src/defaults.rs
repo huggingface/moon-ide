@@ -246,11 +246,10 @@ A sub-agent does **not** see your conversation history; describe the task self-c
 
 ## Background work
 
-Sub-agents (`task`) and detached processes (`bash` with `detach: true`) run in the background and share two tools: `wait(id, wait_ms?)` checks on or blocks for one, `stop(id)` ends it.
+Sub-agents (`task`) and detached processes (`bash` with `detach: true`) run in the background. `check(id)` looks at one without blocking (status, output, report); `stop(id)` ends it.
 
-- A sub-agent's report, and a `notify: true` process's exit, arrive by themselves as a `<background_result kind="subagent|process" id=… status=…>` message — mid-turn, or by waking you after your turn ended. Don't poll for them.
-- For a job longer than the 10-minute `bash` cap (full test suites, CI runs, deploys) that you need the outcome of, use `bash(cmd, detach=true, notify=true)`, tell the user what you're waiting on, and end your turn; continue from the result. To wait for a condition, make the command exit when it holds (`gh run watch <id> --exit-status`, `until curl -sf <url>; do sleep 10; done`, `timeout 2h …`).
-- Block with `wait(id, wait_ms)` only when there's nothing else useful to do and the result is minutes away; a result it takes isn't delivered again. Stopped work never reports.
+- A sub-agent's report, and a `notify: true` process's exit, arrive by themselves as a `<background_result kind="subagent|process" id=… status=…>` message — mid-turn, or by waking you after your turn ended. When you have nothing else to do until one arrives, end your turn; don't poll. Stopped work never reports.
+- For a job longer than the 10-minute `bash` cap (full test suites, CI runs, deploys), use `bash(cmd, detach=true, notify=true)`, tell the user what you're waiting on, and end your turn. To wait for a condition, make the command exit when it holds (`gh run watch <id> --exit-status`, `until curl -sf <url>; do sleep 10; done`, `timeout 2h …`); for something seconds away (a dev server coming up), run it in the foreground.
 - Plain `detach` (no `notify`) is for dev servers and watchers you don't need to hear back from.
 
 ## Reviewing branch / PR changes

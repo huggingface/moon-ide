@@ -326,7 +326,7 @@ pub struct Subagent {
 	/// Whether this run is a background run of a top-level parent
 	/// (every parent `task` is, ADR 0091): the tool call returns a
 	/// handle immediately and the report arrives via the completion
-	/// callback or `wait`. `false` for nested (blocking)
+	/// callback or `check`. `false` for nested (blocking)
 	/// runs and user-driven resumes.
 	pub detach: bool,
 	/// Folder the sub-agent's tools operate against. May differ
@@ -348,7 +348,7 @@ pub struct Subagent {
 /// metadata the UI uses to render the collapsed card / pop-out.
 ///
 /// `Serialize` so a detached run ([ADR 0053]) can stash the
-/// finished report in the registry and have `wait`
+/// finished report in the registry and have `check`
 /// return it verbatim.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SubagentReport {
@@ -384,7 +384,7 @@ pub fn task_tool_definition() -> ToolDefinition {
 		"task",
 		"Delegate a self-contained task to a sub-agent that runs in the background. Sub-agents run in their own context — you spend tokens on the task description and the final report, not on every intermediate read or edit. See \"When to use sub-agents\" in your instructions for when to reach for this (context preservation, parallelism, scoped delegation); it is for *delegation*, not for *access* — your own tools already reach every bound folder. \
 \
-The call returns at once with a `subagent_id`; several `task` calls run concurrently. The report arrives on its own as a `<background_result>` message (see \"Background work\" in your instructions) — don't poll. `wait` blocks on it, `task_steer` redirects the run, `stop` cancels it. \
+The call returns at once with a `subagent_id`; several `task` calls run concurrently. The report arrives on its own as a `<background_result>` message (see \"Background work\" in your instructions) — don't poll. `check` looks at it, `task_steer` redirects the run, `stop` cancels it. \
 \
 The sub-agent has no access to your conversation history — describe the task self-containedly. An `agent`-mode sub-agent can itself delegate read-only investigations to nested `research` sub-agents; `research` sub-agents cannot delegate further.",
 		json!({
@@ -448,7 +448,7 @@ The sub-agent has no access to your conversation history — describe the task s
 /// pop-out composer, so delivery semantics are identical: queued
 /// now, drained at the top of the sub-agent's next iteration.
 /// Advertised to `Agent` mode only; waiting on and stopping a
-/// sub-agent go through `wait` / `stop` (ADR 0102).
+/// sub-agent go through `check` / `stop` (ADR 0102).
 pub fn task_steer_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 			"task_steer",
@@ -1839,7 +1839,7 @@ async fn handle_subagent_todo_write(
 
 const RESEARCH_SYSTEM_PROMPT: &str = r#"You are a research sub-agent inside moon-ide. You have been spawned by a parent agent to gather information from a workspace folder and report back. Your job is investigation, not editing.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `wait`, and `stop`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `check`, and `stop`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it. You cannot spawn further sub-agents.
 
 The shell is for read-only inspection only — `git log`, `git diff --stat`, `cargo check`, `pytest --collect-only`, `ls -la`, `cat`, `wc`, and similar. Do **not** run commands that mutate the filesystem, network state, or remote services. No `git commit`, `git push`, `cargo build` (it writes to `target/`), `mv`, `rm`, `npm install`, `pip install`, redirection-to-file (`> path`, `>> path`), or anything that would change persistent state.
 
@@ -1848,7 +1848,7 @@ Return your findings as a single coherent text result when you finish. The paren
 
 const AGENT_SYSTEM_PROMPT: &str = r#"You are an agent sub-agent inside moon-ide. You have been spawned by a parent agent to perform a focused task in a workspace folder. Your capabilities are the same as the parent's — you can read, search, run commands, and edit files freely.
 
-Tools available: `read_file`, `list_dir`, `grep`, `bash`, `wait`, `stop`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it.
+Tools available: `read_file`, `list_dir`, `grep`, `bash`, `check`, `stop`, `write_file`, `edit_file`. You are scoped to a single folder (shown below); `grep` and `bash` run against it, and relative paths resolve inside it.
 
 You can delegate self-contained read-only investigations to nested research sub-agents via the `task` tool — useful when the answer is much smaller than the inputs (grep-then-read sweeps, "find every callsite of X"). Nested sub-agents are research-only, run synchronously, and cannot delegate further.
 
