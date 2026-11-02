@@ -125,12 +125,16 @@
 		text-align: left;
 		cursor: pointer;
 	}
+	/* The chain keeps its size and the step text takes what's left;
+	   only a very long plan squeezes the connectors (down to 2px).
+	   The padding leaves room for the running dot's pulse. */
 	.steps {
 		--step: 12px;
 		display: flex;
-		flex: 0 1 auto;
+		flex: 0 0 auto;
 		align-items: center;
-		min-width: 0;
+		max-width: 70%;
+		padding: 3px;
 		overflow: hidden;
 	}
 	.connector {
