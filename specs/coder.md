@@ -1892,8 +1892,10 @@ nothing to wake it.
 - **Active strip.** Above the composer, the session lists its running
   sub-agents and `notify` processes, each with a stop button, plus
   "stop all".
-- **Counts as agent activity.** A running sub-agent keeps the OS
-  activity indicator "running", and a turn that ends while sub-agents
+- **Counts as agent activity.** A running sub-agent or `notify`
+  process keeps the session's running pip (folder bar, session list)
+  lit; a running sub-agent also keeps the OS activity indicator
+  "running", and a turn that ends while sub-agents
   or `notify` processes are still running doesn't fire the
   turn-finished notification
   ([ADR 0089](decisions/0089-turn-finished-notification.md)) — the

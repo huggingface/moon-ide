@@ -476,15 +476,22 @@ class SessionViewState {
 	 *  explicit `openSession` (e.g. HMR rehydrate). */
 	openIpcMs: number | null = null;
 
-	/** "Is this session doing work?" — a turn in flight, or a
-	 *  background `task` sub-agent still running after the parent's
-	 *  turn ended (ADR 0091). The running pips (folder bar, session
-	 *  list) read this rather than `busy` so they keep pulsing until
-	 *  the sub-agents settle and the report wakes the parent.
-	 *  Coordinator workers are excluded: they're sessions of their
-	 *  own and light their own rows. */
+	/** Ids of this session's running `notify: true` background
+	 *  processes (ADR 0102), seen live: added by the detached `bash`
+	 *  result, removed by `background_process_exited`. Not rebuilt on
+	 *  replay (the exit event is live-only). */
+	pendingNotify = $state<string[]>([]);
+
+	/** "Is this session doing work?" — a turn in flight, or
+	 *  background work that will wake it: a `task` sub-agent still
+	 *  running after the parent's turn ended (ADR 0091) or a
+	 *  `notify` process (ADR 0102). The running pips (folder bar,
+	 *  session list) read this rather than `busy` so they keep
+	 *  pulsing until that work reports back. Coordinator workers
+	 *  are excluded: they're sessions of their own and light their
+	 *  own rows. */
 	get working(): boolean {
-		if (this.busy) {
+		if (this.busy || this.pendingNotify.length > 0) {
 			return true;
 		}
 		for (const summary of this.subagentSummaries.values()) {
@@ -3723,6 +3730,10 @@ export class CoderPanelState {
 					if (toolRow.name === 'bash' && isDetachedBashResult(event.result)) {
 						toolRow.bgStatus = { state: 'running' };
 						this.backgroundVersion += 1;
+						const notifyId = notifyProcessId(event.result);
+						if (notifyId !== null && !session.replaying) {
+							session.pendingNotify = [...session.pendingNotify, notifyId];
+						}
 					}
 					// The parked `ask_user` prompt just resolved
 					// (answered or skipped) — drop the "needs input"
@@ -3760,6 +3771,9 @@ export class CoderPanelState {
 					toolRow.bgStatus = event.killed
 						? { state: 'killed' }
 						: { state: 'exited', exitCode: event.exit_code ?? null };
+				}
+				if (session.pendingNotify.includes(event.id)) {
+					session.pendingNotify = session.pendingNotify.filter((id) => id !== event.id);
 				}
 				this.backgroundVersion += 1;
 				return;
@@ -4737,6 +4751,14 @@ function upsertToolCallRow(rows: CoderRow[], event: Extract<CoderEvent, { kind: 
  *  Shared by both `tool_result` reducers (parent transcript and
  *  sub-agent pop-out) to flip the row into its live
  *  process-running state. */
+/** The process id of a detached `bash` spawned with `notify: true`. */
+function notifyProcessId(result: unknown): string | null {
+	if (typeof result !== 'object' || result === null || !('notify' in result) || result.notify !== true) {
+		return null;
+	}
+	return 'id' in result && typeof result.id === 'string' ? result.id : null;
+}
+
 function isDetachedBashResult(result: unknown): boolean {
 	if (typeof result !== 'object' || result === null) {
 		return false;
