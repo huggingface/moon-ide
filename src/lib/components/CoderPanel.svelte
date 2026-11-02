@@ -11,6 +11,7 @@
 	type ToolGroupItem = Extract<TranscriptItem, { kind: 'group' }>;
 	import { frontendLog } from '../logs.svelte';
 	import { workspace } from '../state.svelte';
+	import { copyImageToClipboard } from '../copyImage';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
 	import CoderModelSettingsModal from './CoderModelSettingsModal.svelte';
@@ -485,6 +486,69 @@
 		coder.draft = extra.length > 0 ? `${SHIP_IT_PROMPT}\n\n${extra}` : SHIP_IT_PROMPT;
 		await coder.send();
 	}
+
+	// Images in the transcript (replies, tool screenshots, pasted
+	// attachments) get our own menu: WebKitGTK's "Copy Image" copies a
+	// `data:` image as its URL text.
+	let imageMenu = $state<{ src: string; workspacePath: string | null; x: number; y: number } | null>(null);
+
+	function onPanelContextMenu(event: MouseEvent): void {
+		const target = event.target;
+		if (!(target instanceof HTMLImageElement) || target.currentSrc === '') {
+			return;
+		}
+		event.preventDefault();
+		imageMenu = {
+			src: target.currentSrc,
+			workspacePath: target.dataset.workspacePath ?? null,
+			x: event.clientX,
+			y: event.clientY,
+		};
+	}
+
+	$effect(() => {
+		const el = panelEl;
+		if (!el) {
+			return;
+		}
+		el.addEventListener('contextmenu', onPanelContextMenu);
+		return () => el.removeEventListener('contextmenu', onPanelContextMenu);
+	});
+
+	const imageMenuItems = $derived<ContextMenuItem[]>(
+		imageMenu === null
+			? []
+			: [
+					{
+						id: 'copy-image',
+						label: 'Copy image',
+						onSelect: () => {
+							const src = imageMenu?.src;
+							if (src === undefined) {
+								return;
+							}
+							copyImageToClipboard(src).then(
+								() => workspace.flash('Image copied'),
+								(err: unknown) => workspace.flash(`Copy failed: ${formatError(err)}`),
+							);
+						},
+					},
+					...(imageMenu.workspacePath === null
+						? []
+						: [
+								{
+									id: 'open-image',
+									label: 'Open in editor',
+									onSelect: () => {
+										const path = imageMenu?.workspacePath;
+										if (path) {
+											void workspace.openFile(path);
+										}
+									},
+								},
+							]),
+				],
+	);
 
 	// Our own menu rather than a native `<select>`: WebKitGTK's select
 	// popup needs press-drag-release to pick a value.
@@ -3837,6 +3901,13 @@
 				></textarea>
 			</div>
 		{/if}
+	{/if}
+	{#if imageMenu !== null}
+		<ContextMenu
+			items={imageMenuItems}
+			anchorRect={{ left: imageMenu.x, top: imageMenu.y, width: 0, height: 0 }}
+			onClose={() => (imageMenu = null)}
+		/>
 	{/if}
 </div>
 
