@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { Attachment } from 'svelte/attachments';
 	import { isFailedService, type ServiceStatus } from '../protocol';
 	import { composeLogs } from '../composeLogs.svelte';
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
@@ -44,6 +45,36 @@
 	};
 
 	let { folderPath, folderName, onClose }: Props = $props();
+
+	// Fixed against the viewport, under the folder row and clamped to
+	// the window: anchored inside the narrow sidebar, an `absolute`
+	// panel as wide as a long compose error ran off the window's left
+	// edge (and the sidebar clips anything past its right edge).
+	const placeUnderAnchor: Attachment<HTMLElement> = (node) => {
+		const anchor = node.parentElement;
+		if (anchor === null) {
+			return;
+		}
+		const margin = 8;
+		const place = () => {
+			const a = anchor.getBoundingClientRect();
+			const width = node.offsetWidth;
+			const left = Math.min(Math.max(margin, a.right - width), window.innerWidth - width - margin);
+			node.style.left = `${Math.max(margin, left)}px`;
+			node.style.top = `${a.bottom + 4}px`;
+			node.style.maxHeight = `${Math.max(160, window.innerHeight - a.bottom - 4 - margin)}px`;
+		};
+		place();
+		const observer = new ResizeObserver(place);
+		observer.observe(node);
+		window.addEventListener('resize', place);
+		window.addEventListener('scroll', place, true);
+		return () => {
+			observer.disconnect();
+			window.removeEventListener('resize', place);
+			window.removeEventListener('scroll', place, true);
+		};
+	};
 
 	const snapshot = $derived(projectCompose.snapshotFor(folderPath));
 	const inFlight = $derived(projectCompose.inFlightFor(folderPath));
@@ -139,7 +170,7 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class="panel" role="dialog" aria-label="Project services for {folderName}">
+<div class="panel" role="dialog" aria-label="Project services for {folderName}" {@attach placeUnderAnchor}>
 	<header>
 		<span class="title">{folderName} services</span>
 		<span
@@ -369,17 +400,11 @@
 
 <style>
 	.panel {
-		position: absolute;
-		top: 100%;
-		right: 0;
-		margin-top: 4px;
+		position: fixed;
 		min-width: 280px;
-		max-width: 420px;
-		/* Cap so the popover never extends past the viewport on
-		   tall service lists. The internal services list takes
-		   the slack via flex; everything above (header, errors,
-		   meta, actions) stays anchored at the top. */
-		max-height: calc(100vh - 64px);
+		max-width: min(420px, calc(100vw - 16px));
+		/* `max-height` is set inline to the room below the anchor;
+		   the internal services list takes the slack via flex. */
 		background: var(--m-bg-2);
 		border: 1px solid var(--m-border-strong);
 		border-radius: 6px;
@@ -390,7 +415,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
-		z-index: 20;
+		z-index: 1000;
 	}
 	header {
 		display: flex;
@@ -540,6 +565,7 @@
 		border-radius: 4px;
 		padding: 6px 8px;
 		white-space: pre-wrap;
+		overflow-wrap: anywhere;
 		max-height: 8em;
 		overflow: auto;
 	}
