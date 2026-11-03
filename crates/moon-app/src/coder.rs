@@ -893,6 +893,16 @@ pub async fn coder_set_bash_target_override(app: &AppCore, force_host: bool) -> 
 		.map_err(MoonError::from)
 }
 
+/// Set the reasoning effort for the active folder's visible session
+/// only; `None` follows the model settings' default.
+pub async fn coder_set_session_reasoning_effort(app: &AppCore, effort: Option<String>) -> Result<(), MoonError> {
+	app
+		.coder
+		.set_session_reasoning_effort(effort)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Replace the in-memory session with the persisted one
 /// identified by `id`. Backend emits `session_loaded` + per-record
 /// replay events on the `coder:event` channel; the frontend reacts
@@ -1641,6 +1651,7 @@ crate::commands! {
 	coder_move_session_to_worktree([app]),
 	coder_associate_branch([app]),
 	coder_set_bash_target_override([app] force_host: bool),
+	coder_set_session_reasoning_effort([app] effort: Option<String>),
 	coder_open_session([app] id: String),
 	coder_session_jsonl_path([app] id: String),
 	coder_rename_session([app] id: String, title: String),

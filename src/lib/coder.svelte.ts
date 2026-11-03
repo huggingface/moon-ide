@@ -825,12 +825,17 @@ export class CoderPanelState {
 
 	/** Change only the reasoning effort, through the normal settings
 	 *  round-trip. `null` = provider default. */
-	async setReasoningEffort(effort: string | null): Promise<void> {
-		const settings = this.modelSettings;
-		if (settings === null) {
-			return;
-		}
-		await this.saveModelSettings({ ...settings, reasoning_effort: effort });
+	/** The visible session's reasoning-effort override; `null` when
+	 *  it follows the model settings' default. */
+	get sessionReasoningEffort(): string | null {
+		return this.status?.session_reasoning_effort ?? null;
+	}
+
+	/** Set the visible session's reasoning effort only; other
+	 *  sessions keep the model settings' default. */
+	async setSessionReasoningEffort(effort: string | null): Promise<void> {
+		await ipc.coder.setSessionReasoningEffort(effort);
+		await this.refreshStatus();
 	}
 
 	/** Short display name of the model the next turn will use —

@@ -204,6 +204,10 @@ pub struct SessionHeader {
 	/// session's work is first committed; unused for worktree sessions
 	/// (their branch is [`worktree_branch`](Self::worktree_branch)).
 	pub committed_branch: Option<String>,
+	/// Per-session reasoning effort, overriding the model settings'
+	/// default for this session's turns only. `None` follows the
+	/// default.
+	pub reasoning_effort: Option<String>,
 }
 
 /// Per-session override for the `bash` tool's execution target.
@@ -294,6 +298,9 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.bash_target_override {
 			map.serialize_entry("bash_target_override", v.as_wire())?;
 		}
+		if let Some(v) = &self.reasoning_effort {
+			map.serialize_entry("reasoning_effort", v)?;
+		}
 		if let Some(v) = &self.worktree_root {
 			map.serialize_entry("worktree_root", v)?;
 		}
@@ -346,6 +353,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			#[serde(default)]
 			bash_target_override: Option<String>,
 			#[serde(default)]
+			reasoning_effort: Option<String>,
+			#[serde(default)]
 			worktree_root: Option<String>,
 			#[serde(default)]
 			worktree_branch: Option<String>,
@@ -374,6 +383,7 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			worktree_root: raw.worktree_root,
 			worktree_branch: raw.worktree_branch,
 			committed_branch: raw.committed_branch,
+			reasoning_effort: raw.reasoning_effort,
 		})
 	}
 }
@@ -3234,6 +3244,7 @@ mod tests {
 			worktree_root: None,
 			worktree_branch: None,
 			committed_branch: None,
+			reasoning_effort: None,
 		}
 	}
 
@@ -3512,6 +3523,11 @@ mod tests {
 		assert!(json.contains("\"bash_target_override\":\"host\""), "got {json}");
 		let back: SessionHeader = serde_json::from_str(&json).unwrap();
 		assert_eq!(back.bash_target_override, Some(BashTargetOverride::ForceHost));
+		assert!(!json.contains("reasoning_effort"), "got {json}");
+		header.reasoning_effort = Some("high".into());
+		let json = serde_json::to_string(&header).unwrap();
+		let with_effort: SessionHeader = serde_json::from_str(&json).unwrap();
+		assert_eq!(with_effort.reasoning_effort.as_deref(), Some("high"));
 
 		// An unrecognised / future value degrades to auto rather than
 		// erroring the load.

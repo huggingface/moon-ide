@@ -2454,7 +2454,11 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
   `state.json` alongside the picks; CLI:
   `moon-remote model --reasoning xhigh` (empty string clears).
   Anthropic native route ignores it (its thinking config is
-  budget-based, separate).
+  budget-based, separate). That pick is the default; the composer's
+  reasoning picker overrides it for the visible session only
+  (`reasoning_effort` in the session header, `None` = follow the
+  default), applied from the session's next turn. Detached
+  sub-agents use the default.
 - **Compaction cut is tool-boundary-safe** (ADR-worthy): the
   summary cut snaps forward past any Tool run whose owning
   Assistant survived (and drops a leading orphan Tool run), so the

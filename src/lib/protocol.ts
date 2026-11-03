@@ -1803,6 +1803,9 @@ export type CoderStatus = {
 	 * target pip and pre-selects the radio in the override popover.
 	 */
 	force_host_override: boolean;
+	/** The visible session's reasoning-effort override; absent when it
+	 *  follows the model settings' default. */
+	session_reasoning_effort?: string | null;
 };
 
 /**

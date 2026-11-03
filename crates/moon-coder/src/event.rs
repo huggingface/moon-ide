@@ -579,4 +579,8 @@ pub struct CoderStatus {
 	/// badge on the target pip and pre-select the radio in the
 	/// popover.
 	pub force_host_override: bool,
+	/// The visible session's reasoning-effort override; `None` when
+	/// it follows the model settings' default.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub session_reasoning_effort: Option<String>,
 }

@@ -463,9 +463,12 @@
 	});
 
 	const reasoningChoices = $derived(coder.reasoningChoices);
-	const reasoningEffort = $derived(coder.modelSettings?.reasoning_effort ?? null);
+	// The composer picks this session's effort; the default other
+	// sessions use lives in model settings.
+	const reasoningEffort = $derived(coder.sessionReasoningEffort);
+	const defaultEffort = $derived(coder.modelSettings?.reasoning_effort ?? reasoningChoices.defaultLevel);
 	// A saved effort the current model doesn't take stays listed so
-	// the select shows it; the backend leaves it off the wire.
+	// the picker shows it; the backend leaves it off the wire.
 	const reasoningOptions = $derived(
 		reasoningEffort !== null && !reasoningChoices.levels.includes(reasoningEffort)
 			? [...reasoningChoices.levels, reasoningEffort]
@@ -567,15 +570,15 @@
 	}
 
 	function setReasoning(value: string | null): void {
-		coder.setReasoningEffort(value).catch(() => {
-			// `saveModelSettings` already records the error in `modelsError`.
+		coder.setSessionReasoningEffort(value).catch((err: unknown) => {
+			workspace.flash(`Couldn't set reasoning effort: ${formatError(err)}`);
 		});
 	}
 
 	const reasoningMenuItems = $derived<ContextMenuItem[]>([
 		{
 			id: 'default',
-			label: `${reasoningEffort === null ? '✓ ' : ''}default${reasoningChoices.defaultLevel ? ` (${reasoningChoices.defaultLevel})` : ''}`,
+			label: `${reasoningEffort === null ? '✓ ' : ''}default${defaultEffort ? ` (${defaultEffort})` : ''}`,
 			onSelect: () => setReasoning(null),
 		},
 		...reasoningOptions.map((lvl) => ({
@@ -3798,7 +3801,7 @@
 							<button
 								type="button"
 								class="reasoning-button"
-								title="Reasoning effort for the next turn (also in model settings)"
+								title="Reasoning effort for this session (the default for other sessions is in model settings)"
 								aria-haspopup="menu"
 								aria-expanded={reasoningMenuAnchor !== null}
 								onpointerdown={(e) => e.stopPropagation()}

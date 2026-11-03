@@ -613,6 +613,7 @@ async fn run_subagent_in_dir(
 		// Branch association is a top-level-session concern (the user
 		// commits from the panel); sub-agents never carry one.
 		committed_branch: None,
+		reasoning_effort: None,
 	};
 
 	// Best-effort: persistence failures log at warn but never

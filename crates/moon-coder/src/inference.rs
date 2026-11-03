@@ -798,6 +798,14 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+	/// The session header's `reasoning_effort` for the turn running
+	/// in this task, scoped around each `run_turn` like
+	/// [`SESSION_HINT`]. Tasks the turn spawns (detached sub-agents)
+	/// don't inherit it and use the settings' default.
+	pub static SESSION_REASONING_EFFORT: Option<String>;
+}
+
+tokio::task_local! {
 	/// Turn-scoped sticky fallback, set when rotation lands on a
 	/// working model: `(original, fallback)`. Later dispatches in
 	/// the same turn whose wire model equals `original` go straight
@@ -1631,6 +1639,13 @@ impl InferenceClient {
 		self.chatgpt.account(id)
 	}
 
+	/// Reasoning effort for `model`: the running session's override
+	/// when the turn set one, else the settings' default.
+	async fn effort_for(&self, model: &str) -> Option<String> {
+		let session = SESSION_REASONING_EFFORT.try_with(Clone::clone).ok().flatten();
+		self.models.read().await.effort_for_override(model, session.as_deref())
+	}
+
 	async fn chatgpt_request<'a>(
 		&'a self,
 		route: &'a ResolvedRoute,
@@ -1642,7 +1657,7 @@ impl InferenceClient {
 			route,
 			provider_id: route.provider_id.as_deref().unwrap_or_default(),
 			model,
-			reasoning_effort: self.models.read().await.effort_for(model),
+			reasoning_effort: self.effort_for(model).await,
 		}
 	}
 
@@ -1740,7 +1755,7 @@ impl InferenceClient {
 			max_tokens: None,
 			stream: false,
 			stream_options: None,
-			reasoning_effort: self.models.read().await.effort_for(model),
+			reasoning_effort: self.effort_for(model).await,
 		};
 
 		let mut response = self.send_once(&endpoint, &route, &body, cancel).await?;
@@ -1845,7 +1860,7 @@ impl InferenceClient {
 			// `AssistantResponse.usage` to drive the context-usage
 			// indicator and the auto-compaction trigger.
 			stream_options: Some(StreamOptions { include_usage: true }),
-			reasoning_effort: self.models.read().await.effort_for(model),
+			reasoning_effort: self.effort_for(model).await,
 		};
 
 		let mut response = self.send_once_stream(&endpoint, &route, &body, cancel).await?;

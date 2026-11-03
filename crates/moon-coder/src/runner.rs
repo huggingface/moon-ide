@@ -957,6 +957,7 @@ impl Session {
 				worktree_root: None,
 				worktree_branch: None,
 				committed_branch: None,
+				reasoning_effort: None,
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System { content: system_prompt }],
@@ -1950,12 +1951,17 @@ impl CoderHandle {
 			}
 			_ => (None, false),
 		};
+		let session_reasoning_effort = match &coder_root_fs {
+			Some(fs) => self.visible_session_reasoning_effort(fs).await,
+			None => None,
+		};
 		Ok(CoderStatus {
 			signed_in,
 			identity,
 			busy,
 			bash_target,
 			force_host_override,
+			session_reasoning_effort,
 		})
 	}
 
@@ -2606,6 +2612,26 @@ impl CoderHandle {
 		Ok(force_host)
 	}
 
+	/// Set the reasoning effort of the active folder's visible session
+	/// only (`None` = follow the model settings' default). Persisted
+	/// in the session header; applies from the session's next turn.
+	pub async fn set_session_reasoning_effort(&self, effort: Option<String>) -> Result<(), CoderError> {
+		// Mints the blank visible session when there's none yet, so a
+		// pick made before the first message sticks to that session.
+		let (rt, _, _) = self.state.active_visible_runtime().await?;
+		let (session_dir, header) = {
+			let mut session = rt.session.lock().await;
+			session.header.reasoning_effort = effort.filter(|e| !e.trim().is_empty());
+			(session.session_dir.clone(), session.header.clone())
+		};
+		if let Some(dir) = session_dir {
+			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+				tracing::warn!(?err, "failed to persist reasoning_effort header rewrite");
+			}
+		}
+		Ok(())
+	}
+
 	/// Tag the active folder's **visible** session with the branch its
 	/// work was committed onto (ADR 0028), rewriting the on-disk
 	/// header so a re-open remembers it. Called whenever the user
@@ -2847,6 +2873,14 @@ impl CoderHandle {
 		};
 		let forced = rt.session.lock().await.header.bash_target_override == Some(BashTargetOverride::ForceHost);
 		forced
+	}
+
+	/// The visible session's reasoning-effort override, if any.
+	async fn visible_session_reasoning_effort(&self, fs: &Arc<FolderSession>) -> Option<String> {
+		let id = fs.visible_session_id().await?;
+		let rt = fs.runtime(&id).await?;
+		let effort = rt.session.lock().await.header.reasoning_effort.clone();
+		effort
 	}
 
 	/// Revert the active folder's visible session back to just
@@ -6702,20 +6736,25 @@ fn spawn_turn_loop(
 					// `None` means no git repo / git unavailable, in which
 					// case we skip the diff computation at turn end.
 					let baseline_sha = capture_baseline(&state, &folder_for_turn).await;
-					let result = run_turn(
-						&state,
-						&rt_for_turn,
-						&folder_for_turn,
-						&sink_for_turn,
-						cancel_outer.clone(),
-						format_queue.clone(),
-						background.clone(),
-						// Only the first run_turn call gets the resume
-						// tool calls; subsequent loop iterations (steer
-						// drains after an abort) start fresh.
-						resume.take(),
-					)
-					.await;
+					let session_effort = rt_for_turn.session.lock().await.header.reasoning_effort.clone();
+					let result = crate::inference::SESSION_REASONING_EFFORT
+						.scope(
+							session_effort,
+							run_turn(
+								&state,
+								&rt_for_turn,
+								&folder_for_turn,
+								&sink_for_turn,
+								cancel_outer.clone(),
+								format_queue.clone(),
+								background.clone(),
+								// Only the first run_turn call gets the resume
+								// tool calls; subsequent loop iterations (steer
+								// drains after an abort) start fresh.
+								resume.take(),
+							),
+						)
+						.await;
 					let flushed_files = flush_format_queue(&state, &format_queue).await;
 					// Deliberately no `background.cleanup()` here (ADR
 					// 0085): detached processes outlive the turn. They
@@ -13399,6 +13438,7 @@ mod tests {
 			worktree_root: None,
 			worktree_branch: None,
 			committed_branch: None,
+			reasoning_effort: None,
 		}
 	}
 

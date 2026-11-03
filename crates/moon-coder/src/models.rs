@@ -448,7 +448,13 @@ impl CoderModels {
 	/// `slug`: dropped when the catalog says the model doesn't accept
 	/// it (a level picked for another provider's model would 400).
 	pub fn effort_for(&self, slug: &str) -> Option<String> {
-		let effort = self.reasoning_effort.clone()?;
+		self.effort_for_override(slug, None)
+	}
+
+	/// [`effort_for`](Self::effort_for) with a per-session override
+	/// taking the place of the settings' default.
+	pub fn effort_for_override(&self, slug: &str, session: Option<&str>) -> Option<String> {
+		let effort = session.map(str::to_string).or_else(|| self.reasoning_effort.clone())?;
 		let levels = self
 			.reasoning_levels
 			.get(slug)
@@ -673,6 +679,16 @@ mod tests {
 		assert_eq!(models.effort_for("gpt-old"), None);
 		assert_eq!(models.effort_for("plain"), None);
 		assert_eq!(models.effort_for("unknown").as_deref(), Some("max"));
+		// A session override replaces the default, under the same
+		// catalog filter.
+		assert_eq!(models.effort_for_override("gpt-x", Some("low")).as_deref(), Some("low"));
+		assert_eq!(models.effort_for_override("gpt-old", Some("max")), None);
+		models.reasoning_effort = None;
+		assert_eq!(
+			models.effort_for_override("unknown", Some("high")).as_deref(),
+			Some("high")
+		);
+		assert_eq!(models.effort_for_override("unknown", None), None);
 	}
 
 	#[test]
