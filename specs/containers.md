@@ -63,12 +63,16 @@ services:
   dev:
     image: huggingface/moon-base:1.0
     volumes:
+      - persist:/home/dev/.moon-persist
       - /home/me/code/moon-landing:/workspace/moon-landing
       - /home/me/code/moon-ide:/workspace/moon-ide
     working_dir: /workspace
     command: ['sleep', 'infinity']
     init: true
     # No `privileged: true`. We don't run nested Docker. See ADR 0008.
+
+volumes:
+  persist: {}
 
 x-moon:
   shell-service: dev
@@ -909,6 +913,21 @@ Recreating `dev` on every folder change would nuke `~/.cargo`,
 prompting, see the `moon-base` image above). Named volumes for those
 paths make the bytes survive recreation; they land when there's cache
 state worth preserving.
+
+#### Persisted home paths
+
+Recreation also wipes anything users put in the container home
+(tokens like `~/.bgs`). Each workspace's `dev` mounts a named volume
+`persist` at `/home/dev/.moon-persist`; the container popover's
+"Persisted home paths" list (`<state-dir>/persist-paths.json`,
+home-relative) names what to keep. After every `up`, and when the list
+is saved while running, each listed path becomes a symlink into the
+volume: moved in the first time it exists, relinked on a fresh
+container (an image-provided copy is kept aside as `<path>.moon-image`).
+A path that doesn't exist yet is linked once it does. A volume for all
+of `/home/dev` was rejected: moon-base installs its toolchains there
+(rustup, cargo, bun, go, `.bashrc`), and a volume would freeze them
+across image upgrades.
 
 #### Inventory + GC
 

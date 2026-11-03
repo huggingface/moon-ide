@@ -216,6 +216,20 @@ pub async fn container_render_compose(app: &AppCore) -> Result<String, MoonError
 	Ok(container.render_compose(DEFAULT_DEV_IMAGE).yaml)
 }
 
+/// Home paths kept across `dev` recreation (relative to the
+/// container home).
+pub async fn container_persist_paths(app: &AppCore) -> Result<Vec<String>, MoonError> {
+	let container = workspace_handle(app).await?;
+	Ok(container.persist_paths().await)
+}
+
+/// Replace the persisted home paths; linked right away when `dev`
+/// is running. Returns the normalised list.
+pub async fn container_set_persist_paths(app: &AppCore, paths: Vec<String>) -> Result<Vec<String>, MoonError> {
+	let container = workspace_handle(app).await?;
+	Ok(container.set_persist_paths(&paths).await?)
+}
+
 crate::commands! {
 	container_status([app]),
 	container_setup([app]),
@@ -226,4 +240,6 @@ crate::commands! {
 	container_teardown([app]),
 	container_apply_bound_folders([app]),
 	container_render_compose([app]),
+	container_persist_paths([app]),
+	container_set_persist_paths([app] paths: Vec<String>),
 }

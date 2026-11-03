@@ -10180,10 +10180,12 @@ mod tests {
 		run_git(&git, root.path(), &["clone", "-q", remote.to_str().unwrap(), "local"]);
 		run_git(&git, &local, &["config", "user.email", "l@example.com"]);
 		run_git(&git, &local, &["config", "user.name", "Local"]);
-		// Belt-and-braces: pin the default push policy so the
-		// fallback path's safety doesn't hinge on the host's git
-		// global config.
+		// Belt-and-braces: pin the default push policy and the
+		// tracking setup so neither hinges on the host's git global
+		// config (`branch.autoSetupMerge=simple` skips tracking a
+		// differently-named upstream).
 		run_git(&git, &local, &["config", "push.default", "simple"]);
+		run_git(&git, &local, &["config", "branch.autoSetupMerge", "true"]);
 
 		// The coder's branch-creation shape: branch directly off the
 		// remote-tracking default ref.

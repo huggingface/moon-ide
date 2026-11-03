@@ -3495,7 +3495,37 @@ impl CoderHandle {
 			None => self.state.tools.context_for_active(CoderMode::Research).await?,
 		}
 		.with_force_host_bash(rt.force_host_bash.clone());
-		self.state.tools.read_image_data_url(path, &cx).await
+		let snapshot = {
+			let session = rt.session.lock().await;
+			session
+				.session_dir
+				.as_ref()
+				.map(|dir| image_snapshot_path(&subagent_session_dir(dir, &session.header.id), path))
+		};
+		let (mime, bytes) = match self.state.tools.read_display_image(path, &cx).await {
+			Ok(found) => found,
+			// Gone from where the agent left it (`/tmp` after a reboot,
+			// a recreated container): fall back to the session's copy.
+			Err(err) => {
+				let Some(snap) = &snapshot else {
+					return Err(err);
+				};
+				let Some(mime) = crate::tools::image_mime_for(path) else {
+					return Err(err);
+				};
+				match tokio::fs::read(snap.as_std_path()).await {
+					Ok(bytes) => (mime, bytes),
+					Err(_) => return Err(err),
+				}
+			}
+		};
+		if let Some(snap) = &snapshot {
+			save_image_snapshot(snap, &bytes).await;
+		}
+		Ok(format!(
+			"data:{mime};base64,{}",
+			base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+		))
 	}
 
 	/// Make the persisted session identified by `id` the visible
@@ -8288,6 +8318,39 @@ fn subagent_report_message(subagent_id: &str, finish: &DetachedFinish) -> Option
 	))
 }
 
+/// Where a session keeps its copy of an image a reply displayed, so
+/// the transcript still shows it once the original is gone. Keyed by
+/// the path the reply names (FNV-1a), under the session's own
+/// directory so deleting the session deletes the copies.
+fn image_snapshot_path(session_files: &Utf8Path, path: &str) -> Utf8PathBuf {
+	let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+	for byte in path.as_bytes() {
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(0x0100_0000_01b3);
+	}
+	let ext = Utf8Path::new(path).extension().unwrap_or("img").to_ascii_lowercase();
+	session_files.join("images").join(format!("{hash:016x}.{ext}"))
+}
+
+/// Best-effort refresh of a session's image copy; skipped when the
+/// stored copy already has the same size (the common re-render).
+async fn save_image_snapshot(snap: &Utf8Path, bytes: &[u8]) {
+	if let Ok(meta) = tokio::fs::metadata(snap.as_std_path()).await {
+		if meta.len() == bytes.len() as u64 {
+			return;
+		}
+	}
+	if let Some(parent) = snap.parent() {
+		if let Err(err) = tokio::fs::create_dir_all(parent.as_std_path()).await {
+			tracing::debug!(%err, "could not create the session image directory");
+			return;
+		}
+	}
+	if let Err(err) = tokio::fs::write(snap.as_std_path(), bytes).await {
+		tracing::debug!(%err, "could not save a session image copy");
+	}
+}
+
 /// The wake text for a `notify` process that exited (ADR 0102).
 fn process_result_message(notice: &crate::tools::ProcessNotice) -> String {
 	let status = if notice.exit_code == Some(0) { "done" } else { "error" };
@@ -12499,6 +12562,16 @@ mod tests {
 			super::process_result_message(&notice),
 			"<background_result kind=\"process\" id=\"bg_4\" status=\"error\" exit_code=\"1\">\n$ pnpm test\n2 failed\n</background_result>"
 		);
+	}
+
+	#[test]
+	fn image_snapshots_are_keyed_by_path_under_the_session_dir() {
+		let dir = camino::Utf8Path::new("/s/sess-1");
+		let a = super::image_snapshot_path(dir, "/tmp/shot.PNG");
+		assert_eq!(a, super::image_snapshot_path(dir, "/tmp/shot.PNG"));
+		assert_ne!(a, super::image_snapshot_path(dir, "/tmp/other.png"));
+		assert!(a.starts_with("/s/sess-1/images"));
+		assert_eq!(a.extension(), Some("png"));
 	}
 
 	#[test]

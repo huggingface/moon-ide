@@ -76,6 +76,7 @@ use crate::compose::{
 	SshPublicKeyMount,
 };
 use crate::network::{connect_container_to_network, dev_container_name, project_default_network};
+use crate::persist;
 use crate::port_forward::stop_forwards;
 use crate::project::{project_name_for_id, ProjectName, ProjectNameError};
 use crate::project_compose::ProjectCompose;
@@ -137,6 +138,9 @@ pub enum LifecycleError {
 
 	#[error("io error: {0}")]
 	Io(#[from] std::io::Error),
+
+	#[error("{0}")]
+	InvalidPersistPath(String),
 }
 
 /// Map lifecycle errors onto the protocol-level `MoonError` the
@@ -166,6 +170,7 @@ impl From<LifecycleError> for MoonError {
 			LifecycleError::ParseError(msg) => MoonError::internal(format!("could not parse docker compose output: {msg}")),
 			LifecycleError::InvalidWorkspaceId(err) => MoonError::invalid(err.to_string()),
 			LifecycleError::Io(err) => MoonError::from(err),
+			LifecycleError::InvalidPersistPath(msg) => MoonError::invalid(msg),
 		}
 	}
 }
@@ -421,6 +426,7 @@ impl Workspace {
 		self.docker_compose(["up", "-d", "--wait"]).await?;
 		self.invalidate_status_cache().await;
 		self.reattach_running_projects().await;
+		self.link_persisted_paths().await;
 		Ok(())
 	}
 
@@ -448,8 +454,36 @@ impl Workspace {
 			self.docker_compose(["up", "-d", "--wait"]).await?;
 			self.invalidate_status_cache().await;
 			self.reattach_running_projects().await;
+			self.link_persisted_paths().await;
 		}
 		Ok(())
+	}
+
+	/// The workspace's persisted home paths (see [`crate::persist`]).
+	pub async fn persist_paths(&self) -> Vec<String> {
+		persist::read_persist_paths(&self.state_dir).await
+	}
+
+	/// Replace the persisted home paths and, when `dev` is running,
+	/// link them right away (no recreate needed). Returns the stored,
+	/// normalised list.
+	pub async fn set_persist_paths(&self, raw: &[String]) -> Result<Vec<String>, LifecycleError> {
+		let paths = persist::write_persist_paths(&self.state_dir, raw)
+			.await
+			.map_err(LifecycleError::InvalidPersistPath)?;
+		if matches!(self.status().await?.state, ContainerState::Running) {
+			persist::link_persisted_paths(&dev_container_name(&self.project), &paths).await?;
+		}
+		Ok(paths)
+	}
+
+	/// Best-effort link pass after `dev` came up: a fresh container
+	/// has a fresh home, so the symlinks into the volume are redone.
+	async fn link_persisted_paths(&self) {
+		let paths = self.persist_paths().await;
+		if let Err(err) = persist::link_persisted_paths(&dev_container_name(&self.project), &paths).await {
+			tracing::warn!(%err, project = %self.project, "could not link persisted home paths");
+		}
 	}
 
 	/// Pause every container in the project. Idempotency: if
@@ -496,6 +530,7 @@ impl Workspace {
 			.await?;
 		self.invalidate_status_cache().await;
 		self.reattach_running_projects().await;
+		self.link_persisted_paths().await;
 		Ok(())
 	}
 

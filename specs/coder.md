@@ -1968,7 +1968,10 @@ workspace-relative path or any absolute path. Workspace files load
 directly and open in the editor on click; other absolute paths go
 through `coder_read_image`, which reads them where the agent's `bash`
 runs (the workspace container for paths outside the bind mount, ADR 0025) and returns a data URL. png / jpeg / gif / webp only, 20 MB
-cap. The system prompt tells the model to
+cap. Each one read is copied into the session's directory
+(`<id>/images/`, keyed by path, deleted with the session); when the
+original is gone (`/tmp` after a reboot, a recreated container) the
+copy is shown instead. The system prompt tells the model to
 show screenshots and generated images this way rather than only
 naming the path.
 

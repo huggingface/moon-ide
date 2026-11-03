@@ -23,9 +23,13 @@
 //!     init: true
 //!     working_dir: /workspace
 //!     volumes:
+//!       - persist:/home/dev/.moon-persist
 //!       - /home/me/code/moon-landing:/workspace/moon-landing
 //!       - /home/me/code/moon-ide:/workspace/moon-ide
 //!     command: ["sleep", "infinity"]
+//!
+//! volumes:
+//!   persist: {}
 //!
 //! x-moon:
 //!   shell-service: dev
@@ -446,9 +450,9 @@ pub struct ComposeRenderOptions<'a> {
 	/// exists this'll move to `huggingface/moon-base:<tag>`.
 	pub dev_image: &'a str,
 	/// Bind-mount entries for the `dev` service. Empty is fine
-	/// — we still emit `volumes: []` (compose tolerates it) so
-	/// the generator's output is consistent. In practice the IDE
-	/// only writes this file once at least one folder is bound.
+	/// (the persist volume is always mounted). In practice the
+	/// IDE only writes this file once at least one folder is
+	/// bound.
 	pub bound_mounts: &'a [BoundMount],
 	/// Optional SSH agent forwarding. `None` skips the volume
 	/// and environment block entirely (no `SSH_AUTH_SOCK` set
@@ -548,135 +552,121 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    init: true");
 	let _ = writeln!(yaml, "    working_dir: /workspace");
 	let _ = writeln!(yaml, "    volumes:");
-	let has_extra_mount = options.ssh_agent.is_some()
-		|| !options.ssh_public_keys.is_empty()
-		|| options.ssh_config.is_some()
-		|| options.ssh_known_hosts.is_some()
-		|| options.gh_config.is_some()
-		|| options.fj_data.is_some()
-		|| options.hf_home.is_some()
-		|| options.moon_edit_socket.is_some();
-	if options.bound_mounts.is_empty() && !has_extra_mount {
-		// Empty list is valid YAML and compose accepts it; this
-		// keeps the structure consistent for the no-folder /
-		// no-ssh-agent / no-ssh-config / no-gh-config /
-		// no-fj-data edge case.
-		let _ = writeln!(yaml, "      []");
-	} else {
-		for mount in options.bound_mounts {
-			let _ = writeln!(
-				yaml,
-				"      - {host}:/workspace/{name}",
-				host = mount.host_path.as_str(),
-				name = mount.mount_name,
-			);
-		}
-		match options.ssh_agent {
-			// Bind the host's SSH agent so `git fetch`, `gh`, etc.
-			// inside the container reach the host's keys without
-			// copying any private material.
-			Some(SshAgentForward::Socket { host_socket }) => {
-				let _ = writeln!(
-					yaml,
-					"      - {host}:{container}",
-					host = host_socket.as_str(),
-					container = SSH_AGENT_CONTAINER_PATH,
-				);
-			}
-			// Directory mount (ADR 0060): the IDE's proxy rebinds
-			// the socket inside without the mount going stale.
-			Some(SshAgentForward::ProxyDir { host_dir }) => {
-				let _ = writeln!(
-					yaml,
-					"      - {host}:{container}",
-					host = host_dir.as_str(),
-					container = SSH_AGENT_CONTAINER_DIR,
-				);
-			}
-			None => {}
-		}
-		for key in options.ssh_public_keys {
-			// Read-only by design; public halves only (ADR 0060) —
-			// they let `IdentityFile`+`IdentitiesOnly` select agent
-			// keys, never authenticate by themselves.
-			let _ = writeln!(
-				yaml,
-				"      - {host}:/home/dev/.ssh/{name}:ro",
-				host = key.host_path.as_str(),
-				name = key.file_name,
-			);
-		}
-		if let Some(cfg) = options.ssh_config {
-			// Read-only by design — the host owns the config,
-			// the container reads Host aliases & per-host
-			// options from it. Private key material stays out
-			// (only the file itself, not the whole `.ssh` dir,
-			// is mounted).
-			let _ = writeln!(
-				yaml,
-				"      - {host}:{container}:ro",
-				host = cfg.host_path.as_str(),
-				container = SSH_CONFIG_CONTAINER_PATH,
-			);
-		}
-		if let Some(kh) = options.ssh_known_hosts {
-			// Read-only by design — the host owns the trust
-			// store. Extends host-key trust beyond the image's
-			// pre-seeded github/gitlab keys to every host the
-			// user already accepted on the host.
-			let _ = writeln!(
-				yaml,
-				"      - {host}:{container}:ro",
-				host = kh.host_path.as_str(),
-				container = SSH_KNOWN_HOSTS_CONTAINER_PATH,
-			);
-		}
-		if let Some(gh) = options.gh_config {
-			// Read-only by design — the container reads the
-			// host's auth, never writes back.
-			let _ = writeln!(
-				yaml,
-				"      - {host}:{container}:ro",
-				host = gh.host_path.as_str(),
-				container = GH_CONFIG_CONTAINER_PATH,
-			);
-		}
-		if let Some(fj) = options.fj_data {
-			// Read-only by design — same one-source-of-truth
-			// rule as the gh config mount.
-			let _ = writeln!(
-				yaml,
-				"      - {host}:{container}:ro",
-				host = fj.host_path.as_str(),
-				container = FJ_DATA_CONTAINER_PATH,
-			);
-		}
-		if let Some(hf) = options.hf_home {
-			// Read-only by design — same one-source-of-truth
-			// rule as the gh config mount.
-			let _ = writeln!(
-				yaml,
-				"      - {host}:{container}:ro",
-				host = hf.host_path.as_str(),
-				container = HF_HOME_CONTAINER_PATH,
-			);
-		}
-		if let Some(edit) = options.moon_edit_socket {
-			// Read-write by necessity — Unix-socket `connect()`
-			// needs write permission on the inode, and a
-			// read-only directory mount makes the socket inside
-			// unreachable. We mount the socket's parent `run/`
-			// directory (which holds only the socket) rather than
-			// the socket file, so the socket can be rebound across
-			// IDE restarts without the mount going stale; see
-			// ADR 0026.
+	// The workspace's persist volume (see `crate::persist`).
+	let _ = writeln!(yaml, "      - persist:{}", crate::persist::PERSIST_CONTAINER_DIR);
+	for mount in options.bound_mounts {
+		let _ = writeln!(
+			yaml,
+			"      - {host}:/workspace/{name}",
+			host = mount.host_path.as_str(),
+			name = mount.mount_name,
+		);
+	}
+	match options.ssh_agent {
+		// Bind the host's SSH agent so `git fetch`, `gh`, etc.
+		// inside the container reach the host's keys without
+		// copying any private material.
+		Some(SshAgentForward::Socket { host_socket }) => {
 			let _ = writeln!(
 				yaml,
 				"      - {host}:{container}",
-				host = edit.host_dir.as_str(),
-				container = MOON_EDIT_SOCKET_DIR_CONTAINER_PATH,
+				host = host_socket.as_str(),
+				container = SSH_AGENT_CONTAINER_PATH,
 			);
 		}
+		// Directory mount (ADR 0060): the IDE's proxy rebinds
+		// the socket inside without the mount going stale.
+		Some(SshAgentForward::ProxyDir { host_dir }) => {
+			let _ = writeln!(
+				yaml,
+				"      - {host}:{container}",
+				host = host_dir.as_str(),
+				container = SSH_AGENT_CONTAINER_DIR,
+			);
+		}
+		None => {}
+	}
+	for key in options.ssh_public_keys {
+		// Read-only by design; public halves only (ADR 0060) —
+		// they let `IdentityFile`+`IdentitiesOnly` select agent
+		// keys, never authenticate by themselves.
+		let _ = writeln!(
+			yaml,
+			"      - {host}:/home/dev/.ssh/{name}:ro",
+			host = key.host_path.as_str(),
+			name = key.file_name,
+		);
+	}
+	if let Some(cfg) = options.ssh_config {
+		// Read-only by design — the host owns the config,
+		// the container reads Host aliases & per-host
+		// options from it. Private key material stays out
+		// (only the file itself, not the whole `.ssh` dir,
+		// is mounted).
+		let _ = writeln!(
+			yaml,
+			"      - {host}:{container}:ro",
+			host = cfg.host_path.as_str(),
+			container = SSH_CONFIG_CONTAINER_PATH,
+		);
+	}
+	if let Some(kh) = options.ssh_known_hosts {
+		// Read-only by design — the host owns the trust
+		// store. Extends host-key trust beyond the image's
+		// pre-seeded github/gitlab keys to every host the
+		// user already accepted on the host.
+		let _ = writeln!(
+			yaml,
+			"      - {host}:{container}:ro",
+			host = kh.host_path.as_str(),
+			container = SSH_KNOWN_HOSTS_CONTAINER_PATH,
+		);
+	}
+	if let Some(gh) = options.gh_config {
+		// Read-only by design — the container reads the
+		// host's auth, never writes back.
+		let _ = writeln!(
+			yaml,
+			"      - {host}:{container}:ro",
+			host = gh.host_path.as_str(),
+			container = GH_CONFIG_CONTAINER_PATH,
+		);
+	}
+	if let Some(fj) = options.fj_data {
+		// Read-only by design — same one-source-of-truth
+		// rule as the gh config mount.
+		let _ = writeln!(
+			yaml,
+			"      - {host}:{container}:ro",
+			host = fj.host_path.as_str(),
+			container = FJ_DATA_CONTAINER_PATH,
+		);
+	}
+	if let Some(hf) = options.hf_home {
+		// Read-only by design — same one-source-of-truth
+		// rule as the gh config mount.
+		let _ = writeln!(
+			yaml,
+			"      - {host}:{container}:ro",
+			host = hf.host_path.as_str(),
+			container = HF_HOME_CONTAINER_PATH,
+		);
+	}
+	if let Some(edit) = options.moon_edit_socket {
+		// Read-write by necessity — Unix-socket `connect()`
+		// needs write permission on the inode, and a
+		// read-only directory mount makes the socket inside
+		// unreachable. We mount the socket's parent `run/`
+		// directory (which holds only the socket) rather than
+		// the socket file, so the socket can be rebound across
+		// IDE restarts without the mount going stale; see
+		// ADR 0026.
+		let _ = writeln!(
+			yaml,
+			"      - {host}:{container}",
+			host = edit.host_dir.as_str(),
+			container = MOON_EDIT_SOCKET_DIR_CONTAINER_PATH,
+		);
 	}
 	// Collect every env entry first so we can emit one
 	// `environment:` block (or none). Order is stable for diff-
@@ -715,6 +705,10 @@ pub fn generate_compose(options: ComposeRenderOptions<'_>) -> ComposeRender {
 	let _ = writeln!(yaml, "    command: [\"sleep\", \"infinity\"]");
 	let _ = writeln!(yaml);
 
+	let _ = writeln!(yaml, "volumes:");
+	let _ = writeln!(yaml, "  persist: {{}}");
+	let _ = writeln!(yaml);
+
 	let _ = writeln!(yaml, "x-moon:");
 	// The "which service do new terminals attach to?" key. Single
 	// service today; 2.4 promotes this to a user-pickable default.
@@ -742,7 +736,7 @@ mod tests {
 	}
 
 	#[test]
-	fn no_folders_renders_empty_volumes_list() {
+	fn no_folders_still_mounts_the_persist_volume() {
 		let project = project();
 		let render = generate_compose(ComposeRenderOptions {
 			project: &project,
@@ -761,7 +755,10 @@ mod tests {
 		});
 
 		assert!(render.yaml.contains("name: moon-ws-default"));
-		assert!(render.yaml.contains("    volumes:\n      []"));
+		assert!(render
+			.yaml
+			.contains("    volumes:\n      - persist:/home/dev/.moon-persist\n"));
+		assert!(render.yaml.contains("\nvolumes:\n  persist: {}\n"));
 		// Workspace compose no longer pulls in project services —
 		// they're managed per-folder now.
 		assert!(!render.yaml.contains("include:"));

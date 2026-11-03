@@ -279,6 +279,8 @@ export const ipc = {
 		teardown: () => call<ContainerStatus>('container_teardown'),
 		applyBoundFolders: () => call<ContainerStatus>('container_apply_bound_folders'),
 		renderCompose: () => call<string>('container_render_compose'),
+		persistPaths: () => call<string[]>('container_persist_paths'),
+		setPersistPaths: (paths: string[]) => call<string[]>('container_set_persist_paths', { paths }),
 	},
 	projectCompose: {
 		status: (folderPath: string) => call<ProjectComposeStatus>('project_compose_status', { folderPath }),

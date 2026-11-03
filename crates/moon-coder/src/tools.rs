@@ -3266,11 +3266,11 @@ impl ToolRegistry {
 		}
 	}
 
-	/// An image the model referenced in its reply (`![](path)`), as a
-	/// data URL for the panel. Resolved like `read_file`, so `/tmp`
-	/// paths come from the container when `bash` runs there. Image
-	/// extensions only.
-	pub async fn read_image_data_url(&self, path: &str, cx: &ToolContext) -> Result<String, CoderError> {
+	/// An image the model referenced in its reply (`![](path)`), for
+	/// the panel: its mime type and bytes. Resolved like `read_file`,
+	/// so `/tmp` paths come from the container when `bash` runs there.
+	/// Image extensions only.
+	pub async fn read_display_image(&self, path: &str, cx: &ToolContext) -> Result<(&'static str, Vec<u8>), CoderError> {
 		const TOOL: &str = "read_image";
 		let Some(mime) = image_mime_for(path) else {
 			return Err(CoderError::invalid_args(
@@ -3289,10 +3289,7 @@ impl ToolRegistry {
 				),
 			));
 		}
-		Ok(format!(
-			"data:{mime};base64,{}",
-			base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
-		))
+		Ok((mime, bytes))
 	}
 
 	async fn read_image_result(
@@ -3544,7 +3541,7 @@ async fn host_read_dir_abs(abs_path: &Utf8Path) -> Result<Vec<DirEntry>, CoderEr
 /// than erroring on, mapped to their MIME type. Extension-based
 /// (no magic-byte sniffing): the model already knows the name it
 /// asked for, and a mislabeled extension is the user's own doing.
-fn image_mime_for(path: &str) -> Option<&'static str> {
+pub(crate) fn image_mime_for(path: &str) -> Option<&'static str> {
 	let ext = Utf8Path::new(path).extension()?.to_ascii_lowercase();
 	Some(match ext.as_str() {
 		"png" => "image/png",

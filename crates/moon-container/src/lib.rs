@@ -23,6 +23,7 @@ pub mod compose;
 pub mod discovery;
 pub mod lifecycle;
 pub mod network;
+pub mod persist;
 pub mod port_forward;
 pub mod preview_tunnel;
 pub mod project;
