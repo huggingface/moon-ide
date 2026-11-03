@@ -9,6 +9,7 @@
 		type MarkdownBlock,
 	} from '../markdown';
 	import { workspace } from '../state.svelte';
+	import { openLightbox } from '../imageLightbox.svelte';
 	import { visibleOnce } from '../actions/visibleOnce';
 
 	/** `breaks`: single newlines are line breaks — for user-typed
@@ -154,8 +155,12 @@
 			return;
 		}
 		const anchor = target.closest('a');
-		if (anchor === null && target instanceof HTMLImageElement && target.dataset.workspacePath) {
-			void workspace.openFile(target.dataset.workspacePath);
+		if (anchor === null && target instanceof HTMLImageElement && target.src !== '') {
+			openLightbox({
+				src: target.currentSrc || target.src,
+				alt: target.alt,
+				workspacePath: target.dataset.workspacePath,
+			});
 			return;
 		}
 		if (!anchor) {
@@ -251,7 +256,7 @@
 		max-height: 420px;
 		border-radius: 4px;
 	}
-	.coder-md :global(img[data-workspace-path]) {
+	.coder-md :global(img) {
 		cursor: zoom-in;
 	}
 	/* Plain-text placeholder shown while a cache-miss row is still

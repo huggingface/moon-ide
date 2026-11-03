@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import Sidebar from './lib/components/Sidebar.svelte';
 	import BrowserFrames from './lib/components/BrowserFrames.svelte';
+	import ImageLightbox from './lib/components/ImageLightbox.svelte';
 	import EditorPane from './lib/components/EditorPane.svelte';
 	import StatusBar from './lib/components/StatusBar.svelte';
 	import Splash from './lib/components/Splash.svelte';
@@ -621,6 +622,7 @@
 		{/if}
 	</div>
 	<BrowserFrames />
+	<ImageLightbox />
 	<StatusBar />
 	<CommandPalette />
 	<BranchSwitcher />

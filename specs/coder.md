@@ -1964,8 +1964,10 @@ unless told, so this is the one-click "go ahead". The reasoning
 picker sits at the other end of that row.
 
 Images in transcript markdown (`![alt](path)`) load from a
-workspace-relative path or any absolute path. Workspace files load
-directly and open in the editor on click; other absolute paths go
+workspace-relative path or any absolute path. Clicking one opens the
+app-wide image viewer (the same one pasted attachments and tool-result
+images use), with "Open in editor" for workspace files. Workspace
+files load directly; other absolute paths go
 through `coder_read_image`, which reads them where the agent's `bash`
 runs (the workspace container for paths outside the bind mount, ADR 0025) and returns a data URL. png / jpeg / gif / webp only, 20 MB
 cap. Each one read is copied into the session's directory

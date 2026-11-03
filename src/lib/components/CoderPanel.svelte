@@ -11,6 +11,7 @@
 	type ToolGroupItem = Extract<TranscriptItem, { kind: 'group' }>;
 	import { frontendLog } from '../logs.svelte';
 	import { workspace } from '../state.svelte';
+	import { openLightbox } from '../imageLightbox.svelte';
 	import { copyImageToClipboard } from '../copyImage';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
@@ -74,12 +75,6 @@
 	// emit a Svelte re-render of every panel consumer.
 	let modelSettingsOpen = $state(false);
 	let hubSettingsOpen = $state(false);
-
-	// Full-size preview of a pasted image, opened by clicking its
-	// thumbnail in the transcript. We render an in-app lightbox
-	// rather than `target="_blank"`, which the Tauri webview can't
-	// honour for `data:` URLs.
-	let lightboxUrl = $state<string | null>(null);
 
 	// Draft for the sub-agent pop-out's composer. Separate from
 	// the parent's `coder.draft` so switching between the pop-out
@@ -168,20 +163,6 @@
 			window.removeEventListener('pointerdown', onPointerDown);
 			window.removeEventListener('keydown', onKey);
 		};
-	});
-
-	// Escape dismiss for the full-size image lightbox.
-	$effect(() => {
-		if (lightboxUrl === null) {
-			return;
-		}
-		const onKey = (event: KeyboardEvent) => {
-			if (event.key === 'Escape') {
-				lightboxUrl = null;
-			}
-		};
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
 	});
 
 	// Find-in-transcript (Ctrl+F). Same approach as MarkdownView's
@@ -3978,21 +3959,6 @@
 	<HfBucketSettingsModal onClose={() => (hubSettingsOpen = false)} />
 {/if}
 
-{#if lightboxUrl}
-	<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-	<div
-		class="lightbox-backdrop"
-		onclick={() => (lightboxUrl = null)}
-		role="dialog"
-		aria-modal="true"
-		aria-label="Image preview"
-		tabindex="-1"
-	>
-		<img class="lightbox-image" src={lightboxUrl} alt="Pasted attachment at full size" />
-		<button type="button" class="lightbox-close" title="Close (Esc)" onclick={() => (lightboxUrl = null)}>×</button>
-	</div>
-{/if}
-
 <!-- Find-in-transcript bar, shared by the session view and the
      sub-agent pop-out. Rendered in-flow between the header and the
      transcript (the panel is narrow — a floating overlay would sit
@@ -4252,7 +4218,7 @@
 							type="button"
 							class="user-image"
 							title="Open image full-size"
-							onclick={() => (lightboxUrl = img.data_url)}
+							onclick={() => openLightbox({ src: img.data_url, alt: `pasted image ${i + 1}` })}
 						>
 							<img src={img.data_url} alt={`pasted image ${i + 1}`} />
 						</button>
@@ -6807,44 +6773,6 @@
 		max-width: 100%;
 		max-height: 240px;
 		height: auto;
-	}
-	.lightbox-backdrop {
-		position: fixed;
-		inset: 0;
-		z-index: 1000;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		padding: 32px;
-		background: rgba(0, 0, 0, 0.8);
-		cursor: zoom-out;
-	}
-	.lightbox-image {
-		max-width: 100%;
-		max-height: 100%;
-		object-fit: contain;
-		border-radius: 4px;
-		box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-	}
-	.lightbox-close {
-		position: absolute;
-		top: 16px;
-		right: 16px;
-		width: 32px;
-		height: 32px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		font-size: 22px;
-		line-height: 1;
-		color: var(--m-fg);
-		background: var(--m-bg-overlay);
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		cursor: pointer;
-	}
-	.lightbox-close:hover {
-		background: var(--m-bg);
 	}
 	textarea {
 		width: 100%;
