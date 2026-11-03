@@ -3851,10 +3851,12 @@
 								onpointerdown={(e) => e.stopPropagation()}
 								onclick={toggleReasoningMenu}
 							>
-								<span class:session-pick={coder.sessionModel !== null}>{coder.currentModelName ?? 'model'}</span>
+								<span class="reasoning-model" class:session-pick={coder.sessionModel !== null}
+									>{coder.currentModelName ?? 'model'}</span
+								>
 								{#if showEffortChoices}
 									<span class="reasoning-sep" aria-hidden="true">·</span>
-									<span class:session-pick={reasoningEffort !== null}
+									<span class="reasoning-effort" class:session-pick={reasoningEffort !== null}
 										>{reasoningEffort ?? defaultEffort ?? 'default'}</span
 									>
 								{/if}
@@ -6583,8 +6585,11 @@
 	}
 	.composer-meta .reasoning-pick {
 		margin-left: auto;
+		min-width: 0;
 	}
 	.ship-it {
+		flex: none;
+		white-space: nowrap;
 		display: inline-flex;
 		align-items: center;
 		gap: 5px;
@@ -6612,6 +6617,9 @@
 		display: inline-flex;
 		align-items: center;
 		gap: 4px;
+		min-width: 0;
+		max-width: 100%;
+		white-space: nowrap;
 		background: transparent;
 		color: var(--m-fg-muted);
 		border: 1px solid transparent;
@@ -6630,6 +6638,16 @@
 	}
 	.reasoning-sep {
 		color: var(--m-fg-subtle);
+	}
+	.reasoning-model {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.reasoning-sep,
+	.reasoning-caret,
+	.reasoning-effort {
+		flex: none;
 	}
 	/* A session-only pick (not the settings' default). */
 	.session-pick {
