@@ -614,6 +614,7 @@ async fn run_subagent_in_dir(
 		// commits from the panel); sub-agents never carry one.
 		committed_branch: None,
 		reasoning_effort: None,
+		model_override: None,
 	};
 
 	// Best-effort: persistence failures log at warn but never

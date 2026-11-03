@@ -2454,11 +2454,14 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
   `state.json` alongside the picks; CLI:
   `moon-remote model --reasoning xhigh` (empty string clears).
   Anthropic native route ignores it (its thinking config is
-  budget-based, separate). That pick is the default; the composer's
-  reasoning picker overrides it for the visible session only
-  (`reasoning_effort` in the session header, `None` = follow the
-  default), applied from the session's next turn. Detached
-  sub-agents use the default.
+  budget-based, separate). That pick is the default. The composer's
+  model · effort picker overrides the standard model and the effort
+  for the visible session only (`model_override` / `reasoning_effort`
+  in the session header, `None` = follow the settings), applied from
+  the session's next turn. A model override is stored with the
+  provider it was picked under and only applies while that provider
+  is active; the picker lists the provider's catalog when it's short
+  (≤ 30 models). Sub-agents inherit their parent session's picks.
 - **Compaction cut is tool-boundary-safe** (ADR-worthy): the
   summary cut snaps forward past any Tool run whose owning
   Assistant survived (and drops a leading orphan Tool run), so the

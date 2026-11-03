@@ -1806,6 +1806,9 @@ export type CoderStatus = {
 	/** The visible session's reasoning-effort override; absent when it
 	 *  follows the model settings' default. */
 	session_reasoning_effort?: string | null;
+	/** The visible session's model override (under the active
+	 *  provider); absent when it follows the model settings. */
+	session_model?: string | null;
 };
 
 /**

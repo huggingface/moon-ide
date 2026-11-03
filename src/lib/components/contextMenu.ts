@@ -15,5 +15,8 @@ export type ContextMenuItem = {
 	 * are separated by a thin divider. Defaults to `'default'` so
 	 * callers that don't care just get a flat list. */
 	kind?: 'default' | 'danger';
+	/** Items with a different `group` than the previous one get a
+	 *  divider, like a `kind` change. */
+	group?: string;
 	title?: string;
 };

@@ -128,7 +128,7 @@
 		>
 			<span class="label">{item.label}</span>
 		</button>
-		{#if idx < items.length - 1 && item.kind !== items[idx + 1]?.kind}
+		{#if idx < items.length - 1 && (item.kind !== items[idx + 1]?.kind || item.group !== items[idx + 1]?.group)}
 			<div class="divider" aria-hidden="true"></div>
 		{/if}
 	{/each}

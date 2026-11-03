@@ -39,6 +39,22 @@ use tokio::sync::RwLock;
 
 use crate::defaults::{context_window_for, DEFAULT_CHEAP_MODEL, DEFAULT_STANDARD_MODEL};
 
+/// A session's standard-model override and the provider it was picked
+/// under (`None` = the HF route).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionModel {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub provider: Option<String>,
+	pub model: String,
+}
+
+tokio::task_local! {
+	/// The running session's model override, scoped around each turn
+	/// like `inference::SESSION_REASONING_EFFORT`; [`CoderModels::standard`]
+	/// returns it while its provider is the active one.
+	pub static SESSION_MODEL: Option<SessionModel>;
+}
+
 #[derive(Debug, Clone)]
 pub struct CoderModels {
 	/// HF-tier standard slug (optionally `:provider` /
@@ -240,7 +256,22 @@ impl CoderModels {
 	/// entry was deleted out of band).
 	///
 	/// [`standard`]: Self::standard
-	pub fn standard(&self) -> &str {
+	pub fn standard(&self) -> String {
+		if let Some(model) = self.session_model() {
+			return model;
+		}
+		self.default_standard().to_owned()
+	}
+
+	/// The running session's model override ([`SESSION_MODEL`]), when
+	/// it was picked under the provider that's active now.
+	fn session_model(&self) -> Option<String> {
+		let picked = SESSION_MODEL.try_with(Clone::clone).ok().flatten()?;
+		(picked.provider == self.active_provider).then_some(picked.model)
+	}
+
+	/// The standard model from settings, ignoring any session override.
+	pub fn default_standard(&self) -> &str {
 		match self.active_provider_entry() {
 			Some(p) if !p.standard_model.is_empty() => p.standard_model.as_str(),
 			Some(_) => DEFAULT_STANDARD_MODEL,
@@ -474,7 +505,7 @@ impl CoderModels {
 		if matches!(self.resolve_route(), ResolvedProvider::Anthropic { .. }) {
 			return Some(true);
 		}
-		self.supports_images(self.standard())
+		self.supports_images(&self.standard())
 	}
 }
 
@@ -689,6 +720,25 @@ mod tests {
 			Some("high")
 		);
 		assert_eq!(models.effort_for_override("unknown", None), None);
+	}
+
+	#[tokio::test]
+	async fn session_model_applies_only_under_its_provider() {
+		let models = CoderModels {
+			active_provider: Some("prov-a".into()),
+			..CoderModels::default()
+		};
+		let default = models.standard();
+		let picked = |provider: &str| {
+			Some(SessionModel {
+				provider: Some(provider.into()),
+				model: "sol".into(),
+			})
+		};
+		let under_a = SESSION_MODEL.scope(picked("prov-a"), async { models.standard() }).await;
+		assert_eq!(under_a, "sol");
+		let under_b = SESSION_MODEL.scope(picked("prov-b"), async { models.standard() }).await;
+		assert_eq!(under_b, default);
 	}
 
 	#[test]

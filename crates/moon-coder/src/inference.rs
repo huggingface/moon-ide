@@ -800,8 +800,8 @@ tokio::task_local! {
 tokio::task_local! {
 	/// The session header's `reasoning_effort` for the turn running
 	/// in this task, scoped around each `run_turn` like
-	/// [`SESSION_HINT`]. Tasks the turn spawns (detached sub-agents)
-	/// don't inherit it and use the settings' default.
+	/// [`SESSION_HINT`]. Detached sub-agents get their parent's value
+	/// re-scoped onto their own task.
 	pub static SESSION_REASONING_EFFORT: Option<String>;
 }
 

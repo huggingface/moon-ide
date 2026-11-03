@@ -192,7 +192,7 @@ pub(crate) async fn compact_if_needed(
 	// one whose history we're trying to fit. The summary call also
 	// uses the standard model (see `summarise_once`), so the same
 	// window gates both the trigger and the chunk budget.
-	let context = models.context_window(models.standard());
+	let context = models.context_window(&models.standard());
 	if context == 0 {
 		return None;
 	}
@@ -498,7 +498,7 @@ async fn summarise_in_session(
 	let mut last_reported = 0u32;
 	let result = inference
 		.chat_completion_stream(
-			models.standard(),
+			&models.standard(),
 			&call,
 			tools,
 			Some(max_summary_tokens),
@@ -587,7 +587,7 @@ async fn summarise_prefix(
 	// catalog's max-across-providers lookup can overestimate the
 	// cheap model's actual per-route limit — which 400'd the summary
 	// call every turn and made compaction a no-op.
-	let window = models.context_window(models.standard());
+	let window = models.context_window(&models.standard());
 	let budget = if window == 0 {
 		SUMMARY_FALLBACK_BUDGET_TOKENS
 	} else {
@@ -731,9 +731,9 @@ async fn summarise_once(
 	// point of both paths is to beat the provider default, which
 	// on some HF deployments is a 2,048-token cap.
 	let output_budget =
-		crate::defaults::turn_output_budget(estimate_prompt_tokens(&call), models.context_window(models.standard()));
+		crate::defaults::turn_output_budget(estimate_prompt_tokens(&call), models.context_window(&models.standard()));
 	let result = inference
-		.chat_completion_stream(models.standard(), &call, &[], output_budget, cancel, |ev| {
+		.chat_completion_stream(&models.standard(), &call, &[], output_budget, cancel, |ev| {
 			if let StreamEvent::ContentDelta { delta } = ev {
 				bytes += delta.len();
 				let tokens = (bytes / 4) as u32;

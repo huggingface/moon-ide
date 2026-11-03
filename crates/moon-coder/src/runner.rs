@@ -958,6 +958,7 @@ impl Session {
 				worktree_branch: None,
 				committed_branch: None,
 				reasoning_effort: None,
+				model_override: None,
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System { content: system_prompt }],
@@ -1951,9 +1952,9 @@ impl CoderHandle {
 			}
 			_ => (None, false),
 		};
-		let session_reasoning_effort = match &coder_root_fs {
-			Some(fs) => self.visible_session_reasoning_effort(fs).await,
-			None => None,
+		let (session_reasoning_effort, session_model) = match &coder_root_fs {
+			Some(fs) => self.visible_session_overrides(fs).await,
+			None => (None, None),
 		};
 		Ok(CoderStatus {
 			signed_in,
@@ -1962,6 +1963,7 @@ impl CoderHandle {
 			bash_target,
 			force_host_override,
 			session_reasoning_effort,
+			session_model,
 		})
 	}
 
@@ -2632,6 +2634,29 @@ impl CoderHandle {
 		Ok(())
 	}
 
+	/// Set the standard model of the active folder's visible session
+	/// only (`None` = follow the model settings). Recorded with the
+	/// active provider, and only applied while that provider is
+	/// active. Persisted in the session header; applies from the
+	/// session's next turn.
+	pub async fn set_session_model(&self, model: Option<String>) -> Result<(), CoderError> {
+		let provider = self.state.models.read().await.active_provider.clone();
+		let (rt, _, _) = self.state.active_visible_runtime().await?;
+		let (session_dir, header) = {
+			let mut session = rt.session.lock().await;
+			session.header.model_override = model
+				.filter(|m| !m.trim().is_empty())
+				.map(|model| crate::models::SessionModel { provider, model });
+			(session.session_dir.clone(), session.header.clone())
+		};
+		if let Some(dir) = session_dir {
+			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+				tracing::warn!(?err, "failed to persist model_override header rewrite");
+			}
+		}
+		Ok(())
+	}
+
 	/// Tag the active folder's **visible** session with the branch its
 	/// work was committed onto (ADR 0028), rewriting the on-disk
 	/// header so a re-open remembers it. Called whenever the user
@@ -2875,12 +2900,24 @@ impl CoderHandle {
 		forced
 	}
 
-	/// The visible session's reasoning-effort override, if any.
-	async fn visible_session_reasoning_effort(&self, fs: &Arc<FolderSession>) -> Option<String> {
-		let id = fs.visible_session_id().await?;
-		let rt = fs.runtime(&id).await?;
-		let effort = rt.session.lock().await.header.reasoning_effort.clone();
-		effort
+	/// The visible session's reasoning-effort and model overrides; the
+	/// model only when it was picked under the active provider.
+	async fn visible_session_overrides(&self, fs: &Arc<FolderSession>) -> (Option<String>, Option<String>) {
+		let Some(id) = fs.visible_session_id().await else {
+			return (None, None);
+		};
+		let Some(rt) = fs.runtime(&id).await else {
+			return (None, None);
+		};
+		let (effort, model) = {
+			let session = rt.session.lock().await;
+			(
+				session.header.reasoning_effort.clone(),
+				session.header.model_override.clone(),
+			)
+		};
+		let active = self.state.models.read().await.active_provider.clone();
+		(effort, model.filter(|m| m.provider == active).map(|m| m.model))
 	}
 
 	/// Revert the active folder's visible session back to just
@@ -6736,23 +6773,30 @@ fn spawn_turn_loop(
 					// `None` means no git repo / git unavailable, in which
 					// case we skip the diff computation at turn end.
 					let baseline_sha = capture_baseline(&state, &folder_for_turn).await;
-					let session_effort = rt_for_turn.session.lock().await.header.reasoning_effort.clone();
-					let result = crate::inference::SESSION_REASONING_EFFORT
+					let (session_effort, session_model) = {
+						let session = rt_for_turn.session.lock().await;
+						(
+							session.header.reasoning_effort.clone(),
+							session.header.model_override.clone(),
+						)
+					};
+					let turn = run_turn(
+						&state,
+						&rt_for_turn,
+						&folder_for_turn,
+						&sink_for_turn,
+						cancel_outer.clone(),
+						format_queue.clone(),
+						background.clone(),
+						// Only the first run_turn call gets the resume
+						// tool calls; subsequent loop iterations (steer
+						// drains after an abort) start fresh.
+						resume.take(),
+					);
+					let result = crate::models::SESSION_MODEL
 						.scope(
-							session_effort,
-							run_turn(
-								&state,
-								&rt_for_turn,
-								&folder_for_turn,
-								&sink_for_turn,
-								cancel_outer.clone(),
-								format_queue.clone(),
-								background.clone(),
-								// Only the first run_turn call gets the resume
-								// tool calls; subsequent loop iterations (steer
-								// drains after an abort) start fresh.
-								resume.take(),
-							),
+							session_model,
+							crate::inference::SESSION_REASONING_EFFORT.scope(session_effort, turn),
 						)
 						.await;
 					let flushed_files = flush_format_queue(&state, &format_queue).await;
@@ -8160,9 +8204,16 @@ async fn handle_task_detached(
 	// parent is idle waiting on them. Held across the callback so the
 	// turn it starts takes over without a gap.
 	let running_guard = RunningTurnGuard::acquire(&state.running_turns);
+	// The run outlives the parent's turn task, so the parent session's
+	// model and reasoning effort are carried over explicitly.
+	let parent_effort = crate::inference::SESSION_REASONING_EFFORT
+		.try_with(Clone::clone)
+		.ok()
+		.flatten();
+	let parent_model = crate::models::SESSION_MODEL.try_with(Clone::clone).ok().flatten();
 	tokio::spawn(async move {
 		let _running_guard = running_guard;
-		let outcome = run_subagent(
+		let run = run_subagent(
 			&state_for_run.tools,
 			&state_for_run.inference,
 			&sink_for_run,
@@ -8170,8 +8221,13 @@ async fn handle_task_detached(
 			&state_for_run.models,
 			spec,
 			cancel,
-		)
-		.await;
+		);
+		let outcome = crate::models::SESSION_MODEL
+			.scope(
+				parent_model,
+				crate::inference::SESSION_REASONING_EFFORT.scope(parent_effort, run),
+			)
+			.await;
 		let finish = match &outcome {
 			Ok(report) => DetachedFinish::Done(report.clone()),
 			Err(CoderError::Aborted) => DetachedFinish::Aborted,
@@ -13439,6 +13495,7 @@ mod tests {
 			worktree_branch: None,
 			committed_branch: None,
 			reasoning_effort: None,
+			model_override: None,
 		}
 	}
 

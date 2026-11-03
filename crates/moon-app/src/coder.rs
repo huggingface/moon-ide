@@ -903,6 +903,12 @@ pub async fn coder_set_session_reasoning_effort(app: &AppCore, effort: Option<St
 		.map_err(MoonError::from)
 }
 
+/// Set the standard model for the active folder's visible session
+/// only; `None` follows the model settings.
+pub async fn coder_set_session_model(app: &AppCore, model: Option<String>) -> Result<(), MoonError> {
+	app.coder.set_session_model(model).await.map_err(MoonError::from)
+}
+
 /// Replace the in-memory session with the persisted one
 /// identified by `id`. Backend emits `session_loaded` + per-record
 /// replay events on the `coder:event` channel; the frontend reacts
@@ -1652,6 +1658,7 @@ crate::commands! {
 	coder_associate_branch([app]),
 	coder_set_bash_target_override([app] force_host: bool),
 	coder_set_session_reasoning_effort([app] effort: Option<String>),
+	coder_set_session_model([app] model: Option<String>),
 	coder_open_session([app] id: String),
 	coder_session_jsonl_path([app] id: String),
 	coder_rename_session([app] id: String, title: String),

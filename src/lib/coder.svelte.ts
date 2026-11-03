@@ -812,10 +812,7 @@ export class CoderPanelState {
 	get reasoningChoices(): { levels: readonly string[]; defaultLevel: string | null; sent: boolean } {
 		const settings = this.modelSettings;
 		const active = settings?.providers.find((p) => p.id === settings.active_provider) ?? null;
-		const row =
-			active === null
-				? null
-				: (this.providerModels[active.id]?.find((r) => r.id === settings?.resolved_standard_model) ?? null);
+		const row = active === null ? null : (this.providerModels[active.id]?.find((r) => r.id === this.turnModel) ?? null);
 		return {
 			levels: row?.reasoning_levels ?? FIXED_REASONING_EFFORTS,
 			defaultLevel: row?.default_reasoning_level ?? null,
@@ -823,8 +820,25 @@ export class CoderPanelState {
 		};
 	}
 
-	/** Change only the reasoning effort, through the normal settings
-	 *  round-trip. `null` = provider default. */
+	/** Model the visible session's next turn uses: its own override,
+	 *  else the settings' standard model. */
+	get turnModel(): string | null {
+		return this.sessionModel ?? this.modelSettings?.resolved_standard_model ?? null;
+	}
+
+	/** The visible session's model override; `null` when it follows
+	 *  the model settings. */
+	get sessionModel(): string | null {
+		return this.status?.session_model ?? null;
+	}
+
+	/** Set the visible session's model only; other sessions keep the
+	 *  settings' standard model. */
+	async setSessionModel(model: string | null): Promise<void> {
+		await ipc.coder.setSessionModel(model);
+		await this.refreshStatus();
+	}
+
 	/** The visible session's reasoning-effort override; `null` when
 	 *  it follows the model settings' default. */
 	get sessionReasoningEffort(): string | null {
@@ -844,7 +858,7 @@ export class CoderPanelState {
 	 *  → `Qwen3.5-397B-A17B`). `null` until the first
 	 *  [`loadModelSettings`] lands. */
 	get currentModelName(): string | null {
-		const slug = this.modelSettings?.resolved_standard_model ?? '';
+		const slug = this.turnModel ?? '';
 		const bare = slug.split(':')[0] ?? '';
 		const name = bare.split('/').at(-1) ?? '';
 		return name === '' ? null : name;

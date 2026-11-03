@@ -208,6 +208,10 @@ pub struct SessionHeader {
 	/// default for this session's turns only. `None` follows the
 	/// default.
 	pub reasoning_effort: Option<String>,
+	/// Per-session standard model, overriding the model settings' pick
+	/// while the provider it was chosen under is active. `None`
+	/// follows the default.
+	pub model_override: Option<crate::models::SessionModel>,
 }
 
 /// Per-session override for the `bash` tool's execution target.
@@ -301,6 +305,9 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.reasoning_effort {
 			map.serialize_entry("reasoning_effort", v)?;
 		}
+		if let Some(v) = &self.model_override {
+			map.serialize_entry("model_override", v)?;
+		}
 		if let Some(v) = &self.worktree_root {
 			map.serialize_entry("worktree_root", v)?;
 		}
@@ -355,6 +362,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			#[serde(default)]
 			reasoning_effort: Option<String>,
 			#[serde(default)]
+			model_override: Option<crate::models::SessionModel>,
+			#[serde(default)]
 			worktree_root: Option<String>,
 			#[serde(default)]
 			worktree_branch: Option<String>,
@@ -384,6 +393,7 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			worktree_branch: raw.worktree_branch,
 			committed_branch: raw.committed_branch,
 			reasoning_effort: raw.reasoning_effort,
+			model_override: raw.model_override,
 		})
 	}
 }
@@ -3245,6 +3255,7 @@ mod tests {
 			worktree_branch: None,
 			committed_branch: None,
 			reasoning_effort: None,
+			model_override: None,
 		}
 	}
 

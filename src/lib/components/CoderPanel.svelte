@@ -475,9 +475,24 @@
 			: reasoningChoices.levels,
 	);
 
+	const showEffortChoices = $derived(reasoningChoices.sent && reasoningChoices.levels.length > 0);
+	// Session model choices: the active provider's catalog, when it's
+	// short enough for a menu (ChatGPT's is; OpenRouter's isn't).
+	const SESSION_MODEL_MENU_MAX = 30;
+	const sessionModelChoices = $derived.by(() => {
+		const settings = coder.modelSettings;
+		const active = settings?.providers.find((p) => p.id === settings.active_provider);
+		const rows = active === undefined ? null : (coder.providerModels[active.id] ?? null);
+		return rows !== null && rows.length > 0 && rows.length <= SESSION_MODEL_MENU_MAX ? rows : [];
+	});
 	const showReasoningPick = $derived(
-		coder.modelSettings !== null && reasoningChoices.sent && reasoningChoices.levels.length > 0,
+		coder.modelSettings !== null && (showEffortChoices || sessionModelChoices.length > 0),
 	);
+	const defaultModelName = $derived(shortModelName(coder.modelSettings?.resolved_standard_model ?? ''));
+
+	function shortModelName(slug: string): string {
+		return (slug.split(':')[0] ?? '').split('/').at(-1) ?? slug;
+	}
 
 	// Agents stop short of landing work ("not pushed yet", "not
 	// published yet") unless told; this is the one-click "go ahead".
@@ -575,17 +590,47 @@
 		});
 	}
 
+	function setSessionModel(model: string | null): void {
+		coder.setSessionModel(model).catch((err: unknown) => {
+			workspace.flash(`Couldn't switch model: ${formatError(err)}`);
+		});
+	}
+
+	// One menu for both session picks: models (with the settings'
+	// standard model as "default"), then reasoning levels.
 	const reasoningMenuItems = $derived<ContextMenuItem[]>([
-		{
-			id: 'default',
-			label: `${reasoningEffort === null ? '✓ ' : ''}default${defaultEffort ? ` (${defaultEffort})` : ''}`,
-			onSelect: () => setReasoning(null),
-		},
-		...reasoningOptions.map((lvl) => ({
-			id: lvl,
-			label: `${reasoningEffort === lvl ? '✓ ' : ''}${lvl}${reasoningChoices.levels.includes(lvl) ? '' : ' (not supported, not sent)'}`,
-			onSelect: () => setReasoning(lvl),
-		})),
+		...(sessionModelChoices.length === 0
+			? []
+			: [
+					{
+						id: 'model:default',
+						group: 'model',
+						label: `${coder.sessionModel === null ? '✓ ' : ''}default model (${defaultModelName})`,
+						onSelect: () => setSessionModel(null),
+					},
+					...sessionModelChoices.map((row) => ({
+						id: `model:${row.id}`,
+						group: 'model',
+						label: `${coder.sessionModel === row.id ? '✓ ' : ''}${row.name ?? shortModelName(row.id)}`,
+						onSelect: () => setSessionModel(row.id),
+					})),
+				]),
+		...(!showEffortChoices
+			? []
+			: [
+					{
+						id: 'effort:default',
+						group: 'effort',
+						label: `${reasoningEffort === null ? '✓ ' : ''}default reasoning${defaultEffort ? ` (${defaultEffort})` : ''}`,
+						onSelect: () => setReasoning(null),
+					},
+					...reasoningOptions.map((lvl) => ({
+						id: `effort:${lvl}`,
+						group: 'effort',
+						label: `${reasoningEffort === lvl ? '✓ ' : ''}${lvl}${reasoningChoices.levels.includes(lvl) ? '' : ' (not supported, not sent)'}`,
+						onSelect: () => setReasoning(lvl),
+					})),
+				]),
 	]);
 
 	function hubRowState(sessionId: string): 'idle' | 'syncing' | 'synced' | 'failed' {
@@ -3797,17 +3842,22 @@
 					{/if}
 					{#if showReasoningPick}
 						<span class="reasoning-pick">
-							<span>Reasoning</span>
 							<button
 								type="button"
 								class="reasoning-button"
-								title="Reasoning effort for this session (the default for other sessions is in model settings)"
+								title="Model and reasoning effort for this session (the defaults for other sessions are in model settings)"
 								aria-haspopup="menu"
 								aria-expanded={reasoningMenuAnchor !== null}
 								onpointerdown={(e) => e.stopPropagation()}
 								onclick={toggleReasoningMenu}
 							>
-								{reasoningEffort ?? 'default'}
+								<span class:session-pick={coder.sessionModel !== null}>{coder.currentModelName ?? 'model'}</span>
+								{#if showEffortChoices}
+									<span class="reasoning-sep" aria-hidden="true">·</span>
+									<span class:session-pick={reasoningEffort !== null}
+										>{reasoningEffort ?? defaultEffort ?? 'default'}</span
+									>
+								{/if}
 								<span class="reasoning-caret" aria-hidden="true">▾</span>
 							</button>
 						</span>
@@ -6577,6 +6627,13 @@
 	}
 	.reasoning-caret {
 		font-size: 9px;
+	}
+	.reasoning-sep {
+		color: var(--m-fg-subtle);
+	}
+	/* A session-only pick (not the settings' default). */
+	.session-pick {
+		color: var(--m-accent);
 	}
 	.mention-menu {
 		position: absolute;

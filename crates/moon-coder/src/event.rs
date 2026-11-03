@@ -583,4 +583,8 @@ pub struct CoderStatus {
 	/// it follows the model settings' default.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub session_reasoning_effort: Option<String>,
+	/// The visible session's standard-model override, when it applies
+	/// to the active provider; `None` follows the model settings.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub session_model: Option<String>,
 }
