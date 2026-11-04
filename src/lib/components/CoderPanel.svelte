@@ -2900,7 +2900,7 @@
 		}
 		button.textContent = ok ? 'Copied' : 'Failed';
 		window.setTimeout(() => {
-			button.textContent = 'Copy markdown';
+			button.textContent = 'Copy';
 		}, 1200);
 	}
 
@@ -4338,11 +4338,12 @@
 							type="button"
 							class="copy-md"
 							aria-label="Copy markdown"
+							title="Copy markdown"
 							onclick={(event) => {
 								void onCopyAssistantMarkdown(event, row.text);
 							}}
 						>
-							Copy markdown
+							Copy
 						</button>
 					</div>
 				{/if}
