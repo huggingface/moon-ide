@@ -136,15 +136,16 @@ impl BrowserTabRegistry {
 
 	/// Open a tab on `url`, focused, filed under `folder` (see
 	/// [`BrowserTab::folder`]). With `reuse`, an existing tab on the
-	/// same URL and side is focused and reloaded instead; the bool
-	/// reports whether that happened.
+	/// same URL and side, filed under the same folder, is focused and
+	/// reloaded instead (another folder's tab is left where it is);
+	/// the bool reports whether that happened.
 	pub fn open(&self, url: &str, in_container: bool, folder: Option<&str>, reuse: bool) -> (BrowserTab, bool) {
 		let mut inner = self.lock();
 		if reuse {
 			if let Some(existing) = inner
 				.tabs
 				.iter()
-				.find(|tab| tab.url == url && tab.in_container == in_container)
+				.find(|tab| tab.url == url && tab.in_container == in_container && tab.folder.as_deref() == folder)
 				.cloned()
 			{
 				self.emit(&inner, Some(existing.id), Some(existing.id));
@@ -234,6 +235,9 @@ mod tests {
 		let (other, _) = registry.open("http://localhost:5173/", false, Some("/w/app"), true);
 		assert_ne!(other.id, first.id);
 		assert_eq!(other.folder.as_deref(), Some("/w/app"));
+		let (elsewhere, reused) = registry.open("http://localhost:5173/", false, Some("/w/lib"), true);
+		assert!(!reused, "another folder's tab is not reused");
+		assert!(registry.close(elsewhere.id).is_some());
 
 		let moved = registry
 			.navigate(first.id, "http://localhost:5173/about", None)

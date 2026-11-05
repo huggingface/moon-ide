@@ -4773,9 +4773,10 @@ class WorkspaceState {
 
 	/** Reconcile the tab strips with the backend registry: attach
 	 *  tabs that aren't in any folder yet, drop ones the registry
-	 *  closed, and apply focus / reload. A focused tab parked in
-	 *  another folder moves to the active one so it's actually
-	 *  visible. */
+	 *  closed, and apply focus / reload. A focused tab filed under
+	 *  another folder (an agent working there) is selected in that
+	 *  folder's strip and stays there; only an unfiled one moves to
+	 *  the active folder to become visible. */
 	applyBrowserTabs(change: BrowserTabsChanged) {
 		const previous = this.browserTabs;
 		const next: Record<string, BrowserTabView> = {};
@@ -4813,10 +4814,16 @@ class WorkspaceState {
 				continue;
 			}
 			if (owner !== this.activeFolderPath) {
-				if (focused) {
-					this.#detachBrowserBuffer(path);
-					this.#attachBrowserBuffer(path, this.focusedSide, true);
+				if (!focused) {
+					continue;
 				}
+				const ownerState = this.folderStates.get(owner);
+				if (tab.folder !== null && tab.folder !== this.activeFolderPath && ownerState) {
+					this.#attachBrowserBufferTo(ownerState, path, true);
+					continue;
+				}
+				this.#detachBrowserBuffer(path);
+				this.#attachBrowserBuffer(path, this.focusedSide, true);
 				continue;
 			}
 			this.openFiles = this.openFiles.map((f) =>
@@ -4879,7 +4886,7 @@ class WorkspaceState {
 		if (!state.openFiles.some((f) => f.path === path)) {
 			state.openFiles = [...state.openFiles, browserBuffer(path, tab.url)];
 		}
-		const side = state.focusedSide;
+		const side = state.leftTabs.includes(path) ? 'left' : state.rightTabs.includes(path) ? 'right' : state.focusedSide;
 		const tabs = side === 'left' ? state.leftTabs : state.rightTabs;
 		if (!tabs.includes(path)) {
 			if (side === 'left') {
