@@ -332,6 +332,11 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.toggleLineWrap(),
 	},
 	{
+		id: 'diff.toggleLayout',
+		title: 'Toggle Unified / Side-by-side Diff',
+		run: () => workspace.toggleDiffLayout(),
+	},
+	{
 		id: 'diff.toggleIgnoreWhitespace',
 		title: 'Toggle Whitespace in Diffs',
 		run: () => workspace.toggleIgnoreWhitespace(),

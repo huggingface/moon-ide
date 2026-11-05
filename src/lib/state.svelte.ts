@@ -40,6 +40,7 @@ import {
 	type SplitSide,
 	type SystemTheme,
 	type ThemeMode,
+	type DiffLayout,
 	type Workspace,
 	type WorkspaceFolder,
 	type WorkspaceSession,
@@ -444,6 +445,8 @@ class WorkspaceState {
 	// Not persisted across restarts: the on-vs-off cost is one
 	// keystroke and the team is small.
 	lineWrap = $state(false);
+	/** Diff rendering preference (persisted in app state). */
+	diffLayout = $state<DiffLayout>('split');
 
 	// Local autocomplete (llama.cpp / Sweep-style model). Persisted in AppState; probe runs on a timer.
 	nextEditExternalBaseUrl = $state('');
@@ -1847,6 +1850,7 @@ class WorkspaceState {
 		}
 
 		this.theme = state.theme;
+		this.diffLayout = state.diff_layout ?? 'split';
 		this.nextEditExternalBaseUrl = (state.next_edit.external_base_url ?? '').trim();
 		this.nextEditLlamaBinary = state.next_edit.llama_binary ?? '';
 		{
@@ -2597,6 +2601,7 @@ class WorkspaceState {
 				bottom_panel: bottomPanel.serialise(),
 				right_panel: null,
 				coder: { last_session_by_folder: {} },
+				diff_layout: this.diffLayout,
 				next_edit: {
 					external_base_url: this.nextEditExternalBaseUrl.trim(),
 					llama_binary: this.nextEditLlamaBinary.trim(),
@@ -5257,6 +5262,13 @@ class WorkspaceState {
 	toggleLineWrap() {
 		this.lineWrap = !this.lineWrap;
 		this.flash(this.lineWrap ? 'Line wrap on' : 'Line wrap off');
+	}
+
+	/** Flip diffs between split and unified, app-wide. */
+	toggleDiffLayout() {
+		this.diffLayout = this.diffLayout === 'split' ? 'unified' : 'split';
+		this.flash(this.diffLayout === 'unified' ? 'Unified diffs' : 'Side-by-side diffs');
+		this.persistAppState();
 	}
 
 	/** Flip whitespace-insensitive diffing for the active folder's

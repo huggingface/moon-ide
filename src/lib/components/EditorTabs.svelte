@@ -670,6 +670,18 @@
 						Diff
 					</button>
 				{/if}
+				{#if currentView === 'diff'}
+					<button
+						type="button"
+						class="view-btn"
+						class:selected={workspace.diffLayout === 'unified'}
+						aria-pressed={workspace.diffLayout === 'unified'}
+						onclick={() => workspace.toggleDiffLayout()}
+						title="Show deletions inline in one column (narrow panes always do)"
+					>
+						Unified
+					</button>
+				{/if}
 			{/if}
 			{#if canRevert}
 				<button

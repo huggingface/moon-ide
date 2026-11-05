@@ -70,6 +70,18 @@ pub struct AppState {
 	/// Local llama.cpp autocomplete: managed `llama-server` spawn fields + optional external HTTP base.
 	#[serde(default)]
 	pub next_edit: NextEditAppState,
+	/// How diffs render: two columns, or one with deletions inline.
+	/// Narrow panes show unified regardless.
+	pub diff_layout: DiffLayout,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLayout {
+	#[default]
+	Split,
+	Unified,
 }
 
 /// Surface mounted in the right-side panel. Chat and coder are

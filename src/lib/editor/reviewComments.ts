@@ -613,10 +613,22 @@ const hoverTracker = ViewPlugin.define((view) => {
 // their content, and the "+" marker only exists on the hovered line,
 // so without the reservation the column would appear/disappear on
 // hover and shift the code horizontally (the original bug). 14px is
-// reserved once at mount and never changes.
+// reserved once at mount and never changes. Next to the lint gutter
+// (the editable panes) it takes no width at all: the "+" floats over
+// the lint column instead, which is otherwise empty on most lines and
+// left 30+px of blank gutter before the code. On a hovered line that
+// has a lint marker the "+" covers it until the pointer leaves; the
+// squiggle still carries the same tooltip.
 const reviewBaseTheme = EditorView.baseTheme({
 	'.cm-review-add-gutter': {
 		width: '14px',
+	},
+	'.cm-gutter-lint + .cm-review-add-gutter': {
+		width: '0',
+		overflow: 'visible',
+	},
+	'.cm-gutter-lint + .cm-review-add-gutter .cm-review-add-btn': {
+		transform: 'translateX(-16px)',
 	},
 	'.cm-review-add-btn': {
 		display: 'inline-flex',

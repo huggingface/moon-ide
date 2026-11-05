@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { Compartment, EditorSelection, EditorState, Prec, type Extension } from '@codemirror/state';
+	import { onMount, untrack } from 'svelte';
+	import { ChangeSet, Compartment, EditorSelection, EditorState, Prec, Text, type Extension } from '@codemirror/state';
 	import { EditorView, highlightActiveLine, highlightActiveLineGutter, keymap, lineNumbers } from '@codemirror/view';
 	import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 	import { highlightSelectionMatches, searchKeymap } from '@codemirror/search';
@@ -8,7 +8,16 @@
 	import { stickyScrollExtension } from '../editor/stickyScroll';
 	import { bracketMatching, foldGutter, indentOnInput, indentUnit } from '@codemirror/language';
 	import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from '@codemirror/autocomplete';
-	import { MergeView, diff as rawDiff, goToNextChunk, goToPreviousChunk } from '@codemirror/merge';
+	import {
+		MergeView,
+		diff as rawDiff,
+		getChunks,
+		getOriginalDoc,
+		goToNextChunk,
+		goToPreviousChunk,
+		unifiedMergeView,
+		updateOriginalDoc,
+	} from '@codemirror/merge';
 	import { ipc } from '../ipc';
 	import { workspace, type OpenFile, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
@@ -69,6 +78,20 @@
 	// proxied (class instances pass through `$state` as-is in
 	// Svelte 5), so method calls and internal state stay intact.
 	let merge: MergeView | undefined = $state(undefined);
+	// Unified layout: one editor on the working text, deletions shown
+	// inline (`unifiedMergeView`). Exactly one of `merge` / `unified`
+	// is set once built; `paneB` is the working-tree editor either way.
+	let unified: EditorView | undefined = $state(undefined);
+	const paneB = $derived.by<EditorView | undefined>(() => merge?.b ?? unified);
+	const unifiedCompartment = new Compartment();
+	// Below this width two columns are too cramped to read, so the
+	// view goes unified whatever the preference says.
+	const NARROW_DIFF_PX = 720;
+	let hostWidth = $state(0);
+	const layout = $derived<'split' | 'unified'>(
+		workspace.diffLayout === 'unified' || (hostWidth > 0 && hostWidth < NARROW_DIFF_PX) ? 'unified' : 'split',
+	);
+	let builtLayout: 'split' | 'unified' | null = null;
 	// Cleanup for the horizontal-scroll sync wired up at the tail
 	// of `buildMerge`. Cleared on teardown so we don't leak DOM
 	// listeners across diff-view remounts.
@@ -135,16 +158,17 @@
 	const editorMenu = new EditorContextMenu();
 
 	function openDiffMenu(event: MouseEvent) {
-		if (merge === undefined || file.isExternal || isReviewPath(file.path)) {
+		const b = paneB;
+		if (b === undefined || file.isExternal || isReviewPath(file.path)) {
 			return;
 		}
-		const rightDom = merge.b.dom;
+		const rightDom = b.dom;
 		if (!(event.target instanceof Node) || !rightDom.contains(event.target)) {
 			return;
 		}
 		// Deleted files have an empty, LSP-less right pane — no rename.
 		const canRename = !file.isDeleted && lspLanguageFor(file.path) !== null;
-		editorMenu.open(event, merge.b, file.path, { canRename });
+		editorMenu.open(event, b, file.path, { canRename });
 	}
 
 	// In single-tab model, `file.path` is stable for the lifetime of
@@ -159,41 +183,21 @@
 	let currentHead: string | null = null;
 
 	onMount(() => {
+		hostWidth = host.clientWidth;
+		const resize = new ResizeObserver(() => {
+			hostWidth = host.clientWidth;
+		});
+		resize.observe(host);
 		void buildMerge();
 		return () => {
+			resize.disconnect();
 			// Bump the build token so any in-flight `buildMerge`
 			// resolves into a no-op instead of attaching to a
 			// destroyed host node.
 			buildToken++;
-			detachHScrollSync?.();
-			detachHScrollSync = null;
-			detachStickyHbarA?.();
-			detachStickyHbarA = null;
-			detachStickyHbarB?.();
-			detachStickyHbarB = null;
-			// Snapshot the right pane's caret + scroll before
-			// teardown so the matching `Editor.svelte` mount (or
-			// a later return to diff mode) can pick up where the
-			// user left off. Symmetric with `Editor.svelte`'s own
-			// unmount snapshot — together they preserve the caret
-			// across Ctrl+Shift+D toggles. History JSON is
-			// deliberately not captured here: the right pane is
-			// editable but the undo stack lives on the Editor
-			// surface's lifecycle, and feeding a MergeView-flavoured
-			// history JSON back into a regular EditorState would
-			// at best be a no-op and at worst confuse `fromJSON`.
-			const folder = workspace.activeFolderPath;
-			if (merge && !file.isDeleted && folder !== null) {
-				workspace.snapshotViewState(folder, file.path, {
-					caretOffset: merge.b.state.selection.main.head,
-					anchorOffset: merge.b.state.selection.main.anchor,
-					scrollTop: merge.b.scrollDOM.scrollTop,
-				});
-			}
+			destroyViews();
 			reviewWiring.detach();
 			editorMenu.dispose();
-			merge?.destroy();
-			merge = undefined;
 			// Drop any selection snapshot the right pane published
 			// while we were live — symmetric with `Editor.svelte`'s
 			// teardown so the floating "Add to Coder" hint can't
@@ -202,16 +206,65 @@
 		};
 	});
 
+	// Switching layout (preference flip, or the pane crossing
+	// `NARROW_DIFF_PX`) rebuilds the views; the caret and scroll ride
+	// the same view-state snapshot as a diff ↔ editor toggle.
+	$effect(() => {
+		const next = layout;
+		untrack(() => {
+			if (builtLayout === null || builtLayout === next) {
+				return;
+			}
+			buildToken++;
+			destroyViews();
+			void buildMerge();
+		});
+	});
+
+	function destroyViews(): void {
+		detachHScrollSync?.();
+		detachHScrollSync = null;
+		detachStickyHbarA?.();
+		detachStickyHbarA = null;
+		detachStickyHbarB?.();
+		detachStickyHbarB = null;
+		// Snapshot the right pane's caret + scroll before
+		// teardown so the matching `Editor.svelte` mount (or
+		// a later return to diff mode) can pick up where the
+		// user left off. Symmetric with `Editor.svelte`'s own
+		// unmount snapshot — together they preserve the caret
+		// across Ctrl+Shift+D toggles. History JSON is
+		// deliberately not captured here: the right pane is
+		// editable but the undo stack lives on the Editor
+		// surface's lifecycle, and feeding a MergeView-flavoured
+		// history JSON back into a regular EditorState would
+		// at best be a no-op and at worst confuse `fromJSON`.
+		const folder = workspace.activeFolderPath;
+		const b = paneB;
+		if (b && !file.isDeleted && folder !== null) {
+			workspace.snapshotViewState(folder, file.path, {
+				caretOffset: b.state.selection.main.head,
+				anchorOffset: b.state.selection.main.anchor,
+				scrollTop: (merge?.dom ?? b.scrollDOM).scrollTop,
+			});
+		}
+		merge?.destroy();
+		merge = undefined;
+		unified?.destroy();
+		unified = undefined;
+		builtLayout = null;
+	}
+
 	// Keep the review-comment bundle in sync with the gate and the
 	// comment list (same full-reconfigure approach as `Editor.svelte`).
 	$effect(() => {
 		const enabled = reviewEnabled;
 		const comments = reviewComments;
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
-		m.b.dispatch({
+		b.dispatch({
 			effects: reviewCompartment.reconfigure(enabled ? reviewWiring.extension(comments) : []),
 		});
 	});
@@ -551,17 +604,124 @@
 			...(file.isDeleted ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
 		];
 
-		// Tear down any previous sync before rebuilding — `buildMerge`
-		// is only called once per mount today, but keep this defensive
-		// in case the build path grows a rebuild branch later.
-		detachHScrollSync?.();
-		detachHScrollSync = null;
-		detachStickyHbarA?.();
-		detachStickyHbarA = null;
-		detachStickyHbarB?.();
-		detachStickyHbarB = null;
+		builtLayout = layout;
+		if (builtLayout === 'unified') {
+			unified = new EditorView({
+				parent: host,
+				state: EditorState.create({
+					doc: rightText,
+					extensions: [...rightExtensions, unifiedCompartment.of(unifiedDiff(head))],
+				}),
+			});
+		} else {
+			buildSplit(head, sharedLeft, rightText, rightExtensions);
+		}
+		const b = merge?.b ?? unified;
+		if (b === undefined) {
+			return;
+		}
+		reviewWiring.attach(b);
 
-		merge = new MergeView({
+		// Caret restore order, highest precedence first:
+		//
+		//   1. Pending goto-def / search-hit jump — anything queued
+		//      via `workspace.jumpTo` before the diff view mounted
+		//      (Ctrl+Shift+F result, `Go to Definition` from the
+		//      palette, coder tool-block click). The `pendingJumps`
+		//      effect below applies it in a microtask; we just skip
+		//      the snapshot / first-chunk restore so the later rAF
+		//      doesn't clobber the jump's scroll target.
+		//   2. View-state snapshot left by a previous mount of this
+		//      buffer (Editor or DiffView). This is what makes a
+		//      Ctrl+Shift+D toggle land back on the user's caret
+		//      instead of resetting to the first chunk.
+		//   3. First chunk's `fromB` — the legacy "open a 3000-line
+		//      file and jump to the one edit at line 2500" gesture
+		//      that fires on a clean first-time diff view.
+		//   4. Nothing (deleted-file panes have a read-only empty
+		//      right side; no chunks, no snapshot to restore).
+		const folder = workspace.activeFolderPath;
+		const pendingJump = folder !== null ? workspace.pendingJumps.get(`${folder}::${file.path}`) : undefined;
+		const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
+		const chunks = merge?.chunks ?? getChunks(b.state)?.chunks ?? [];
+		if (pendingJump && folder !== null && !file.isDeleted) {
+			// Apply the pending jump here (inside `buildMerge`)
+			// rather than leaving it to the `pendingJumps`
+			// `$effect` below for two reasons:
+			//
+			//   1. Same rAF deferral as the snapshot / first-chunk
+			//      branches. Dispatching `scrollIntoView` in a
+			//      microtask right after `new MergeView` runs the
+			//      target before CM has computed layout, and the
+			//      scroll lands at 0 — same race the first-chunk
+			//      block already documents.
+			//   2. Consuming the jump here means snapshot /
+			//      first-chunk restore stays skipped, and the
+			//      `$effect` consumer below (which is still wired
+			//      for jumps that arrive *after* the diff view has
+			//      mounted, e.g. Ctrl-click goto-def) has nothing
+			//      to do this build.
+			const docLen = b.state.doc.length;
+			const target = pendingJump;
+			// Consume now so the `$effect` consumer below — which
+			// re-runs when `merge` becomes defined and would
+			// otherwise also fire a microtask-timed dispatch
+			// (with the race the rAF below avoids) — sees an
+			// empty `pendingJumps` for this buffer.
+			workspace.consumePendingJump(folder, file.path);
+			requestAnimationFrame(() => {
+				if (token !== buildToken) {
+					return;
+				}
+				const offset = Math.min(offsetForLspPosition(b, target), docLen);
+				b.dispatch({
+					selection: EditorSelection.cursor(offset),
+					effects: EditorView.scrollIntoView(offset, { y: 'center' }),
+				});
+				b.focus();
+			});
+		} else if (snapshot !== null && !file.isDeleted) {
+			const docLen = b.state.doc.length;
+			// `caret` / `selAnchor` to dodge the outer-scope `head`
+			// (HEAD blob text) shadowing.
+			const caret = Math.min(snapshot.caretOffset, docLen);
+			const selAnchor = Math.min(snapshot.anchorOffset, docLen);
+			requestAnimationFrame(() => {
+				if (token !== buildToken) {
+					return;
+				}
+				b.dispatch({
+					selection: caret === selAnchor ? EditorSelection.cursor(caret) : EditorSelection.range(selAnchor, caret),
+					effects: EditorView.scrollIntoView(caret, { y: 'center' }),
+				});
+				(merge?.dom ?? b.scrollDOM).scrollTop = snapshot.scrollTop;
+			});
+		} else if (chunks.length > 0 && !file.isDeleted) {
+			const first = chunks[0];
+			if (first) {
+				const docLen = b.state.doc.length;
+				const pos = Math.min(first.fromB, docLen);
+				// Defer the scroll into the next animation frame —
+				// dispatching synchronously inside the MergeView
+				// constructor's tail races with the library's own
+				// initial layout and the scroll target lands at 0
+				// instead of the chunk. One rAF after build is
+				// enough for the inner `.cm-scroller` to settle.
+				requestAnimationFrame(() => {
+					if (token !== buildToken) {
+						return;
+					}
+					b.dispatch({
+						selection: EditorSelection.cursor(pos),
+						effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+					});
+				});
+			}
+		}
+	}
+
+	function buildSplit(head: string, sharedLeft: Extension[], rightText: string, rightExtensions: Extension[]): void {
+		const view = new MergeView({
 			a: { doc: head, extensions: sharedLeft },
 			b: { doc: rightText, extensions: rightExtensions },
 			parent: host,
@@ -626,107 +786,34 @@
 			},
 		});
 
-		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
-		detachStickyHbarA = attachStickyHScrollbar(merge.a.scrollDOM, merge.a.dom);
-		detachStickyHbarB = attachStickyHScrollbar(merge.b.scrollDOM, merge.b.dom);
-		reviewWiring.attach(merge.b);
+		detachHScrollSync = wireHorizontalScrollSync(view.a.scrollDOM, view.b.scrollDOM);
+		detachStickyHbarA = attachStickyHScrollbar(view.a.scrollDOM, view.a.dom);
+		detachStickyHbarB = attachStickyHScrollbar(view.b.scrollDOM, view.b.dom);
+		merge = view;
+	}
 
-		// Caret restore order, highest precedence first:
-		//
-		//   1. Pending goto-def / search-hit jump — anything queued
-		//      via `workspace.jumpTo` before the diff view mounted
-		//      (Ctrl+Shift+F result, `Go to Definition` from the
-		//      palette, coder tool-block click). The `pendingJumps`
-		//      effect below applies it in a microtask; we just skip
-		//      the snapshot / first-chunk restore so the later rAF
-		//      doesn't clobber the jump's scroll target.
-		//   2. View-state snapshot left by a previous mount of this
-		//      buffer (Editor or DiffView). This is what makes a
-		//      Ctrl+Shift+D toggle land back on the user's caret
-		//      instead of resetting to the first chunk.
-		//   3. First chunk's `fromB` — the legacy "open a 3000-line
-		//      file and jump to the one edit at line 2500" gesture
-		//      that fires on a clean first-time diff view.
-		//   4. Nothing (deleted-file panes have a read-only empty
-		//      right side; no chunks, no snapshot to restore).
-		const folder = workspace.activeFolderPath;
-		const pendingJump = folder !== null ? workspace.pendingJumps.get(`${folder}::${file.path}`) : undefined;
-		const snapshot = folder !== null ? workspace.getViewState(folder, file.path) : null;
-		const chunks = merge.chunks;
-		if (pendingJump && folder !== null && !file.isDeleted) {
-			// Apply the pending jump here (inside `buildMerge`)
-			// rather than leaving it to the `pendingJumps`
-			// `$effect` below for two reasons:
-			//
-			//   1. Same rAF deferral as the snapshot / first-chunk
-			//      branches. Dispatching `scrollIntoView` in a
-			//      microtask right after `new MergeView` runs the
-			//      target before CM has computed layout, and the
-			//      scroll lands at 0 — same race the first-chunk
-			//      block already documents.
-			//   2. Consuming the jump here means snapshot /
-			//      first-chunk restore stays skipped, and the
-			//      `$effect` consumer below (which is still wired
-			//      for jumps that arrive *after* the diff view has
-			//      mounted, e.g. Ctrl-click goto-def) has nothing
-			//      to do this build.
-			const docLen = merge.b.state.doc.length;
-			const target = pendingJump;
-			// Consume now so the `$effect` consumer below — which
-			// re-runs when `merge` becomes defined and would
-			// otherwise also fire a microtask-timed dispatch
-			// (with the race the rAF below avoids) — sees an
-			// empty `pendingJumps` for this buffer.
-			workspace.consumePendingJump(folder, file.path);
-			requestAnimationFrame(() => {
-				if (token !== buildToken || !merge) {
-					return;
+	// Revert-only chunk controls: "accept" would just move the
+	// in-memory baseline, which nothing on disk follows.
+	function unifiedDiff(original: string): Extension {
+		return unifiedMergeView({
+			original,
+			gutter: false,
+			highlightChanges: true,
+			syntaxHighlightDeletions: true,
+			mergeControls: (type, action) => {
+				const button = document.createElement('button');
+				if (type === 'accept') {
+					button.hidden = true;
+					return button;
 				}
-				const offset = Math.min(offsetForLspPosition(merge.b, target), docLen);
-				merge.b.dispatch({
-					selection: EditorSelection.cursor(offset),
-					effects: EditorView.scrollIntoView(offset, { y: 'center' }),
-				});
-				merge.b.focus();
-			});
-		} else if (snapshot !== null && !file.isDeleted) {
-			const docLen = merge.b.state.doc.length;
-			// `caret` / `selAnchor` to dodge the outer-scope `head`
-			// (HEAD blob text) shadowing.
-			const caret = Math.min(snapshot.caretOffset, docLen);
-			const selAnchor = Math.min(snapshot.anchorOffset, docLen);
-			requestAnimationFrame(() => {
-				if (token !== buildToken || !merge) {
-					return;
-				}
-				merge.b.dispatch({
-					selection: caret === selAnchor ? EditorSelection.cursor(caret) : EditorSelection.range(selAnchor, caret),
-					effects: EditorView.scrollIntoView(caret, { y: 'center' }),
-				});
-				merge.b.scrollDOM.scrollTop = snapshot.scrollTop;
-			});
-		} else if (chunks.length > 0 && !file.isDeleted) {
-			const first = chunks[0];
-			if (first) {
-				const docLen = merge.b.state.doc.length;
-				const pos = Math.min(first.fromB, docLen);
-				// Defer the scroll into the next animation frame —
-				// dispatching synchronously inside the MergeView
-				// constructor's tail races with the library's own
-				// initial layout and the scroll target lands at 0
-				// instead of the chunk. One rAF after build is
-				// enough for the inner `.cm-scroller` to settle.
-				requestAnimationFrame(() => {
-					if (token !== buildToken || !merge) {
-						return;
-					}
-					merge.b.dispatch({
-						selection: EditorSelection.cursor(pos),
-						effects: EditorView.scrollIntoView(pos, { y: 'center' }),
-					});
-				});
-			}
-		}
+				button.name = 'reject';
+				button.textContent = 'Revert';
+				button.title = 'Revert this change to the base version';
+				button.addEventListener('mousedown', action);
+				return button;
+			},
+			diffConfig: { override: workspace.ignoreWhitespace ? diffConfigIgnoringWhitespace().override : rawDiff },
+		});
 	}
 
 	// External text edits to the right-side buffer (e.g. save-time
@@ -736,16 +823,16 @@
 	// updateListener-driven dispatch doesn't ping-pong.
 	$effect(() => {
 		const text = file.text;
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
-		const current = m.b.state.doc.toString();
+		const current = b.state.doc.toString();
 		if (current === text) {
 			return;
 		}
-		m.b.dispatch({
-			changes: { from: 0, to: m.b.state.doc.length, insert: text },
+		b.dispatch({
+			changes: { from: 0, to: b.state.doc.length, insert: text },
 		});
 	});
 
@@ -779,26 +866,21 @@
 		if (!pending) {
 			return;
 		}
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
 		// Microtask defers the dispatch past any in-flight CM
 		// state-rebuild (matches the timing rationale in
-		// `Editor.svelte`'s consumer). Capturing `buildToken` /
-		// rechecking `merge` would be defensive against a swap
-		// mid-microtask, but the consumer is cheap enough that an
-		// orphan dispatch into a torn-down view is just a no-op.
+		// `Editor.svelte`'s consumer). An orphan dispatch into a
+		// view torn down mid-microtask is just a no-op.
 		queueMicrotask(() => {
-			if (!merge) {
-				return;
-			}
-			const offset = offsetForLspPosition(merge.b, pending);
-			merge.b.dispatch({
+			const offset = offsetForLspPosition(b, pending);
+			b.dispatch({
 				selection: EditorSelection.cursor(offset),
 				effects: EditorView.scrollIntoView(offset, { y: 'center' }),
 			});
-			merge.b.focus();
+			b.focus();
 			workspace.consumePendingJump(folder, file.path);
 		});
 	});
@@ -811,11 +893,11 @@
 	// blame extension to reconfigure.
 	$effect(() => {
 		const blame = workspace.blameByPath.get(file.path) ?? null;
-		const m = merge;
-		if (!m || file.isDeleted) {
+		const b = paneB;
+		if (!b || file.isDeleted) {
 			return;
 		}
-		m.b.dispatch({
+		b.dispatch({
 			effects: blameB.reconfigure(blameFacet.of(blame)),
 		});
 	});
@@ -826,8 +908,8 @@
 	// short-circuits when nothing actually changed.
 	$effect(() => {
 		const cached = workspace.headByPath.get(file.path);
-		const m = merge;
-		if (!m || cached === undefined) {
+		const b = paneB;
+		if (!b || cached === undefined) {
 			return;
 		}
 		const head = cached ?? '';
@@ -835,27 +917,37 @@
 			return;
 		}
 		currentHead = head;
-		m.a.dispatch({
-			changes: { from: 0, to: m.a.state.doc.length, insert: head },
-		});
+		if (merge) {
+			merge.a.dispatch({
+				changes: { from: 0, to: merge.a.state.doc.length, insert: head },
+			});
+		} else {
+			const previous = getOriginalDoc(b.state);
+			b.dispatch({
+				effects: updateOriginalDoc.of({
+					doc: Text.of(head.split('\n')),
+					changes: ChangeSet.of([{ from: 0, to: previous.length, insert: head }], previous.length),
+				}),
+			});
+		}
 		// Keep the right pane's `headTextFacet` aligned with the
 		// left doc so the change-bar gutter and overview-ruler
 		// repaint instead of pointing at stale HEAD content.
 		// Skipped for deleted buffers — they don't carry the
 		// extension.
 		if (!file.isDeleted) {
-			m.b.dispatch({ effects: headB.reconfigure(headTextFacet.of(head)) });
+			b.dispatch({ effects: headB.reconfigure(headTextFacet.of(head)) });
 		}
 	});
 
 	$effect(() => {
 		const mode = workspace.effectiveTheme;
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
-		m.a.dispatch({ effects: themeA.reconfigure(moonEditorTheme(mode)) });
-		m.b.dispatch({ effects: themeB.reconfigure(moonEditorTheme(mode)) });
+		merge?.a.dispatch({ effects: themeA.reconfigure(moonEditorTheme(mode)) });
+		b.dispatch({ effects: themeB.reconfigure(moonEditorTheme(mode)) });
 	});
 
 	// Soft-wrap. Both sides of the merge get the same setting in the
@@ -863,13 +955,13 @@
 	// MergeView's gutter alignment between hunks.
 	$effect(() => {
 		const wrap = workspace.lineWrap;
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
 		const ext = wrap ? EditorView.lineWrapping : [];
-		m.a.dispatch({ effects: wrapA.reconfigure(ext) });
-		m.b.dispatch({ effects: wrapB.reconfigure(ext) });
+		merge?.a.dispatch({ effects: wrapA.reconfigure(ext) });
+		b.dispatch({ effects: wrapB.reconfigure(ext) });
 	});
 
 	// Whitespace-toggle flip. `MergeView.reconfigure` only stashes
@@ -878,12 +970,18 @@
 	// away. Docs, folds, and selections survive: no doc bytes change.
 	$effect(() => {
 		const ignore = workspace.ignoreWhitespace;
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
-		m.reconfigure({ diffConfig: { override: ignore ? diffConfigIgnoringWhitespace().override : rawDiff } });
-		m.b.dispatch({ changes: { from: 0, insert: '' } });
+		if (merge) {
+			merge.reconfigure({ diffConfig: { override: ignore ? diffConfigIgnoringWhitespace().override : rawDiff } });
+		} else {
+			// `unifiedDiff` reads the toggle itself; the original doc
+			// field keeps its value across the reconfigure.
+			b.dispatch({ effects: unifiedCompartment.reconfigure(unifiedDiff(getOriginalDoc(b.state).toString())) });
+		}
+		b.dispatch({ changes: { from: 0, insert: '' } });
 	});
 
 	// LSP diagnostics: push the latest list for this path into the
@@ -892,22 +990,22 @@
 	// both views so flipping diff ↔ source carries the squigglies
 	// across without re-fetching.
 	$effect(() => {
-		const m = merge;
-		if (!m || file.isDeleted) {
+		const b = paneB;
+		if (!b || file.isDeleted) {
 			return;
 		}
 		const perProducer = workspace.diagnosticsByProducer.get(file.path) ?? null;
-		applyDiagnostics(m.b, perProducer);
+		applyDiagnostics(b, perProducer);
 	});
 
 	$effect(() => {
 		const ec = workspace.editorConfigFor(file.path);
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
-		m.a.dispatch({ effects: ecA.reconfigure(editorConfigExtensions(ec)) });
-		m.b.dispatch({ effects: ecB.reconfigure(editorConfigExtensions(ec)) });
+		merge?.a.dispatch({ effects: ecA.reconfigure(editorConfigExtensions(ec)) });
+		b.dispatch({ effects: ecB.reconfigure(editorConfigExtensions(ec)) });
 	});
 
 	// Pull keyboard focus into the right-side editor (the editable
@@ -920,11 +1018,11 @@
 		if (workspace.focusedSide !== side) {
 			return;
 		}
-		const m = merge;
-		if (!m) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
-		queueMicrotask(() => m.b.focus());
+		queueMicrotask(() => b.focus());
 	});
 
 	function editorConfigExtensions(ec: EditorConfig): Extension {
@@ -1188,11 +1286,32 @@
 	 * sticky bar below replaces it at viewport bottom. Mouse-
 	 * wheel / touch horizontal scrolling still works on the
 	 * scroller; only the chrome moves. */
-	.diff-host :global(.cm-scroller) {
+	.diff-host :global(.cm-mergeView .cm-scroller) {
 		scrollbar-width: none;
 	}
-	.diff-host :global(.cm-scroller::-webkit-scrollbar) {
+	.diff-host :global(.cm-mergeView .cm-scroller::-webkit-scrollbar) {
 		display: none;
+	}
+	/* Unified layout: one plain editor filling the host, scrolling
+	 * itself like the regular editor. */
+	.diff-host > :global(.cm-editor) {
+		flex: 1;
+		min-width: 0;
+		height: 100%;
+	}
+	/* The per-chunk "Revert" in unified mode, in the palette rather
+	 * than the package's hardcoded red. */
+	.diff-host :global(.cm-deletedChunk .cm-chunkButtons button[name='reject']) {
+		background: var(--m-bg-overlay);
+		color: var(--m-fg-muted);
+		border: 1px solid var(--m-border);
+		font: inherit;
+		font-size: 11px;
+		padding: 0 6px;
+	}
+	.diff-host :global(.cm-deletedChunk .cm-chunkButtons button[name='reject']:hover) {
+		color: var(--m-danger);
+		border-color: var(--m-danger);
 	}
 	/* Sticky synthetic horizontal scrollbar. Lives inside
 	 * `.cm-mergeViewEditor` (sibling of `.cm-editor`); because

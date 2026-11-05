@@ -1177,7 +1177,11 @@ export type AppState = {
 	right_panel: RightPanelKind | null;
 	coder: CoderAppState;
 	next_edit: NextEditAppState;
+	/** How diffs render; narrow panes show unified regardless. */
+	diff_layout: DiffLayout;
 };
+
+export type DiffLayout = 'split' | 'unified';
 
 /** Bottom-panel chrome state — visibility + height only. Tab
  * contents aren't persisted here: log streams back onto running
@@ -1312,6 +1316,7 @@ export const defaultAppState: AppState = {
 		server_port: DEFAULT_NEXT_EDIT_SERVER_PORT,
 		server_autostart: false,
 	},
+	diff_layout: 'split',
 };
 
 /**

@@ -2,8 +2,8 @@
 //!
 //! AppState is split across multiple writers:
 //! - The frontend's persist path owns `theme`, `bottom_panel`
-//!   (visibility + height + the terminal restore list), and
-//!   `next_edit` and hits this `app_state_save` command on every
+//!   (visibility + height + the terminal restore list), `next_edit`
+//!   and `diff_layout`, and hits this `app_state_save` command on every
 //!   navigation.
 //! - The Slack tauri commands own `slack.*` and write via their own
 //!   load-mutate-save path (see `commands::slack`).
@@ -46,6 +46,7 @@ pub async fn app_state_save(state: State<'_, AppState>, app_state: AppStatePaylo
 		s.theme = app_state.theme;
 		s.bottom_panel = app_state.bottom_panel;
 		s.next_edit = app_state.next_edit;
+		s.diff_layout = app_state.diff_layout;
 		// `workspaces`, `slack`, `right_panel`, `coder` are
 		// preserved from disk verbatim — owned by other writers,
 		// see the module docs above.
