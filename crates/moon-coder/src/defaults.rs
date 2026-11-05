@@ -56,6 +56,12 @@ pub const HF_HUB_BASE: &str = "https://huggingface.co";
 /// Inference Providers router base. OpenAI-compatible API surface.
 pub const HF_ROUTER_BASE: &str = "https://router.huggingface.co/v1";
 
+/// Speech-to-text for the composer's voice input: Whisper on HF
+/// Inference Providers, paid with the user's HF sign-in like the
+/// default chat route. Multilingual, so French and English both work.
+pub const VOICE_TRANSCRIBE_URL: &str =
+	"https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3-turbo";
+
 /// Cap on how many LLM round-trips one user prompt can trigger.
 /// Each iteration is "send messages → get tool calls → run them →
 /// send results back". 200 leaves plenty of headroom for serious

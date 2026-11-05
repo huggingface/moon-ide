@@ -1854,6 +1854,11 @@ impl CoderHandle {
 		self.state.inference.openrouter_credits(&base_url, &api_key).await
 	}
 
+	/// Speech-to-text for the composer's voice input.
+	pub async fn transcribe(&self, wav: Vec<u8>) -> Result<String, CoderError> {
+		self.state.inference.transcribe(wav).await
+	}
+
 	/// Plan usage (5 h / weekly windows) of a ChatGPT provider
 	/// (ADR 0101).
 	pub async fn chatgpt_usage(

@@ -40,6 +40,7 @@
 	import CoderPlanStrip from './CoderPlanStrip.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
+	import MicIcon from './icons/MicIcon.svelte';
 	import RocketIcon from './icons/RocketIcon.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -479,6 +480,81 @@
 	// published yet") unless told; this is the one-click "go ahead".
 	const SHIP_IT_PROMPT =
 		'Ship it: go ahead with what you held back to land this work — commit, push, publish, open or update the PR, whatever it still needs.';
+
+	// Voice input: the desktop side records, the workspace core
+	// transcribes, and the text lands at the composer's caret (never
+	// sent by itself).
+	let voiceState = $state<'idle' | 'recording' | 'transcribing'>('idle');
+
+	async function toggleVoice(): Promise<void> {
+		if (voiceState === 'transcribing') {
+			return;
+		}
+		if (voiceState === 'idle') {
+			try {
+				await ipc.voice.start();
+				voiceState = 'recording';
+			} catch (err) {
+				workspace.flash(`Couldn't start recording: ${formatError(err)}`);
+			}
+			return;
+		}
+		voiceState = 'transcribing';
+		try {
+			const wav = await ipc.voice.stop();
+			if (wav === '') {
+				workspace.flash("Didn't hear anything");
+				return;
+			}
+			insertDictation(await ipc.coder.transcribe(wav));
+		} catch (err) {
+			workspace.flash(`Voice input failed: ${formatError(err)}`);
+		} finally {
+			voiceState = 'idle';
+		}
+	}
+
+	function cancelVoice(): void {
+		voiceState = 'idle';
+		void ipc.voice.cancel();
+	}
+
+	// Through `insertText` so the dictation is one native undo step.
+	function insertDictation(text: string): void {
+		if (text === '' || composer === undefined) {
+			return;
+		}
+		const el = composer;
+		const start = el.selectionStart ?? el.value.length;
+		const end = el.selectionEnd ?? el.value.length;
+		const before = el.value.slice(0, start);
+		const after = el.value.slice(end);
+		const lead = before === '' || /\s$/.test(before) ? '' : ' ';
+		const trail = after === '' || /^\s/.test(after) ? '' : ' ';
+		el.focus();
+		el.setSelectionRange(start, end);
+		if (!document.execCommand('insertText', false, lead + text + trail)) {
+			const next = before + lead + text + trail + after;
+			el.value = next;
+			coder.draft = next;
+		}
+	}
+
+	$effect(() => {
+		if (voiceState !== 'recording') {
+			return;
+		}
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key !== 'Escape') {
+				return;
+			}
+			event.preventDefault();
+			event.stopPropagation();
+			cancelVoice();
+		};
+		window.addEventListener('keydown', onKey, true);
+		return () => window.removeEventListener('keydown', onKey, true);
+	});
 
 	async function shipIt(): Promise<void> {
 		const extra = coder.draft.trim();
@@ -3808,52 +3884,70 @@
 				onpaste={onComposerPaste}
 				onblur={onComposerBlur}
 			></textarea>
-			{#if coder.rows.length > 0 || showReasoningPick}
-				<div class="composer-meta">
-					{#if coder.rows.length > 0}
+			<div class="composer-meta">
+				{#if coder.rows.length > 0}
+					<button
+						type="button"
+						class="ship-it"
+						title="Tell the agent to land what it held back: commit, push, publish, open the PR (anything typed in the composer is sent along)"
+						onclick={() => void shipIt()}
+					>
+						<RocketIcon size={12} />
+						Ship it
+					</button>
+				{/if}
+				<button
+					type="button"
+					class="voice"
+					class:recording={voiceState === 'recording'}
+					disabled={voiceState === 'transcribing'}
+					title={voiceState === 'recording'
+						? 'Stop and transcribe into the composer (Esc to discard)'
+						: voiceState === 'transcribing'
+							? 'Transcribing…'
+							: 'Dictate into the composer'}
+					aria-pressed={voiceState === 'recording'}
+					onclick={() => void toggleVoice()}
+				>
+					<MicIcon size={12} />
+					{#if voiceState === 'recording'}
+						Listening…
+					{:else if voiceState === 'transcribing'}
+						Transcribing…
+					{/if}
+				</button>
+				{#if showReasoningPick}
+					<span class="reasoning-pick">
 						<button
 							type="button"
-							class="ship-it"
-							title="Tell the agent to land what it held back: commit, push, publish, open the PR (anything typed in the composer is sent along)"
-							onclick={() => void shipIt()}
+							class="reasoning-button"
+							title="Model and reasoning effort for this session (the defaults for other sessions are in model settings)"
+							aria-haspopup="menu"
+							aria-expanded={reasoningMenuAnchor !== null}
+							onpointerdown={(e) => e.stopPropagation()}
+							onclick={toggleReasoningMenu}
 						>
-							<RocketIcon size={12} />
-							Ship it
-						</button>
-					{/if}
-					{#if showReasoningPick}
-						<span class="reasoning-pick">
-							<button
-								type="button"
-								class="reasoning-button"
-								title="Model and reasoning effort for this session (the defaults for other sessions are in model settings)"
-								aria-haspopup="menu"
-								aria-expanded={reasoningMenuAnchor !== null}
-								onpointerdown={(e) => e.stopPropagation()}
-								onclick={toggleReasoningMenu}
+							<span class="reasoning-model" class:session-pick={coder.sessionModel !== null}
+								>{coder.currentModelName ?? 'model'}</span
 							>
-								<span class="reasoning-model" class:session-pick={coder.sessionModel !== null}
-									>{coder.currentModelName ?? 'model'}</span
+							{#if showEffortChoices}
+								<span class="reasoning-sep" aria-hidden="true">·</span>
+								<span class="reasoning-effort" class:session-pick={reasoningEffort !== null}
+									>{reasoningEffort ?? defaultEffort ?? 'default'}</span
 								>
-								{#if showEffortChoices}
-									<span class="reasoning-sep" aria-hidden="true">·</span>
-									<span class="reasoning-effort" class:session-pick={reasoningEffort !== null}
-										>{reasoningEffort ?? defaultEffort ?? 'default'}</span
-									>
-								{/if}
-								<span class="reasoning-caret" aria-hidden="true">▾</span>
-							</button>
-						</span>
-						{#if reasoningMenuAnchor !== null}
-							<ContextMenu
-								items={reasoningMenuItems}
-								anchorRect={reasoningMenuAnchor}
-								onClose={() => (reasoningMenuAnchor = null)}
-							/>
-						{/if}
+							{/if}
+							<span class="reasoning-caret" aria-hidden="true">▾</span>
+						</button>
+					</span>
+					{#if reasoningMenuAnchor !== null}
+						<ContextMenu
+							items={reasoningMenuItems}
+							anchorRect={reasoningMenuAnchor}
+							onClose={() => (reasoningMenuAnchor = null)}
+						/>
 					{/if}
-				</div>
-			{/if}
+				{/if}
+			</div>
 		</div>
 	{:else if coder.view === 'subagent'}
 		<!-- Sub-agent pop-out: full transcript of one sub-agent, with
@@ -6553,6 +6647,37 @@
 	.composer-meta .reasoning-pick {
 		margin-left: auto;
 		min-width: 0;
+	}
+	.voice {
+		flex: none;
+		white-space: nowrap;
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		padding: 1px 6px;
+		background: transparent;
+		color: var(--m-fg-subtle);
+		border: 1px solid transparent;
+		border-radius: 4px;
+		font: inherit;
+		font-size: 11px;
+		cursor: pointer;
+	}
+	.voice:hover:not(:disabled) {
+		color: var(--m-accent);
+	}
+	.voice:disabled {
+		cursor: progress;
+	}
+	.voice.recording {
+		color: var(--m-danger);
+		border-color: var(--m-danger);
+		animation: voice-pulse 1.2s ease-in-out infinite;
+	}
+	@keyframes voice-pulse {
+		50% {
+			opacity: 0.55;
+		}
 	}
 	.ship-it {
 		flex: none;

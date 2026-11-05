@@ -299,6 +299,14 @@ export const ipc = {
 		serviceRecreate: (folderPath: string, service: string) =>
 			call<ProjectComposeStatus>('project_compose_service_recreate', { folderPath, service }),
 	},
+	/** Microphone capture for the composer's voice input; desktop-
+	 *  local (the mic is on this machine, the workspace may not be). */
+	voice: {
+		start: () => local<void>('voice_start'),
+		/** Base64 WAV, or '' when only silence was captured. */
+		stop: () => local<string>('voice_stop'),
+		cancel: () => local<void>('voice_cancel'),
+	},
 	browser: {
 		/** Turn a URL into one the webview can load: unchanged for
 		 *  `inContainer = false`, otherwise rewritten onto a host
@@ -506,6 +514,8 @@ export const ipc = {
 		listProviderModels: (id: string) => call<ProviderModelSummary[]>('coder_list_provider_models', { id }),
 		openrouterCredits: (id: string) => call<OpenRouterCredits>('coder_openrouter_credits', { id }),
 		chatgptUsage: (id: string) => call<ChatGptUsage>('coder_chatgpt_usage', { id }),
+		/** Speech-to-text for a base64 WAV clip from `voice.stop`. */
+		transcribe: (wavBase64: string) => call<string>('coder_transcribe', { wavBase64 }),
 		newProviderId: () => call<string>('coder_new_provider_id'),
 		probeProvider: (baseUrl: string, apiKey: string, kind: ProviderKind = 'custom') =>
 			call<ProviderProbeResult>('coder_probe_provider', {

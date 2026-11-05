@@ -903,6 +903,14 @@ pub async fn coder_set_session_reasoning_effort(app: &AppCore, effort: Option<St
 		.map_err(MoonError::from)
 }
 
+/// Transcribe a base64 WAV clip recorded by the desktop side (the
+/// composer's voice input).
+pub async fn coder_transcribe(app: &AppCore, wav_base64: String) -> Result<String, MoonError> {
+	let wav = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, wav_base64.as_bytes())
+		.map_err(|err| MoonError::invalid(format!("invalid audio: {err}")))?;
+	app.coder.transcribe(wav).await.map_err(MoonError::from)
+}
+
 /// Set the standard model for the active folder's visible session
 /// only; `None` follows the model settings.
 pub async fn coder_set_session_model(app: &AppCore, model: Option<String>) -> Result<(), MoonError> {
@@ -1659,6 +1667,7 @@ crate::commands! {
 	coder_set_bash_target_override([app] force_host: bool),
 	coder_set_session_reasoning_effort([app] effort: Option<String>),
 	coder_set_session_model([app] model: Option<String>),
+	coder_transcribe([app] wav_base64: String),
 	coder_open_session([app] id: String),
 	coder_session_jsonl_path([app] id: String),
 	coder_rename_session([app] id: String, title: String),

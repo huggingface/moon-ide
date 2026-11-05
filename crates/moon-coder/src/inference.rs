@@ -1617,6 +1617,36 @@ impl InferenceClient {
 		crate::chatgpt::usage(&self.http, &self.chatgpt, id, base_url).await
 	}
 
+	/// Transcribe a WAV clip for the composer's voice input
+	/// ([`crate::defaults::VOICE_TRANSCRIBE_URL`]).
+	pub async fn transcribe(&self, wav: Vec<u8>) -> Result<String, CoderError> {
+		#[derive(serde::Deserialize)]
+		struct Transcript {
+			text: String,
+		}
+		let token = self.auth.current_access_token().await?;
+		let endpoint = crate::defaults::VOICE_TRANSCRIBE_URL;
+		let response = self
+			.http
+			.post(endpoint)
+			.timeout(REQUEST_TIMEOUT)
+			.bearer_auth(&token)
+			.header(reqwest::header::CONTENT_TYPE, "audio/wav")
+			.body(wav)
+			.send()
+			.await
+			.map_err(CoderError::from)?;
+		let status = response.status();
+		let request_id = request_id_of(&response);
+		let body = response.text().await.map_err(CoderError::from)?;
+		if !status.is_success() {
+			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
+		}
+		let parsed: Transcript = serde_json::from_str(&body)
+			.map_err(|err| CoderError::Internal(format!("unexpected transcription response: {err}")))?;
+		Ok(parsed.text.trim().to_owned())
+	}
+
 	/// Start a Codex device-code sign-in (ADR 0101).
 	pub async fn chatgpt_start_login(&self) -> Result<moon_protocol::coder_models::ChatGptDeviceCode, CoderError> {
 		crate::chatgpt_auth::start_device_login(&self.http).await

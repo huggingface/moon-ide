@@ -1963,6 +1963,19 @@ with any composer text appended. Agents stop short of landing work
 unless told, so this is the one-click "go ahead". The reasoning
 picker sits at the other end of that row.
 
+Next to it, a **mic** button dictates into the composer: click to
+record, click again to transcribe, Esc to discard. The text lands at
+the caret and is never sent by itself. Recording is desktop-local
+(`voice_*` commands shelling out to `pw-record`, else `arecord`, as
+16 kHz mono WAV; the mic is on the window's machine, the workspace may
+be remote; Linux only for now). Near-silent clips are dropped (Whisper
+invents text for silence). Transcription goes through the workspace
+core (`coder_transcribe`) to Whisper on HF Inference Providers
+(`openai/whisper-large-v3-turbo`) with the user's HF sign-in, so audio
+leaves the machine. Linking an audio library (cpal) was rejected: it
+needs ALSA headers at build time; local Whisper was rejected for a
+0.5–1.5 GB model download and CPU load.
+
 Images in transcript markdown (`![alt](path)`) load from a
 workspace-relative path or any absolute path. Clicking one opens the
 app-wide image viewer (the same one pasted attachments and tool-result

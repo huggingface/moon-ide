@@ -173,11 +173,15 @@ pub fn run() {
 			commands::companion::companion_e2e_revoke,
 			commands::ui::ui_set_right_panel,
 			commands::browser::browser_capture,
+			commands::voice::voice_start,
+			commands::voice::voice_stop,
+			commands::voice::voice_cancel,
 			transfer::transfer_upload,
 			transfer::transfer_download,
 			transfer::transfer_cancel,
 		])
 		.manage(transfer::Transfers::default())
+		.manage(commands::voice::Voice::default())
 		.setup(move |app| {
 			let SetupInputs {
 				mode,

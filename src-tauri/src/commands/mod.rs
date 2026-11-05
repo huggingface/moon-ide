@@ -10,5 +10,6 @@ pub mod rpc;
 pub mod slack;
 pub mod system;
 pub mod ui;
+pub mod voice;
 pub mod window;
 pub mod workspace;
