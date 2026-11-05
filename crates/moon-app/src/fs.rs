@@ -618,9 +618,22 @@ pub async fn fs_git_existing_pr_url(app: &AppCore) -> Result<Option<String>, Moo
 /// frontend's flash carries the actionable hint without us
 /// re-wrapping it.
 pub async fn fs_branch_switch(app: &AppCore, target: BranchSwitchTarget) -> Result<(), MoonError> {
+	let t0 = std::time::Instant::now();
 	let entry = app.workspaces.require_active_folder().await?;
 	refuse_switching_owned_worktree(&app.coder, &entry).await?;
-	entry.host.branch_switch(&target).await
+	let t1 = std::time::Instant::now();
+	let result = entry.host.branch_switch(&target).await;
+	let t2 = std::time::Instant::now();
+	app.logs.emit(
+		"perf",
+		moon_core::logs::LogLevel::Info,
+		format!(
+			"fs_branch_switch preflight={}ms switch={}ms (lock wait + git, see git lock lines)",
+			(t1 - t0).as_millis(),
+			(t2 - t1).as_millis(),
+		),
+	);
+	result
 }
 
 /// Refuse a branch switch in a worktree folder a coder session runs

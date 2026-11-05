@@ -24,7 +24,7 @@
 //! is fine for a debug pane: the user always wants the most recent
 //! activity.
 
-import { subscribe, type Unsubscribe } from './transport';
+import { setSlowCallReporter, subscribe, type Unsubscribe } from './transport';
 import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
@@ -327,3 +327,7 @@ export function frontendLog(source: string, level: LogLevel, message: string): v
 		seq: frontendSeq--,
 	});
 }
+
+setSlowCallReporter((method, elapsedMs) => {
+	frontendLog('perf', 'info', `ipc ${method}: ${elapsedMs.toFixed(0)}ms`);
+});

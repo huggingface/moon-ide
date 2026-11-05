@@ -10,7 +10,32 @@ export type Unsubscribe = () => void;
 
 /** Call a command on the shared workspace-process surface (`moon-app`). */
 export function call<T>(method: string, params?: Record<string, unknown>): Promise<T> {
-	return invoke<T>('rpc', { method, params: params ?? {} });
+	const started = performance.now();
+	const pending = invoke<T>('rpc', { method, params: params ?? {} });
+	if (slowCallReporter === null) {
+		return pending;
+	}
+	const report = slowCallReporter;
+	return pending.finally(() => {
+		const elapsed = performance.now() - started;
+		if (elapsed >= SLOW_CALL_MS) {
+			report(method, elapsed);
+		}
+	});
+}
+
+const SLOW_CALL_MS = 100;
+
+let slowCallReporter: ((method: string, elapsedMs: number) => void) | null = null;
+
+/**
+ * Report every `call` slower than `SLOW_CALL_MS` (wall time, including
+ * queueing behind the backend's git lock). Installed by the logs
+ * store; a setter rather than an import because `logs.svelte.ts`
+ * already depends on this module.
+ */
+export function setSlowCallReporter(reporter: (method: string, elapsedMs: number) => void): void {
+	slowCallReporter = reporter;
 }
 
 /**

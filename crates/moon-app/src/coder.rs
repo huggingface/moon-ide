@@ -608,6 +608,8 @@ pub async fn coder_discard_worktree(
 	// stale-leftover checkouts (ADR 0044 / ADR 0068), so a checkout
 	// git already forgot still discards instead of erroring forever.
 	let host_path = camino::Utf8Path::new(&path);
+	let t0 = std::time::Instant::now();
+	let mut t_container = t0;
 	match app.workspaces.folder_for_path(&parent_path).await {
 		Some(parent) => {
 			// `git worktree remove` runs against the parent repo on its
@@ -622,6 +624,7 @@ pub async fn coder_discard_worktree(
 			} else {
 				camino::Utf8PathBuf::from(&path)
 			};
+			t_container = std::time::Instant::now();
 			moon_core::worktree::discard_checkout(parent.host.as_ref(), host_path, &remove_path, force).await?;
 		}
 		None => {
@@ -638,8 +641,22 @@ pub async fn coder_discard_worktree(
 			}
 		}
 	}
+	let t_discard = std::time::Instant::now();
 	app.workspaces.remove_folder(&path).await?;
-	Ok(app.workspaces.snapshot().await)
+	let snap = app.workspaces.snapshot().await;
+	let t_end = std::time::Instant::now();
+	app.logs.emit(
+		"perf",
+		moon_core::logs::LogLevel::Info,
+		format!(
+			"coder_discard_worktree container_check={}ms discard={}ms unbind={}ms total={}ms",
+			(t_container - t0).as_millis(),
+			(t_discard - t_container).as_millis(),
+			(t_end - t_discard).as_millis(),
+			(t_end - t0).as_millis(),
+		),
+	);
+	Ok(snap)
 }
 
 /// Merge a worktree's branch into `base_branch` on the parent repo,

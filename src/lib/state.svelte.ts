@@ -1541,13 +1541,17 @@ class WorkspaceState {
 	}
 
 	private async pruneWorktree(path: string, force: boolean) {
+		const perf = perfTimer('pruneWorktree');
 		const ws = await ipc.coder.discardWorktree(path, force);
+		perf.lap('discardWorktree');
 		this.folderStates.delete(path);
 		this.pruneNavEntriesForFolder(path);
 		projectCompose.forget(path);
 		forgetTerminalMemoryFor(path);
 		await this.adoptWorkspaceSnapshot(ws);
+		perf.lap('adoptWorkspaceSnapshot');
 		this.persistAppState();
+		perf.done();
 	}
 
 	/**
@@ -2666,6 +2670,11 @@ class WorkspaceState {
 			// `setGitStatus` updates in place, so late-arriving
 			// entries fade / tint the affected rows without a reflow.
 			void this.refreshGitStatus(collected.paths, changedSubset);
+			frontendLog(
+				'perf',
+				'info',
+				`loadPaths walk=${(tWalk - tStart).toFixed(0)}ms assign=${(tAssign - tWalk).toFixed(0)}ms count=${collected.paths.length}`,
+			);
 			// eslint-disable-next-line no-console
 			console.info(
 				`moon-ide: loadPaths(${this.activeFolderPath}) ` +
@@ -3554,13 +3563,19 @@ class WorkspaceState {
 			return false;
 		}
 		this.branchSwitcher.switching = true;
+		const perf = perfTimer('switchToBranch');
 		try {
 			await ipc.fs.branchSwitch(target);
+			perf.lap('branchSwitch');
 			const label = target.kind === 'local' ? target.name : `PR #${target.number}`;
 			this.flash(`Switched to ${label}.`);
 			this.closeBranchSwitcher();
 			await this.refreshGitBranch();
-			void this.refreshActiveFolder();
+			perf.lap('refreshGitBranch');
+			void this.refreshActiveFolder().then(() => {
+				perf.lap('refreshActiveFolder');
+				perf.done();
+			});
 			// Switching a worktree's branch changes its bar label too.
 			void this.syncWorktreeBranchLabel();
 			return true;
@@ -3803,9 +3818,11 @@ class WorkspaceState {
 			);
 			return;
 		}
+		const perf = perfTimer(`refreshActiveFolder(topology=${topologyChanged})`);
 		try {
 			if (topologyChanged) {
 				await this.loadPaths(changedSubset);
+				perf.lap('loadPaths');
 			} else {
 				// Modify-only batch: every changed entry already
 				// exists in the tree's `paths` snapshot, so the
@@ -3817,9 +3834,12 @@ class WorkspaceState {
 				// one `git status` call and one re-read instead of a
 				// tree walk plus N×(git show + read).
 				await this.refreshGitStatus(this.paths, changedSubset);
+				perf.lap('refreshGitStatus');
 			}
 		} finally {
 			await this.#drainPendingRefresh();
+			perf.lap('drainPending');
+			perf.done();
 		}
 	}
 
@@ -7357,6 +7377,28 @@ function resolveSystemTheme(theme: SystemTheme): boolean {
  * leaking trees we haven't seen in the wild yet.
  */
 const MAX_TREE_DEPTH = 16;
+
+/**
+ * Phase timer for the `perf` logs source: `lap` records the time
+ * since the previous lap, `done` emits one line with every lap and
+ * the total. Investigation aid for slow branch switches / worktree
+ * removal.
+ */
+function perfTimer(label: string): { lap: (name: string) => void; done: () => void } {
+	const start = performance.now();
+	let last = start;
+	const laps: string[] = [];
+	return {
+		lap(name) {
+			const now = performance.now();
+			laps.push(`${name}=${(now - last).toFixed(0)}ms`);
+			last = now;
+		},
+		done() {
+			frontendLog('perf', 'info', `${label} ${laps.join(' ')} total=${(performance.now() - start).toFixed(0)}ms`);
+		},
+	};
+}
 
 /**
  * Quick check for column-0 merge-conflict marker lines —

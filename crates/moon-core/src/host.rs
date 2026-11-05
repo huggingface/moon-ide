@@ -806,6 +806,37 @@ pub trait WorkspaceHost: Send + Sync {
 	async fn git_init(&self, path: &Utf8Path) -> MoonResult<()>;
 }
 
+/// Logs-panel source for git-lock contention and slow-operation
+/// timings. Investigation aid for slow branch switches / worktree
+/// removal on big repos; entries under the threshold are dropped so
+/// the panel only shows what's worth reading.
+const PERF_LOG_SOURCE: &str = "perf";
+const PERF_LOG_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Owned git-mutex guard that reports long holds to the `perf` log
+/// source on drop, naming the operation so contention is attributable.
+struct GitLockGuard {
+	_inner: tokio::sync::OwnedMutexGuard<()>,
+	op: &'static str,
+	acquired: std::time::Instant,
+	sink: Option<Arc<crate::logs::LogSink>>,
+}
+
+impl Drop for GitLockGuard {
+	fn drop(&mut self) {
+		let held = self.acquired.elapsed();
+		if held < PERF_LOG_THRESHOLD {
+			return;
+		}
+		let Some(sink) = &self.sink else { return };
+		sink.emit(
+			PERF_LOG_SOURCE,
+			crate::logs::LogLevel::Info,
+			format!("git lock held {}: {}ms", self.op, held.as_millis()),
+		);
+	}
+}
+
 pub struct LocalHost {
 	root: Utf8PathBuf,
 	editorconfig: EditorConfigService,
@@ -864,8 +895,26 @@ impl LocalHost {
 	/// a hook mid-`git stash apply`. See [ADR 0015].
 	///
 	/// [ADR 0015]: ../../specs/decisions/0015-git-serialisation.md
-	async fn git_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
-		self.git_mutex.clone().lock_owned().await
+	async fn git_lock(&self, op: &'static str) -> GitLockGuard {
+		let requested = std::time::Instant::now();
+		let inner = self.git_mutex.clone().lock_owned().await;
+		let acquired = std::time::Instant::now();
+		let waited = acquired - requested;
+		if waited >= PERF_LOG_THRESHOLD {
+			if let Some(sink) = &self.log_sink {
+				sink.emit(
+					PERF_LOG_SOURCE,
+					crate::logs::LogLevel::Info,
+					format!("git lock wait {op}: {}ms", waited.as_millis()),
+				);
+			}
+		}
+		GitLockGuard {
+			_inner: inner,
+			op,
+			acquired,
+			sink: self.log_sink.clone(),
+		}
 	}
 
 	/// Re-stat `path` after the lint-staged chain ran, returning a
@@ -1679,7 +1728,7 @@ impl WorkspaceHost for LocalHost {
 		// path is dominated by git itself anyway; the walker is
 		// single-threaded but fast enough for IDE-sized trees (tens
 		// of thousands of files) without `build_parallel`'s wiring.
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_status_entries").await;
 		let target = self.shell_target().await;
 		let root = self.root.clone();
 		let paths = paths.to_vec();
@@ -1759,7 +1808,7 @@ impl WorkspaceHost for LocalHost {
 		// merge conflict against a divergent base, where
 		// `git status` against the unmerged index can take tens
 		// of seconds — see [ADR 0015](crate::specs#0015).
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("collect_paths").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let skip = {
@@ -1833,7 +1882,7 @@ impl WorkspaceHost for LocalHost {
 		if rels.is_empty() {
 			return Ok(());
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_restore_paths").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -1892,7 +1941,7 @@ impl WorkspaceHost for LocalHost {
 		if rels.is_empty() {
 			return Ok(());
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_add_paths").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -1933,7 +1982,7 @@ impl WorkspaceHost for LocalHost {
 				}
 			}
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_blame").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -1952,7 +2001,7 @@ impl WorkspaceHost for LocalHost {
 			return Ok(None);
 		}
 		let rel = reject_uncontained_path("git_permalink", path)?;
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_permalink").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -1967,7 +2016,7 @@ impl WorkspaceHost for LocalHost {
 		if rel.as_str().is_empty() {
 			return Ok(None);
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_blob_sha").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2024,7 +2073,7 @@ impl WorkspaceHost for LocalHost {
 				}
 			}
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_ref_content").await;
 		let root = self.root.clone();
 		let rev = rev.to_owned();
 		tokio::task::spawn_blocking(move || {
@@ -2036,7 +2085,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_default_branch_diff(&self) -> MoonResult<Option<BranchDiffStatus>> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_default_branch_diff").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2047,7 +2096,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_branch(&self) -> MoonResult<GitBranchInfo> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_branch").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2058,7 +2107,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_exclude_path(&self) -> MoonResult<Option<String>> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_exclude_path").await;
 		let root = self.root.clone();
 		let target = self.shell_target().await;
 		tokio::task::spawn_blocking(move || {
@@ -2070,7 +2119,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_local_branches(&self) -> MoonResult<Vec<String>> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_local_branches").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2088,7 +2137,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_commit_on_new_branch(&self, branch: &str, message: &str) -> MoonResult<GitCommitResult> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_commit_on_new_branch").await;
 		let target = self.shell_target().await;
 		let root = self.root.clone();
 		let branch = branch.to_owned();
@@ -2102,7 +2151,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_worktree_add(&self, path: &Utf8Path, branch: WorktreeBranch) -> MoonResult<GitWorktree> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_worktree_add").await;
 		let root = self.root.clone();
 		let path = path.to_owned();
 		tokio::task::spawn_blocking(move || {
@@ -2124,7 +2173,7 @@ impl WorkspaceHost for LocalHost {
 		branch: WorktreeBranch,
 		reset_main_to: Option<String>,
 	) -> MoonResult<GitWorktree> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_worktree_add_moving").await;
 		let root = self.root.clone();
 		let path = path.to_owned();
 		tokio::task::spawn_blocking(move || {
@@ -2138,7 +2187,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_worktree_list(&self) -> MoonResult<Vec<GitWorktree>> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_worktree_list").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2149,7 +2198,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_worktree_remove(&self, path: &Utf8Path, force: bool) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_worktree_remove").await;
 		// Remove runs where the worktree's metadata is valid: the
 		// container when the workspace runs there (the caller passes
 		// the `/workspace/.worktrees/…` path), the host otherwise.
@@ -2176,7 +2225,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_worktree_forget(&self, path: &Utf8Path) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_worktree_forget").await;
 		// Same target rationale as `git_worktree_remove`: prune runs
 		// where the worktree metadata is valid.
 		let target = self.shell_target().await;
@@ -2191,7 +2240,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_delete_branch(&self, name: &str) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_delete_branch").await;
 		let root = self.root.clone();
 		let name = name.to_owned();
 		tokio::task::spawn_blocking(move || {
@@ -2203,7 +2252,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_diff_summary(&self) -> MoonResult<String> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_diff_summary").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2218,7 +2267,7 @@ impl WorkspaceHost for LocalHost {
 		if trimmed.is_empty() && !amend {
 			return Err(MoonError::invalid("commit message is empty"));
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_commit").await;
 		let target = self.shell_target().await;
 		let root = self.root.clone();
 		let owned = trimmed.to_owned();
@@ -2257,7 +2306,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_pull(&self) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_pull").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2286,7 +2335,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_merge_default_branch(&self, remote_ref: &str) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_merge_default_branch").await;
 		let root = self.root.clone();
 		let remote_ref = remote_ref.to_owned();
 		tokio::task::spawn_blocking(move || {
@@ -2325,7 +2374,7 @@ impl WorkspaceHost for LocalHost {
 		// the snapshot internally consistent — a concurrent
 		// `git merge --abort` can't half-clear the state from
 		// under us.
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_merge_state").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2336,7 +2385,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_merge_abort(&self) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_merge_abort").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2368,7 +2417,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn branch_switch(&self, target: &BranchSwitchTarget) -> MoonResult<()> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("branch_switch").await;
 		let root = self.root.clone();
 		let target = target.clone();
 		tokio::task::spawn_blocking(move || {
@@ -2380,7 +2429,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_head_commit_message(&self) -> MoonResult<String> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_head_commit_message").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2391,7 +2440,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_diff_patch(&self) -> MoonResult<String> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_diff_patch").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2402,7 +2451,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_log(&self, limit: u32) -> MoonResult<Vec<CommitEntry>> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_log").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
@@ -2413,7 +2462,7 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_commit_diff(&self, sha: &str) -> MoonResult<Option<CommitDiff>> {
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_commit_diff").await;
 		let root = self.root.clone();
 		let sha = sha.to_owned();
 		tokio::task::spawn_blocking(move || {
@@ -2430,7 +2479,7 @@ impl WorkspaceHost for LocalHost {
 				"git_revert rejects rev: {sha:?} (expected \"HEAD\" or 40-char hex SHA)"
 			)));
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_revert").await;
 		let root = self.root.clone();
 		let sha = sha.to_owned();
 		tokio::task::spawn_blocking(move || {
@@ -2466,7 +2515,7 @@ impl WorkspaceHost for LocalHost {
 				"git_diff_against rejects commit_sha: {commit_sha:?} (expected \"HEAD\" or 40-char hex SHA)"
 			)));
 		}
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_diff_against").await;
 		let root = self.root.clone();
 		let sha = commit_sha.to_owned();
 		let files = files.to_vec();
@@ -2491,7 +2540,7 @@ impl WorkspaceHost for LocalHost {
 		}
 		// The probe itself runs under the lock so no concurrent commit
 		// slides HEAD between the behind-count and the numstat.
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_base_check").await;
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
 			Ok(run_git_base_check(&root))
@@ -2514,7 +2563,7 @@ impl WorkspaceHost for LocalHost {
 
 	async fn git_init(&self, path: &Utf8Path) -> MoonResult<()> {
 		// Init runs on the host — the path isn't bound yet.
-		let guard = self.git_lock().await;
+		let guard = self.git_lock("git_init").await;
 		let path = path.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
