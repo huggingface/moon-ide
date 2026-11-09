@@ -4549,9 +4549,18 @@ class WorkspaceState {
 	 * watcher-triggered reloads) can land two or three writes back-
 	 * to-back; one `git blame` subprocess at the end of the burst is
 	 * enough.
+	 *
+	 * Only buffers showing in a split are re-blamed; background tabs
+	 * just drop their cached blame and refetch through `setActive`
+	 * when next shown. A branch switch otherwise queued one blame per
+	 * open tab (hundreds of ms each on big repos).
 	 */
 	scheduleBlameRefresh(path: string) {
 		if (isSyntheticBufferPath(path)) {
+			return;
+		}
+		if (path !== this.leftActive && path !== this.rightActive) {
+			this.clearBlameFor(path);
 			return;
 		}
 		const existing = this.#blameTimers.get(path);

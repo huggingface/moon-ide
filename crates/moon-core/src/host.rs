@@ -1982,14 +1982,10 @@ impl WorkspaceHost for LocalHost {
 				}
 			}
 		}
-		let guard = self.git_lock("git_blame").await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			run_git_blame(&root, &rel)
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_blame join error: {e}")))?
+		tokio::task::spawn_blocking(move || run_git_blame(&root, &rel))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_blame join error: {e}")))?
 	}
 
 	async fn git_permalink(&self, path: &Utf8Path, start_line: u32, end_line: u32) -> MoonResult<Option<GitPermalink>> {
@@ -2001,14 +1997,10 @@ impl WorkspaceHost for LocalHost {
 			return Ok(None);
 		}
 		let rel = reject_uncontained_path("git_permalink", path)?;
-		let guard = self.git_lock("git_permalink").await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(run_git_permalink(&root, &rel, start_line, end_line))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_permalink join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(run_git_permalink(&root, &rel, start_line, end_line)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_permalink join error: {e}")))?
 	}
 
 	async fn git_blob_sha(&self, path: &Utf8Path) -> MoonResult<Option<String>> {
@@ -2016,14 +2008,10 @@ impl WorkspaceHost for LocalHost {
 		if rel.as_str().is_empty() {
 			return Ok(None);
 		}
-		let guard = self.git_lock("git_blob_sha").await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(run_git_blob_sha(&root, &rel))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_blob_sha join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(run_git_blob_sha(&root, &rel)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_blob_sha join error: {e}")))?
 	}
 
 	async fn publish_pr_review(&self, request: PublishReviewRequest) -> MoonResult<PublishReviewResult> {
@@ -2073,15 +2061,11 @@ impl WorkspaceHost for LocalHost {
 				}
 			}
 		}
-		let guard = self.git_lock("git_ref_content").await;
 		let root = self.root.clone();
 		let rev = rev.to_owned();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			run_git_ref_content(&root, &rev, &rel)
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_ref_content join error: {e}")))?
+		tokio::task::spawn_blocking(move || run_git_ref_content(&root, &rev, &rel))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_ref_content join error: {e}")))?
 	}
 
 	async fn git_default_branch_diff(&self) -> MoonResult<Option<BranchDiffStatus>> {
@@ -2096,33 +2080,23 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_branch(&self) -> MoonResult<GitBranchInfo> {
-		let guard = self.git_lock("git_branch").await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(run_git_branch(&root))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(run_git_branch(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_branch join error: {e}")))?
 	}
 
 	async fn git_exclude_path(&self) -> MoonResult<Option<String>> {
-		let guard = self.git_lock("git_exclude_path").await;
 		let root = self.root.clone();
 		let target = self.shell_target().await;
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(git_exclude_path(&root, &target).map(|p| p.to_string()))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_exclude_path join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(git_exclude_path(&root, &target).map(|p| p.to_string())))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_exclude_path join error: {e}")))?
 	}
 
 	async fn git_local_branches(&self) -> MoonResult<Vec<String>> {
-		let guard = self.git_lock("git_local_branches").await;
 		let root = self.root.clone();
 		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
 			let names = run_branch_list_local(&root)
 				.into_iter()
 				.filter_map(|entry| match entry {
@@ -2367,21 +2341,14 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_merge_state(&self) -> MoonResult<GitMergeState> {
-		// Holds the git mutex for the `ls-files` call. The
-		// MERGE_HEAD / MERGE_MSG reads are pure filesystem
-		// operations against `.git/` and don't need git's index
-		// lock, but bundling them under the same guard keeps
-		// the snapshot internally consistent — a concurrent
-		// `git merge --abort` can't half-clear the state from
-		// under us.
-		let guard = self.git_lock("git_merge_state").await;
+		// No git mutex (ADR 0108): `ls-files` and the MERGE_HEAD /
+		// MERGE_MSG reads never write. A snapshot torn by a
+		// concurrent `git merge --abort` is corrected by the
+		// refresh that abort's own `.git/` writes trigger.
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(read_git_merge_state(&root))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_merge_state join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(read_git_merge_state(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_merge_state join error: {e}")))?
 	}
 
 	async fn git_merge_abort(&self) -> MoonResult<()> {
@@ -2429,14 +2396,10 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_head_commit_message(&self) -> MoonResult<String> {
-		let guard = self.git_lock("git_head_commit_message").await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(run_git_head_commit_message(&root))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_head_commit_message join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(run_git_head_commit_message(&root)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_head_commit_message join error: {e}")))?
 	}
 
 	async fn git_diff_patch(&self) -> MoonResult<String> {
@@ -2451,26 +2414,18 @@ impl WorkspaceHost for LocalHost {
 	}
 
 	async fn git_log(&self, limit: u32) -> MoonResult<Vec<CommitEntry>> {
-		let guard = self.git_lock("git_log").await;
 		let root = self.root.clone();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(run_git_log(&root, limit))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_log join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(run_git_log(&root, limit)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_log join error: {e}")))?
 	}
 
 	async fn git_commit_diff(&self, sha: &str) -> MoonResult<Option<CommitDiff>> {
-		let guard = self.git_lock("git_commit_diff").await;
 		let root = self.root.clone();
 		let sha = sha.to_owned();
-		tokio::task::spawn_blocking(move || {
-			let _guard = guard;
-			Ok(run_git_commit_diff(&root, &sha))
-		})
-		.await
-		.map_err(|e| MoonError::Internal(format!("git_commit_diff join error: {e}")))?
+		tokio::task::spawn_blocking(move || Ok(run_git_commit_diff(&root, &sha)))
+			.await
+			.map_err(|e| MoonError::Internal(format!("git_commit_diff join error: {e}")))?
 	}
 
 	async fn git_revert(&self, sha: &str) -> MoonResult<()> {
@@ -5912,6 +5867,7 @@ fn run_git_blame(root: &Utf8Path, path: &Utf8PathBuf) -> MoonResult<Option<GitFi
 	let output = Command::new("git")
 		.arg("-C")
 		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
 		.args(["blame", "--porcelain", "--root", "-w", "--"])
 		.arg(path.as_std_path())
 		.output();

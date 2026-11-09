@@ -540,8 +540,9 @@ Architecturally:
   and layers the badge separately — Pierre's row colour stays
   consistent with the rest of the change vocabulary.
 - New `GitMergeState` DTO + `git_merge_state` /
-  `git_merge_abort` host methods. Both serialise via the
-  per-folder git mutex (ADR 0015). `git_merge_state` reads
+  `git_merge_abort` host methods. `git_merge_abort` serialises via
+  the per-folder git mutex (ADR 0015); `git_merge_state` is
+  read-only and runs without it (ADR 0108). `git_merge_state` reads
   `.git/MERGE_HEAD` + `.git/MERGE_MSG` and runs `git ls-files
 --unmerged` for the path list.
 - New `git_add_paths` host method for the auto-stage-on-save

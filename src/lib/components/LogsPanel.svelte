@@ -3,7 +3,7 @@
 	import { bottomPanel, type DiagTab } from '../bottomPanel.svelte';
 	import { diagLogs, MAX_ENTRIES_PER_SOURCE } from '../logs.svelte';
 	import { workspace } from '../state.svelte';
-	import type { LogLevel } from '../protocol';
+	import type { LogEntry, LogLevel } from '../protocol';
 
 	/** Diagnostic-logs sources for live LSP brokers are tagged
 	 * `lsp.<language_id>` (matches the convention in
@@ -27,7 +27,22 @@
 	type Props = { tab: DiagTab };
 	let { tab }: Props = $props();
 
-	const entries = $derived(diagLogs.entriesFor(tab.source));
+	const live = $derived(diagLogs.entriesFor(tab.source));
+	// Pause freezes the rendered list, not just auto-scroll: once a
+	// source sits at the ring cap every new entry drops the oldest,
+	// so a merely un-followed view still slides under the reader.
+	// The store's arrays are immutable, so holding the reference is
+	// a stable snapshot.
+	let frozen = $state.raw<readonly LogEntry[] | null>(null);
+	const entries = $derived(frozen ?? live);
+	const newSincePause = $derived.by(() => {
+		const last = frozen?.at(-1);
+		if (last === undefined) {
+			return live.length;
+		}
+		const idx = live.findIndex((e) => e.seq === last.seq);
+		return idx === -1 ? live.length : live.length - idx - 1;
+	});
 	const lspLanguageId = $derived(
 		tab.source.startsWith(LSP_SOURCE_PREFIX) ? tab.source.slice(LSP_SOURCE_PREFIX.length) : null,
 	);
@@ -67,6 +82,9 @@
 
 	async function clear() {
 		await diagLogs.clear(tab.source);
+		if (frozen !== null) {
+			frozen = [];
+		}
 	}
 
 	async function restart() {
@@ -84,8 +102,11 @@
 	function toggleFollow() {
 		follow = !follow;
 		if (follow) {
+			frozen = null;
 			userScrolledAway = false;
+			return;
 		}
+		frozen = live;
 	}
 
 	function close() {
@@ -110,12 +131,15 @@
 	<div class="toolbar">
 		<span class="meta">{tab.source}</span>
 		<span class="meta count">{entries.length} entr{entries.length === 1 ? 'y' : 'ies'}</span>
+		{#if frozen !== null}
+			<span class="meta count">paused, {newSincePause} new</span>
+		{/if}
 		<span class="spacer"></span>
 		<button
 			type="button"
 			class="tb-btn"
 			onclick={toggleFollow}
-			title={follow ? 'Pause auto-scroll' : 'Resume auto-scroll'}
+			title={follow ? 'Freeze the view (new entries keep buffering)' : 'Resume the live view'}
 			aria-pressed={follow}
 		>
 			{follow ? '⏸ Pause' : '▶ Follow'}
