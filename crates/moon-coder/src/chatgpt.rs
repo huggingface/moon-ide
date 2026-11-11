@@ -41,6 +41,12 @@ const ORIGINATOR: &str = "moon-ide";
 /// enough to list every model the Codex CLI's bundled catalog lists.
 const CODEX_CLIENT_VERSION: &str = "0.155.0";
 const ZSTD_LEVEL: i32 = 3;
+/// The backend rejects zstd bodies that decompress past about 2.5 MB
+/// with a bare `{"detail":"Bad Request"}` (measured: 2.49 MB passes,
+/// 2.59 MB fails), while plain JSON is accepted far beyond that. Long
+/// sessions cross it through replayed encrypted reasoning items, so
+/// bigger bodies go uncompressed.
+const ZSTD_MAX_RAW_BYTES: usize = 2_000_000;
 
 /// Everything one request needs beyond the messages.
 pub(crate) struct ChatGptRequest<'a> {
@@ -74,16 +80,22 @@ where
 	let endpoint = format!("{}/responses", req.route.base_url);
 	let body = build_body(req.model, messages, tools, req.reasoning_effort.as_deref());
 	let raw = serde_json::to_vec(&body).map_err(|err| CoderError::Internal(err.to_string()))?;
-	let compressed = zstd::bulk::compress(&raw, ZSTD_LEVEL).map_err(|err| CoderError::Internal(err.to_string()))?;
+	let zstd = raw.len() <= ZSTD_MAX_RAW_BYTES;
+	let payload = if zstd {
+		zstd::bulk::compress(&raw, ZSTD_LEVEL).map_err(|err| CoderError::Internal(err.to_string()))?
+	} else {
+		raw
+	};
 
 	let mut creds = abortable(cancel, req.auth.credentials(req.http, req.provider_id, false)).await?;
 	let mut refreshed = false;
 	let mut attempt: u32 = 0;
 	let response = loop {
-		let send = responses_builder(req.http, &endpoint, &creds)
-			.header(reqwest::header::CONTENT_ENCODING, "zstd")
-			.body(compressed.clone())
-			.send();
+		let mut builder = responses_builder(req.http, &endpoint, &creds);
+		if zstd {
+			builder = builder.header(reqwest::header::CONTENT_ENCODING, "zstd");
+		}
+		let send = builder.body(payload.clone()).send();
 		let response = abortable(cancel, async { send.await.map_err(CoderError::from) }).await?;
 		let status = response.status();
 		if status.is_success() {

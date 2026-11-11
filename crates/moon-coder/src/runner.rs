@@ -5368,7 +5368,13 @@ impl CoderHandle {
 			let turn = rt.turn.lock().await;
 			if turn.cancel.is_some() {
 				drop(turn);
-				if rt.prompts.has_pending().await {
+				// Unlike a composer send, an automated message (a
+				// `<background_result>`, a worker notice) doesn't skip a
+				// parked `ask_user`: the user is still answering it. It
+				// waits in the steer queue and reaches the model with
+				// the answer. A coordinator steering its worker does
+				// mean "move on", like the human composer.
+				if from_coordinator && rt.prompts.has_pending().await {
 					rt.prompts.skip_any().await;
 				}
 				let steer_id = new_message_id();

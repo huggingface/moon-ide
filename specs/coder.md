@@ -1874,8 +1874,10 @@ nothing to wake it.
   process that exits, send the session
   `<background_result kind="subagent|process" id="…" status="done|error" [exit_code="…"]>…</background_result>`
   (the report, or the command plus its output tail) — queued into the
-  running turn, or waking an idle session. The panel renders it as a
-  collapsed result card. Stopped work sends nothing; plain detached
+  running turn, or waking an idle session. A turn parked on `ask_user`
+  keeps its question: the result waits in the queue and reaches the
+  model with the answer (a composer send, by contrast, skips the
+  question). The panel renders it as a collapsed result card. Stopped work sends nothing; plain detached
   processes never wake anyone.
 - **`check(id)` / `stop(id)`** are shared by both kinds. `check`
   never blocks ([ADR 0106](decisions/0106-never-wait-on-background-work.md)):
