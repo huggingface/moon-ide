@@ -4303,15 +4303,6 @@
 					</span>
 				{/if}
 			</div>
-			{#if parsed.prose.trim().length > 0}
-				<!-- Markdown like assistant bubbles. User-typed text keeps
-					 its single line breaks (`breaks`); sub-agent user rows
-					 are model-authored markdown (the `task` instructions,
-					 the cap sentinel) and render as plain markdown. -->
-				<div class="bubble user-md">
-					<CoderMarkdown text={parsed.prose} breaks={inParentTranscript} />
-				</div>
-			{/if}
 			{#if row.images.length > 0}
 				<!-- Pasted images, rendered as thumbnails so the
 								 user can recognise what they attached two
@@ -4328,6 +4319,15 @@
 							<img src={img.data_url} alt={`pasted image ${i + 1}`} />
 						</button>
 					{/each}
+				</div>
+			{/if}
+			{#if parsed.prose.trim().length > 0}
+				<!-- Markdown like assistant bubbles. User-typed text keeps
+					 its single line breaks (`breaks`); sub-agent user rows
+					 are model-authored markdown (the `task` instructions,
+					 the cap sentinel) and render as plain markdown. -->
+				<div class="bubble user-md">
+					<CoderMarkdown text={parsed.prose} breaks={inParentTranscript} />
 				</div>
 			{/if}
 			{#if parsed.attachments.length > 0}
