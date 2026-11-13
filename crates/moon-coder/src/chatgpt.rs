@@ -78,14 +78,15 @@ where
 	F: FnMut(StreamEvent<'_>),
 {
 	let endpoint = format!("{}/responses", req.route.base_url);
-	let body = build_body(req.model, messages, tools, req.reasoning_effort.as_deref());
-	let raw = serde_json::to_vec(&body).map_err(|err| CoderError::Internal(err.to_string()))?;
-	let zstd = raw.len() <= ZSTD_MAX_RAW_BYTES;
-	let payload = if zstd {
-		zstd::bulk::compress(&raw, ZSTD_LEVEL).map_err(|err| CoderError::Internal(err.to_string()))?
-	} else {
-		raw
-	};
+	let session = crate::inference::SESSION_HINT.try_with(Clone::clone).ok();
+	let mut replay = session.as_deref().is_none_or(|s| !replay_disabled(s));
+	let (mut payload, mut zstd, mut raw) = encode_body(&build_body(
+		req.model,
+		messages,
+		tools,
+		req.reasoning_effort.as_deref(),
+		replay,
+	))?;
 
 	let mut creds = abortable(cancel, req.auth.credentials(req.http, req.provider_id, false)).await?;
 	let mut refreshed = false;
@@ -110,6 +111,30 @@ where
 		let retry_after = retry_after_of(&response);
 		let request_id = request_id_of(&response);
 		let text = abortable(cancel, async { response.text().await.map_err(CoderError::from) }).await?;
+		// The backend has rejected requests carrying replayed output
+		// items with a bare `{"detail":"Bad Request"}` that the same
+		// history sent stateless (as after a reload) passes. Keep the
+		// rejected body for diagnosis, then go stateless for the rest
+		// of this session's process lifetime.
+		if status == reqwest::StatusCode::BAD_REQUEST && replay {
+			let dump = std::env::temp_dir().join(format!("moon-chatgpt-400-{}.json", chrono_ms()));
+			if let Err(err) = std::fs::write(&dump, &raw) {
+				tracing::debug!(%err, "could not save the rejected ChatGPT request");
+			}
+			tracing::warn!(body = %text, dump = %dump.display(), "ChatGPT backend rejected the request; retrying without replayed output items");
+			if let Some(session) = &session {
+				disable_replay(session);
+			}
+			replay = false;
+			(payload, zstd, raw) = encode_body(&build_body(
+				req.model,
+				messages,
+				tools,
+				req.reasoning_effort.as_deref(),
+				false,
+			))?;
+			continue;
+		}
 		if let Some(message) = plan_limit_message(status, &text) {
 			return Err(CoderError::http(endpoint, status.as_u16(), message, request_id));
 		}
@@ -134,6 +159,38 @@ where
 		.await?;
 	};
 	consume_stream(response, req.model, cancel, &mut on_event).await
+}
+
+/// Serialize, and zstd-compress when small enough. Returns the payload,
+/// whether it's compressed, and the raw JSON.
+fn encode_body(body: &Value) -> Result<(Vec<u8>, bool, Vec<u8>), CoderError> {
+	let raw = serde_json::to_vec(body).map_err(|err| CoderError::Internal(err.to_string()))?;
+	if raw.len() > ZSTD_MAX_RAW_BYTES {
+		return Ok((raw.clone(), false, raw));
+	}
+	let compressed = zstd::bulk::compress(&raw, ZSTD_LEVEL).map_err(|err| CoderError::Internal(err.to_string()))?;
+	Ok((compressed, true, raw))
+}
+
+fn chrono_ms() -> u128 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_or(0, |d| d.as_millis())
+}
+
+/// Sessions whose replayed output items the backend rejected (see
+/// `chat_completion_stream`); they send stateless history from then on.
+static REPLAY_DISABLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+	std::sync::LazyLock::new(Default::default);
+
+fn replay_disabled(session: &str) -> bool {
+	REPLAY_DISABLED.lock().is_ok_and(|set| set.contains(session))
+}
+
+fn disable_replay(session: &str) {
+	if let Ok(mut set) = REPLAY_DISABLED.lock() {
+		set.insert(session.to_owned());
+	}
 }
 
 /// `GET <base>/models`: the plan's model catalog, minus hidden entries.
@@ -396,8 +453,18 @@ fn plan_limit_message(status: reqwest::StatusCode, body: &str) -> Option<String>
 	}
 }
 
-fn build_body(model: &str, messages: &[ChatMessage], tools: &[ToolDefinition], effort: Option<&str>) -> Value {
-	let (instructions, input) = translate(messages, model);
+/// `replay`: send this model's stored output items (encrypted
+/// reasoning, item ids) back verbatim; without it every assistant turn
+/// goes as plain text + calls, like a session reloaded from disk.
+fn build_body(
+	model: &str,
+	messages: &[ChatMessage],
+	tools: &[ToolDefinition],
+	effort: Option<&str>,
+	replay: bool,
+) -> Value {
+	// No stored items are filed under an empty model name.
+	let (instructions, input) = translate(messages, if replay { model } else { "" });
 	let mut body = json!({
 		"model": model,
 		"store": false,
@@ -867,7 +934,7 @@ mod tests {
 				parameters: json!({ "type": "object", "properties": { "timeout_ms": { "type": "integer" } } }),
 			},
 		};
-		let body = build_body("gpt-x", &[ChatMessage::user("hi")], &[tool], None);
+		let body = build_body("gpt-x", &[ChatMessage::user("hi")], &[tool], None, true);
 		assert_eq!(body["tools"][0]["strict"], false);
 	}
 
@@ -962,6 +1029,12 @@ mod tests {
 		let (_, other) = translate(&messages, "gpt-y");
 		assert!(other.iter().all(|i| i["type"] != "reasoning"));
 		assert!(other.iter().all(|i| i.get("id").is_none()));
+
+		// Nor is anything once replay is off (the 400 fallback).
+		let stateless = build_body("gpt-x", &messages, &[], None, false);
+		let items = stateless["input"].as_array().unwrap();
+		assert!(items.iter().all(|i| i["type"] != "reasoning"));
+		assert!(items.iter().all(|i| i.get("id").is_none()));
 	}
 
 	#[test]
