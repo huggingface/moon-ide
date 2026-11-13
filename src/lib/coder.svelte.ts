@@ -1410,6 +1410,62 @@ export class CoderPanelState {
 		return false;
 	}
 
+	/** When every session behind a folder bar's running (`working`)
+	 *  or finished (`attentionPending`) glyph is a coordinator's
+	 *  worker, the title of (one of) those coordinators, so the bar
+	 *  can say where that activity is driven from instead of looking
+	 *  like a session of the user's own. `null` when the user's own
+	 *  session is among them, or nothing is flagged. */
+	coordinatorBehind(
+		coderRoot: string,
+		worktreeRoot: string | null,
+		flag: 'working' | 'attentionPending',
+	): string | null {
+		const f = this.bucketFor(coderRoot);
+		let orchestrator: string | null = null;
+		for (const [id, session] of f.sessionsById) {
+			if (!session[flag] || this.#sessionWorktreeRoot(f, id) !== worktreeRoot) {
+				continue;
+			}
+			const owner = this.#orchestratorOf(f, id);
+			if (owner === null) {
+				return null;
+			}
+			orchestrator ??= owner;
+		}
+		if (orchestrator === null) {
+			return null;
+		}
+		for (const folder of this.byFolder.values()) {
+			const title =
+				folder.sessions?.find((s) => s.id === orchestrator)?.title ??
+				folder.sessionsById.get(orchestrator)?.activeSession?.title;
+			if (title !== undefined) {
+				return title;
+			}
+		}
+		return 'a coordinator';
+	}
+
+	/** The coordinator that spawned session `id`: from the folder's
+	 *  sessions list, else from a live coordinator's `spawn_worker`
+	 *  cards (the list isn't loaded for folders not visited yet). */
+	#orchestratorOf(folder: FolderState, id: string): string | null {
+		const listed = folder.sessions?.find((s) => s.id === id)?.orchestrator_session_id;
+		if (listed) {
+			return listed;
+		}
+		for (const bucket of this.byFolder.values()) {
+			for (const [coordinatorId, session] of bucket.sessionsById) {
+				const card = session.subagentSummaries.get(id);
+				if (card?.worker) {
+					return coordinatorId;
+				}
+			}
+		}
+		return null;
+	}
+
 	/** Resolve the `worktree_root` for a session id within a folder
 	 *  bucket. Checks the session bucket's `activeSession` summary
 	 *  first (set by `session_loaded` / `openSession`), then falls
@@ -3229,6 +3285,34 @@ export class CoderPanelState {
 		return [...this.subagentSummaries.values()].filter((s) => s.status === 'running' && !s.worker);
 	}
 
+	/** A coordinator's spawned workers whose own session is running a
+	 *  turn (or parked on `ask_user`), for the strip above the
+	 *  composer. Workers are separate sessions: they don't wake the
+	 *  coordinator, so they stay out of `hasBackgroundWork`. */
+	get runningWorkers(): SubagentSummary[] {
+		return [...this.subagentSummaries.values()].filter((s) => s.worker && this.isSessionRunningAnywhere(s.id));
+	}
+
+	/** Like `FolderState.isSessionRunning`, across every folder: a
+	 *  coordinator's workers live in other folders and worktrees. */
+	isSessionRunningAnywhere(sessionId: string): boolean {
+		return this.#sessionAnywhere(sessionId)?.working ?? false;
+	}
+
+	isSessionAwaitingInputAnywhere(sessionId: string): boolean {
+		return this.#sessionAnywhere(sessionId)?.awaitingInput ?? false;
+	}
+
+	#sessionAnywhere(sessionId: string): SessionViewState | undefined {
+		for (const folder of this.byFolder.values()) {
+			const session = folder.sessionsById.get(sessionId);
+			if (session !== undefined) {
+				return session;
+			}
+		}
+		return undefined;
+	}
+
 	/** Whether anything would still wake the visible session. */
 	get hasBackgroundWork(): boolean {
 		return this.activeProcesses.length > 0 || this.backgroundSubagents.length > 0;
@@ -3465,6 +3549,18 @@ export class CoderPanelState {
 		const following = folderPath === active && folder.view === 'session' && folder.visibleSessionId === sessionId;
 		if (following) {
 			return;
+		}
+		// Not done while its background work, or a coordinator's
+		// workers, still run: their reports start another turn, and
+		// that one earns the marker (same rule as the desktop
+		// notification).
+		if (session.working) {
+			return;
+		}
+		for (const summary of session.subagentSummaries.values()) {
+			if (summary.worker && this.isSessionRunningAnywhere(summary.id)) {
+				return;
+			}
 		}
 		session.attentionPending = true;
 	}

@@ -1,4 +1,7 @@
 <script lang="ts">
+	import { normalizeBrowserUrl, openInIdeBrowser } from '../browserOpen';
+	import { palette } from '../commands.svelte';
+	import { formatError } from '../protocol';
 	import { workspace } from '../state.svelte';
 	import { workspacePicker } from '../workspacePicker.svelte';
 	import { workspaceCreate } from '../workspaceCreate.svelte';
@@ -14,16 +17,56 @@
 	const isMac =
 		typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
 	const mod = isMac ? '⌘' : 'Ctrl';
+
+	// With folders bound this is just the "no file open" pane.
+	const hasFolders = $derived((workspace.workspace?.folders.length ?? 0) > 0);
+
+	let browserUrl = $state('');
+
+	function openBrowserTab(event: SubmitEvent): void {
+		event.preventDefault();
+		const url = normalizeBrowserUrl(browserUrl);
+		if (url === null) {
+			workspace.flash('Enter an http(s) address, e.g. localhost:5173');
+			return;
+		}
+		openInIdeBrowser(url).then(
+			() => {
+				browserUrl = '';
+			},
+			(err: unknown) => workspace.flash(`Couldn't open the tab: ${formatError(err)}`),
+		);
+	}
 </script>
 
 <div class="welcome">
 	<div class="card">
 		<h1>{workspace.workspaceName ?? 'moon-ide'}</h1>
-		<p class="subtitle">This workspace is empty. Open a folder to begin.</p>
-		<div class="actions">
-			<button class="primary" onclick={() => void onPickFolder()}>Add folder…</button>
-		</div>
+		{#if hasFolders}
+			<p class="subtitle">No file open.</p>
+			<form class="browser-open" onsubmit={openBrowserTab}>
+				<input
+					type="text"
+					placeholder="localhost:5173 or any URL"
+					aria-label="Address to open in a browser tab"
+					spellcheck="false"
+					bind:value={browserUrl}
+				/>
+				<button type="submit" class="primary">Open in browser tab</button>
+			</form>
+		{:else}
+			<p class="subtitle">This workspace is empty. Open a folder to begin.</p>
+			<div class="actions">
+				<button class="primary" onclick={() => void onPickFolder()}>Add folder…</button>
+			</div>
+		{/if}
 		<div class="shortcuts" aria-label="Workspace shortcuts">
+			{#if hasFolders}
+				<div class="shortcut">
+					<kbd>{mod}+P</kbd>
+					<button type="button" class="link" onclick={() => palette.show('files')}>Go to file</button>
+				</div>
+			{/if}
 			<div class="shortcut">
 				<kbd>{mod}+Shift+O</kbd>
 				<button type="button" class="link" onclick={() => void workspacePicker.open()}>Switch workspace</button>
@@ -69,6 +112,26 @@
 	.actions {
 		display: flex;
 		gap: 8px;
+	}
+	.browser-open {
+		display: flex;
+		gap: 8px;
+		width: 100%;
+	}
+	.browser-open input {
+		flex: 1;
+		min-width: 0;
+		font: inherit;
+		font-size: 13px;
+		color: var(--m-fg);
+		background: var(--m-bg-1);
+		border: 1px solid var(--m-border);
+		border-radius: 6px;
+		padding: 7px 10px;
+	}
+	.browser-open input:focus {
+		outline: none;
+		border-color: var(--m-accent);
 	}
 	.primary {
 		background: var(--m-accent);

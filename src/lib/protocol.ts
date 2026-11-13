@@ -2133,6 +2133,8 @@ export type CoderSessionSummary = {
 	 * header's `mode` field.
 	 */
 	mode?: string | null;
+	/** The coordinator that spawned this session, for a worker. */
+	orchestrator_session_id?: string | null;
 	/**
 	 * True when the session's newest conversational record is a
 	 * persisted turn error — the last turn failed and nothing has

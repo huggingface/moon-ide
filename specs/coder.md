@@ -1900,8 +1900,14 @@ nothing to wake it.
   "running", and a turn that ends while sub-agents
   or `notify` processes are still running doesn't fire the
   turn-finished notification
-  ([ADR 0089](decisions/0089-turn-finished-notification.md)) — the
-  turn their result starts does.
+  ([ADR 0089](decisions/0089-turn-finished-notification.md)) or light
+  the "finished" marker — the turn their result starts does. A
+  coordinator's attached workers mid-turn count the same way, and show
+  as chips in its strip (click to open the worker's session). On a
+  worker's own folder bar, activity that only comes from a
+  coordinator's workers shows the coordinator glyph instead of the
+  sparkles (tooltip names the coordinator), so it doesn't read as a
+  session of the user's own to go and look at.
 - **Handles are in-memory.** A restart loses live runs and processes
   (sub-agent JSONLs stay on disk) and their pending results; `check`
   on a lost id says so. A settled sub-agent's report stays collectable

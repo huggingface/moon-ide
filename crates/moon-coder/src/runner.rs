@@ -985,6 +985,7 @@ impl Session {
 			worktree_branch: self.header.worktree_branch.clone(),
 			committed_branch: self.header.committed_branch.clone(),
 			mode: self.header.mode.clone(),
+			orchestrator_session_id: self.header.orchestrator_session_id.clone(),
 			last_error: false,
 			interrupted: false,
 		}
@@ -3817,6 +3818,7 @@ impl CoderHandle {
 			worktree_branch: header.worktree_branch,
 			committed_branch: header.committed_branch,
 			mode: header.mode,
+			orchestrator_session_id: header.orchestrator_session_id,
 			last_error: false,
 			interrupted: false,
 		})
@@ -4109,6 +4111,7 @@ impl CoderHandle {
 			worktree_branch: header.worktree_branch.clone(),
 			committed_branch: header.committed_branch.clone(),
 			mode: header.mode.clone(),
+			orchestrator_session_id: header.orchestrator_session_id.clone(),
 			last_error: false,
 			interrupted: false,
 		};
@@ -6968,6 +6971,22 @@ async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &
 	// No subscriber (headless / tests): skip the transcript walk.
 	if state.turn_settled.receiver_count() == 0 {
 		return;
+	}
+	// A coordinator whose workers are mid-turn isn't done either: their
+	// completion notices start another turn, and that one notifies.
+	// Checked before taking this session's lock, since it locks the
+	// workers' runtimes.
+	let session_id = rt.session.lock().await.header.id.clone();
+	let workers = state.coordinator_workers.read().await.workers_of(&session_id);
+	for (worker_id, attached) in workers {
+		if !attached {
+			continue;
+		}
+		if let Some((worker_rt, _)) = state.runtime_for_session(&worker_id).await {
+			if worker_rt.turn.lock().await.cancel.is_some() {
+				return;
+			}
+		}
 	}
 	let session = rt.session.lock().await;
 	let header = &session.header;

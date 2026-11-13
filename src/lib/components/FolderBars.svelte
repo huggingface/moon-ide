@@ -7,6 +7,7 @@
 	import ContainerIcon from './icons/ContainerIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
 	import QuestionBubbleIcon from './icons/QuestionBubbleIcon.svelte';
+	import CoordinatorIcon from './icons/CoordinatorIcon.svelte';
 	import SparklesIcon from './icons/SparklesIcon.svelte';
 	import ProjectComposePopover from './ProjectComposePopover.svelte';
 
@@ -164,6 +165,11 @@
 			(isWorktree
 				? coder.attentionPendingForWorktree(coderRoot, folder.path)
 				: coder.attentionPendingForFolder(folder.path))}
+		{@const drivenBy = agentRunning
+			? coder.coordinatorBehind(coderRoot, isWorktree ? folder.path : null, 'working')
+			: agentDone
+				? coder.coordinatorBehind(coderRoot, isWorktree ? folder.path : null, 'attentionPending')
+				: null}
 		{@const barTitle = agentAwaitingInput
 			? `${folder.path}\n(agent needs your input)`
 			: agentRunning
@@ -204,9 +210,28 @@
 					>
 						<QuestionBubbleIcon size={12} />
 					</span>
+				{:else if agentRunning && drivenBy !== null}
+					<!-- Only a coordinator's workers run here: a distinct
+						 glyph, so the bar doesn't read as a session of
+						 the user's own to go and look at. -->
+					<span
+						class="agent-glyph running"
+						aria-label={`Worker of coordinator "${drivenBy}" running`}
+						title={`Worker of coordinator "${drivenBy}" running — follow it from the coordinator's session`}
+					>
+						<CoordinatorIcon size={12} />
+					</span>
 				{:else if agentRunning}
 					<span class="agent-glyph running" aria-label="Agent running" title="Agent running">
 						<SparklesIcon size={12} />
+					</span>
+				{:else if agentDone && drivenBy !== null}
+					<span
+						class="agent-glyph done"
+						aria-label={`Worker of coordinator "${drivenBy}" finished`}
+						title={`Worker of coordinator "${drivenBy}" finished — click to view`}
+					>
+						<CoordinatorIcon size={12} />
 					</span>
 				{:else if agentDone}
 					<span

@@ -12,6 +12,7 @@
 	import { frontendLog } from '../logs.svelte';
 	import { workspace } from '../state.svelte';
 	import { openLightbox } from '../imageLightbox.svelte';
+	import { openInIdeBrowser } from '../browserOpen';
 	import { copyImageToClipboard } from '../copyImage';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
@@ -566,23 +567,23 @@
 		await coder.send();
 	}
 
-	// Images in the transcript (replies, tool screenshots, pasted
-	// attachments) get our own menu: WebKitGTK's "Copy Image" copies a
-	// `data:` image as its URL text.
-	let imageMenu = $state<{ src: string; workspacePath: string | null; x: number; y: number } | null>(null);
+	// Our own right-click menu for links and images in the transcript.
+	// Links: open in the IDE browser as well as the system one. Images
+	// (replies, tool screenshots, pasted attachments): WebKitGTK's
+	// "Copy Image" copies a `data:` image as its URL text.
+	let panelMenu = $state<{ items: ContextMenuItem[]; x: number; y: number } | null>(null);
 
 	function onPanelContextMenu(event: MouseEvent): void {
 		const target = event.target;
-		if (!(target instanceof HTMLImageElement) || target.currentSrc === '') {
+		if (!(target instanceof Element)) {
+			return;
+		}
+		const items = linkMenuItems(target.closest('a')) ?? imageMenuItems(target);
+		if (items === null) {
 			return;
 		}
 		event.preventDefault();
-		imageMenu = {
-			src: target.currentSrc,
-			workspacePath: target.dataset.workspacePath ?? null,
-			x: event.clientX,
-			y: event.clientY,
-		};
+		panelMenu = { items, x: event.clientX, y: event.clientY };
 	}
 
 	$effect(() => {
@@ -594,40 +595,58 @@
 		return () => el.removeEventListener('contextmenu', onPanelContextMenu);
 	});
 
-	const imageMenuItems = $derived<ContextMenuItem[]>(
-		imageMenu === null
-			? []
-			: [
-					{
-						id: 'copy-image',
-						label: 'Copy image',
-						onSelect: () => {
-							const src = imageMenu?.src;
-							if (src === undefined) {
-								return;
-							}
-							copyImageToClipboard(src).then(
-								() => workspace.flash('Image copied'),
-								(err: unknown) => workspace.flash(`Copy failed: ${formatError(err)}`),
-							);
-						},
-					},
-					...(imageMenu.workspacePath === null
-						? []
-						: [
-								{
-									id: 'open-image',
-									label: 'Open in editor',
-									onSelect: () => {
-										const path = imageMenu?.workspacePath;
-										if (path) {
-											void workspace.openFile(path);
-										}
-									},
-								},
-							]),
-				],
-	);
+	function linkMenuItems(anchor: HTMLAnchorElement | null): ContextMenuItem[] | null {
+		const href = anchor?.getAttribute('href') ?? '';
+		if (!/^https?:\/\//i.test(href)) {
+			return null;
+		}
+		return [
+			{
+				id: 'open-link-ide',
+				label: 'Open in IDE browser',
+				onSelect: () => {
+					openInIdeBrowser(href).catch((err: unknown) => {
+						workspace.flash(`Couldn't open the tab: ${formatError(err)}`);
+					});
+				},
+			},
+			{ id: 'open-link', label: 'Open in system browser', onSelect: () => void openUrl(href) },
+			{
+				id: 'copy-link',
+				label: 'Copy link',
+				onSelect: () => {
+					clipboardWriteText(href).then(
+						() => workspace.flash('Link copied'),
+						(err: unknown) => workspace.flash(`Copy failed: ${formatError(err)}`),
+					);
+				},
+			},
+		];
+	}
+
+	function imageMenuItems(target: Element): ContextMenuItem[] | null {
+		if (!(target instanceof HTMLImageElement) || target.currentSrc === '') {
+			return null;
+		}
+		const src = target.currentSrc;
+		const workspacePath = target.dataset.workspacePath;
+		const items: ContextMenuItem[] = [
+			{
+				id: 'copy-image',
+				label: 'Copy image',
+				onSelect: () => {
+					copyImageToClipboard(src).then(
+						() => workspace.flash('Image copied'),
+						(err: unknown) => workspace.flash(`Copy failed: ${formatError(err)}`),
+					);
+				},
+			},
+		];
+		if (workspacePath !== undefined) {
+			items.push({ id: 'open-image', label: 'Open in editor', onSelect: () => void workspace.openFile(workspacePath) });
+		}
+		return items;
+	}
 
 	// Our own menu rather than a native `<select>`: WebKitGTK's select
 	// popup needs press-drag-release to pick a value.
@@ -3675,9 +3694,25 @@
 		</div>
 		<div class="composer">
 			<CoderPlanStrip />
-			{#if coder.hasBackgroundWork}
-				<!-- Background work that will wake this session (ADR 0102). -->
+			{#if coder.hasBackgroundWork || coder.runningWorkers.length > 0}
+				<!-- Background work that will wake this session (ADR 0102),
+					 plus a coordinator's running workers. -->
 				<div class="background-strip" aria-label="Running in the background">
+					{#each coder.runningWorkers as worker (worker.id)}
+						{@const waiting = coder.isSessionAwaitingInputAnywhere(worker.id)}
+						<span class="background-item">
+							<button
+								type="button"
+								class="background-open"
+								title={`Open worker session${waiting ? ' (waiting for input)' : ''} · ${worker.worktreeRoot ?? worker.targetFolder}`}
+								onclick={() => void coder.openSessionInFolder(worker.worktreeRoot, worker.id)}
+							>
+								<span class="background-dot" class:waiting aria-hidden="true"></span>
+								<span class="background-kind">worker</span>
+								<span class="background-name">{baseName(worker.worktreeRoot ?? worker.targetFolder)}</span>
+							</button>
+						</span>
+					{/each}
 					{#each coder.backgroundSubagents as sub (sub.id)}
 						<span class="background-item">
 							<button
@@ -3720,7 +3755,7 @@
 							>
 						</span>
 					{/each}
-					{#if !coder.busy}
+					{#if !coder.busy && coder.hasBackgroundWork}
 						<button
 							type="button"
 							class="background-stop-all"
@@ -4054,11 +4089,11 @@
 			</div>
 		{/if}
 	{/if}
-	{#if imageMenu !== null}
+	{#if panelMenu !== null}
 		<ContextMenu
-			items={imageMenuItems}
-			anchorRect={{ left: imageMenu.x, top: imageMenu.y, width: 0, height: 0 }}
-			onClose={() => (imageMenu = null)}
+			items={panelMenu.items}
+			anchorRect={{ left: panelMenu.x, top: panelMenu.y, width: 0, height: 0 }}
+			onClose={() => (panelMenu = null)}
 		/>
 	{/if}
 </div>
@@ -6623,6 +6658,11 @@
 		background: var(--m-accent);
 		flex-shrink: 0;
 		animation: background-pulse 1.6s ease-in-out infinite;
+	}
+	/* A worker parked on `ask_user`, waiting for the user. */
+	.background-dot.waiting {
+		background: var(--m-warning);
+		animation: none;
 	}
 	@keyframes background-pulse {
 		50% {

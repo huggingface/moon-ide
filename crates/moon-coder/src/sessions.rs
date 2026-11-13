@@ -1773,6 +1773,11 @@ pub struct SessionSummary {
 	/// header's `mode` field (which elides the same way).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub mode: Option<String>,
+	/// The coordinator that spawned this session, for a worker
+	/// (header's `orchestrator_session_id`). Lets the folder bar mark
+	/// activity that a coordinator launched apart from the user's own.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub orchestrator_session_id: Option<String>,
 	/// True when the newest *conversational* record is a persisted
 	/// turn error (`moon_error`) — i.e. the session's last turn
 	/// failed and nothing has been said since. Lets the sessions
@@ -2216,6 +2221,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 				worktree_branch: header.worktree_branch,
 				committed_branch: header.committed_branch,
 				mode: header.mode,
+				orchestrator_session_id: header.orchestrator_session_id,
 				last_error: summary.1,
 				interrupted: summary.2,
 			});
@@ -2232,6 +2238,7 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		worktree_branch: header.worktree_branch,
 		committed_branch: header.committed_branch,
 		mode: header.mode,
+		orchestrator_session_id: header.orchestrator_session_id,
 		last_error,
 		interrupted,
 	})
@@ -5408,6 +5415,7 @@ mod tests {
 				worktree_branch: None,
 				committed_branch: None,
 				mode: coord.mode.clone(),
+				orchestrator_session_id: None,
 				last_error: false,
 				interrupted: false,
 			};
@@ -5423,6 +5431,7 @@ mod tests {
 				worktree_branch: None,
 				committed_branch: None,
 				mode: None,
+				orchestrator_session_id: None,
 				last_error: false,
 				interrupted: false,
 			};
