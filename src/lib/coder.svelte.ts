@@ -466,6 +466,9 @@ class SessionViewState {
 	 *  `coder.profile` line in the in-app Logs tab). `null` outside
 	 *  a replay. */
 	replayStartedAtMs: number | null = null;
+	/** A `session_loaded` for the session already shown deferred its
+	 *  reset to the replay batch (see that handler). */
+	resetPendingReplay = false;
 	/** How long the `coder_open_session` IPC call took to return
 	 *  (ms) — backend disk-load + history rebuild + serializing the
 	 *  one batched `Replay` payload, plus IPC framing. Captured by
@@ -1457,9 +1460,10 @@ export class CoderPanelState {
 		}
 		for (const bucket of this.byFolder.values()) {
 			for (const [coordinatorId, session] of bucket.sessionsById) {
-				const card = session.subagentSummaries.get(id);
-				if (card?.worker) {
-					return coordinatorId;
+				for (const card of session.subagentSummaries.values()) {
+					if (card.worker && card.id === id) {
+						return coordinatorId;
+					}
 				}
 			}
 		}
@@ -3565,6 +3569,34 @@ export class CoderPanelState {
 		session.attentionPending = true;
 	}
 
+	/** Clear a session bucket for a full replay of its transcript. */
+	#resetForReplay(session: SessionViewState): void {
+		session.rows = [];
+		session.subagentSummaries = new Map();
+		session.subagentTranscripts = new Map();
+		session.viewSubagentId = null;
+		session.subagentViewStack = [];
+		session.busy = false;
+		// Reset before replay. A live-parked `ask_user`
+		// re-emits its `tool_call` (with no `tool_result`)
+		// during replay, which flips this back to `true`;
+		// a settled session leaves it `false`.
+		session.awaitingInput = false;
+		// Gate the sessions-list re-sort: replayed
+		// `UserMessage` events shouldn't pretend the user
+		// just typed them. Cleared on the terminator
+		// `turn_complete` the backend appends after the
+		// replay stream.
+		session.replaying = true;
+		session.replayStartedAtMs = performance.now();
+		// Wipe the todo list and compaction trace before
+		// replay; the session's last `tool_result` for
+		// `todo_write` (if any) repopulates `todos` in the
+		// per-record replay stream.
+		session.todos = [];
+		session.compaction = null;
+	}
+
 	/** Route one inbound `coder:event` envelope to the right
 	 *  bucket. A `replay` envelope is unpacked into its inner events
 	 *  here (see the session-scoped branch); everything else
@@ -3602,6 +3634,10 @@ export class CoderPanelState {
 		// one-per-event. Ordering and semantics are identical to the
 		// old one-emit-per-record path.
 		if (envelope.event.kind === 'replay') {
+			if (sessionBucket.resetPendingReplay) {
+				sessionBucket.resetPendingReplay = false;
+				this.#resetForReplay(sessionBucket);
+			}
 			for (const inner of envelope.event.events) {
 				this.#applySessionEvent(sessionBucket, folderBucket, envelope.folder, envelope.session_id, inner);
 			}
@@ -4026,30 +4062,16 @@ export class CoderPanelState {
 				if (!isWorker) {
 					folder.visibleSessionId = event.id;
 				}
-				session.rows = [];
-				session.subagentSummaries = new Map();
-				session.subagentTranscripts = new Map();
-				session.viewSubagentId = null;
-				session.subagentViewStack = [];
-				session.busy = false;
-				// Reset before replay. A live-parked `ask_user`
-				// re-emits its `tool_call` (with no `tool_result`)
-				// during replay, which flips this back to `true`;
-				// a settled session leaves it `false`.
-				session.awaitingInput = false;
-				// Gate the sessions-list re-sort: replayed
-				// `UserMessage` events shouldn't pretend the user
-				// just typed them. Cleared on the terminator
-				// `turn_complete` the backend appends after the
-				// replay stream.
-				session.replaying = true;
-				session.replayStartedAtMs = performance.now();
-				// Wipe the todo list and compaction trace before
-				// replay; the session's last `tool_result` for
-				// `todo_write` (if any) repopulates `todos` in the
-				// per-record replay stream.
-				session.todos = [];
-				session.compaction = null;
+				// Reopening a session that's already on screen (a
+				// notification click, re-selecting it): keep its rows
+				// until the replay batch lands — on a long session the
+				// backend takes seconds to build it, and clearing now
+				// blanked the transcript and composer meanwhile.
+				if (session.rows.length > 0 && session.activeSession?.id === event.id) {
+					session.resetPendingReplay = true;
+				} else {
+					this.#resetForReplay(session);
+				}
 				session.activeSession = {
 					id: event.id,
 					title: event.title,

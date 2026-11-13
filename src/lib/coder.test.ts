@@ -148,3 +148,34 @@ describe('terminal attachments carry their source terminal (ADR 0048)', () => {
 		expect(out).toContain('<terminal_output token="@terminal:moon-ide" label="moon-ide">');
 	});
 });
+
+describe('coordinatorBehind', () => {
+	it('names the coordinator when only its workers run in a folder', () => {
+		const coder = new CoderPanelState();
+		coder.bucketFor('/coord').sessions = [{ ...summary('coord', null), title: 'Fleet' }];
+		const coordinator = coder.sessionStateFor('/coord', 'coord');
+		coordinator.subagentSummaries = new Map([
+			[
+				'call-1',
+				{
+					id: 'worker-1',
+					toolCallId: 'call-1',
+					targetFolder: PARENT,
+					mode: 'agent',
+					status: 'running',
+					resultPreview: null,
+					tokensUsedEstimate: 0,
+					subSessionId: null,
+					worktreeRoot: null,
+					worker: true,
+					detached: false,
+				},
+			],
+		]);
+		coder.sessionStateFor(PARENT, 'worker-1').busy = true;
+		expect(coder.coordinatorBehind(PARENT, null, 'working')).toBe('Fleet');
+
+		coder.sessionStateFor(PARENT, 'mine').busy = true;
+		expect(coder.coordinatorBehind(PARENT, null, 'working')).toBeNull();
+	});
+});

@@ -1897,6 +1897,19 @@
 			// `preventDefault`ed here, which silently ate every
 			// text paste because the OS clipboard image read
 			// returned null and the original text never landed.
+			// An image copied as its `data:` URL (WebKitGTK's native
+			// "Copy Image" on a data image) pastes as that text:
+			// attach the picture instead of dumping base64.
+			const text = data.getData('text/plain').trim();
+			if (/^data:image\/[a-z+.-]+;base64,/i.test(text)) {
+				event.preventDefault();
+				const blob = await fetch(text).then((r) => r.blob());
+				const result = await coder.addImageAttachment(blob, 'pasted.png');
+				if (!result.ok) {
+					workspace.flash(`Couldn't attach the image: ${result.reason}`);
+				}
+				return;
+			}
 			const eventEmpty = items.length === 0 && data.files.length === 0 && data.types.length === 0;
 			if (!eventEmpty) {
 				return;

@@ -1,6 +1,10 @@
 <script lang="ts">
+	import { copyImageToClipboard } from '../copyImage';
 	import { closeLightbox, lightbox } from '../imageLightbox.svelte';
+	import { formatError } from '../protocol';
 	import { workspace } from '../state.svelte';
+	import ContextMenu from './ContextMenu.svelte';
+	import type { ContextMenuItem } from './contextMenu';
 
 	const image = $derived(lightbox.image);
 
@@ -16,11 +20,39 @@
 			}
 			event.preventDefault();
 			event.stopPropagation();
+			if (menu !== null) {
+				menu = null;
+				return;
+			}
 			closeLightbox();
 		};
 		window.addEventListener('keydown', onKey, true);
 		return () => window.removeEventListener('keydown', onKey, true);
 	});
+
+	// Our own menu: WebKitGTK's "Copy Image" copies a `data:` image as
+	// its URL text, which pastes back as base64 instead of a picture.
+	let menu = $state<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
+
+	function onImageContextMenu(event: MouseEvent, src: string, path: string | undefined): void {
+		event.preventDefault();
+		const items: ContextMenuItem[] = [
+			{
+				id: 'copy-image',
+				label: 'Copy image',
+				onSelect: () => {
+					copyImageToClipboard(src).then(
+						() => workspace.flash('Image copied'),
+						(err: unknown) => workspace.flash(`Copy failed: ${formatError(err)}`),
+					);
+				},
+			},
+		];
+		if (path !== undefined) {
+			items.push({ id: 'open-image', label: 'Open in editor', onSelect: () => openInEditor(path) });
+		}
+		menu = { x: event.clientX, y: event.clientY, items };
+	}
 
 	function openInEditor(path: string): void {
 		closeLightbox();
@@ -38,7 +70,12 @@
 		aria-label="Image preview"
 		tabindex="-1"
 	>
-		<img class="image" src={image.src} alt={image.alt} />
+		<img
+			class="image"
+			src={image.src}
+			alt={image.alt}
+			oncontextmenu={(e) => onImageContextMenu(e, image.src, image.workspacePath)}
+		/>
 		<div class="actions">
 			{#if image.workspacePath !== undefined}
 				{@const path = image.workspacePath}
@@ -57,6 +94,13 @@
 			<button type="button" class="action close" title="Close (Esc)" onclick={closeLightbox}>×</button>
 		</div>
 	</div>
+	{#if menu !== null}
+		<ContextMenu
+			items={menu.items}
+			anchorRect={{ left: menu.x, top: menu.y, width: 0, height: 0 }}
+			onClose={() => (menu = null)}
+		/>
+	{/if}
 {/if}
 
 <style>
