@@ -1959,10 +1959,12 @@ failed. Assistant rows with no text (tool-only turns, reasoning) don't
 break a run. Clicking the row expands it to the individual calls.
 
 Under the composer, a **Ship it** button (once the session has
-messages) sends a fixed message telling the agent to go ahead with
-what it held back — commit, push, publish, open or update the PR —
-with any composer text appended. Agents stop short of landing work
-unless told, so this is the one-click "go ahead". The reasoning
+messages) sends "Ship it", telling the agent to go ahead with what it
+held back — commit, push, publish, open or update the PR — with any
+composer text appended. Agents stop short of landing work
+unless told, so this is the one-click "go ahead". Next to it, **Show
+me** sends "Show me" the same way, for the agent to open the result in
+a browser tab or screenshot it instead of describing it. The reasoning
 picker sits at the other end of that row.
 
 Next to it, a **mic** button dictates into the composer: click to

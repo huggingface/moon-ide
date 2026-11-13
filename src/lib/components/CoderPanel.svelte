@@ -41,6 +41,7 @@
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import MicIcon from './icons/MicIcon.svelte';
+	import EyeIcon from './icons/EyeIcon.svelte';
 	import RocketIcon from './icons/RocketIcon.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -476,10 +477,11 @@
 		return (slug.split(':')[0] ?? '').split('/').at(-1) ?? slug;
 	}
 
-	// Agents stop short of landing work ("not pushed yet", "not
-	// published yet") unless told; this is the one-click "go ahead".
-	const SHIP_IT_PROMPT =
-		'Ship it: go ahead with what you held back to land this work — commit, push, publish, open or update the PR, whatever it still needs.';
+	// One-click nudges. Agents stop short of landing work ("not
+	// pushed yet") unless told, and describe UI changes instead of
+	// showing them (a browser tab, a screenshot) unless asked.
+	const SHIP_IT_PROMPT = 'Ship it';
+	const SHOW_ME_PROMPT = 'Show me';
 
 	// Voice input: the desktop side records, the workspace core
 	// transcribes, and the text lands at the composer's caret (never
@@ -556,9 +558,9 @@
 		return () => window.removeEventListener('keydown', onKey, true);
 	});
 
-	async function shipIt(): Promise<void> {
+	async function sendNudge(prompt: string): Promise<void> {
 		const extra = coder.draft.trim();
-		coder.draft = extra.length > 0 ? `${SHIP_IT_PROMPT}\n\n${extra}` : SHIP_IT_PROMPT;
+		coder.draft = extra.length > 0 ? `${prompt}\n\n${extra}` : prompt;
 		await coder.send();
 	}
 
@@ -3890,10 +3892,19 @@
 						type="button"
 						class="ship-it"
 						title="Tell the agent to land what it held back: commit, push, publish, open the PR (anything typed in the composer is sent along)"
-						onclick={() => void shipIt()}
+						onclick={() => void sendNudge(SHIP_IT_PROMPT)}
 					>
 						<RocketIcon size={12} />
 						Ship it
+					</button>
+					<button
+						type="button"
+						class="ship-it"
+						title="Ask the agent to show the result: open it in a browser tab, take a screenshot (anything typed in the composer is sent along)"
+						onclick={() => void sendNudge(SHOW_ME_PROMPT)}
+					>
+						<EyeIcon size={12} />
+						Show me
 					</button>
 				{/if}
 				<button
