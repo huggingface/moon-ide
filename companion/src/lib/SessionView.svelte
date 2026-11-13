@@ -365,14 +365,10 @@
 				return 'steer worker';
 			case 'abort_worker':
 				return 'abort worker';
-			case 'commit_worker_changes':
-				return 'commit worker changes';
-			case 'merge_worker_changes':
-				return 'merge worker changes';
-			case 'discard_worker_worktree':
-				return 'discard worker worktree';
-			case 'retire_worker':
-				return 'retire worker';
+			case 'land_worker':
+				return 'land worker';
+			case 'close_worker':
+				return 'close worker';
 			case 'review_worker_changes':
 				return 'review worker changes';
 			case 'respond_to_worker_prompt':
@@ -389,11 +385,10 @@
 		'observe_worker',
 		'steer_worker',
 		'abort_worker',
-		'commit_worker_changes',
-		'merge_worker_changes',
+		'land_worker',
+		'close_worker',
 		'review_worker_changes',
 		'respond_to_worker_prompt',
-		'retire_worker',
 		'workspace_scm_status',
 	]);
 

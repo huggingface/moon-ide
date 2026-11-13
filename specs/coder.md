@@ -897,8 +897,8 @@ no worktree, no branch — the session drives the target folder's own
 checkout (uncommitted state included), so its edits and commits land
 on the currently checked-out branch alongside anything else working
 there. `base_branch` is refused in-place (switching the shared tree's
-branch under the user), `merge_worker_changes` refuses (nothing to
-merge), `discard_worker_worktree` is the usual no-op, and passing an
+branch under the user), `land_worker` just commits and retires
+(nothing to merge), `close_worker` has no worktree to remove, and passing an
 existing worker's worktree as `folder` puts a second worker inside
 that same checkout. The shared-tree race is accepted — the
 coordinator opts in explicitly and is told the tree is shared.
@@ -958,8 +958,8 @@ shown only on a coordinator-spawned worker
 it unhooks the worker — the feeder stops forwarding, the coordinator
 gets one final notice, and its mutating control tools
 (`steer_worker`, `abort_worker`, `respond_to_worker_prompt`,
-`commit_worker_changes`, `merge_worker_changes`,
-`discard_worker_worktree`) start refusing it. The worker keeps its
+`land_worker`) start refusing it; `close_worker` only drops the
+coordinator's bookkeeping. The worker keeps its
 transcript, branch, and worktree, and an in-flight turn runs to
 completion; clicking the button a second time cancels that turn.
 
@@ -2242,20 +2242,33 @@ where `git worktree remove` fails "is not a working tree" with or
 without `--force` — is refused without force and deleted with it
 ([ADR 0068](decisions/0068-stale-worktree-leftovers.md)), so the row
 can always be closed.
-A coordinator cleans up after its own workers with
-`discard_worker_worktree`, which does the same thing plus clears the
-worktree routing on the worker's session; it refuses a running worker
-and a dirty worktree (without `force`), and keeps the branch. It is
-idempotent too ([ADR 0064](decisions/0064-worker-retirement.md)): a
-checkout that's already gone — merged-and-removed, reconciled away, or
-discarded twice — is an `already_gone` no-op, never an error. Once a
-worker's work is landed and its worktree discarded, the coordinator
-drops it from its fleet with `retire_worker` (same ADR): the worker
-leaves `list_workers` and stops waking the coordinator, while its
-session, transcript, and branch stay untouched. The usual pair
-collapses to one call: `discard_worker_worktree` takes
-`retire: true`, and both tools take `worker_ids` for batch cleanup
-(per-worker results; one failure doesn't stop the rest).
+A coordinator finishes its workers with two tools
+([ADR 0109](decisions/0109-land-and-close-workers.md)), both taking
+`worker_id` or `worker_ids` (per-worker results; one failure doesn't
+stop the rest) and both refusing a running worker:
+
+- `land_worker(base_branch?, message?)` merges locally and cleans up:
+  commit leftover changes (given or AI-suggested message), run the
+  `check_worker_base` gate (a flagged revert risk returns
+  `status: "blocked"` with nothing merged), switch the parent to
+  `base_branch` (default: the repo's default branch, else `main`) and
+  merge — a conflict aborts and errors with nothing cleaned up
+  ([ADR 0055](decisions/0055-merge-aborts-on-conflict.md)) — then
+  remove the worktree, safe-delete the merged branch (`git branch -d`),
+  and retire the worker. An in-place worker is just committed and
+  retired.
+- `close_worker(delete_branch?, force?)` cleans up without merging
+  (after a PR, or to abandon work): remove the worktree (dirty needs
+  `force`), optionally delete the branch (unmerged needs `force`), and
+  retire. Idempotent like the UI discard
+  ([ADR 0064](decisions/0064-worker-retirement.md)): an already-gone
+  checkout is fine.
+
+Retiring drops the worker from the coordinator's fleet: it leaves
+`list_workers` and stops waking the coordinator, while its session and
+transcript stay. Which landing path fits is the project's call; the
+coordinator follows the project's conventions (e.g. its AGENTS.md) and
+may also leave a worker's worktree and branch in place for the user.
 
 Staleness is also **reconciled without a click**
 ([ADR 0063](decisions/0063-stale-worktree-reconciliation.md)): at the

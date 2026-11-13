@@ -163,6 +163,11 @@ pub struct SessionHeader {
 	/// own `SubagentSpawned` / `WorkerDetached` records). `None`
 	/// for every non-worker session.
 	pub orchestrator_session_id: Option<String>,
+	/// A coordinator's worker spawned to work directly in a bound
+	/// folder (ADR 0070), as opposed to one whose worktree was later
+	/// removed: both have no `worktree_root`, but only the first may
+	/// land by committing in the folder.
+	pub in_place_worker: bool,
 	/// Per-session escape hatch for where the coder's `bash` /
 	/// shell tools run. `None` is the default ("auto"): `bash`
 	/// routes to the workspace shell container when it's running,
@@ -299,6 +304,9 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.orchestrator_session_id {
 			map.serialize_entry("orchestrator_session_id", v)?;
 		}
+		if self.in_place_worker {
+			map.serialize_entry("in_place_worker", &true)?;
+		}
 		if let Some(v) = &self.bash_target_override {
 			map.serialize_entry("bash_target_override", v.as_wire())?;
 		}
@@ -358,6 +366,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			#[serde(default)]
 			orchestrator_session_id: Option<String>,
 			#[serde(default)]
+			in_place_worker: bool,
+			#[serde(default)]
 			bash_target_override: Option<String>,
 			#[serde(default)]
 			reasoning_effort: Option<String>,
@@ -385,6 +395,7 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			mode: raw.mode,
 			subagent_target_folder: raw.subagent_target_folder,
 			orchestrator_session_id: raw.orchestrator_session_id,
+			in_place_worker: raw.in_place_worker,
 			bash_target_override: raw
 				.bash_target_override
 				.as_deref()
@@ -1517,7 +1528,7 @@ pub enum SessionRecord {
 	},
 	/// A coordinator worker left this orchestrator's fleet
 	/// (ADR 0065): explicit user disconnect (ADR 0052), a
-	/// `retire_worker`, or a spawn whose seed send failed and was
+	/// `land_worker` / `close_worker`, or a spawn whose seed send failed and was
 	/// rolled back. Appended to the **coordinator's** JSONL so a
 	/// restart-time fleet rebuild (fold of `SubagentSpawned` with a
 	/// `worktree_root` minus these) doesn't resurrect the link.
@@ -3247,6 +3258,7 @@ mod tests {
 			schema: SESSION_SCHEMA_VERSION,
 			id: id.into(),
 			orchestrator_session_id: None,
+			in_place_worker: false,
 			cwd: "/tmp/test".into(),
 			title: format!("{id} title"),
 			created_at_ms: 1_700_000_000_000,

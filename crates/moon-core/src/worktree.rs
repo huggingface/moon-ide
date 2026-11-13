@@ -235,7 +235,7 @@ pub fn checkout_state(path: &Utf8Path) -> CheckoutState {
 
 /// Discard a worktree checkout idempotently (ADR 0044 / ADR 0068).
 /// Shared by the UI's discard command and the coordinator's
-/// `discard_worker_worktree` tool so both sides agree on what
+/// `land_worker` / `close_worker` tools so both sides agree on what
 /// "gone" means:
 ///
 /// - [`CheckoutState::Live`] → `git worktree remove [--force]`; a

@@ -928,6 +928,7 @@ impl Session {
 				// Stamped post-create by `handle_spawn_worker` for
 				// coordinator workers; every other session stays None.
 				orchestrator_session_id: None,
+				in_place_worker: false,
 				// Bound at first-persistence time by `Coder::send`
 				// once we know which workspace folder the session
 				// is attached to. Left blank here so the freshly-
@@ -2562,6 +2563,7 @@ impl CoderHandle {
 		// title suppresses the auto-rename.
 		blank.header.title = slug.clone();
 		blank.header.id = new_named_session_id(&slug);
+		blank.header.in_place_worker = true;
 		if let moon_protocol::workspace::FolderOrigin::Worktree { branch, .. } = &parent.folder.origin {
 			blank.header.worktree_root = Some(parent.folder.path.clone());
 			blank.header.worktree_branch = Some(branch.clone());
@@ -7157,11 +7159,9 @@ async fn run_turn(
 		tool_defs.push(crate::coordinator::respond_to_worker_prompt_tool_definition());
 		tool_defs.push(crate::coordinator::review_worker_changes_tool_definition());
 		tool_defs.push(crate::coordinator::workspace_scm_status_tool_definition());
-		tool_defs.push(crate::coordinator::commit_worker_changes_tool_definition());
-		tool_defs.push(crate::coordinator::merge_worker_changes_tool_definition());
 		tool_defs.push(crate::coordinator::check_worker_base_tool_definition());
-		tool_defs.push(crate::coordinator::discard_worker_worktree_tool_definition());
-		tool_defs.push(crate::coordinator::retire_worker_tool_definition());
+		tool_defs.push(crate::coordinator::land_worker_tool_definition());
+		tool_defs.push(crate::coordinator::close_worker_tool_definition());
 		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
 		tool_defs.push(crate::coordinator::init_repo_tool_definition());
 		tool_defs.push(crate::coordinator::add_folder_tool_definition());
@@ -7980,16 +7980,12 @@ async fn dispatch_tool_calls(
 			handle_review_worker_changes(state, &args).await
 		} else if call.function.name == "workspace_scm_status" {
 			handle_workspace_scm_status(state, sink, &args).await
-		} else if call.function.name == "commit_worker_changes" {
-			handle_commit_worker_changes(state, &args).await
-		} else if call.function.name == "merge_worker_changes" {
-			handle_merge_worker_changes(state, &args).await
 		} else if call.function.name == "check_worker_base" {
 			handle_check_worker_base(state, &args).await
-		} else if call.function.name == "discard_worker_worktree" {
-			handle_discard_worker_worktree(state, sink, &args).await
-		} else if call.function.name == "retire_worker" {
-			handle_retire_worker(state, sink, &args).await
+		} else if call.function.name == "land_worker" {
+			handle_land_worker(state, sink, &args).await
+		} else if call.function.name == "close_worker" {
+			handle_close_worker(state, sink, &args).await
 		} else if call.function.name == "clone_repo" {
 			handle_clone_repo(state, sink, &args).await
 		} else if call.function.name == "init_repo" {
@@ -9493,70 +9489,33 @@ async fn handle_workspace_scm_status(
 	}))
 }
 
-/// `check_worker_base` — the rebase-before-merge / rebase-before-PR
-/// gate. Resolves the worker's worktree, runs the host's base check
-/// (fetch + behind-count + three-dot numstat vs the default branch),
-/// then cross-references the diff's deleted files against the files the
-/// worker actually touched (its last turn diff) to flag the stale-base
-/// revert tripwire: a file with deletions the worker didn't write means
-/// merging / PR-ing the branch would re-delete work that landed on the
-/// default after the branch's base.
-async fn handle_check_worker_base(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
-	#[derive(serde::Deserialize)]
-	struct CheckArgs {
-		worker_id: String,
+/// Where a worker's tools run: its bound worktree, else its session
+/// folder (an in-place worker, or one whose worktree was discarded).
+async fn worker_checkout_path(
+	state: &Arc<CoderState>,
+	rt: &SessionRuntime,
+	tool: &str,
+	worker_id: &str,
+) -> Result<String, CoderError> {
+	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+	if let Some(root) = worktree_root {
+		if state.workspaces.folder_for_path(&root).await.is_some() {
+			return Ok(root);
+		}
 	}
-	let parsed: CheckArgs = serde_json::from_value(args.clone())
-		.map_err(|err| CoderError::invalid_args("check_worker_base", err.to_string()))?;
-	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
-		return Err(CoderError::invalid_args(
-			"check_worker_base",
-			format!("no mounted session for worker_id `{}`", parsed.worker_id),
-		));
+	let Some((_, folder_path)) = state.runtime_for_session(worker_id).await else {
+		return Err(CoderError::invalid_args(tool, "could not resolve folder for worker"));
 	};
-	// Resolve the worker's worktree (falling back to its session folder
-	// for a non-worktree worker), and grab the files its last turn
-	// touched — the "did the worker write this?" reference set.
-	let (routing_path, worker_files) = {
-		let session = rt.session.lock().await;
-		let touched: HashSet<String> = session
-			.last_turn_diff
-			.as_ref()
-			.map(|(files, _)| files.iter().cloned().collect())
-			.unwrap_or_default();
-		let path = match session.header.worktree_root.clone() {
-			Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
-			_ => {
-				let Some((_, folder_path)) = state.runtime_for_session(&parsed.worker_id).await else {
-					return Err(CoderError::invalid_args(
-						"check_worker_base",
-						"could not resolve folder for worker",
-					));
-				};
-				folder_path.to_string()
-			}
-		};
-		(path, touched)
-	};
-	let Some(folder) = state.folder_entry_for(&routing_path).await else {
-		return Err(CoderError::invalid_args(
-			"check_worker_base",
-			format!("no bound folder for path `{routing_path}`"),
-		));
-	};
-	let Some(check) = folder.host.git_base_check().await? else {
-		return Ok(json!({
-			"has_base": false,
-			"note": "no default remote branch (local-only repo) — there's no origin/main to drift from",
-		}));
-	};
-	// The revert tripwire. A diff file with deletions the worker didn't
-	// touch is a revert candidate. Two caveats keep this honest:
-	// - `last_turn_diff` only covers the *latest* turn, so a worker that
-	//   legitimately edited a file several turns back reads as "didn't
-	//   touch it". We mark the verdict heuristic, not proof.
-	// - A file the worker *did* delete on purpose shows deletions on a
-	//   path it touched — correctly not flagged.
+	Ok(folder_path.to_string())
+}
+
+/// The stale-base verdict (ADR 0056) for a branch's base check. A
+/// diff file with deletions the worker didn't touch is a revert
+/// candidate: merging / PR-ing the branch would re-delete work that
+/// landed on the default after the branch's base. Heuristic, not
+/// proof — `worker_files` only covers the worker's *latest* turn, so a
+/// file it edited several turns back reads as "didn't touch it".
+fn base_check_report(check: &moon_protocol::git::GitBaseCheck, worker_files: &HashSet<String>) -> Value {
 	let touched_unknown = worker_files.is_empty();
 	let revert_suspects: Vec<Value> = check
 		.files
@@ -9567,196 +9526,89 @@ async fn handle_check_worker_base(state: &Arc<CoderState>, args: &Value) -> Resu
 				"path": f.path,
 				"additions": f.additions,
 				"deletions": f.deletions,
-				"worker_touched": worker_files.contains(&f.path),
 			})
 		})
 		.collect();
 	let stale = check.behind_default > 0;
 	let flagged = !revert_suspects.is_empty();
+	let remote_ref = &check.default_branch_remote_ref;
 	let verdict = if flagged {
 		format!(
-				"STALE-BASE REVERT RISK: the branch is {} commit(s) behind {} and its diff deletes lines in {} file(s) the worker didn't write — merging or PR-ing it would re-delete work that merged after its base. Do NOT merge / PR as-is; steer the worker to rebase onto current {} first, then re-check.",
-				check.behind_default,
-				check.default_branch_remote_ref,
-				revert_suspects.len(),
-				check.default_branch_remote_ref,
-			)
+			"STALE-BASE REVERT RISK: the branch is {} commit(s) behind {remote_ref} and its diff deletes lines in {} file(s) the worker didn't write — merging or PR-ing it would re-delete work that merged after its base. Do NOT merge / PR as-is; steer the worker to rebase onto current {remote_ref} first, then re-check.",
+			check.behind_default,
+			revert_suspects.len(),
+		)
 	} else if stale {
 		format!(
-				"Behind: the branch is {} commit(s) behind {} but its diff doesn't delete files the worker didn't write. Likely safe, but a rebase onto current {} keeps the history clean.",
-				check.behind_default, check.default_branch_remote_ref, check.default_branch_remote_ref,
-			)
+			"Behind: the branch is {} commit(s) behind {remote_ref} but its diff doesn't delete files the worker didn't write. Likely safe, but a rebase onto current {remote_ref} keeps the history clean.",
+			check.behind_default,
+		)
 	} else {
 		"Fresh: the branch is up to date with the default branch; its diff touches only the worker's own changes. Safe to merge / PR.".to_string()
 	};
-	Ok(json!({
+	json!({
 		"has_base": true,
-		"default_branch_remote_ref": check.default_branch_remote_ref,
+		"default_branch_remote_ref": remote_ref,
 		"behind_default": check.behind_default,
 		"stale": stale,
 		"revert_suspects": revert_suspects,
 		"flagged": flagged,
-		// Heuristic, not proof: based on the worker's *last* turn diff.
 		"verdict_basis": if touched_unknown {
 			"no worker turn-diff recorded — the revert check couldn't compare against the worker's touched files, so suspects are every deleted file in the diff"
 		} else {
 			"compared the diff's deleted files against the files the worker touched on its last turn"
 		},
 		"verdict": verdict,
-	}))
+	})
 }
 
-/// `commit_worker_changes` — checkpoint a worker's uncommitted work
-/// with a git commit (ADR 0030). Resolves the worker's worktree,
-/// optionally AI-suggests a commit message from the diff, then runs
-/// `git add -A` + `git commit` — the same flow the IDE's SCM panel
-/// uses.
-async fn handle_commit_worker_changes(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
-	#[derive(serde::Deserialize)]
-	struct CommitArgs {
-		worker_id: String,
-		#[serde(default)]
-		message: Option<String>,
-	}
-	let parsed: CommitArgs = serde_json::from_value(args.clone())
-		.map_err(|err| CoderError::invalid_args("commit_worker_changes", err.to_string()))?;
-	ensure_worker_still_attached(state, "commit_worker_changes", &parsed.worker_id).await?;
-	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
+/// Run the host's base check (fetch + behind-count + three-dot numstat
+/// vs the default branch) on a worker's checkout and judge it with
+/// [`base_check_report`]. Shared by `check_worker_base` and
+/// `land_worker`'s pre-merge gate.
+async fn worker_base_report(state: &Arc<CoderState>, tool: &str, worker_id: &str) -> Result<Value, CoderError> {
+	let Some((rt, _)) = state.runtime_for_session(worker_id).await else {
 		return Err(CoderError::invalid_args(
-			"commit_worker_changes",
-			format!("no mounted session for worker_id `{}`", parsed.worker_id),
+			tool,
+			format!("no mounted session for worker_id `{worker_id}`"),
 		));
 	};
-	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
-	let routing_path = match worktree_root {
-		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root,
-		_ => {
-			let Some((_, folder_path)) = state.runtime_for_session(&parsed.worker_id).await else {
-				return Err(CoderError::invalid_args(
-					"commit_worker_changes",
-					"could not resolve folder for worker",
-				));
-			};
-			folder_path.to_string()
-		}
-	};
-	let Some(folder) = state.workspaces.folder_for_path(&routing_path).await else {
+	let worker_files: HashSet<String> = rt
+		.session
+		.lock()
+		.await
+		.last_turn_diff
+		.as_ref()
+		.map(|(files, _)| files.iter().cloned().collect())
+		.unwrap_or_default();
+	let routing_path = worker_checkout_path(state, &rt, tool, worker_id).await?;
+	let Some(folder) = state.folder_entry_for(&routing_path).await else {
 		return Err(CoderError::invalid_args(
-			"commit_worker_changes",
+			tool,
 			format!("no bound folder for path `{routing_path}`"),
 		));
 	};
-	// Determine the commit message. If the caller provided one, use
-	// it. Otherwise, pull the diff and AI-suggest a message.
-	let message = match &parsed.message {
-		Some(msg) if !msg.trim().is_empty() => msg.trim().to_owned(),
-		_ => {
-			let diff = folder.host.git_diff_patch().await.unwrap_or_default();
-			if diff.is_empty() {
-				return Err(CoderError::invalid_args(
-					"commit_worker_changes",
-					"nothing to commit — working tree is clean",
-				));
-			}
-			suggest_commit_message_from_state(state, &diff).await?
-		}
+	let Some(check) = folder.host.git_base_check().await? else {
+		return Ok(json!({
+			"has_base": false,
+			"note": "no default remote branch (local-only repo) — there's no origin/main to drift from",
+		}));
 	};
-	let result = folder.host.git_commit(&message, false).await?;
-	Ok(json!({
-		"short_sha": result.short_sha,
-		"summary": result.summary,
-	}))
+	Ok(base_check_report(&check, &worker_files))
 }
 
-/// `merge_worker_changes` — merge a worker's branch into a base
-/// branch on the parent repo (ADR 0037). Switches the parent repo to
-/// `base_branch` (default `main`), then runs `git merge --no-edit
-/// <worker_branch>` on the parent's host. The worker's worktree and
-/// branch are left intact — this only lands the commits, it doesn't
-/// clean up the worktree.
-async fn handle_merge_worker_changes(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
+/// `check_worker_base` — the rebase-before-merge / rebase-before-PR
+/// gate, read-only.
+async fn handle_check_worker_base(state: &Arc<CoderState>, args: &Value) -> Result<Value, CoderError> {
 	#[derive(serde::Deserialize)]
-	struct MergeArgs {
+	struct CheckArgs {
 		worker_id: String,
-		#[serde(default)]
-		base_branch: Option<String>,
 	}
-	let parsed: MergeArgs = serde_json::from_value(args.clone())
-		.map_err(|err| CoderError::invalid_args("merge_worker_changes", err.to_string()))?;
-	ensure_worker_still_attached(state, "merge_worker_changes", &parsed.worker_id).await?;
-	let Some((rt, _)) = state.runtime_for_session(&parsed.worker_id).await else {
-		return Err(CoderError::invalid_args(
-			"merge_worker_changes",
-			format!("no mounted session for worker_id `{}`", parsed.worker_id),
-		));
-	};
-	let (worktree_root, worktree_branch) = {
-		let session = rt.session.lock().await;
-		(
-			session.header.worktree_root.clone(),
-			session.header.worktree_branch.clone(),
-		)
-	};
-	let Some(worktree_path) = worktree_root else {
-		return Err(CoderError::invalid_args(
-			"merge_worker_changes",
-			"worker has no worktree — an in-place worker's commits land directly on the folder's checked-out branch, so there is nothing to merge",
-		));
-	};
-	let Some(branch) = worktree_branch else {
-		return Err(CoderError::invalid_args(
-			"merge_worker_changes",
-			"worker has no worktree_branch — cannot merge without a branch name",
-		));
-	};
-	// Resolve the worktree folder to find its parent.
-	let Some(wt_entry) = state.workspaces.folder_for_path(&worktree_path).await else {
-		return Err(CoderError::invalid_args(
-			"merge_worker_changes",
-			format!("worktree folder `{worktree_path}` is not bound"),
-		));
-	};
-	let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = wt_entry.folder.origin.clone() else {
-		return Err(CoderError::invalid_args(
-			"merge_worker_changes",
-			format!("`{worktree_path}` is not a worktree folder"),
-		));
-	};
-	let Some(parent) = state.workspaces.folder_for_path(&parent_path).await else {
-		return Err(CoderError::invalid_args(
-			"merge_worker_changes",
-			"the worktree's parent folder is not bound; can't merge",
-		));
-	};
-	let base = parsed.base_branch.as_deref().unwrap_or("main").trim();
-	if base.is_empty() {
-		return Err(CoderError::invalid_args(
-			"merge_worker_changes",
-			"base_branch must not be empty",
-		));
-	}
-	// Switch the parent to the base branch, then merge the worker's
-	// branch into it. Both run on the parent's host so they share the
-	// same git index lock.
-	parent
-		.host
-		.branch_switch(&moon_protocol::git::BranchSwitchTarget::Local { name: base.to_string() })
-		.await?;
-	parent.host.git_merge_default_branch(&branch).await?;
-	Ok(json!({
-		"merged_branch": branch,
-		"into": base,
-	}))
+	let parsed: CheckArgs = serde_json::from_value(args.clone())
+		.map_err(|err| CoderError::invalid_args("check_worker_base", err.to_string()))?;
+	worker_base_report(state, "check_worker_base", &parsed.worker_id).await
 }
 
-/// `discard_worker_worktree` — remove a finished worker's checkout and
-/// unbind its folder (ADR 0044). The branch is kept; the worker's
-/// session stays in the list and falls back to the parent project.
-///
-/// This is the agent-side twin of the `coder_discard_worktree` Tauri
-/// command, and shares its idempotence: a checkout that's already gone
-/// from disk is forgotten (stale git metadata pruned) rather than
-/// erroring.
 /// Normalise a fleet tool's target list: `worker_id` (one) and/or
 /// `worker_ids` (several), deduplicated in order. Erroring on an
 /// empty set keeps "forgot both fields" a loud arg failure instead
@@ -9789,8 +9641,7 @@ fn parse_worker_ids(tool: &str, args: &Value) -> Result<Vec<String>, CoderError>
 /// Fold per-worker outcomes for a multi-target fleet tool: each
 /// entry is the worker's result stamped with its `worker_id`, or a
 /// `{worker_id, error}` row — one bad id doesn't fail the batch.
-/// (Single-target calls skip this and return the bare result, the
-/// historic shape.)
+/// (Single-target calls skip this and return the bare result.)
 fn fold_worker_results(results: Vec<(String, Result<Value, CoderError>)>) -> Value {
 	let rows: Vec<Value> = results
 		.into_iter()
@@ -9807,53 +9658,18 @@ fn fold_worker_results(results: Vec<(String, Result<Value, CoderError>)>) -> Val
 	json!({ "results": rows })
 }
 
-async fn handle_discard_worker_worktree(
-	state: &Arc<CoderState>,
-	sink: &FolderEventSink,
-	args: &Value,
-) -> Result<Value, CoderError> {
-	#[derive(serde::Deserialize)]
-	struct DiscardArgs {
-		#[serde(default)]
-		force: bool,
-		#[serde(default)]
-		retire: bool,
-	}
-	let parsed: DiscardArgs = serde_json::from_value(args.clone())
-		.map_err(|err| CoderError::invalid_args("discard_worker_worktree", err.to_string()))?;
-	let ids = parse_worker_ids("discard_worker_worktree", args)?;
-	// `retire: true` folds the follow-up `retire_worker` into the
-	// same call — discard first (retire refuses a bound worktree),
-	// then drop the fleet link. A retire refusal (e.g. the turn
-	// started between the two steps) reports on the result instead
-	// of erroring the already-done discard.
-	let discard_and_retire = |result: &mut Result<Value, CoderError>,
-	                          retire_outcome: Option<Result<Value, CoderError>>| {
-		let (Ok(value), Some(outcome)) = (result, retire_outcome) else {
-			return;
-		};
-		let Some(map) = value.as_object_mut() else {
-			return;
-		};
-		match outcome {
-			Ok(_) => {
-				map.insert("retired".into(), json!(true));
-			}
-			Err(err) => {
-				map.insert("retire_error".into(), json!(err.to_string()));
-			}
-		}
-	};
+/// Run a per-worker fleet operation over `worker_id` / `worker_ids`.
+/// One id returns the bare result; several fold into `results`.
+async fn for_each_worker<'a, F, Fut>(tool: &str, args: &Value, mut run: F) -> Result<Value, CoderError>
+where
+	F: FnMut(String) -> Fut,
+	Fut: std::future::Future<Output = Result<Value, CoderError>> + 'a,
+{
+	let ids = parse_worker_ids(tool, args)?;
 	let single = ids.len() == 1;
 	let mut results: Vec<(String, Result<Value, CoderError>)> = Vec::new();
 	for worker_id in ids {
-		let mut result = discard_one_worker_worktree(state, sink, &worker_id, parsed.force).await;
-		let retire_outcome = if parsed.retire && result.is_ok() {
-			Some(retire_one_worker(state, sink, &worker_id).await)
-		} else {
-			None
-		};
-		discard_and_retire(&mut result, retire_outcome);
+		let result = run(worker_id.clone()).await;
 		results.push((worker_id, result));
 	}
 	if single {
@@ -9862,71 +9678,370 @@ async fn handle_discard_worker_worktree(
 	Ok(fold_worker_results(results))
 }
 
-async fn discard_one_worker_worktree(
-	state: &Arc<CoderState>,
+/// A cleanup tool may only act on this coordinator's own, still-attached
+/// worker. `Ok(false)` is the user-disconnected case (ADR 0052): the
+/// coordinator may drop its bookkeeping but must not touch the work.
+async fn own_worker_attached(
 	sink: &FolderEventSink,
+	state: &Arc<CoderState>,
+	tool: &str,
 	worker_id: &str,
-	force: bool,
-) -> Result<Value, CoderError> {
-	ensure_worker_still_attached(state, "discard_worker_worktree", worker_id).await?;
-	let Some((rt, worker_folder)) = state.runtime_for_session(worker_id).await else {
-		return Err(CoderError::invalid_args(
-			"discard_worker_worktree",
-			format!("no mounted session for worker_id `{worker_id}`"),
-		));
-	};
-	// Never yank a checkout out from under a running turn — the
-	// worker's next tool call would write into a deleted directory.
+) -> Result<bool, CoderError> {
+	let ownership = state.coordinator_workers.read().await.ownership_of(worker_id);
+	match ownership {
+		Some((owner, attached)) if owner == sink.session_id() => Ok(attached),
+		_ => Err(CoderError::invalid_args(
+			tool,
+			format!("`{worker_id}` is not a worker of this coordinator"),
+		)),
+	}
+}
+
+async fn ensure_worker_idle(rt: &SessionRuntime, tool: &str, worker_id: &str) -> Result<(), CoderError> {
 	if rt.turn.lock().await.cancel.is_some() {
 		return Err(CoderError::invalid_args(
-			"discard_worker_worktree",
+			tool,
 			format!("worker `{worker_id}` has a turn in flight — wait for it to finish or `abort_worker` first"),
 		));
 	}
-	let (worktree_root, worktree_branch) = {
+	Ok(())
+}
+
+/// `git add -A` + commit in `folder` when it has changes; `None` when
+/// clean. Without a `message` the cheap model suggests one from the
+/// diff (falling back to `fallback` when only untracked files changed,
+/// which `git diff HEAD` doesn't show).
+async fn commit_if_dirty(
+	state: &Arc<CoderState>,
+	folder: &WorkspaceFolderEntry,
+	message: Option<&str>,
+	fallback: &str,
+) -> Result<Option<String>, CoderError> {
+	let entries = folder.host.git_status_entries(&[]).await?;
+	let dirty = entries
+		.iter()
+		.any(|e| !matches!(e.status, moon_protocol::git::GitFileStatus::Ignored));
+	if !dirty {
+		return Ok(None);
+	}
+	let message = match message.map(str::trim) {
+		Some(msg) if !msg.is_empty() => msg.to_owned(),
+		_ => {
+			let diff = folder.host.git_diff_patch().await.unwrap_or_default();
+			if diff.is_empty() {
+				fallback.to_owned()
+			} else {
+				suggest_commit_message_from_state(state, &diff).await?
+			}
+		}
+	};
+	let result = folder.host.git_commit(&message, false).await?;
+	Ok(Some(result.short_sha))
+}
+
+/// The branch `land_worker` merges into when the caller names none:
+/// the repo's default (`origin/HEAD` → `main`), else `main`.
+fn default_land_base(default_branch_remote_ref: Option<&str>) -> String {
+	default_branch_remote_ref
+		.and_then(|r| r.split_once('/'))
+		.map(|(_, branch)| branch.to_string())
+		.filter(|branch| !branch.is_empty())
+		.unwrap_or_else(|| "main".to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct LandArgs {
+	#[serde(default)]
+	base_branch: Option<String>,
+	#[serde(default)]
+	message: Option<String>,
+}
+
+/// `land_worker` — commit, base-check, merge locally, then remove the
+/// worktree, delete the merged branch, and retire the worker
+/// (ADR 0109). Stops before the merge on a flagged stale base; a failed
+/// merge (aborted on conflict, ADR 0055) leaves everything untouched.
+async fn handle_land_worker(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	let parsed: LandArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("land_worker", err.to_string()))?;
+	for_each_worker("land_worker", args, |worker_id| {
+		let parsed = &parsed;
+		async move { land_one_worker(state, sink, &worker_id, parsed).await }
+	})
+	.await
+}
+
+async fn land_one_worker(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	worker_id: &str,
+	parsed: &LandArgs,
+) -> Result<Value, CoderError> {
+	const TOOL: &str = "land_worker";
+	if !own_worker_attached(sink, state, TOOL, worker_id).await? {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			format!("worker `{worker_id}` was disconnected by the user — it is no longer attached to you; leave it alone"),
+		));
+	}
+	let Some((rt, worker_folder)) = state.runtime_for_session(worker_id).await else {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			format!("no mounted session for worker_id `{worker_id}`"),
+		));
+	};
+	ensure_worker_idle(&rt, TOOL, worker_id).await?;
+	let (worktree_root, worktree_branch, in_place) = {
 		let session = rt.session.lock().await;
 		(
 			session.header.worktree_root.clone(),
 			session.header.worktree_branch.clone(),
+			session.header.in_place_worker,
 		)
 	};
-	// Idempotent (ADR 0064): a worker whose checkout is already gone
-	// — merged-and-removed, auto-reconciled after an out-of-band
-	// `git worktree remove` (ADR 0063), or discarded once before —
-	// has nothing left to do. Erroring here left coordinators with
-	// workers they could never finish cleaning up.
-	let Some(worktree_path) = worktree_root else {
+	// No worktree and not spawned in place: its worktree was removed
+	// earlier and the session now routes to the parent folder, whose
+	// uncommitted changes may be the user's own — never commit those.
+	if worktree_root.is_none() && !in_place {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			format!("worker `{worker_id}` has no worktree any more (removed earlier) — there is nothing of its own to land here; `close_worker` it"),
+		));
+	}
+	let worktree_entry = match &worktree_root {
+		Some(root) => {
+			let Some(entry) = state.workspaces.folder_for_path(root).await else {
+				return Err(CoderError::invalid_args(
+					TOOL,
+					format!("worker `{worker_id}`'s worktree `{root}` is no longer bound — its checkout is gone, so there is nothing to commit; inspect its branch by hand or `close_worker` it"),
+				));
+			};
+			Some(entry)
+		}
+		None => None,
+	};
+	let checkout = match &worktree_entry {
+		Some(entry) => entry.clone(),
+		None => state
+			.folder_entry_for(worker_folder.as_str())
+			.await
+			.ok_or_else(|| CoderError::invalid_args(TOOL, format!("no bound folder for path `{worker_folder}`")))?,
+	};
+	let fallback = format!("Work from {}", worktree_branch.as_deref().unwrap_or(worker_id));
+	let committed = commit_if_dirty(state, &checkout, parsed.message.as_deref(), &fallback).await?;
+
+	// In-place worker: its commits already sit on the checked-out
+	// branch, so landing is just the commit plus retirement.
+	let (Some(worktree_path), Some(entry)) = (worktree_root, worktree_entry) else {
+		retire_one_worker(state, sink, TOOL, worker_id).await?;
 		return Ok(json!({
-			"status": "already_gone",
-			"note": "the worker has no worktree checkout anymore — nothing to discard; its session and branch are untouched",
+			"status": "landed",
+			"committed": committed,
+			"merged_into": null,
+			"branch_deleted": false,
+			"worktree_removed": false,
+			"retired": true,
 		}));
 	};
+	let Some(branch) = worktree_branch else {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			"worker has no worktree_branch — cannot merge without a branch name",
+		));
+	};
+	let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = entry.folder.origin.clone() else {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			format!("`{worktree_path}` is not a worktree folder"),
+		));
+	};
+	let Some(parent) = state.workspaces.folder_for_path(&parent_path).await else {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			"the worktree's parent folder is not bound; can't merge",
+		));
+	};
+
+	let base_report = worker_base_report(state, TOOL, worker_id).await?;
+	if base_report["flagged"].as_bool() == Some(true) {
+		return Ok(json!({
+			"status": "blocked",
+			"committed": committed,
+			"branch": branch,
+			"base_check": base_report,
+			"note": "nothing was merged or cleaned up — steer the worker to rebase, then land again",
+		}));
+	}
+
+	let base = match parsed.base_branch.as_deref().map(str::trim) {
+		Some(name) if !name.is_empty() => name.to_string(),
+		_ => {
+			let info = parent.host.git_branch().await.unwrap_or_default();
+			default_land_base(info.default_branch_remote_ref.as_deref())
+		}
+	};
+	// Both run on the parent's host so they share its git index lock.
+	let merged = async {
+		parent
+			.host
+			.branch_switch(&moon_protocol::git::BranchSwitchTarget::Local { name: base.clone() })
+			.await?;
+		parent.host.git_merge_default_branch(&branch).await
+	}
+	.await;
+	if let Err(err) = merged {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			format!("merging `{branch}` into `{base}` failed — the worktree, branch, and worker are untouched: {err}"),
+		));
+	}
+
+	let mut result = json!({
+		"status": "landed",
+		"committed": committed,
+		"merged_into": base,
+		"branch_deleted": false,
+		"worktree_removed": false,
+		"retired": false,
+	});
+	// The merge landed; a cleanup failure is reported, not raised, so
+	// the coordinator can finish with `close_worker`.
+	if let Err(err) = remove_worker_worktree(state, sink, TOOL, worker_id, false).await {
+		result["cleanup_error"] = json!(format!("{err} — finish with `close_worker`"));
+		return Ok(result);
+	}
+	result["worktree_removed"] = json!(true);
+	match parent.host.git_delete_branch(&branch, false).await {
+		Ok(()) => result["branch_deleted"] = json!(true),
+		Err(err) => result["branch_delete_error"] = json!(err.to_string()),
+	}
+	match retire_one_worker(state, sink, TOOL, worker_id).await {
+		Ok(()) => result["retired"] = json!(true),
+		Err(err) => result["cleanup_error"] = json!(err.to_string()),
+	}
+	Ok(result)
+}
+
+#[derive(serde::Deserialize)]
+struct CloseArgs {
+	#[serde(default)]
+	delete_branch: bool,
+	#[serde(default)]
+	force: bool,
+}
+
+/// `close_worker` — stop tracking a worker without merging: remove its
+/// worktree (dirty needs `force`), optionally delete its branch, and
+/// retire it (ADR 0109). Idempotent on an already-gone checkout.
+async fn handle_close_worker(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	args: &Value,
+) -> Result<Value, CoderError> {
+	let parsed: CloseArgs =
+		serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args("close_worker", err.to_string()))?;
+	for_each_worker("close_worker", args, |worker_id| {
+		let parsed = &parsed;
+		async move { close_one_worker(state, sink, &worker_id, parsed).await }
+	})
+	.await
+}
+
+async fn close_one_worker(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	worker_id: &str,
+	parsed: &CloseArgs,
+) -> Result<Value, CoderError> {
+	const TOOL: &str = "close_worker";
+	if !own_worker_attached(sink, state, TOOL, worker_id).await? {
+		// The user owns a disconnected worker's work; only the
+		// coordinator's bookkeeping goes.
+		retire_one_worker(state, sink, TOOL, worker_id).await?;
+		return Ok(json!({
+			"status": "closed",
+			"worktree_removed": false,
+			"branch_deleted": false,
+			"retired": true,
+			"note": "the user disconnected this worker — its worktree and branch are theirs and were left alone",
+		}));
+	}
+	let Some((rt, worker_folder)) = state.runtime_for_session(worker_id).await else {
+		return Err(CoderError::invalid_args(
+			TOOL,
+			format!("no mounted session for worker_id `{worker_id}`"),
+		));
+	};
+	ensure_worker_idle(&rt, TOOL, worker_id).await?;
+	let branch = rt.session.lock().await.header.worktree_branch.clone();
+	let worktree_removed = remove_worker_worktree(state, sink, TOOL, worker_id, parsed.force).await?;
+	let mut branch_deleted = false;
+	if let (true, Some(name)) = (parsed.delete_branch, &branch) {
+		if let Some(parent) = state.workspaces.folder_for_path(worker_folder.as_str()).await {
+			if let Err(err) = parent.host.git_delete_branch(name, parsed.force).await {
+				return Err(CoderError::invalid_args(
+					TOOL,
+					format!("the worktree is gone, but branch `{name}` was not deleted: {err} — pass `force: true` to drop unmerged work, or close again without `delete_branch`"),
+				));
+			}
+			branch_deleted = true;
+		}
+	}
+	retire_one_worker(state, sink, TOOL, worker_id).await?;
+	Ok(json!({
+		"status": "closed",
+		"branch": branch,
+		"worktree_removed": worktree_removed,
+		"branch_deleted": branch_deleted,
+		"retired": true,
+	}))
+}
+
+/// Remove a worker's checkout and unbind its folder (ADR 0044);
+/// `Ok(false)` when there was no bound checkout left. Idempotent
+/// (ADR 0064): a checkout that's already gone is forgotten (stale git
+/// metadata pruned) rather than erroring. The branch is not touched.
+async fn remove_worker_worktree(
+	state: &Arc<CoderState>,
+	sink: &FolderEventSink,
+	tool: &str,
+	worker_id: &str,
+	force: bool,
+) -> Result<bool, CoderError> {
+	let Some((rt, worker_folder)) = state.runtime_for_session(worker_id).await else {
+		return Err(CoderError::invalid_args(
+			tool,
+			format!("no mounted session for worker_id `{worker_id}`"),
+		));
+	};
+	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+	let Some(worktree_path) = worktree_root else {
+		return Ok(false);
+	};
+	let handle = CoderHandle { state: state.clone() };
 	let Some(wt_entry) = state.workspaces.folder_for_path(&worktree_path).await else {
 		// The header still points at a checkout the workspace no
 		// longer binds (removed out-of-band before the end-of-turn
 		// reconciliation caught it). Forget any stale git metadata —
 		// it would refuse a later `git worktree add` at the same
-		// deterministic path — then clear the stale routing so the
-		// session drives the parent tree, and report the same no-op
-		// success as the no-root case. The worker's session is filed
-		// under the worktree's parent project, so that folder's host
-		// runs the prune.
+		// deterministic path — then clear the stale routing. The
+		// worker's session is filed under the worktree's parent
+		// project, so that folder's host runs the prune.
 		if let Some(parent) = state.workspaces.folder_for_path(worker_folder.as_str()).await {
 			if let Err(err) = parent.host.git_worktree_forget(Utf8Path::new(&worktree_path)).await {
 				tracing::warn!(error = %err, worktree = %worktree_path, "git worktree prune failed for an unbound checkout");
 			}
 		}
-		let handle = CoderHandle { state: state.clone() };
 		handle.clear_worktree_sessions(&worktree_path).await;
-		return Ok(json!({
-			"status": "already_gone",
-			"worktree_path": worktree_path,
-			"note": "the worktree folder was already unbound — cleared the worker's stale routing; its session and branch are untouched",
-		}));
+		return Ok(false);
 	};
 	let moon_protocol::workspace::FolderOrigin::Worktree { parent_path, .. } = wt_entry.folder.origin.clone() else {
 		return Err(CoderError::invalid_args(
-			"discard_worker_worktree",
+			tool,
 			format!("`{worktree_path}` is not a worktree folder"),
 		));
 	};
@@ -9934,91 +10049,50 @@ async fn discard_one_worker_worktree(
 	// (ADR 0029) even when the workspace runs in a container, so
 	// `discard_checkout`'s host-side liveness test is valid under
 	// either shell target; `git_worktree_remove` translates the path
-	// for whichever target the parent runs on. Live / gone /
-	// stale-leftover checkouts all discard (ADR 0044 / ADR 0068) —
-	// leftovers need `force`, like a dirty tree.
+	// for whichever target the parent runs on. Stale-leftover
+	// checkouts need `force`, like a dirty tree (ADR 0068).
 	if let Some(parent) = state.workspaces.folder_for_path(&parent_path).await {
 		let path = Utf8Path::new(&worktree_path);
-		moon_core::worktree::discard_checkout(parent.host.as_ref(), path, path, force).await?;
+		moon_core::worktree::discard_checkout(parent.host.as_ref(), path, path, force)
+			.await
+			.map_err(|err| {
+				CoderError::invalid_args(
+					tool,
+					format!("{err} — commit it first, or pass `force: true` to drop it"),
+				)
+			})?;
 	}
 	state.workspaces.remove_folder(&worktree_path).await?;
 	// Sessions that routed to the checkout drive the parent's main
 	// tree from here on (and the panel drops their worktree chip).
-	let handle = CoderHandle { state: state.clone() };
 	handle.clear_worktree_sessions(&worktree_path).await;
 	// The folder bar has no other way to learn about an unbind it
 	// didn't initiate.
 	sink.send(CoderEvent::WorkspaceFoldersChanged);
-	Ok(json!({
-		"status": "discarded",
-		"worktree_path": worktree_path,
-		"branch": worktree_branch,
-		"note": "the branch is kept; the worker's session now runs against the parent project",
-	}))
+	Ok(true)
 }
 
-/// `retire_worker` — drop a fully-done worker from the coordinator's
-/// fleet registry (ADR 0064). Pure bookkeeping: the session, its
-/// transcript, and its branch are untouched; the registry link is
-/// removed so `list_workers` stops listing it, the feeder stops
-/// forwarding its events, and the control tools stop treating it as
-/// this coordinator's worker. Refuses a running worker (abort first)
-/// and one whose worktree is still bound (`discard_worker_worktree`
-/// first) so retirement can't strand an in-flight turn or an orphan
-/// folder the coordinator no longer has tools to clean up. A
-/// disconnected worker may be retired — that only drops the
-/// coordinator's own bookkeeping for a session the user already owns.
-async fn handle_retire_worker(
-	state: &Arc<CoderState>,
-	sink: &FolderEventSink,
-	args: &Value,
-) -> Result<Value, CoderError> {
-	let ids = parse_worker_ids("retire_worker", args)?;
-	let single = ids.len() == 1;
-	let mut results: Vec<(String, Result<Value, CoderError>)> = Vec::new();
-	for worker_id in ids {
-		let result = retire_one_worker(state, sink, &worker_id).await;
-		results.push((worker_id, result));
-	}
-	if single {
-		return results.remove(0).1;
-	}
-	Ok(fold_worker_results(results))
-}
-
+/// Drop a worker from this coordinator's fleet registry (ADR 0064):
+/// it leaves `list_workers`, stops waking the coordinator, and the
+/// control tools stop treating it as this coordinator's. The session,
+/// transcript, and branch are untouched. Refuses a running worker and
+/// one whose worktree is still bound, so retirement can't strand an
+/// in-flight turn or an orphan folder.
 async fn retire_one_worker(
 	state: &Arc<CoderState>,
 	sink: &FolderEventSink,
+	tool: &str,
 	worker_id: &str,
-) -> Result<Value, CoderError> {
+) -> Result<(), CoderError> {
 	let orchestrator_id = sink.session_id().to_string();
-	let owning = state
-		.coordinator_workers
-		.read()
-		.await
-		.owning_orchestrator_of(worker_id)
-		.map(str::to_string);
-	if owning.as_deref() != Some(orchestrator_id.as_str()) {
-		return Err(CoderError::invalid_args(
-			"retire_worker",
-			format!("`{worker_id}` is not a worker of this coordinator"),
-		));
-	}
 	if let Some((rt, _)) = state.runtime_for_session(worker_id).await {
-		if rt.turn.lock().await.cancel.is_some() {
-			return Err(CoderError::invalid_args(
-				"retire_worker",
-				format!("worker `{worker_id}` has a turn in flight — wait for it to finish or `abort_worker` first"),
-			));
-		}
+		ensure_worker_idle(&rt, tool, worker_id).await?;
 		let worktree_root = rt.session.lock().await.header.worktree_root.clone();
 		if let Some(root) = worktree_root {
 			if state.workspaces.folder_for_path(&root).await.is_some() {
 				return Err(CoderError::invalid_args(
-					"retire_worker",
-					format!(
-						"worker `{worker_id}` still has a bound worktree at `{root}` — land its work and `discard_worker_worktree` first"
-					),
+					tool,
+					format!("worker `{worker_id}` still has a bound worktree at `{root}`"),
 				));
 			}
 		}
@@ -10028,18 +10102,14 @@ async fn retire_one_worker(
 		.write()
 		.await
 		.remove(&orchestrator_id, worker_id);
+	// Kill the worker's MCP server instances (its headless browser,
+	// per-session) — a retired worker's chromium shouldn't idle until
+	// process restart.
+	state.tools.mcp().drop_session_connections(worker_id).await;
 	// Persist (ADR 0065): without this a restart-time fleet rebuild
 	// would re-register the retired worker.
-	// Kill the worker's MCP server instances (its headless
-	// browser, per-session since the tab-fight fix) — a retired
-	// worker's chromium shouldn't idle until process restart.
-	state.tools.mcp().drop_session_connections(worker_id).await;
 	persist_worker_detached(state, &orchestrator_id, worker_id, Some(sink.folder.as_str())).await;
-	Ok(json!({
-		"status": "retired",
-		"worker_id": worker_id,
-		"note": "the worker left your fleet; its session, transcript, and branch are untouched",
-	}))
+	Ok(())
 }
 
 /// Unbind worktree folders whose checkout vanished from disk
@@ -12681,6 +12751,49 @@ mod tests {
 	}
 
 	#[test]
+	fn base_check_report_flags_only_deletions_the_worker_didnt_write() {
+		use moon_protocol::git::{GitBaseCheck, GitBaseCheckFile};
+		let file = |path: &str, deletions: u32| GitBaseCheckFile {
+			path: path.into(),
+			additions: 1,
+			deletions,
+		};
+		let check = GitBaseCheck {
+			default_branch_remote_ref: "origin/main".into(),
+			behind_default: 2,
+			files: vec![file("mine.rs", 3), file("theirs.rs", 5), file("added.rs", 0)],
+		};
+		let touched: HashSet<String> = ["mine.rs".to_string()].into();
+		let report = base_check_report(&check, &touched);
+		assert_eq!(report["flagged"], true);
+		assert_eq!(report["stale"], true);
+		let suspects = report["revert_suspects"].as_array().unwrap();
+		assert_eq!(suspects.len(), 1);
+		assert_eq!(suspects[0]["path"], "theirs.rs");
+		assert!(report["verdict"]
+			.as_str()
+			.unwrap()
+			.starts_with("STALE-BASE REVERT RISK"));
+
+		// Behind but only touching its own files: not a land blocker.
+		let behind = GitBaseCheck {
+			files: vec![file("mine.rs", 3)],
+			..check
+		};
+		let report = base_check_report(&behind, &touched);
+		assert_eq!(report["flagged"], false);
+		assert!(report["verdict"].as_str().unwrap().starts_with("Behind"));
+	}
+
+	#[test]
+	fn default_land_base_strips_the_remote_and_falls_back_to_main() {
+		assert_eq!(default_land_base(Some("origin/main")), "main");
+		assert_eq!(default_land_base(Some("origin/release/2.x")), "release/2.x");
+		assert_eq!(default_land_base(Some("origin/")), "main");
+		assert_eq!(default_land_base(None), "main");
+	}
+
+	#[test]
 	fn fold_worker_results_stamps_ids_and_keeps_errors() {
 		let folded = fold_worker_results(vec![
 			("w-1".into(), Ok(json!({ "status": "retired" }))),
@@ -13583,6 +13696,7 @@ mod tests {
 			schema: SESSION_SCHEMA_VERSION,
 			id: id.into(),
 			orchestrator_session_id: None,
+			in_place_worker: false,
 			cwd: "/tmp/steer-test".into(),
 			title: "steer test".into(),
 			created_at_ms: 1,

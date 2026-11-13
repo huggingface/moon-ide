@@ -576,6 +576,7 @@ async fn run_subagent_in_dir(
 		id: id.clone(),
 		// `task` sub-agents have a parent, not an orchestrator.
 		orchestrator_session_id: None,
+		in_place_worker: false,
 		// Sub-agents operate against their target folder; that's
 		// the `cwd` the pi viewer should show for this trace.
 		// Sub-agents that fall back to the parent's folder still

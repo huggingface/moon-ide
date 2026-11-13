@@ -64,11 +64,9 @@ You manage workers with (details in each tool's description):
 - `steer_worker(worker_id, text)` — queued steering message, delivered at the worker's next loop iteration.
 - `abort_worker(worker_id)` — cancel a worker's in-flight turn.
 - `workspace_scm_status(worker_id?)` — read-only git status of a worker's worktree (or the main folder).
-- `commit_worker_changes(worker_id, message?)` — `git add -A` + commit on the worker's tree; omit `message` for an AI-suggested one.
-- `merge_worker_changes(worker_id, base_branch?)` — merge a worker's branch into a base branch locally. Commit first; run `check_worker_base` first. For repos with a remote, prefer leaving the branch for the user to PR.
 - `check_worker_base(worker_id)` — the rebase-before-merge / rebase-before-PR gate (see Worktrees and branches below).
-- `discard_worker_worktree(worker_id, force?)` — remove a landed worker's checkout and unbind its folder; the branch is kept. Never remove a worktree with `bash` — the folder would stay bound.
-- `retire_worker(worker_id)` — drop a fully-landed, discarded worker from the fleet. Retire as you go so `list_workers` stays a live picture instead of a graveyard.
+- `land_worker(worker_id | worker_ids, base_branch?, message?)` — merge a finished worker locally and clean up in one call: commits leftover changes, runs the base check (stops with `status: "blocked"` on a revert risk), merges into `base_branch` (default: the repo's default branch), removes the worktree, deletes the merged branch, and retires the worker.
+- `close_worker(worker_id | worker_ids, delete_branch?, force?)` — clean up without merging (e.g. after the worker pushed a PR, or to abandon the work): removes the worktree, optionally deletes the branch, and retires the worker. Never remove a worktree with `bash` — the folder would stay bound.
 - `clone_repo(url, path?)` / `init_repo(name)` — clone or create a repo and bind it as a workspace folder; pass the returned path to `spawn_worker`'s `folder` to put a worker in it.
 - `respond_to_worker_prompt(worker_id, answers)` — answer a worker's parked `ask_user` prompt (surfaced by `observe_worker` and needs-input wakes).
 
@@ -97,6 +95,8 @@ An **in-place worker** (`worktree: false`) trades that isolation away: it works 
 
 **Bases go stale.** A worker's branch is created off `origin/main` at spawn time and drifts further behind as its siblings' PRs merge. A stale branch can produce a diff that *deletes* work it didn't write — merging it silently reverts those merged PRs. So: **before any merge or PR, run `check_worker_base`; after one worker's PR merges, re-check every still-in-flight worker's base** and steer a rebase where it overlaps. Never land a branch it flags as reverting.
 
+**Landing.** How a worker's work lands is the project's call, not yours to assume: follow the project's landing conventions (e.g. its AGENTS.md) and ask the user if unclear. Your options per worker: merge it locally with `land_worker`; have the worker push / open a PR itself, then `close_worker`; or leave its worktree and branch in place for the user (just don't land or close it). Clean up as you go — `land_worker` / `close_worker` retire the worker, so `list_workers` stays a live picture instead of a graveyard.
+
 ## Reading rules
 
 - `read_file` returns each line prefixed with `<line_number>|<line>`. The prefix is metadata, not part of the file — strip it before quoting content.
@@ -121,7 +121,7 @@ Be concise. Do not narrate what each tool call is for; the UI already shows the 
 pub fn spawn_worker_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"spawn_worker",
-		"Spawn a worker — a peer top-level coder session — and seed it with a task prompt. Returns a `worker_id` handle immediately; the worker runs in the background and does not block. The worker is an ordinary agent session (full toolkit, can edit files). It shows up in the sessions list and the user can take over. Use this to delegate a self-contained piece of work to an autonomous agent.\n\nBy default the worker gets its own git worktree on a fresh `moon/<name>` branch off the coordinator's own project — isolated deliverable, mergeable later. Pass `worktree: false` to run the worker **in place** instead: directly in the target folder's existing checkout, on whatever branch is checked out, uncommitted changes included. Use in-place for quick fixes on the current branch, work that must build on uncommitted state, or a follow-up inside an existing worker's worktree (pass that worktree as `folder`). In-place workers share the tree with anything else working there — edits and commits are not isolated, and `merge_worker_changes` does not apply (commits already land on the checked-out branch). Only spawn multiple in-place workers on one folder when their files can't collide.\n\nGive the worker a short `name`: it becomes its session title (and, for worktree workers, the branch `moon/<name>` and worktree directory), so the user can tell your workers apart at a glance.",
+		"Spawn a worker — a peer top-level coder session — and seed it with a task prompt. Returns a `worker_id` handle immediately; the worker runs in the background and does not block. The worker is an ordinary agent session (full toolkit, can edit files). It shows up in the sessions list and the user can take over. Use this to delegate a self-contained piece of work to an autonomous agent.\n\nBy default the worker gets its own git worktree on a fresh `moon/<name>` branch off the coordinator's own project — isolated deliverable, mergeable later. Pass `worktree: false` to run the worker **in place** instead: directly in the target folder's existing checkout, on whatever branch is checked out, uncommitted changes included. Use in-place for quick fixes on the current branch, work that must build on uncommitted state, or a follow-up inside an existing worker's worktree (pass that worktree as `folder`). In-place workers share the tree with anything else working there — edits and commits are not isolated, and `land_worker` has nothing to merge (commits already land on the checked-out branch). Only spawn multiple in-place workers on one folder when their files can't collide.\n\nGive the worker a short `name`: it becomes its session title (and, for worktree workers, the branch `moon/<name>` and worktree directory), so the user can tell your workers apart at a glance.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -305,71 +305,12 @@ pub fn init_repo_tool_definition() -> ToolDefinition {
 	)
 }
 
-/// `commit_worker_changes` — checkpoint a worker's uncommitted
-/// work with a git commit. Runs `git add -A` + `git commit` on the
-/// worker's worktree (the same flow the IDE's SCM panel uses). If
-/// `message` is omitted, an AI-suggested commit message is generated
-/// from the diff. Returns the commit's short SHA + summary.
-pub fn commit_worker_changes_tool_definition() -> ToolDefinition {
+/// `land_worker` — merge a finished worker locally and clean up in
+/// one call (ADR 0109).
+pub fn land_worker_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
-		"commit_worker_changes",
-		"Commit a worker's uncommitted changes — runs `git add -A` + `git commit` on the worker's worktree, the same flow the IDE's SCM panel uses. Pass `message` to set the commit subject; omit it to get an AI-suggested message from the diff. Use `workspace_scm_status` first to check whether there's anything to commit. Returns the commit's short SHA and summary, or an error if there's nothing to commit.",
-		json!({
-			"type": "object",
-			"properties": {
-				"worker_id": {
-					"type": "string",
-					"description": "The worker id returned by `spawn_worker`."
-				},
-				"message": {
-					"type": "string",
-					"description": "Optional commit message (subject line). If omitted, an AI-suggested message is generated from the diff."
-				}
-			},
-			"required": ["worker_id"]
-		}),
-	)
-}
-
-/// `merge_worker_changes` — merge a worker's branch into a base
-/// branch on the parent repo. The parent repo is switched to
-/// `base_branch` (default: the repo's default branch), then `git
-/// merge --no-edit <worker_branch>` runs on the parent's host. The
-/// worker's worktree and branch are left intact — call this after
-/// `commit_worker_changes` to land committed work onto the base
-/// branch. Use this for local repos without a PR flow; for repos with
-/// a remote, leave the branch for the user to PR instead.
-pub fn merge_worker_changes_tool_definition() -> ToolDefinition {
-	ToolDefinition::function(
-		"merge_worker_changes",
-		"Merge a worker's branch into a base branch on the parent repo. Switches the parent repo to `base_branch` (defaults to `main`), then runs `git merge --no-edit <worker_branch>`. The worker's worktree and branch are left intact. Use `commit_worker_changes` first if the worker has uncommitted work. Use this for local repos without a PR flow — for repos with a remote, leave the branch for the user to PR instead. Returns the merge result or an error (conflicts, dirty tree, unknown ref).",
-		json!({
-			"type": "object",
-			"properties": {
-				"worker_id": {
-					"type": "string",
-					"description": "The worker id returned by `spawn_worker`."
-				},
-				"base_branch": {
-					"type": "string",
-					"description": "Optional. The branch to merge into. Defaults to `main`. Use this when the repo's default branch has a different name."
-				}
-			},
-			"required": ["worker_id"]
-		}),
-	)
-}
-
-/// `discard_worker_worktree` — remove a finished worker's checkout
-/// and unbind its folder (ADR 0044). The branch is kept: it is the
-/// deliverable. This is the coordinator's cleanup tool; without it a
-/// long run leaves one bound folder per worker in the user's project
-/// bar, and a `git worktree remove` through `bash` would leave the
-/// folder bound (the workspace registry never learns about it).
-pub fn discard_worker_worktree_tool_definition() -> ToolDefinition {
-	ToolDefinition::function(
-		"discard_worker_worktree",
-		"Remove a finished worker's git worktree and unbind its folder from the workspace. **The branch is kept** — it's the deliverable. Use this once the work is landed (merged, or pushed for a PR). Refuses while the worker's turn is running, and refuses uncommitted changes unless `force` is set — commit or merge first rather than forcing. The worker's session stays in the list and falls back to the parent project. Set `retire: true` to also retire the worker in the same call (the usual cleanup pair); pass `worker_ids` to clean up several at once.",
+		"land_worker",
+		"Merge a finished worker's work locally and clean up, in one call. Steps: commit any uncommitted changes in the worker's checkout (`message`, or an AI-suggested one); run the `check_worker_base` gate and stop with `status: \"blocked\"` (nothing merged) if it flags a stale-base revert risk — steer the worker to rebase, then land again; switch the parent repo to `base_branch` and merge the worker's branch (a conflict aborts the merge and errors, leaving everything untouched); remove the worktree, delete the merged branch, and retire the worker. An in-place worker (no worktree) just gets the commit and retirement. Refuses a worker whose turn is running. Returns `{status, committed, merged_into, branch_deleted, worktree_removed, retired}`. Pass `worker_ids` to land several in order.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -380,31 +321,27 @@ pub fn discard_worker_worktree_tool_definition() -> ToolDefinition {
 				"worker_ids": {
 					"type": "array",
 					"items": { "type": "string" },
-					"description": "Several worker ids to discard in one call. Each reports its own result; one failure doesn't stop the rest."
+					"description": "Several worker ids to land in one call, in order. Each reports its own result; one failure doesn't stop the rest."
 				},
-				"force": {
-					"type": "boolean",
-					"description": "Discard even when the worktree has uncommitted or untracked changes (`git worktree remove --force`). Those changes are lost. Default false — prefer `commit_worker_changes` first."
+				"base_branch": {
+					"type": "string",
+					"description": "Optional branch to merge into. Defaults to the repo's default branch (`main` when it can't tell)."
 				},
-				"retire": {
-					"type": "boolean",
-					"description": "Also retire the worker(s) from your fleet after a successful discard — same effect as a follow-up `retire_worker`, without the second call. Default false."
+				"message": {
+					"type": "string",
+					"description": "Optional commit message for uncommitted changes. Omit for an AI-suggested one. Ignored when the checkout is clean."
 				}
 			}
 		}),
 	)
 }
 
-/// `retire_worker` — drop a finished worker from the coordinator's
-/// fleet registry (ADR 0064). The session, its transcript, and its
-/// branch are untouched; the worker just stops appearing in
-/// `list_workers` and stops waking the coordinator. Without this a
-/// long-running coordinator's fleet grows monotonically — every
-/// landed worker lingers as an idle row forever.
-pub fn retire_worker_tool_definition() -> ToolDefinition {
+/// `close_worker` — stop tracking a worker and clean up without
+/// merging (ADR 0109).
+pub fn close_worker_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
-		"retire_worker",
-		"Retire a finished worker from your fleet: it stops appearing in `list_workers`, stops waking you, and the control tools no longer treat it as yours. Its session, transcript, and branch are untouched — bookkeeping, not deletion. Use it once the work is fully landed and the worktree discarded. Refuses a worker whose turn is running or whose worktree is still bound (use `discard_worker_worktree`'s `retire: true` to do both in one call). Pass `worker_ids` to retire several at once.",
+		"close_worker",
+		"Close a worker without merging: remove its git worktree and unbind the folder, optionally delete its branch, and retire it from your fleet (it leaves `list_workers` and stops waking you; its session and transcript stay). Use it after the worker's branch was pushed / PR'd, or to abandon the work. Refuses a worker whose turn is running, and a worktree with uncommitted changes unless `force`. An already-removed worktree is fine. For a worker the user disconnected, only your bookkeeping is dropped. Pass `worker_ids` to close several at once.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -415,7 +352,15 @@ pub fn retire_worker_tool_definition() -> ToolDefinition {
 				"worker_ids": {
 					"type": "array",
 					"items": { "type": "string" },
-					"description": "Several worker ids to retire in one call. Each reports its own result; one failure doesn't stop the rest."
+					"description": "Several worker ids to close in one call. Each reports its own result; one failure doesn't stop the rest."
+				},
+				"delete_branch": {
+					"type": "boolean",
+					"description": "Also delete the worker's branch. Default false (the branch is kept). Without `force` this refuses a branch whose commits aren't merged or pushed."
+				},
+				"force": {
+					"type": "boolean",
+					"description": "Drop uncommitted changes in the worktree and, with `delete_branch`, delete the branch even if unmerged. That work is lost. Default false."
 				}
 			}
 		}),
@@ -446,13 +391,13 @@ pub fn workspace_scm_status_tool_definition() -> ToolDefinition {
 /// `check_worker_base` — the rebase-before-merge / rebase-before-PR
 /// gate. Reports how far a worker's branch has drifted behind the
 /// repo's default branch and flags the stale-base revert tripwire: a
-/// file with deletions the worker didn't write. Use this before
-/// `merge_worker_changes`, before opening / updating a PR, and after a
+/// file with deletions the worker didn't write. `land_worker` runs it
+/// before merging; use it before opening / updating a PR, and after a
 /// wave-1 PR merges underneath an in-flight worker.
 pub fn check_worker_base_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"check_worker_base",
-		"Check whether a worker's branch has drifted stale against the repo's default branch — the rebase-before-merge / rebase-before-PR gate. Fetches, then reports how many commits behind `origin/main` the branch is and whether its diff **reverts work it didn't write** (a file with deletions the worker never touched). Run it before `merge_worker_changes` or opening / updating a PR, and on every in-flight worker after a sibling merges. If it flags a revert, don't merge / PR — steer the worker to rebase onto current `origin/main` first. Read-only.",
+		"Check whether a worker's branch has drifted stale against the repo's default branch — the rebase-before-merge / rebase-before-PR gate. Fetches, then reports how many commits behind `origin/main` the branch is and whether its diff **reverts work it didn't write** (a file with deletions the worker never touched). `land_worker` runs it before merging; run it yourself before opening / updating a PR, and on every in-flight worker after a sibling merges. If it flags a revert, don't merge / PR — steer the worker to rebase onto current `origin/main` first. Read-only.",
 		json!({
 			"type": "object",
 			"properties": {
@@ -540,20 +485,9 @@ mod tests {
 			workspace_scm_status_tool_definition().function.name,
 			"workspace_scm_status"
 		);
-		assert_eq!(
-			commit_worker_changes_tool_definition().function.name,
-			"commit_worker_changes"
-		);
-		assert_eq!(
-			merge_worker_changes_tool_definition().function.name,
-			"merge_worker_changes"
-		);
 		assert_eq!(check_worker_base_tool_definition().function.name, "check_worker_base");
-		assert_eq!(retire_worker_tool_definition().function.name, "retire_worker");
-		assert_eq!(
-			discard_worker_worktree_tool_definition().function.name,
-			"discard_worker_worktree"
-		);
+		assert_eq!(land_worker_tool_definition().function.name, "land_worker");
+		assert_eq!(close_worker_tool_definition().function.name, "close_worker");
 		assert_eq!(clone_repo_tool_definition().function.name, "clone_repo");
 		assert_eq!(init_repo_tool_definition().function.name, "init_repo");
 		assert_eq!(add_folder_tool_definition().function.name, "add_folder");
@@ -579,23 +513,21 @@ mod tests {
 	}
 
 	#[test]
-	fn discard_worker_worktree_takes_single_or_batch_ids_and_defaults_to_no_force() {
-		let params = discard_worker_worktree_tool_definition().function.parameters;
-		// `worker_id` or `worker_ids` — either is acceptable, so
-		// neither is schema-required (the handler validates).
-		assert!(params["properties"]["worker_id"].is_object());
-		assert!(params["properties"]["worker_ids"].is_object());
-		assert!(params["required"].is_null());
-		assert_eq!(params["properties"]["force"]["type"], "boolean");
-		assert_eq!(params["properties"]["retire"]["type"], "boolean");
-	}
-
-	#[test]
-	fn retire_worker_takes_single_or_batch_ids() {
-		let params = retire_worker_tool_definition().function.parameters;
-		assert!(params["properties"]["worker_id"].is_object());
-		assert!(params["properties"]["worker_ids"].is_object());
-		assert!(params["required"].is_null());
+	fn land_and_close_take_single_or_batch_ids() {
+		for def in [land_worker_tool_definition(), close_worker_tool_definition()] {
+			let params = def.function.parameters;
+			// Either id field works, so neither is schema-required
+			// (the handler validates).
+			assert!(params["properties"]["worker_id"].is_object());
+			assert!(params["properties"]["worker_ids"].is_object());
+			assert!(params["required"].is_null());
+		}
+		let land = land_worker_tool_definition().function.parameters;
+		assert_eq!(land["properties"]["base_branch"]["type"], "string");
+		assert_eq!(land["properties"]["message"]["type"], "string");
+		let close = close_worker_tool_definition().function.parameters;
+		assert_eq!(close["properties"]["delete_branch"]["type"], "boolean");
+		assert_eq!(close["properties"]["force"]["type"], "boolean");
 	}
 
 	#[test]
@@ -630,5 +562,9 @@ mod tests {
 		// Fleet awareness: the prompt points at `list_workers` as the
 		// ground-truth inventory and tells the coordinator workers are named.
 		assert!(COORDINATOR_SYSTEM_PROMPT.contains("list_workers"));
+		// Landing policy is the project's, not hardcoded (ADR 0109).
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("land_worker"));
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("close_worker"));
+		assert!(COORDINATOR_SYSTEM_PROMPT.contains("landing conventions"));
 	}
 }

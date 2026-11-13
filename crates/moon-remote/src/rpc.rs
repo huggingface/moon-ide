@@ -866,7 +866,7 @@ impl BridgeRpcHandler for BridgeRpc {
 				let folder = self.resolve_folder(&FolderParams { folder: p.folder }).await?;
 				// Auto-suggest when no message supplied — same
 				// fast-model prompt as the desktop's sparkle button
-				// and the coordinator's `commit_worker_changes`.
+				// and the coordinator's `land_worker`.
 				let message = if p.message.trim().is_empty() {
 					let diff = folder.host.git_diff_patch().await.unwrap_or_default();
 					self

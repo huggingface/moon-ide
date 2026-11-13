@@ -509,13 +509,14 @@ pub trait WorkspaceHost: Send + Sync {
 	/// best-effort housekeeping, not a gate.
 	async fn git_worktree_forget(&self, path: &Utf8Path) -> MoonResult<()>;
 
-	/// Delete a local branch (`git branch -D <name>`). Used after
-	/// merging a worktree session's branch into the base branch and
-	/// pruning the worktree — the branch's commits are now in the
-	/// base, so the branch itself is no longer needed. Errors
-	/// propagate git's stderr verbatim (branch not found, branch
-	/// checked out in a linked worktree, etc.).
-	async fn git_delete_branch(&self, name: &str) -> MoonResult<()>;
+	/// Delete a local branch: `git branch -d <name>`, or `-D` with
+	/// `force`. Used after merging a worktree's branch into the base
+	/// and pruning the worktree. The safe form refuses a branch whose
+	/// commits aren't merged into `HEAD` or its upstream, so callers
+	/// that can't vouch for the merge pass `force: false`. Errors
+	/// propagate git's stderr verbatim (not fully merged, branch not
+	/// found, checked out in a linked worktree, etc.).
+	async fn git_delete_branch(&self, name: &str, force: bool) -> MoonResult<()>;
 
 	/// Lightweight diff summary of the working tree against `HEAD`,
 	/// suitable for feeding to a small LLM that's suggesting a
@@ -2213,13 +2214,14 @@ impl WorkspaceHost for LocalHost {
 		.map_err(|e| MoonError::Internal(format!("git_worktree_forget join error: {e}")))?
 	}
 
-	async fn git_delete_branch(&self, name: &str) -> MoonResult<()> {
+	async fn git_delete_branch(&self, name: &str, force: bool) -> MoonResult<()> {
 		let guard = self.git_lock("git_delete_branch").await;
 		let root = self.root.clone();
 		let name = name.to_owned();
+		let flag = if force { "-D" } else { "-d" };
 		tokio::task::spawn_blocking(move || {
 			let _guard = guard;
-			run_git_simple(&root, &["branch", "-D", &name], &format!("git branch -D {name}"))
+			run_git_simple(&root, &["branch", flag, &name], &format!("git branch {flag} {name}"))
 		})
 		.await
 		.map_err(|e| MoonError::Internal(format!("git_delete_branch join error: {e}")))?
@@ -9787,6 +9789,35 @@ mod tests {
 		let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
 		let check = LocalHost::new(root).git_base_check().await.unwrap();
 		assert!(check.is_none(), "no origin/main → no base to check, got {check:?}");
+	}
+
+	/// The safe delete refuses an unmerged branch; `force` drops it.
+	#[tokio::test]
+	async fn git_delete_branch_is_safe_unless_forced() {
+		let Some(git) = which_git() else {
+			eprintln!("git not on PATH — skipping branch-delete test");
+			return;
+		};
+		let dir = TempDir::new().unwrap();
+		run_git(&git, dir.path(), &["init", "-q", "-b", "main"]);
+		run_git(&git, dir.path(), &["config", "user.email", "l@example.com"]);
+		run_git(&git, dir.path(), &["config", "user.name", "Local"]);
+		std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "initial"]);
+		run_git(&git, dir.path(), &["branch", "merged"]);
+		run_git(&git, dir.path(), &["checkout", "-q", "-b", "unmerged"]);
+		std::fs::write(dir.path().join("b.txt"), "new\n").unwrap();
+		run_git(&git, dir.path(), &["add", "."]);
+		run_git(&git, dir.path(), &["commit", "-q", "-m", "unmerged work"]);
+		run_git(&git, dir.path(), &["checkout", "-q", "main"]);
+
+		let root = Utf8PathBuf::from_path_buf(dir.path().canonicalize().unwrap()).unwrap();
+		let host = LocalHost::new(root);
+		host.git_delete_branch("merged", false).await.unwrap();
+		let err = host.git_delete_branch("unmerged", false).await.unwrap_err();
+		assert!(err.to_string().contains("git branch -d unmerged"), "{err}");
+		host.git_delete_branch("unmerged", true).await.unwrap();
 	}
 
 	/// Reproduces the `gh pr checkout <N>` shape for a fork PR

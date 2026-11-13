@@ -338,7 +338,7 @@ pub enum CoderEvent {
 	/// The set of bound workspace folders changed from an **agent**
 	/// path — a coordinator's `spawn_worker` (new worktree),
 	/// `clone_repo` / `init_repo` (new project), or
-	/// `discard_worker_worktree` (folder gone). Every UI-driven bind /
+	/// `land_worker` / `close_worker` (folder gone). Every UI-driven bind /
 	/// unbind returns a fresh `Workspace` snapshot from its own
 	/// command, but an agent-driven one has no such round trip, so
 	/// without this the folder bar shows a stale set until the user

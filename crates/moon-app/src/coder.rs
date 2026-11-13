@@ -731,7 +731,7 @@ pub async fn coder_merge_and_remove_worktree(
 	// already succeeded, so a branch-delete failure (e.g. git
 	// refusing because the branch is checked out elsewhere) is
 	// logged but not surfaced as a hard error.
-	if let Err(err) = parent.host.git_delete_branch(&branch).await {
+	if let Err(err) = parent.host.git_delete_branch(&branch, true).await {
 		tracing::warn!(?err, branch = %branch, "failed to delete merged worktree branch");
 	}
 	app.workspaces.remove_folder(&path).await?;

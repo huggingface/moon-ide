@@ -2157,10 +2157,8 @@
 		'steer_worker',
 		'abort_worker',
 		'review_worker_changes',
-		'commit_worker_changes',
-		'merge_worker_changes',
-		'discard_worker_worktree',
-		'retire_worker',
+		'land_worker',
+		'close_worker',
 		'respond_to_worker_prompt',
 	]);
 
@@ -2258,10 +2256,8 @@
 			case 'steer_worker':
 			case 'abort_worker':
 			case 'review_worker_changes':
-			case 'commit_worker_changes':
-			case 'merge_worker_changes':
-			case 'discard_worker_worktree':
-			case 'retire_worker':
+			case 'land_worker':
+			case 'close_worker':
 			case 'respond_to_worker_prompt': {
 				return typeof o.worker_id === 'string' ? firstLine(o.worker_id) : null;
 			}

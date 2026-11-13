@@ -393,7 +393,7 @@ async fn workspace_add(name: String, folder: Utf8PathBuf, slug: Option<String>) 
 /// Unbind one folder from a workspace's `session.json`. Worktree
 /// folders whose parent is the removed folder are left alone — they
 /// belong to coordinator workers and get cleaned up through
-/// `discard_worker_worktree`.
+/// `land_worker` / `close_worker`.
 async fn workspace_remove_folder(workspace: String, folder: Utf8PathBuf) -> anyhow::Result<()> {
 	moon_protocol::workspace::validate_workspace_id(&workspace)?;
 	let (_, workspaces_dir) = data_dirs()?;
