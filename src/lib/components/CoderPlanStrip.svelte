@@ -26,6 +26,10 @@
 					? `Next: ${next.content}`
 					: '',
 	);
+	// The running step only pulses while the agent is working (a turn,
+	// or background work that will resume it); a stopped session's
+	// unfinished step sits still.
+	const working = $derived(coder.currentSession.working);
 	let open = $state(false);
 
 	/** Whether the latest plan update came after the latest user
@@ -49,7 +53,7 @@
 </script>
 
 {#if visible}
-	<div class="plan-strip">
+	<div class="plan-strip" class:idle={!working}>
 		{#if open}
 			<div class="plan-strip-list">
 				<TodoList {todos} />
@@ -203,6 +207,10 @@
 			transform: scale(1.5);
 			opacity: 0;
 		}
+	}
+	.idle .step[data-status='in_progress']::before {
+		animation: none;
+		opacity: 0.25;
 	}
 	@media (prefers-reduced-motion: reduce) {
 		.step[data-status='in_progress']::before {
