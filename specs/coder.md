@@ -1964,7 +1964,8 @@ held back — commit, push, publish, open or update the PR — with any
 composer text appended. Agents stop short of landing work
 unless told, so this is the one-click "go ahead". Next to it, **Show
 me** sends "Show me" the same way, for the agent to open the result in
-a browser tab or screenshot it instead of describing it. The reasoning
+a browser tab or screenshot it instead of describing it, and **Go**
+sends "Go" to approve what the agent proposed. The reasoning
 picker sits at the other end of that row.
 
 Next to it, a **mic** button dictates into the composer: click to

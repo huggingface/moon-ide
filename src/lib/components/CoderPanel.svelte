@@ -42,6 +42,7 @@
 	import type { ContextMenuItem } from './contextMenu';
 	import MicIcon from './icons/MicIcon.svelte';
 	import EyeIcon from './icons/EyeIcon.svelte';
+	import PlayIcon from './icons/PlayIcon.svelte';
 	import RocketIcon from './icons/RocketIcon.svelte';
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -477,9 +478,10 @@
 		return (slug.split(':')[0] ?? '').split('/').at(-1) ?? slug;
 	}
 
-	// One-click nudges. Agents stop short of landing work ("not
-	// pushed yet") unless told, and describe UI changes instead of
-	// showing them (a browser tab, a screenshot) unless asked.
+	// One-click nudges. Agents stop to ask before acting, stop short of
+	// landing work ("not pushed yet"), and describe UI changes instead
+	// of showing them (a browser tab, a screenshot) unless told.
+	const GO_PROMPT = 'Go';
 	const SHIP_IT_PROMPT = 'Ship it';
 	const SHOW_ME_PROMPT = 'Show me';
 
@@ -3888,6 +3890,15 @@
 			></textarea>
 			<div class="composer-meta">
 				{#if coder.rows.length > 0}
+					<button
+						type="button"
+						class="ship-it"
+						title="Tell the agent to go ahead with what it proposed (anything typed in the composer is sent along)"
+						onclick={() => void sendNudge(GO_PROMPT)}
+					>
+						<PlayIcon size={12} />
+						Go
+					</button>
 					<button
 						type="button"
 						class="ship-it"
