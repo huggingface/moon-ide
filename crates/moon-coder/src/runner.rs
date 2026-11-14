@@ -6969,6 +6969,18 @@ fn spawn_turn_loop(
 	));
 }
 
+/// Running detached sub-agents (ADR 0091) or `notify` processes
+/// (ADR 0102) whose results will wake session `session_id`.
+async fn has_background_work(state: &CoderState, rt: &SessionRuntime, session_id: &str) -> bool {
+	let entries = state.detached_tasks.read().await.entries_of(session_id);
+	for entry in entries {
+		if entry.finish.lock().await.is_none() {
+			return true;
+		}
+	}
+	!rt.background.active_notify().is_empty()
+}
+
 async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &Result<(), CoderError>) {
 	// No subscriber (headless / tests): skip the transcript walk.
 	if state.turn_settled.receiver_count() == 0 {
@@ -6985,7 +6997,7 @@ async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &
 			continue;
 		}
 		if let Some((worker_rt, _)) = state.runtime_for_session(&worker_id).await {
-			if worker_rt.turn.lock().await.cancel.is_some() {
+			if worker_rt.turn.lock().await.cancel.is_some() || has_background_work(state, &worker_rt, &worker_id).await {
 				return;
 			}
 		}
@@ -6995,17 +7007,9 @@ async fn publish_turn_settled(state: &CoderState, rt: &SessionRuntime, result: &
 	if header.parent_session_id.is_some() || header.orchestrator_session_id.is_some() {
 		return;
 	}
-	// Still waiting on background sub-agents (ADR 0091): the agent
-	// isn't done — their reports will start another turn, and that
-	// one notifies.
-	let entries = state.detached_tasks.read().await.entries_of(&header.id);
-	for entry in entries {
-		if entry.finish.lock().await.is_none() {
-			return;
-		}
-	}
-	// Same for `notify` processes (ADR 0102).
-	if !rt.background.active_notify().is_empty() {
+	// Still waiting on background work: the agent isn't done — its
+	// results start another turn, and that one notifies.
+	if has_background_work(state, rt, &header.id).await {
 		return;
 	}
 	let outcome = match result {
