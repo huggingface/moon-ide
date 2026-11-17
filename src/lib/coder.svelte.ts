@@ -164,12 +164,13 @@ export type CoderRow =
 			diff: string;
 	  };
 
-/** Which view of the Coder panel is mounted. `'list'` shows the
- *  sessions list; `'session'` shows an active session's transcript
- *  + composer;
- *  `'subagent'` is the pop-out for a single sub-agent's full
- *  transcript — back-arrow returns to the parent's session. */
-export type CoderView = 'list' | 'session' | 'subagent';
+/** Which view of the Coder panel is mounted. `'session'` shows a
+ *  session's transcript + composer; `'empty'` is the folder having
+ *  sessions but none open (the list lives in the sidebar, the panel
+ *  offers a new session); `'subagent'` is the pop-out for a single
+ *  sub-agent's full transcript — back-arrow returns to the parent's
+ *  session. */
+export type CoderView = 'empty' | 'session' | 'subagent';
 
 /** Status of one sub-agent currently visible in the parent's
  *  transcript. Drives the collapsed card under each `task`
@@ -523,7 +524,7 @@ class FolderState {
 	/** Session id the panel is currently mounted on for this
 	 *  folder; `null` when there is no visible session (cold
 	 *  start before hydration, or after deleting the visible
-	 *  session — the panel falls back to the sessions list).
+	 *  session — the panel falls back to its empty view).
 	 *  Mutated by `openSession` / `newSession` / `session_loaded`
 	 *  / `deleteSession` / hydration. */
 	visibleSessionId = $state<string | null>(null);
@@ -585,6 +586,16 @@ class FolderState {
 	 *  yet. */
 	isSessionAttention(sessionId: string): boolean {
 		return this.sessionsById.get(sessionId)?.attentionPending ?? false;
+	}
+
+	/** Drop the `finished` marker without opening the session: the
+	 *  user dismissed the row, so the folder bar's rollup of the same
+	 *  flag should let go too. */
+	clearSessionAttention(sessionId: string): void {
+		const session = this.sessionsById.get(sessionId);
+		if (session !== undefined) {
+			session.attentionPending = false;
+		}
 	}
 }
 
@@ -716,24 +727,12 @@ export type HubSyncRowState =
 const NO_FOLDER_KEY = '';
 
 export class CoderPanelState {
-	/** Whether the coder panel is on screen. Persisted as
-	 *  `AppState.coder_panel_visible`. */
-	panelVisible = $state(false);
-
-	/** Bound by `WorkspaceState.restoreAppState` so a flip triggers
-	 *  an `app_state_save`. Unset until hydration finishes. */
-	#onPanelVisibleChange: (() => void) | null = null;
-
-	bindOnPanelVisibleChange(handler: () => void): void {
-		this.#onPanelVisibleChange = handler;
-	}
+	/** Whether the coder panel is on screen. Not persisted: every
+	 *  launch starts with it open. */
+	panelVisible = $state(true);
 
 	setPanelVisible(visible: boolean): void {
-		if (this.panelVisible === visible) {
-			return;
-		}
 		this.panelVisible = visible;
-		this.#onPanelVisibleChange?.();
 	}
 
 	/** Latest `coder_status`. `null` before the first call. Global
@@ -2407,11 +2406,10 @@ export class CoderPanelState {
 			// gets reissued later.
 			folder.sessionsById.delete(id);
 			if (folder.visibleSessionId === id) {
-				// Fall back to the sessions list (the existing
-				// list-or-empty-session logic at the panel
-				// view layer handles the rest).
+				// With nothing left to pick, land on a blank
+				// session so the composer is immediately usable.
 				folder.visibleSessionId = null;
-				folder.view = (folder.sessions?.length ?? 0) > 0 ? 'list' : 'session';
+				folder.view = (folder.sessions?.length ?? 0) > 0 ? 'empty' : 'session';
 			}
 		} catch (err) {
 			// eslint-disable-next-line no-console
@@ -2423,13 +2421,6 @@ export class CoderPanelState {
 	 *  from the backend's `session_title_updated` broadcast. */
 	async renameSession(id: string, title: string): Promise<void> {
 		await ipc.coder.renameSession(id, title);
-	}
-
-	/** Switch to the sessions-list view. Doesn't drop the
-	 *  in-memory session — the user can come back via a click. */
-	showSessionsList(): void {
-		this.view = 'list';
-		void this.refreshSessions();
 	}
 
 	/** Switch to the transcript view of the current session. If
@@ -2488,7 +2479,7 @@ export class CoderPanelState {
 		// a fresh isolated session, removing an inactive folder). Those
 		// must not re-run the select pass below: a just-minted session
 		// isn't on disk until its first turn persists it (ADR 0028), so
-		// re-selecting would evict it back to the sessions list.
+		// re-selecting would evict it back to the empty view.
 		if (path === this.activeFolderPath && actual === this.#activeFolderActual) {
 			return;
 		}
@@ -2499,8 +2490,8 @@ export class CoderPanelState {
 			// If the session we're switching back into view is the
 			// one that finished while we were away, the user is now
 			// looking at it — drop its per-row `finished` marker too.
-			// (Switching to the list view leaves other rows' markers
-			// intact; only the visible session counts as "seen".)
+			// (Other rows' markers stay intact; only the visible
+			// session counts as "seen".)
 			// A worktree shares its parent's bucket (ADR 0028), so the
 			// pointer may still name a session from another worktree
 			// context — the select pass below swaps it out without the
@@ -2648,8 +2639,8 @@ export class CoderPanelState {
 	 *  it), and bailing here used to leave the panel stuck on
 	 *  whatever the bucket last showed. No-op when the current
 	 *  visible session already matches. When no matching session
-	 *  exists, the panel falls back to the sessions list view so
-	 *  the user can pick one or start a new one. */
+	 *  exists, the panel falls back to its empty view so the user
+	 *  can pick one from the sidebar or start a new one. */
 	async #selectSessionForActiveFolder(): Promise<void> {
 		const folder = this.current;
 		// Snapshot the visible pointer: this pass runs detached from
@@ -2657,8 +2648,8 @@ export class CoderPanelState {
 		// after it (`openSessionInFolder` — the coordinator's worker
 		// card switches folder, then opens the worker by id). If the
 		// pointer moves while we're awaiting below, the explicit open
-		// won; clobbering it to the list view was the "worker session
-		// flashes then bounces to the sessions list" bug.
+		// won; clobbering it to the empty view was the "worker session
+		// flashes then bounces away" bug.
 		const visibleAtStart = folder.visibleSessionId;
 		const explicitOpenLanded = () => this.current !== folder || folder.visibleSessionId !== visibleAtStart;
 		if (folder.sessions === null) {
@@ -2736,10 +2727,10 @@ export class CoderPanelState {
 			}
 			await this.openSession(match.id);
 		} else {
-			// No matching session for this worktree context — show
-			// the sessions list so the user can pick or start one.
+			// No matching session for this worktree context — the
+			// user picks one from the sidebar or starts one.
 			folder.visibleSessionId = null;
-			folder.view = 'list';
+			folder.view = 'empty';
 		}
 	}
 
@@ -2787,6 +2778,12 @@ export class CoderPanelState {
 		this.#hydratedFolders.add(path);
 		await this.refreshStatus();
 		await this.#hydrateSession();
+		// The sidebar lists the folder's sessions whichever way the
+		// session was restored; adopting the backend's live one never
+		// fetched the list.
+		if ((this.activeFolderPath ?? NO_FOLDER_KEY) === path && this.current.sessions === null) {
+			await this.refreshSessions();
+		}
 	}
 
 	/** First-mount session hydration for the **active folder**.
@@ -2798,9 +2795,8 @@ export class CoderPanelState {
 	 *  when it's the parent, the session must be a non-worktree
 	 *  session. If the backend's session doesn't match (or
 	 *  there's none), loads the sessions list and picks the
-	 *  latest matching one. Falls back to the sessions list
-	 *  view when no matching session exists. Best-effort
-	 *  throughout.
+	 *  latest matching one. Falls back to the empty view when
+	 *  no matching session exists. Best-effort throughout.
 	 *
 	 *  Per-folder per the multi-session design: each folder
 	 *  hydrates independently. Switching folders doesn't
@@ -2812,7 +2808,7 @@ export class CoderPanelState {
 		// Same explicit-open race guard as
 		// `#selectSessionForActiveFolder`: if an open lands while we
 		// await (a worker card click racing first-visit hydration),
-		// that open owns the view — never clobber it to the list.
+		// that open owns the view — never clobber it to the empty view.
 		const visibleAtStart = folder.visibleSessionId;
 		const explicitOpenLanded = () => this.current !== folder || folder.visibleSessionId !== visibleAtStart;
 		// Determine the worktree context: when the actual active
@@ -2894,7 +2890,7 @@ export class CoderPanelState {
 					return;
 				} catch {
 					// Session vanished between list and open —
-					// fall through to the list view.
+					// fall through to the empty view.
 				}
 			}
 		}
@@ -2908,7 +2904,7 @@ export class CoderPanelState {
 			folder.view = 'session';
 			return;
 		}
-		folder.view = (sessions?.length ?? 0) > 0 ? 'list' : 'session';
+		folder.view = (sessions?.length ?? 0) > 0 ? 'empty' : 'session';
 	}
 
 	async startDeviceFlow(): Promise<void> {
@@ -3547,9 +3543,9 @@ export class CoderPanelState {
 	/** Flip a *session's* `attentionPending` flag iff its turn
 	 *  ended while the user wasn't following it. "Following" means
 	 *  all three hold: the session's folder is the active one, the
-	 *  panel is on the session view (not the sessions list), and
+	 *  panel is on the session view, and
 	 *  the folder's `visibleSessionId` points at this session.
-	 *  Anything else — a different folder, the list view, or a
+	 *  Anything else — a different folder, the empty view, or a
 	 *  different session mounted — is a background completion that
 	 *  earns the orange `finished` marker on this row. The folder
 	 *  bar's "agent finished" sparkle is a rollup of these

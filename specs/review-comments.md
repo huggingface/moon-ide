@@ -203,7 +203,7 @@ Steps inside `publish_pr_review`:
    ```json
    {
    	"commit_id": "<headRefOid>",
-   	"event": "COMMENT",
+   	"event": "COMMENT | APPROVE | REQUEST_CHANGES",
    	"body": "<optional summary>",
    	"comments": [
    		{ "path": "...", "line": 42, "side": "RIGHT", "body": "..." },
@@ -211,6 +211,11 @@ Steps inside `publish_pr_review`:
    	]
    }
    ```
+   `event` is the verdict picked in the publish dialog
+   ([ADR 0113](decisions/0113-pr-context-in-review-tab.md)). `comments` may be
+   empty: an approval needs nothing else, a request for changes needs `body`, a
+   plain comment needs `body` or a comment. When there were drafts and none
+   could be placed, nothing is posted at all.
    One review event, one notification — not N standalone inline comments. We use
    `line`+`side` (and `start_line`+`start_side` for multi-line), never the legacy
    `position` offset, so anchoring is by file line at `commit_id`, exactly what
@@ -249,13 +254,12 @@ grows), `#[serde(rename_all = "camelCase")]`, `#[ts(export)]`, hand-mirrored in
 
 Carried from [ADR 0027](decisions/0027-review-comments.md):
 
-- **No threading / replies / resolve**, and **no displaying other people's
-  comments**. This is a write-my-own-review tool, not a GitHub review-thread
-  client.
+- **No replies / resolve.** Other people's review threads and moonbot's notes
+  are shown read-only in the review tab
+  ([ADR 0113](decisions/0113-pr-context-in-review-tab.md)); answering them
+  happens on GitHub.
 - **No GitLab / Bitbucket** — GitHub and Forgejo only, matching
   `detect_forge_remote` ([ADR 0073](decisions/0073-forgejo-support.md)).
 - **No `gh pr create`** — link to the create-PR URL and stop.
-- **No APPROVE / REQUEST_CHANGES** initially — every review posts as
-  `event: COMMENT`. The `event` field is the seam to add them later.
 - **No round-tripping published comments back into the IDE** — once posted, the
   local copy is deleted and we don't poll GitHub.

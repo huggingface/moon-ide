@@ -1,7 +1,5 @@
 <script lang="ts">
-	// Three-line "all conversations" list glyph — same visual
-	// language Slack / Discord / Cursor use for the sessions list
-	// header.
+	// Right-pointing chevron — a collapsed disclosure.
 
 	type Props = { size?: number };
 	let { size = 14 }: Props = $props();
@@ -11,16 +9,14 @@
 	xmlns="http://www.w3.org/2000/svg"
 	width={size}
 	height={size}
-	viewBox="0 0 16 16"
+	viewBox="0 0 24 24"
 	fill="none"
 	stroke="currentColor"
-	stroke-width="1.5"
+	stroke-width="2"
 	stroke-linecap="round"
 	stroke-linejoin="round"
 	aria-hidden="true"
 	focusable="false"
 >
-	<path d="M3 4h10" />
-	<path d="M3 8h10" />
-	<path d="M3 12h10" />
+	<path d="m9 18 6-6-6-6" />
 </svg>

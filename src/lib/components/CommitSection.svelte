@@ -14,7 +14,8 @@
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import { diffCollapseContextExtension } from '../editor/diffCollapseContext';
-	import type { EditorConfig, GitFileStatus } from '../protocol';
+	import { annotationsFor, PrAnnotationWiring } from '../editor/prAnnotations';
+	import type { EditorConfig, GitFileStatus, PullRequestDetail } from '../protocol';
 
 	type Props = {
 		path: string;
@@ -28,9 +29,13 @@
 		eager: boolean;
 		registerSection: (path: string, el: HTMLElement | null) => void;
 		side: SplitSide;
+		// The pull request this diff is the "Files changed" of (the
+		// PR tab, ADR 0113): its review threads and line-bound moonbot
+		// notes render under their lines. Absent for a plain commit.
+		pullRequest?: PullRequestDetail;
 	};
 
-	let { path, status, commitSha, parentSha, eager, registerSection, side }: Props = $props();
+	let { path, status, commitSha, parentSha, eager, registerSection, side, pullRequest }: Props = $props();
 
 	let sectionEl: HTMLElement | undefined = $state();
 	let host: HTMLDivElement | undefined = $state();
@@ -51,6 +56,17 @@
 	// CodeMirror falls back to 4.
 	const ecA = new Compartment();
 	const ecB = new Compartment();
+
+	const prWiringA = new PrAnnotationWiring();
+	const prWiringB = new PrAnnotationWiring();
+	const baseAnnotations = $derived(annotationsFor(pullRequest ?? null, path, 'base'));
+	const workingAnnotations = $derived(annotationsFor(pullRequest ?? null, path, 'working'));
+	$effect(() => {
+		prWiringA.sync(baseAnnotations);
+	});
+	$effect(() => {
+		prWiringB.sync(workingAnnotations);
+	});
 
 	function editorConfigExtensions(ec: EditorConfig): Extension {
 		const unit = ec.indent_style === 'tab' ? '\t' : ' '.repeat(Math.max(1, ec.indent_size));
@@ -152,6 +168,7 @@
 			ecA.of(ec),
 			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			selectionPublish,
+			...(pullRequest === undefined ? [] : [prWiringA.extension(baseAnnotations)]),
 			...readOnly,
 		];
 
@@ -169,6 +186,7 @@
 			ecB.of(ec),
 			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			selectionPublish,
+			...(pullRequest === undefined ? [] : [prWiringB.extension(workingAnnotations)]),
 			...readOnly,
 		];
 
@@ -186,6 +204,10 @@
 		});
 
 		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
+		if (pullRequest !== undefined) {
+			prWiringA.attach(merge.a);
+			prWiringB.attach(merge.b);
+		}
 		mounted = true;
 		loading = false;
 	}
@@ -291,6 +313,8 @@
 				buildToken++;
 				detachHScrollSync?.();
 				detachHScrollSync = null;
+				prWiringA.detach();
+				prWiringB.detach();
 				merge?.destroy();
 				merge = undefined;
 				clearOurSelection();
@@ -301,6 +325,8 @@
 			buildToken++;
 			detachHScrollSync?.();
 			detachHScrollSync = null;
+			prWiringA.detach();
+			prWiringB.detach();
 			merge?.destroy();
 			merge = undefined;
 			clearOurSelection();

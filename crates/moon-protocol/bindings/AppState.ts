@@ -27,9 +27,10 @@ theme: ThemeMode,
  */
 bottom_panel: BottomPanelAppState, 
 /**
- * Whether the coder panel was open at last shutdown.
+ * Whether the files panel (the file tree, at the window's right
+ * edge) was open at last shutdown.
  */
-coder_panel_visible: boolean, 
+files_panel_visible: boolean, 
 /**
  * Per-machine coder state — picks up where the user left off
  * without forcing them to navigate the sessions list again.

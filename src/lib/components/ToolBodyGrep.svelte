@@ -168,7 +168,7 @@
 		flex-wrap: wrap;
 		gap: 8px;
 		align-items: baseline;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.grep-pattern {
 		flex: 0 1 auto;
@@ -177,7 +177,7 @@
 		color: var(--m-fg);
 		background: var(--m-bg);
 		padding: 1px 6px;
-		border-radius: 3px;
+		border-radius: var(--m-radius-sm);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -185,25 +185,23 @@
 	}
 	.grep-flag {
 		flex: 0 0 auto;
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		color: var(--m-fg-subtle);
-		border: 1px solid var(--m-border);
-		border-radius: 3px;
-		padding: 0 4px;
+		font-size: var(--m-text-xs);
+		color: var(--m-fg-muted);
+		background: var(--m-bg-3);
+		border-radius: var(--m-radius-sm);
+		padding: 0 5px;
 	}
 	.grep-meta {
 		flex: 1 1 auto;
 		color: var(--m-fg-subtle);
 	}
 	.grep-empty {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		font-style: italic;
 		padding: 6px 8px;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 	}
 	/* Hit list. We deliberately render each row as plain DOM (not a
 	   single `<pre>`) so the path/line/text columns can carry their
@@ -215,11 +213,11 @@
 		display: flex;
 		flex-direction: column;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		max-height: 360px;
 		overflow: auto;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 		padding: 4px 0;
 	}

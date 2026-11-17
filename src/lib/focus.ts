@@ -2,17 +2,20 @@
 // keybindings (App.svelte) and the corresponding palette commands. Lives
 // in its own module — not in `state.svelte.ts` — because the cycle order
 // depends on the DOM layout (sidebar always present, right pane only
-// when split, etc.) rather than on persisted application state.
+// when split, files panel only when open, etc.) rather than on
+// persisted application state.
 //
 // Each region has a `data-region` attribute on its root element. The
 // cycle walks an order computed from the current layout, asks the
 // matching component to pull focus in via a ticker on `WorkspaceState`,
-// and lets the component decide *what* to focus (Pierre Trees row,
-// CodeMirror view, theme button…).
+// and lets the component decide *what* to focus (sessions search box,
+// Pierre Trees row, CodeMirror view, theme button…).
 import { bottomPanel } from './bottomPanel.svelte';
 import { workspace } from './state.svelte';
 
-export type Region = 'sidebar' | 'editor-left' | 'editor-right' | 'bottom-panel' | 'status';
+const REGIONS = ['sidebar', 'editor-left', 'editor-right', 'bottom-panel', 'files', 'status'] as const;
+
+export type Region = (typeof REGIONS)[number];
 
 export function regionOrder(): Region[] {
 	const list: Region[] = ['sidebar'];
@@ -28,6 +31,11 @@ export function regionOrder(): Region[] {
 	if (bottomPanel.visible) {
 		list.push('bottom-panel');
 	}
+	// Same rule for the files panel, which also needs a folder to
+	// have a tree to focus.
+	if (workspace.filesPanelVisible && workspace.activeFolder !== null) {
+		list.push('files');
+	}
 	list.push('status');
 	return list;
 }
@@ -39,15 +47,16 @@ export function currentRegion(): Region | null {
 	}
 	const host = ae.closest<HTMLElement>('[data-region]');
 	const id = host?.dataset.region;
-	if (id === 'sidebar' || id === 'editor-left' || id === 'editor-right' || id === 'bottom-panel' || id === 'status') {
-		return id;
-	}
-	return null;
+	return REGIONS.find((region) => region === id) ?? null;
 }
 
 export function focusRegion(target: Region) {
 	if (target === 'sidebar') {
 		workspace.requestSidebarFocus();
+		return;
+	}
+	if (target === 'files') {
+		workspace.focusFilesPanel();
 		return;
 	}
 	if (target === 'status') {

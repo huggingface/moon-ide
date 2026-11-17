@@ -397,16 +397,23 @@ export const builtInCommands: Command[] = [
 	},
 	{
 		// `Focus File Tree` is the only discrete focus command — it
-		// always means the same thing wherever you invoke it from.
+		// always means the same thing wherever you invoke it from
+		// (opening the files panel first when it is hidden).
 		// The cycle commands (`F6` / `Shift+F6`) are intentionally
 		// keyboard-only: the palette is off-region for the cycle, so
 		// invoking them from there always re-enters at the same edge
 		// rather than advancing relative to where the user was. Use
 		// the keys directly.
-		id: 'focus.sidebar',
+		id: 'focus.files',
 		title: 'Focus File Tree',
 		shortcut: 'Ctrl+0',
-		run: () => workspace.requestSidebarFocus(),
+		run: () => workspace.focusFilesPanel(),
+	},
+	{
+		id: 'files.togglePanel',
+		title: () => (workspace.filesPanelVisible ? 'Files: Hide Panel' : 'Files: Show Panel'),
+		visible: () => workspace.activeFolder !== null,
+		run: () => workspace.toggleFilesPanel(),
 	},
 	{
 		id: 'view.reloadWindow',
@@ -447,6 +454,13 @@ export const builtInCommands: Command[] = [
 		title: () => (coder.panelVisible ? 'Coder: Hide Panel' : 'Coder: Show Panel'),
 		shortcut: 'Ctrl+L',
 		run: () => coder.togglePanel(),
+	},
+	{
+		id: 'inbox.open',
+		title: 'Inbox: Open GitHub Inbox',
+		shortcut: 'Ctrl+Shift+G',
+		visible: () => workspace.workspace !== null,
+		run: () => workspace.openInboxTab(),
 	},
 	{
 		id: 'workspace.openRemote',

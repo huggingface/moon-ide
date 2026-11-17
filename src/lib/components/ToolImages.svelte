@@ -36,7 +36,7 @@
 	.tool-image {
 		padding: 0;
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		background: var(--m-bg);
 		cursor: zoom-in;
 		overflow: hidden;

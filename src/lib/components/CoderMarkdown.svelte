@@ -251,10 +251,65 @@
 		max-width: 100%;
 		overflow: auto;
 	}
+	/* The transcript's own skin over the shared rules: in a
+	   conversation, blocks are set apart by surface and space, so
+	   the document-style rules, boxes and grid lines come off. */
+	.coder-md :global(pre) {
+		padding: 10px var(--m-space-3);
+		border: none;
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg);
+	}
+	.coder-md :global(code) {
+		border-radius: var(--m-radius-sm);
+		background: color-mix(in srgb, var(--m-fg) 8%, transparent);
+	}
+	.coder-md :global(pre code) {
+		background: transparent;
+	}
+	.coder-md :global(.md-copy-code) {
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: var(--m-bg-2);
+	}
+	.coder-md :global(h1),
+	.coder-md :global(h2) {
+		padding-bottom: 0;
+		border-bottom: none;
+	}
+	.coder-md :global(h1) {
+		font-size: 1.3em;
+	}
+	.coder-md :global(h2) {
+		font-size: 1.15em;
+	}
+	.coder-md :global(h3),
+	.coder-md :global(h4) {
+		font-size: 1em;
+	}
+	.coder-md :global(th),
+	.coder-md :global(td) {
+		padding: 6px var(--m-space-3) 6px 0;
+		border: none;
+		border-bottom: 1px solid var(--m-border);
+	}
+	.coder-md :global(th) {
+		background: transparent;
+		color: var(--m-fg-muted);
+		font-size: var(--m-text-sm);
+		font-weight: 500;
+	}
+	.coder-md :global(tr:last-child td) {
+		border-bottom: none;
+	}
+	.coder-md :global(blockquote) {
+		border-left-width: 2px;
+		border-left-color: var(--m-border-strong);
+	}
 	.coder-md :global(img) {
 		max-width: 100%;
 		max-height: 420px;
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 	}
 	.coder-md :global(img) {
 		cursor: zoom-in;

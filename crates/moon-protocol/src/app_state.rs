@@ -51,8 +51,9 @@ pub struct AppState {
 	/// users tend to live with it open or closed and resent the panel
 	/// re-jumping to a default height every restart.
 	pub bottom_panel: BottomPanelAppState,
-	/// Whether the coder panel was open at last shutdown.
-	pub coder_panel_visible: bool,
+	/// Whether the files panel (the file tree, at the window's right
+	/// edge) was open at last shutdown.
+	pub files_panel_visible: bool,
 	/// Per-machine coder state — picks up where the user left off
 	/// without forcing them to navigate the sessions list again.
 	pub coder: CoderAppState,

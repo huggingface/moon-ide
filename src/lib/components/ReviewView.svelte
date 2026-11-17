@@ -2,7 +2,14 @@
 	import { onDestroy, onMount, tick } from 'svelte';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import ReviewSection from './ReviewSection.svelte';
-	import { formatError, type GitStatusEntry, type GitFileStatus, type ReviewComment } from '../protocol';
+	import PullRequestPanel from './PullRequestPanel.svelte';
+	import {
+		formatError,
+		type GitStatusEntry,
+		type GitFileStatus,
+		type ReviewComment,
+		type ReviewEvent,
+	} from '../protocol';
 	import { getCachedMarkdown, renderMarkdown } from '../markdown';
 
 	// The pane this review tab lives in. Plumbed through so a
@@ -315,10 +322,39 @@
 	let publishPhase = $state<'closed' | 'form' | 'busy' | 'done'>('closed');
 	let publishSummary = $state('');
 	let publishOutcome = $state('');
+	let publishEvent = $state<ReviewEvent>('comment');
+
+	// The branch's PR (ADR 0113), re-read each time the tab mounts and
+	// after a publish. The folder keeps the last answer, so a remount
+	// paints it at once and the diff below doesn't shift.
+	const pullRequest = $derived(workspace.pullRequest);
+	let prRefreshing = $state(false);
+	async function refreshPullRequest() {
+		if (prRefreshing) {
+			return;
+		}
+		prRefreshing = true;
+		try {
+			await workspace.refreshPullRequest();
+		} finally {
+			prRefreshing = false;
+		}
+	}
+	void refreshPullRequest();
+
+	const entryPaths = $derived(new Set(entries.map((entry) => entry.path)));
+	// A verdict needs a PR to land on; drafts can be published as soon
+	// as there are any (the backend reports a missing PR).
+	const canPublish = $derived(commentCount > 0 || pullRequest !== null);
+	const publishBlocked = $derived(
+		(publishEvent === 'request_changes' && publishSummary.trim() === '') ||
+			(publishEvent === 'comment' && commentCount === 0 && publishSummary.trim() === ''),
+	);
 
 	function openPublish() {
 		publishSummary = '';
 		publishOutcome = '';
+		publishEvent = 'comment';
 		publishPhase = 'form';
 	}
 	function closePublish() {
@@ -329,21 +365,26 @@
 	async function doPublish() {
 		publishPhase = 'busy';
 		try {
-			const result = await workspace.publishReview(publishSummary.trim() || null);
+			const event = publishEvent;
+			const result = await workspace.publishReview(publishSummary.trim() || null, event);
 			if (result === null) {
 				publishOutcome = 'Nothing to publish.';
 			} else if (result.kind === 'no_pr') {
 				const branch = result.branch || 'this branch';
 				publishOutcome = `No open PR for ${branch}. Push the branch and open a PR, then publish.`;
-			} else if (result.posted === 0) {
+			} else if (result.reviewUrl === '') {
 				publishOutcome =
 					result.lost.length > 0
-						? `Couldn't place ${result.lost.length} comment${result.lost.length === 1 ? '' : 's'} on the current PR head — kept as drafts.`
+						? `Couldn't place ${result.lost.length} comment${result.lost.length === 1 ? '' : 's'} on the current PR head — kept as drafts, and nothing was posted.`
 						: 'Nothing was posted.';
 			} else {
+				const verdict =
+					event === 'approve' ? 'Approved' : event === 'request_changes' ? 'Requested changes' : 'Posted the review';
+				const posted = result.posted > 0 ? ` with ${result.posted} comment${result.posted === 1 ? '' : 's'}` : '';
 				const lostNote =
 					result.lost.length > 0 ? ` ${result.lost.length} couldn't be placed and stayed as drafts.` : '';
-				publishOutcome = `Posted ${result.posted} comment${result.posted === 1 ? '' : 's'} as one review.${lostNote}`;
+				publishOutcome = `${verdict}${posted}.${lostNote}`;
+				void refreshPullRequest();
 			}
 		} catch (err) {
 			publishOutcome = `Publish failed: ${formatError(err)}`;
@@ -781,10 +822,10 @@
 		<button
 			type="button"
 			class="publish"
-			disabled={commentCount === 0}
-			title={commentCount === 0
-				? 'No review comments to publish'
-				: 'Publish your review comments to the branch PR on GitHub'}
+			disabled={!canPublish}
+			title={canPublish
+				? 'Comment on, approve or request changes on the branch PR on GitHub'
+				: 'No review comments to publish, and no PR to approve'}
 			onclick={openPublish}
 		>
 			Publish review →
@@ -842,6 +883,15 @@
 			</div>
 		</div>
 	{/if}
+	{#if pullRequest !== null}
+		<PullRequestPanel
+			pr={pullRequest}
+			paths={entryPaths}
+			refreshing={prRefreshing}
+			onJump={scrollTo}
+			onRefresh={() => void refreshPullRequest()}
+		/>
+	{/if}
 	{#if entries.length === 0}
 		<div class="empty">No changes against {baselineLabel.length > 0 ? baselineLabel : 'the baseline'}.</div>
 	{:else}
@@ -896,9 +946,27 @@
 				</div>
 			{:else}
 				<p class="pub-lede">
-					{commentCount} comment{commentCount === 1 ? '' : 's'} will be posted to the branch's GitHub PR as one review. Comments
-					that can't be placed on the current PR head stay as local drafts.
+					{#if commentCount > 0}
+						{commentCount} comment{commentCount === 1 ? '' : 's'} will be posted to the branch's GitHub PR as one review.
+						Comments that can't be placed on the current PR head stay as local drafts.
+					{:else}
+						No draft comments: this posts a verdict, or a summary alone, on the branch's GitHub PR.
+					{/if}
 				</p>
+				<div class="pub-events" role="radiogroup" aria-label="Review verdict">
+					{#each [['comment', 'Comment'], ['approve', 'Approve'], ['request_changes', 'Request changes']] as const as [value, label] (value)}
+						<label class="pub-event" class:selected={publishEvent === value}>
+							<input
+								type="radio"
+								name="review-event"
+								{value}
+								bind:group={publishEvent}
+								disabled={publishPhase === 'busy'}
+							/>
+							{label}
+						</label>
+					{/each}
+				</div>
 				<ul class="pub-drafts">
 					{#each publishDrafts as group (group.path)}
 						<li class="pub-draft-group">
@@ -930,15 +998,27 @@
 					class="pub-summary"
 					bind:value={publishSummary}
 					rows="3"
-					placeholder="Optional review summary…"
+					placeholder={publishEvent === 'request_changes' ? 'What needs to change…' : 'Optional review summary…'}
 					disabled={publishPhase === 'busy'}
 				></textarea>
 				<div class="pub-actions">
 					<button type="button" class="pub-btn" onclick={closePublish} disabled={publishPhase === 'busy'}>
 						Cancel
 					</button>
-					<button type="button" class="pub-btn pub-primary" onclick={doPublish} disabled={publishPhase === 'busy'}>
-						{publishPhase === 'busy' ? 'Publishing…' : 'Publish'}
+					<button
+						type="button"
+						class="pub-btn pub-primary"
+						onclick={doPublish}
+						disabled={publishPhase === 'busy' || publishBlocked}
+						title={publishBlocked ? 'Write a summary first' : undefined}
+					>
+						{publishPhase === 'busy'
+							? 'Publishing…'
+							: publishEvent === 'approve'
+								? 'Approve'
+								: publishEvent === 'request_changes'
+									? 'Request changes'
+									: 'Publish'}
 					</button>
 				</div>
 			{/if}
@@ -1246,6 +1326,29 @@
 	}
 	.pub-outcome {
 		color: var(--m-fg);
+	}
+	.pub-events {
+		display: flex;
+		gap: var(--m-space-2);
+		margin-bottom: var(--m-space-2);
+	}
+	.pub-event {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--m-space-1);
+		padding: 3px 10px;
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-pill);
+		font-size: var(--m-text-sm);
+		color: var(--m-fg-muted);
+		cursor: pointer;
+	}
+	.pub-event.selected {
+		border-color: var(--m-accent);
+		color: var(--m-fg);
+	}
+	.pub-event input {
+		margin: 0;
 	}
 	.pub-summary {
 		display: block;

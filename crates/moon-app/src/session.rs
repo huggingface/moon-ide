@@ -33,7 +33,8 @@ pub async fn session_load(app: &AppCore) -> Result<WorkspaceSession, MoonError> 
 /// invariant is testable without an `AppState`.
 ///
 /// The frontend is authoritative for `folders` (bound folder
-/// list + per-folder open files / splits) and `active_folder_path`.
+/// list + per-folder open files / splits), `active_folder_path`,
+/// `terminals`, `inbox` and `dismissed_coder_sessions`.
 /// Every other field on [`WorkspaceSession`] is **backend-managed**
 /// (`coder_hub_bucket`, `coder_provider_lock`, `forwarded_ports`)
 /// and gets written through its own dedicated Tauri command —
@@ -57,6 +58,8 @@ fn merge_frontend_session(existing: WorkspaceSession, frontend: WorkspaceSession
 		// frontend snapshots the live tab list on every persist
 		// tick and is the only writer, so its payload wins.
 		terminals: frontend.terminals,
+		inbox: frontend.inbox,
+		dismissed_coder_sessions: frontend.dismissed_coder_sessions,
 		coder_provider_lock: existing.coder_provider_lock,
 		forwarded_ports: existing.forwarded_ports,
 		coder_hub_bucket: existing.coder_hub_bucket,
@@ -105,6 +108,8 @@ mod tests {
 			}],
 			active_folder_path: Some(folder.into()),
 			terminals: Vec::new(),
+			inbox: Default::default(),
+			dismissed_coder_sessions: Vec::new(),
 			coder_provider_lock: None,
 			forwarded_ports: Vec::new(),
 			coder_hub_bucket: None,
@@ -140,6 +145,8 @@ mod tests {
 				m
 			},
 			terminals: Vec::new(),
+			inbox: Default::default(),
+			dismissed_coder_sessions: Vec::new(),
 		}
 	}
 
@@ -184,6 +191,26 @@ mod tests {
 		assert_eq!(merged.active_folder_path.as_deref(), Some("/fresh/path"));
 		assert_eq!(merged.folders.len(), 1);
 		assert_eq!(merged.folders[0].folder_path, "/fresh/path");
+	}
+
+	#[test]
+	fn merge_takes_inbox_and_dismissals_from_the_frontend() {
+		use moon_protocol::session::{DismissedCoderSession, InboxSnooze, InboxState};
+		let mut payload = frontend("/home/me/work");
+		payload.inbox = InboxState {
+			watched_authors: vec!["moon-bot-app[bot]".into()],
+			snoozed: vec![InboxSnooze {
+				id: "acme/app#1".into(),
+				until: "2026-11-19T07:00:00Z".into(),
+			}],
+		};
+		payload.dismissed_coder_sessions = vec![DismissedCoderSession {
+			id: "s1".into(),
+			updated_at_ms: 42,
+		}];
+		let merged = merge_frontend_session(backend_with_extras(), payload.clone());
+		assert_eq!(merged.inbox, payload.inbox);
+		assert_eq!(merged.dismissed_coder_sessions, payload.dismissed_coder_sessions);
 	}
 
 	#[test]

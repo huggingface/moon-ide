@@ -9,12 +9,16 @@
 	import MarkdownView from './MarkdownView.svelte';
 	import ReviewView from './ReviewView.svelte';
 	import CommitView from './CommitView.svelte';
+	import PrView from './PrView.svelte';
 	import BrowserView from './BrowserView.svelte';
+	import InboxView from './InboxView.svelte';
 	import Welcome from './Welcome.svelte';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { isMarkdownPath } from '../util/markdown';
 	import { isReviewPath } from '../util/reviewPath';
+	import { isInboxPath } from '../util/inboxPath';
 	import { isCommitPath } from '../util/commitPath';
+	import { isPrPath } from '../util/prPath';
 	import { isBrowserPath } from '../util/browserPath';
 	import { frontendLog } from '../logs.svelte';
 
@@ -72,11 +76,17 @@
 		if (isBrowserPath(file.path)) {
 			return { path, file, kind: 'browser' as const };
 		}
+		if (isInboxPath(file.path)) {
+			return { path, file, kind: 'inbox' as const };
+		}
 		// Commit diff view: synthetic `commit://<sha>` buffer. Each
 		// commit gets its own tab; the view fetches the file list
 		// and blobs from the SHA embedded in the path.
 		if (isCommitPath(file.path)) {
 			return { path, file, kind: 'commit' as const };
+		}
+		if (isPrPath(file.path)) {
+			return { path, file, kind: 'pr' as const };
 		}
 		// Review view: synthetic `review://…` buffer. Wins over
 		// everything else for that path.
@@ -127,7 +137,7 @@
 		if (view.kind === 'markdown') {
 			return false;
 		}
-		if (view.kind === 'review' || view.kind === 'commit') {
+		if (view.kind === 'review' || view.kind === 'commit' || view.kind === 'pr') {
 			return true;
 		}
 		return selection.path === file.path;
@@ -235,9 +245,15 @@
 				{#key view.file.path}
 					<BrowserView path={view.file.path} />
 				{/key}
+			{:else if view.file && view.kind === 'inbox'}
+				<InboxView {side} />
 			{:else if view.file && view.kind === 'commit'}
 				{#key view.file.path}
 					<CommitView {side} />
+				{/key}
+			{:else if view.file && view.kind === 'pr'}
+				{#key view.file.path}
+					<PrView {side} />
 				{/key}
 			{:else if view.file && view.kind === 'review'}
 				{#key view.file.path}
@@ -313,7 +329,7 @@
 		display: flex;
 		flex-direction: column;
 		align-items: flex-start;
-		gap: 12px;
+		gap: var(--m-space-3);
 		padding: 24px;
 		overflow: auto;
 		color: var(--m-fg);
@@ -324,21 +340,22 @@
 		white-space: pre-wrap;
 		word-break: break-word;
 		font-family: var(--m-font-mono, monospace);
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		color: var(--m-danger);
 	}
 	.body-error button {
 		font-family: var(--m-font-ui);
-		font-size: 12px;
-		padding: 4px 12px;
+		font-size: var(--m-text-sm);
+		padding: 0 var(--m-space-3);
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		background: var(--m-bg-1);
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg-2);
 		color: var(--m-fg);
 		cursor: pointer;
+		height: var(--m-control-h);
 	}
 	.body-error button:hover {
-		background: var(--m-bg-overlay);
+		background: var(--m-bg-3);
 	}
 	/* Floating "Ctrl+L Add selection to Coder" hint. Anchored to
 	   the editor body's top-right corner, away from the file
@@ -348,29 +365,29 @@
 	   on the pill to land here instead of the editor. */
 	.coder-hint {
 		position: absolute;
-		top: 6px;
+		top: var(--m-space-2);
 		right: 14px;
 		z-index: 4;
 		display: flex;
 		align-items: center;
 		gap: 6px;
-		padding: 3px 6px 3px 4px;
-		background: color-mix(in srgb, var(--m-bg-1) 92%, transparent);
+		padding: 3px var(--m-space-2) 3px var(--m-space-1);
+		background: var(--m-bg-2);
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		font-size: 11px;
+		border-radius: var(--m-radius-md);
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
 		pointer-events: none;
-		box-shadow: 0 1px 4px rgba(0, 0, 0, 0.16);
+		box-shadow: var(--m-shadow-pop);
 	}
 	.coder-hint kbd {
 		font: inherit;
 		font-family: var(--m-font-mono, monospace);
-		font-size: 10px;
-		padding: 1px 4px;
-		background: var(--m-bg-overlay);
-		border: 1px solid var(--m-border);
-		border-radius: 3px;
+		font-size: var(--m-text-xs);
+		padding: 1px 5px;
+		background: var(--m-bg-3);
+		border: none;
+		border-radius: var(--m-radius-sm);
 		color: var(--m-fg);
 	}
 </style>

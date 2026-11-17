@@ -42,6 +42,9 @@
 	import { textInputUndo } from '../actions/textInputUndo';
 	import { isReviewPath } from '../util/reviewPath';
 	import BranchIcon from './icons/BranchIcon.svelte';
+	import ChevronUpIcon from './icons/ChevronUpIcon.svelte';
+	import CloseIcon from './icons/CloseIcon.svelte';
+	import EditIcon from './icons/EditIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
 	import SwitchIcon from './icons/SwitchIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
@@ -961,7 +964,7 @@
 					: `Branch: ${branch.name} — click to switch (Ctrl+Shift+B)`}
 				onclick={() => workspace.openBranchSwitcher()}
 			>
-				<span class="branch-icon" aria-hidden="true">⎇</span>
+				<span class="branch-icon" aria-hidden="true"><BranchIcon size={12} /></span>
 				<span class="branch-name">{branchLabel}</span>
 			</button>
 			<div class="actions">
@@ -1194,7 +1197,7 @@
 				{#if aborting}
 					<span class="spinner" aria-hidden="true"></span>
 				{:else}
-					<span aria-hidden="true">✕</span>
+					<CloseIcon size={12} />
 				{/if}
 			</button>
 		{:else}
@@ -1222,7 +1225,7 @@
 				disabled={busy}
 				onclick={() => void setAmend(!amend)}
 			>
-				<span aria-hidden="true">✎</span>
+				<EditIcon size={12} />
 			</button>
 		{/if}
 	</div>
@@ -1317,7 +1320,7 @@
 						type="button"
 						class="commit-collapse"
 						title="Show only the latest {VISIBLE_COMMITS} commits"
-						onclick={() => (showAllCommits = false)}>Show less ▴</button
+						onclick={() => (showAllCommits = false)}>Show less <ChevronUpIcon size={10} /></button
 					>
 				{/if}
 			</div>
@@ -1351,44 +1354,47 @@
 	.scm {
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
-		padding: 6px 8px 8px;
-		border-bottom: 1px solid var(--m-border);
+		gap: 6px;
+		padding: var(--m-space-1) var(--m-space-2) var(--m-space-2);
 		flex-shrink: 0;
+		container-type: inline-size;
 	}
 	.header {
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-1);
 		color: var(--m-fg-muted);
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		min-width: 0;
+		min-height: var(--m-row-h);
 	}
 	.branch {
 		flex: 1;
 		min-width: 0;
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-2);
 		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 4px;
-		padding: 1px 4px;
-		margin: -1px -4px;
+		border: none;
+		border-radius: var(--m-radius-md);
+		padding: 0 var(--m-space-2);
+		margin: 0;
 		color: inherit;
 		font: inherit;
 		cursor: pointer;
 		text-align: left;
+		height: 26px;
 	}
 	.branch:hover {
 		background: var(--m-bg-2);
-		border-color: var(--m-border);
+		color: var(--m-fg);
 	}
 	.branch:focus-visible {
-		outline: 2px solid var(--m-accent);
-		outline-offset: 1px;
+		outline: 1px solid var(--m-accent);
+		outline-offset: -1px;
 	}
 	.branch-icon {
+		display: inline-flex;
 		flex-shrink: 0;
 		font-size: 12px;
 		line-height: 1;
@@ -1413,8 +1419,8 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 22px;
-		height: 22px;
+		width: var(--m-icon-btn);
+		height: var(--m-icon-btn);
 		/* Drop the user-agent button padding so the 22×22 box is
 		   actually 22×22 of content. Without this the inner SVG
 		   (a flex item with default `flex-shrink: 1`) collapses to
@@ -1427,11 +1433,11 @@
 		font: inherit;
 		font-size: 14px;
 		line-height: 1;
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		flex-shrink: 0;
 	}
 	.icon-btn:hover:not(:disabled) {
-		background: var(--m-bg-2);
+		background: var(--m-bg-3);
 		color: var(--m-fg);
 	}
 	.icon-btn:focus-visible {
@@ -1448,7 +1454,7 @@
 	   we use on `.compare-pill.active` so the two stay visually
 	   consistent. */
 	.icon-btn.active {
-		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+		background: var(--m-accent-tint);
 		color: var(--m-accent);
 	}
 	.icon-btn.active:hover:not(:disabled) {
@@ -1479,16 +1485,16 @@
 		display: block;
 		width: 100%;
 		box-sizing: border-box;
-		min-height: 24px;
+		min-height: var(--m-control-h);
 		max-height: 240px;
-		padding: 4px 6px;
+		padding: 5px var(--m-space-2);
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		background: var(--m-bg-1);
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg-2);
 		color: var(--m-fg);
 		font: inherit;
-		font-size: 13px;
-		line-height: 1.4;
+		font-size: var(--m-text-md);
+		line-height: 16px;
 		resize: none;
 		/* `auto` toggled in JS only when scrollHeight exceeds
 		   max-height — see `autoSize`. The off-by-one rendering
@@ -1502,15 +1508,14 @@
 	   actually renders so the placeholder doesn't waste pixels
 	   for signed-out users. */
 	.input.input-with-ai {
-		padding-right: 28px;
+		padding-right: 30px;
 	}
 	.input::placeholder {
 		color: var(--m-fg-subtle);
 	}
 	.input:focus-visible {
-		outline: 1px solid var(--m-accent);
-		outline-offset: 0;
-		border-color: transparent;
+		outline: none;
+		border-color: var(--m-accent);
 	}
 	.input:disabled {
 		opacity: 0.6;
@@ -1521,16 +1526,16 @@
 	.composer-ai {
 		appearance: none;
 		position: absolute;
-		top: 4px;
-		right: 4px;
+		top: 3px;
+		right: 3px;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 20px;
-		height: 20px;
+		width: 22px;
+		height: 22px;
 		padding: 0;
-		border: 1px solid transparent;
-		border-radius: 4px;
+		border: none;
+		border-radius: var(--m-radius-sm);
 		background: transparent;
 		color: var(--m-fg-muted);
 		font: inherit;
@@ -1539,7 +1544,7 @@
 		cursor: pointer;
 	}
 	.composer-ai:hover:not(:disabled) {
-		background: var(--m-bg-2);
+		background: var(--m-bg-3);
 		color: var(--m-fg);
 	}
 	.composer-ai:focus-visible {
@@ -1559,7 +1564,8 @@
 		display: flex;
 		align-items: stretch;
 		gap: 0;
-		margin-top: 2px;
+		margin-top: 0;
+		border-radius: var(--m-radius-md);
 	}
 	.commit-btn {
 		appearance: none;
@@ -1569,23 +1575,23 @@
 		align-items: center;
 		justify-content: center;
 		gap: 6px;
-		min-height: 28px;
-		padding: 4px 12px;
-		border: 1px solid var(--m-accent);
+		min-height: var(--m-control-h);
+		padding: 0 var(--m-space-3);
+		border: none;
 		border-top-right-radius: 0;
 		border-bottom-right-radius: 0;
-		border-top-left-radius: 4px;
-		border-bottom-left-radius: 4px;
+		border-top-left-radius: var(--m-radius-md);
+		border-bottom-left-radius: var(--m-radius-md);
 		background: var(--m-accent);
 		color: var(--m-bg);
 		font: inherit;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		font-weight: 600;
 		line-height: 1.2;
 		cursor: pointer;
 	}
 	.commit-btn:hover:not(:disabled) {
-		filter: brightness(1.1);
+		background: var(--m-accent-strong);
 	}
 	.commit-btn:focus-visible {
 		outline: 2px solid var(--m-accent);
@@ -1594,21 +1600,17 @@
 		z-index: 1;
 	}
 	.commit-btn:disabled {
-		opacity: 0.5;
+		opacity: 1;
 		cursor: not-allowed;
+		background: var(--m-bg-3);
+		color: var(--m-fg-subtle);
 	}
 	.commit-btn-label {
 		flex-shrink: 0;
 	}
-	/* Toggles share the commit button's exact resting vocabulary —
-	   accent border + accent fill + bg-coloured glyph — so the
-	   three children read as one continuous CTA. The "active"
-	   state then doesn't have to fight for visual loudness against
-	   the loud sibling; instead it signals "I'm currently pressed"
-	   with an inset ring in the panel bg colour, which reads
-	   unambiguously even at a glance and works the same way in
-	   light and dark themes (the ring is always on the contrasting
-	   side of the accent). */
+	/* The toggles are segments of the commit button: same fill, a
+	   hairline between them, and the row's outer corners rounded so
+	   the three read as one control. */
 	.commit-btn-toggle {
 		appearance: none;
 		flex-shrink: 0;
@@ -1616,31 +1618,23 @@
 		align-items: center;
 		justify-content: center;
 		width: 28px;
-		min-height: 28px;
+		min-height: var(--m-control-h);
 		padding: 0;
-		border: 1px solid var(--m-accent);
-		/* Collapse the adjoining border with the previous sibling
-		   so the row visually reads as one button. */
-		margin-left: -1px;
+		border: none;
 		border-radius: 0;
 		background: var(--m-accent);
 		color: var(--m-bg);
 		font: inherit;
-		font-size: 12px;
 		line-height: 1;
 		cursor: pointer;
+		border-left: 1px solid color-mix(in srgb, var(--m-bg) 28%, transparent);
 	}
 	.commit-btn-toggle:last-child {
-		border-top-right-radius: 4px;
-		border-bottom-right-radius: 4px;
+		border-top-right-radius: var(--m-radius-md);
+		border-bottom-right-radius: var(--m-radius-md);
 	}
-	/* Hover lifts the whole control with the same `filter:
-	   brightness` the commit button uses, so all three siblings
-	   share the same hover idiom. Works on both off and active
-	   states — the active inset ring brightens with the rest of
-	   the button. */
 	.commit-btn-toggle:hover:not(:disabled) {
-		filter: brightness(1.1);
+		background: var(--m-accent-strong);
 	}
 	.commit-btn-toggle:focus-visible {
 		outline: 2px solid var(--m-accent);
@@ -1648,15 +1642,25 @@
 		position: relative;
 		z-index: 1;
 	}
-	/* Active state: keep the accent fill (so the row stays a
-	   continuous CTA), but stamp an inset ring in the panel bg
-	   colour around the glyph so the toggle reads as "pressed in"
-	   / "selected". The double-line — outer accent border, inner
-	   bg-coloured ring — is a familiar segmented-control idiom and
-	   stays readable next to the loud commit button without
-	   needing a different fill. */
+	/* A pressed segment darkens towards the panel, which reads the
+	   same way in both themes. */
 	.commit-btn-toggle.active {
-		box-shadow: inset 0 0 0 2px var(--m-bg);
+		background: color-mix(in srgb, var(--m-accent) 62%, var(--m-bg));
+	}
+	/* With nothing to commit the whole control goes quiet instead of
+	   leaving two bright segments beside a dimmed button. The toggles
+	   stay clickable. */
+	.commit-row:has(.commit-btn:disabled) .commit-btn-toggle {
+		background: var(--m-bg-3);
+		color: var(--m-fg-muted);
+	}
+	.commit-row:has(.commit-btn:disabled) .commit-btn-toggle:hover:not(:disabled) {
+		background: var(--m-border);
+		color: var(--m-fg);
+	}
+	.commit-row:has(.commit-btn:disabled) .commit-btn-toggle.active {
+		background: var(--m-accent-tint);
+		color: var(--m-accent);
 	}
 	.commit-btn-toggle:disabled {
 		opacity: 0.5;
@@ -1676,24 +1680,23 @@
 		flex: 1;
 		min-width: 0;
 		box-sizing: border-box;
-		height: 26px;
-		padding: 0 6px;
+		height: var(--m-control-h);
+		padding: 0 var(--m-space-2);
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		background: var(--m-bg-1);
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg-2);
 		color: var(--m-fg);
 		font: inherit;
 		font-family: var(--m-font-mono, monospace);
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		line-height: 1;
 	}
 	.new-branch-input::placeholder {
 		color: var(--m-fg-subtle);
 	}
 	.new-branch-input:focus-visible {
-		outline: 1px solid var(--m-accent);
-		outline-offset: 0;
-		border-color: transparent;
+		outline: none;
+		border-color: var(--m-accent);
 	}
 	.new-branch-input:disabled {
 		opacity: 0.6;
@@ -1703,18 +1706,18 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 26px;
-		height: 26px;
+		width: var(--m-control-h);
+		height: var(--m-control-h);
 		padding: 0;
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		background: var(--m-bg-1);
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg-2);
 		color: var(--m-fg-muted);
 		cursor: pointer;
 		flex-shrink: 0;
 	}
 	.new-branch-suggest:hover:not(:disabled) {
-		background: var(--m-bg-2);
+		background: var(--m-bg-3);
 		color: var(--m-fg);
 	}
 	.new-branch-suggest:focus-visible {
@@ -1766,24 +1769,25 @@
 		min-width: 20px;
 		height: 20px;
 		padding: 0 6px;
-		border: 1px solid var(--m-accent);
-		border-radius: 999px;
-		background: transparent;
+		border: none;
+		border-radius: var(--m-radius-pill);
+		background: var(--m-accent-tint);
 		color: var(--m-accent);
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		font-weight: 600;
 		line-height: 1;
 		cursor: pointer;
 		font-variant-numeric: tabular-nums;
 		flex-shrink: 0;
+		margin-left: 2px;
 	}
 	.changes-badge:hover {
-		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
+		background: color-mix(in srgb, var(--m-accent) 24%, transparent);
 	}
 	.changes-badge:focus-visible {
-		outline: 2px solid var(--m-accent);
-		outline-offset: 2px;
+		outline: 1px solid var(--m-accent);
+		outline-offset: 1px;
 	}
 	.changes-badge.active {
 		background: var(--m-accent);
@@ -1794,7 +1798,7 @@
 		color: var(--m-bg);
 	}
 	.changes-badge.active:hover {
-		filter: brightness(1.1);
+		background: var(--m-accent-strong);
 	}
 	/* Compare-against-default-branch pill, sitting next to the
 	   change-count badge in the SCM header. Inactive state is a
@@ -1807,13 +1811,11 @@
 		height: 20px;
 		padding: 0 8px;
 		border: 1px solid var(--m-border);
-		border-radius: 999px;
+		border-radius: var(--m-radius-pill);
 		background: transparent;
-		color: var(--m-fg-subtle);
-		font-size: 10px;
+		color: var(--m-fg-muted);
+		font-size: var(--m-text-xs);
 		font-family: var(--m-font-mono);
-		text-transform: lowercase;
-		letter-spacing: 0.04em;
 		cursor: pointer;
 		white-space: nowrap;
 	}
@@ -1822,12 +1824,12 @@
 		border-color: var(--m-border-strong);
 	}
 	.compare-pill.active {
-		background: var(--m-accent);
-		border-color: var(--m-accent);
-		color: var(--m-bg);
+		background: var(--m-accent-tint);
+		border-color: transparent;
+		color: var(--m-accent);
 	}
 	.compare-pill.active:hover {
-		filter: brightness(0.95);
+		background: color-mix(in srgb, var(--m-accent) 24%, transparent);
 	}
 	/* "Merging <ref>" banner, only present while
 	   `workspace.gitMergeState.inProgress`. Sits on its own row
@@ -1843,22 +1845,18 @@
 	.merge-banner {
 		display: flex;
 		align-items: baseline;
-		gap: 6px;
+		gap: var(--m-space-2);
 		min-width: 0;
-		padding: 4px 8px;
-		border: 1px solid color-mix(in srgb, var(--m-warning) 60%, transparent);
-		border-radius: 4px;
+		padding: 5px var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-md);
 		background: color-mix(in srgb, var(--m-warning) 14%, transparent);
 		color: var(--m-warning);
-		font-size: 11px;
+		font-size: var(--m-text-sm);
 	}
 	.merge-banner-label {
 		flex-shrink: 0;
-		font-family: var(--m-font-mono);
-		font-size: 10px;
-		text-transform: lowercase;
-		letter-spacing: 0.04em;
-		opacity: 0.85;
+		font-weight: 600;
 	}
 	.merge-banner-ref {
 		flex: 1;
@@ -1875,9 +1873,11 @@
 	   with the harmless `✎` amend toggle. */
 	.commit-btn-toggle.merge-abort {
 		color: var(--m-danger);
+		background: var(--m-bg-3);
+		border-left: none;
 	}
 	.commit-btn-toggle.merge-abort:hover:not(:disabled) {
-		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
+		background: color-mix(in srgb, var(--m-danger) 18%, var(--m-bg-3));
 		color: var(--m-danger);
 	}
 	/* "N files still have unresolved conflicts" hint under the
@@ -1885,9 +1885,9 @@
 	   without yelling — the buttons above already carry the
 	   loud signal. */
 	.merge-hint {
-		margin-top: 6px;
-		padding: 0 2px;
-		font-size: 11px;
+		margin-top: 0;
+		padding: 0 var(--m-space-2);
+		font-size: var(--m-text-xs);
 		color: var(--m-warning);
 	}
 	/* Full-width sync button beneath the composer — the unified
@@ -1904,15 +1904,15 @@
 		justify-content: center;
 		gap: 6px;
 		width: 100%;
-		min-height: 26px;
-		margin-top: 2px;
-		padding: 4px 10px;
-		border: 1px solid var(--m-accent);
-		border-radius: 4px;
+		min-height: var(--m-control-h);
+		margin-top: 0;
+		padding: 0 var(--m-space-3);
+		border: none;
+		border-radius: var(--m-radius-md);
 		background: var(--m-accent);
 		color: var(--m-bg);
 		font: inherit;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		font-weight: 600;
 		line-height: 1.2;
 		cursor: pointer;
@@ -1948,7 +1948,7 @@
 		opacity: 0.9;
 	}
 	.sync-btn:hover:not(:disabled) {
-		filter: brightness(1.1);
+		background: var(--m-accent-strong);
 	}
 	.sync-btn:focus-visible {
 		outline: 2px solid var(--m-accent);
@@ -1974,15 +1974,15 @@
 		justify-content: center;
 		gap: 6px;
 		width: 100%;
-		min-height: 26px;
-		margin-top: 2px;
-		padding: 4px 10px;
-		border: 1px solid var(--m-accent);
-		border-radius: 4px;
+		min-height: var(--m-control-h);
+		margin-top: 0;
+		padding: 0 var(--m-space-3);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-md);
 		background: transparent;
 		color: var(--m-accent);
 		font: inherit;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		font-weight: 600;
 		line-height: 1.2;
 		cursor: pointer;
@@ -2022,7 +2022,8 @@
 		opacity: 0.9;
 	}
 	.merge-default-btn:hover:not(:disabled) {
-		background: color-mix(in srgb, var(--m-accent) 12%, transparent);
+		background: var(--m-accent-tint);
+		border-color: transparent;
 	}
 	.merge-default-btn:focus-visible {
 		outline: 2px solid var(--m-accent);
@@ -2039,34 +2040,35 @@
 	   Each row is read-only (no click-through to a commit diff yet);
 	   the tooltip carries the full SHA + author + date for context. */
 	.commit-list {
-		margin-top: 6px;
+		margin-top: var(--m-space-2);
 		display: flex;
 		flex-direction: column;
 		gap: 1px;
 	}
 	.commit-list-header {
 		display: flex;
-		align-items: baseline;
+		align-items: center;
 		justify-content: space-between;
-		font-size: 10px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--m-fg-subtle);
-		padding: 2px 0 3px;
+		font-size: var(--m-text-sm);
+		font-weight: 500;
+		color: var(--m-fg-muted);
+		padding: 0 var(--m-space-2);
+		min-height: 24px;
 	}
 	.commit-collapse {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
 		appearance: none;
 		background: transparent;
 		border: none;
 		color: var(--m-fg-subtle);
 		font: inherit;
-		text-transform: none;
-		letter-spacing: normal;
-		font-weight: 500;
-		padding: 0 4px;
-		border-radius: 4px;
+		font-weight: 400;
+		padding: 2px 6px;
+		border-radius: var(--m-radius-sm);
 		cursor: pointer;
+		font-size: var(--m-text-xs);
 	}
 	.commit-collapse:hover {
 		color: var(--m-fg);
@@ -2082,17 +2084,17 @@
 		overflow-x: hidden;
 		overflow-y: auto;
 		/* Room for the rows' -4px hover bleed inside the scroll box. */
-		margin: 0 -4px;
-		padding: 0 4px;
+		margin: 0;
+		padding: 0;
 	}
 	.commit-list-row {
 		display: flex;
-		align-items: baseline;
-		gap: 6px;
-		padding: 2px 4px;
-		margin: 0 -4px;
-		font-size: 11px;
-		line-height: 1.35;
+		align-items: center;
+		gap: var(--m-space-2);
+		padding: 0 var(--m-space-2);
+		margin: 0;
+		font-size: var(--m-text-sm);
+		line-height: 1;
 		min-width: 0;
 		appearance: none;
 		background: transparent;
@@ -2100,11 +2102,16 @@
 		color: inherit;
 		text-align: left;
 		cursor: pointer;
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		width: 100%;
+		height: 24px;
+		flex-shrink: 0;
 	}
 	.commit-list-row:hover:not(:disabled) {
 		background: var(--m-bg-2);
+	}
+	.commit-list-row:hover:not(:disabled) .commit-subject {
+		color: var(--m-fg);
 	}
 	.commit-list-row:focus-visible {
 		outline: 1px solid var(--m-accent);
@@ -2120,13 +2127,14 @@
 		border: none;
 		color: var(--m-fg-subtle);
 		font: inherit;
-		font-size: 11px;
-		padding: 2px 4px;
-		margin: 0 -4px;
+		font-size: var(--m-text-xs);
+		padding: 0 var(--m-space-2);
+		margin: 0;
 		cursor: pointer;
 		text-align: left;
 		width: 100%;
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
+		height: 22px;
 	}
 	.commit-more:hover:not(:disabled) {
 		color: var(--m-fg-muted);
@@ -2143,7 +2151,7 @@
 	.commit-sha {
 		flex-shrink: 0;
 		font-family: var(--m-font-mono, monospace);
-		font-size: 10px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.commit-subject {
@@ -2156,8 +2164,15 @@
 	}
 	.commit-date {
 		flex-shrink: 0;
-		font-size: 10px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		font-variant-numeric: tabular-nums;
+	}
+	/* In a narrow sidebar the subject matters more than the age,
+	   which stays in the row's tooltip. */
+	@container (max-width: 230px) {
+		.commit-date {
+			display: none;
+		}
 	}
 </style>

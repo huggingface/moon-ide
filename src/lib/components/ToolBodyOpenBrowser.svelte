@@ -55,7 +55,7 @@
 		gap: 8px;
 		align-items: baseline;
 		margin-top: 4px;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.ob-url {
 		flex: 1 1 auto;
@@ -79,7 +79,7 @@
 	}
 	.ob-error {
 		margin-top: 4px;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-danger);
 	}
 </style>

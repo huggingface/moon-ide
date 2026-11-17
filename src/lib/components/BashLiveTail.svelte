@@ -81,41 +81,41 @@
 
 <style>
 	.bg-tail {
-		margin-top: 4px;
+		margin-top: var(--m-space-1);
 		display: flex;
 		flex-direction: column;
-		gap: 2px;
+		gap: var(--m-space-1);
 	}
 	.bg-tail-bar {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		gap: 8px;
+		gap: var(--m-space-2);
 	}
 	.bg-tail-label {
-		font-size: 10px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
+		padding: 0 var(--m-space-1);
 	}
 	.bg-tail.live .bg-tail-label {
 		color: var(--m-warning, var(--m-fg-muted));
 	}
 	.bg-stop {
 		font: inherit;
-		font-size: 10px;
+		font-size: var(--m-text-xs);
 		line-height: 1;
-		background: transparent;
+		background: color-mix(in srgb, var(--m-danger) 12%, transparent);
 		color: var(--m-danger);
-		border: 1px solid var(--m-border);
-		border-radius: 3px;
-		padding: 2px 6px;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		padding: 0 var(--m-space-2);
 		cursor: pointer;
+		height: 20px;
+		font-weight: 600;
 	}
 	.bg-stop:hover:not(:disabled) {
-		background: var(--m-danger);
-		color: var(--m-bg);
-		border-color: var(--m-danger);
+		background: color-mix(in srgb, var(--m-danger) 22%, transparent);
+		color: var(--m-danger);
 	}
 	.bg-stop:disabled {
 		opacity: 0.5;
@@ -127,18 +127,11 @@
 	   the newest 8 kB anyway. */
 	.bg-tail-stream {
 		margin: 0;
-		padding: 6px 8px;
-		background: var(--m-bg-1);
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		font-family:
-			ui-monospace,
-			SFMono-Regular,
-			SF Mono,
-			Menlo,
-			Consolas,
-			monospace;
-		font-size: 11px;
+		padding: var(--m-space-2) var(--m-space-3);
+		background: var(--m-bg);
+		border-radius: var(--m-radius-md);
+		font-family: var(--m-font-mono);
+		font-size: var(--m-text-xs);
 		line-height: 1.45;
 		white-space: pre-wrap;
 		word-break: break-word;
@@ -147,7 +140,7 @@
 		overflow-y: auto;
 	}
 	.bg-tail-empty {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		font-style: italic;
 	}

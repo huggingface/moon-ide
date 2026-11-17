@@ -227,6 +227,57 @@ pub struct WorkspaceSession {
 	/// 0050](../../specs/decisions/0050-terminal-persistence-and-restart.md).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub terminals: Vec<PersistedTerminal>,
+	/// What the user told the GitHub inbox (ADR 0112). Frontend-owned.
+	/// Per-workspace because the inbox is: it lists this workspace's
+	/// repositories, and two workspaces' windows saving one shared
+	/// list would drop each other's snoozes.
+	#[serde(default, skip_serializing_if = "InboxState::is_empty")]
+	pub inbox: InboxState,
+	/// Coder sessions the user dismissed from the sessions list's
+	/// "Needs you" group (ADR 0114). Frontend-owned.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub dismissed_coder_sessions: Vec<DismissedCoderSession>,
+}
+
+/// Inbox slice of [`WorkspaceSession`]: what the user told the inbox,
+/// as opposed to what GitHub says.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(default)]
+pub struct InboxState {
+	/// Authors whose open PRs the inbox lists: logins, or bots as
+	/// `name[bot]`.
+	pub watched_authors: Vec<String>,
+	/// Items hidden until a time. Expired entries are dropped by the
+	/// frontend on its next save.
+	pub snoozed: Vec<InboxSnooze>,
+}
+
+impl InboxState {
+	pub fn is_empty(&self) -> bool {
+		self.watched_authors.is_empty() && self.snoozed.is_empty()
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct InboxSnooze {
+	/// [`crate::inbox::InboxItem::id`].
+	pub id: String,
+	/// RFC 3339 instant the item comes back.
+	pub until: String,
+}
+
+/// A coder session whose failed / interrupted / finished state the
+/// user has seen and set aside. It holds only while the session's
+/// `updated_at_ms` is still `updated_at_ms`: new activity brings the
+/// session back.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct DismissedCoderSession {
+	pub id: String,
+	#[ts(type = "number")]
+	pub updated_at_ms: i64,
 }
 
 /// One terminal tab's restore recipe. See

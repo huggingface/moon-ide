@@ -176,7 +176,7 @@
 		display: flex;
 		gap: 8px;
 		align-items: baseline;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.ld-path {
 		flex: 1 1 auto;
@@ -192,22 +192,22 @@
 		color: var(--m-fg-subtle);
 	}
 	.ld-empty {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		font-style: italic;
 		padding: 6px 8px;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 	}
 	.ld-entries {
 		display: flex;
 		flex-direction: column;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		max-height: 360px;
 		overflow: auto;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 		padding: 4px 0;
 	}

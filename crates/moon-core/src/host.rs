@@ -13,7 +13,7 @@ use moon_protocol::git::{
 	GitBaseCheckFile, GitBranchInfo, GitCommitResult, GitFileBlame, GitFileStatus, GitLineBlame, GitMergeState,
 	GitPermalink, GitStatusEntry, GitWorktree, PrListScope, PrListStatus,
 };
-use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewSide};
+use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewEvent, ReviewSide};
 use moon_protocol::{MoonError, MoonResult};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -27,6 +27,15 @@ use crate::format;
 use crate::lint_staged::{LintStagedRules, LintStagedService};
 use crate::pre_save;
 use crate::shell::{ShellResolverHandle, ShellTarget};
+
+/// Result of [`WorkspaceHost::git_pull_request_diff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestDiff {
+	/// Full SHA the PR head branched from its base at.
+	pub merge_base: String,
+	/// Files changed from `merge_base` to the PR head.
+	pub files: Vec<GitStatusEntry>,
+}
 
 /// What branch a freshly-created worktree should be on (ADR 0028).
 #[derive(Debug, Clone)]
@@ -304,8 +313,9 @@ pub trait WorkspaceHost: Send + Sync {
 	/// range's last line.
 	///
 	/// The flow: resolve the PR + head SHA (`gh pr view` / Forgejo
-	/// open-PR list); for each comment re-anchor its content
-	/// fingerprint against the PR-head version of the file
+	/// open-PR list) for the current branch, or for the request's
+	/// `pr_number` when it names one; for each comment re-anchor its
+	/// content fingerprint against the PR-head version of the file
 	/// (`git show <head>:<path>`); post the survivors as one
 	/// `event: COMMENT` review (`gh api` / REST). Returns
 	/// [`PublishReviewResult::NoPr`] when the branch has no open PR,
@@ -728,6 +738,15 @@ pub trait WorkspaceHost: Send + Sync {
 	/// surface them in dev mode; the auto-fetch loop downgrades
 	/// them to `tracing::debug!`.
 	async fn git_fetch(&self) -> MoonResult<()>;
+
+	/// The diff GitHub shows for pull request `number`, without a
+	/// checkout: fetches `refs/pull/<number>/head` from `origin` into
+	/// `refs/moon/pr/<number>` (a fork's PR has that ref too) and the
+	/// tip of `base_ref` into `origin/<base_ref>`, then returns the
+	/// merge base of that tip with `head_sha` and the files changed
+	/// from it to `head_sha`. No branch, index or working tree is
+	/// touched. A failed fetch is an error carrying git's stderr.
+	async fn git_pull_request_diff(&self, number: u32, base_ref: &str, head_sha: &str) -> MoonResult<PullRequestDiff>;
 
 	/// Capture a baseline commit SHA for per-turn diff attribution
 	/// (ADR 0030): a tree object of the tracked files' current
@@ -2368,7 +2387,31 @@ impl WorkspaceHost for LocalHost {
 		// Remote refs + `FETCH_HEAD` only — no index, no working
 		// tree — so not under `git_mutex` (ADR 0092).
 		let _guard = self.remote_mutex.lock().await;
-		run_git_fetch_quiet(&self.root).await
+		run_git_fetch_quiet(&self.root, &[]).await
+	}
+
+	async fn git_pull_request_diff(&self, number: u32, base_ref: &str, head_sha: &str) -> MoonResult<PullRequestDiff> {
+		if !is_full_sha(head_sha) {
+			return Err(MoonError::invalid(format!("not a commit SHA: {head_sha}")));
+		}
+		let refspecs = pull_request_refspecs(number, base_ref);
+		{
+			// Refs and objects only, like `git_fetch`.
+			let _guard = self.remote_mutex.lock().await;
+			let mut args = vec!["origin"];
+			args.extend(refspecs.iter().map(String::as_str));
+			run_git_fetch_quiet(&self.root, &args).await?;
+		}
+		let root = self.root.clone();
+		let base = format!("refs/remotes/origin/{base_ref}");
+		let head = head_sha.to_owned();
+		tokio::task::spawn_blocking(move || {
+			let merge_base = run_git_merge_base(&root, &base, &head)?;
+			let files = run_git_diff_entries(&root, &merge_base, &head)?;
+			Ok(PullRequestDiff { merge_base, files })
+		})
+		.await
+		.map_err(|e| MoonError::Internal(format!("git_pull_request_diff join error: {e}")))?
 	}
 
 	async fn branch_list(&self, pr_scope: PrListScope) -> MoonResult<BranchList> {
@@ -2493,7 +2536,7 @@ impl WorkspaceHost for LocalHost {
 		// (ADR 0092): a network call must not hold up local git work.
 		{
 			let _remote = self.remote_mutex.lock().await;
-			let _ = run_git_fetch_quiet(&root).await;
+			let _ = run_git_fetch_quiet(&root, &[]).await;
 		}
 		// The probe itself runs under the lock so no concurrent commit
 		// slides HEAD between the behind-count and the numstat.
@@ -4391,28 +4434,80 @@ fn run_git_commit_diff(root: &Utf8Path, sha: &str) -> Option<CommitDiff> {
 	// Root commit: every tracked file is an addition. `git diff`
 	// against a non-existent parent would fail, so diff against the
 	// empty tree instead.
-	let diff_arg = if parent_sha.is_empty() {
-		format!("4b825dc642cb6eb9a060e54bf8d69288fbee4904..{sha}")
+	let base = if parent_sha.is_empty() {
+		"4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 	} else {
-		format!("{parent_sha}..{sha}")
+		parent_sha.as_str()
 	};
-	let diff = Command::new("git")
-		.arg("-C")
-		.arg(root.as_std_path())
-		.arg(NO_OPTIONAL_LOCKS)
-		.args(["diff", "--name-status", "-z", "--no-renames", &diff_arg])
-		.output()
-		.ok()?;
-	if !diff.status.success() {
-		return None;
-	}
-	let entries = parse_diff_name_status_z(&diff.stdout);
+	let entries = run_git_diff_entries(root, base, sha).ok()?;
 	Some(CommitDiff {
 		parent_sha,
 		commit_sha: sha.to_owned(),
 		subject,
 		entries,
 	})
+}
+
+/// Files that differ between two commits (`git diff <base>..<head>`),
+/// deletions and additions reported as such rather than as renames.
+/// Both revisions must already be validated: they go to git as is.
+fn run_git_diff_entries(root: &Utf8Path, base: &str, head: &str) -> MoonResult<Vec<GitStatusEntry>> {
+	let diff = std::process::Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
+		.args([
+			"diff",
+			"--name-status",
+			"-z",
+			"--no-renames",
+			&format!("{base}..{head}"),
+		])
+		.env("LC_ALL", "C")
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git diff failed to launch: {e}")))?;
+	if !diff.status.success() {
+		return Err(MoonError::IoError(format!(
+			"git diff: {}",
+			String::from_utf8_lossy(&diff.stderr).trim()
+		)));
+	}
+	Ok(parse_diff_name_status_z(&diff.stdout))
+}
+
+/// `git merge-base <a> <b>` as a full SHA. Unrelated histories and
+/// unknown revisions are errors: the caller has no diff to show.
+fn run_git_merge_base(root: &Utf8Path, a: &str, b: &str) -> MoonResult<String> {
+	let output = std::process::Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.args(["merge-base", a, b])
+		.env("LC_ALL", "C")
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git merge-base failed to launch: {e}")))?;
+	let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+	if !output.status.success() || !is_full_sha(&sha) {
+		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+		let detail = if stderr.is_empty() {
+			format!("{a} and {b} share no history")
+		} else {
+			stderr
+		};
+		return Err(MoonError::IoError(format!("git merge-base: {detail}")));
+	}
+	Ok(sha)
+}
+
+/// What `git fetch origin` is asked for to show pull request `number`
+/// against `base_ref`. The head lands under `refs/moon/`, which no
+/// branch listing or checkout reads; the base lands on its usual
+/// remote-tracking ref, named in full so a single-branch clone gets
+/// it too.
+fn pull_request_refspecs(number: u32, base_ref: &str) -> [String; 2] {
+	[
+		format!("+refs/pull/{number}/head:refs/moon/pr/{number}"),
+		format!("+refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"),
+	]
 }
 
 /// Working-tree patch the SCM panel feeds to the AI commit-message
@@ -4688,17 +4783,19 @@ fn run_git_init(path: &Utf8Path) -> MoonResult<()> {
 	}
 }
 
-/// `git fetch --quiet --no-tags` with prompts disabled and a 30s
-/// timeout. Used by the periodic auto-fetch loop so the upstream
-/// tracking ref (`refs/remotes/origin/<branch>`) refreshes without
-/// the user clicking anything; `git_branch`'s ahead/behind read
-/// then surfaces the new "Sync Changes" affordance.
+/// `git fetch --quiet --no-tags [what…]` with prompts disabled and a
+/// 30s timeout. `what` is the remote and refspecs; empty fetches the
+/// branch's upstream remote, which is what the periodic auto-fetch
+/// loop asks for so the upstream tracking ref
+/// (`refs/remotes/origin/<branch>`) refreshes without the user
+/// clicking anything; `git_branch`'s ahead/behind read then surfaces
+/// the new "Sync Changes" affordance.
 ///
 /// Async on purpose: `tokio::process::Command` + `tokio::time::timeout`
 /// gives us the deadline for free; the existing `run_git_simple`
 /// (sync, on the blocking pool) has no timeout and would let a
 /// hung fetch park a worker indefinitely.
-async fn run_git_fetch_quiet(root: &Utf8Path) -> MoonResult<()> {
+async fn run_git_fetch_quiet(root: &Utf8Path, what: &[&str]) -> MoonResult<()> {
 	use std::process::Stdio;
 	use tokio::process::Command;
 	use tokio::time::{timeout, Duration};
@@ -4709,6 +4806,7 @@ async fn run_git_fetch_quiet(root: &Utf8Path) -> MoonResult<()> {
 	cmd.arg("-C")
 		.arg(root.as_std_path())
 		.args(["fetch", "--quiet", "--no-tags"])
+		.args(what)
 		// Without these env knobs a remote that needs auth (HTTPS
 		// without a credential helper, or SSH without an agent)
 		// hangs waiting on stdin we can't even render. Fail fast so
@@ -4828,15 +4926,19 @@ fn host_gh() -> std::path::PathBuf {
 	moon_container::resolve_host_gh().unwrap_or_else(|| "gh".into())
 }
 
-/// Resolve the open PR for the current branch via
-/// `gh pr view --json number,headRefOid,headRefName`. Returns
+/// Resolve a PR and its head SHA via
+/// `gh pr view [<number>] --json number,headRefOid,state`: the one
+/// open for the current branch, or `number` when given. Returns
 /// `Ok(None)` when there's no PR (gh exits non-zero / empty), which
 /// the caller surfaces as [`PublishReviewResult::NoPr`].
-async fn gh_pr_head(root: &Utf8Path) -> MoonResult<Option<(u64, String)>> {
+async fn gh_pr_head(root: &Utf8Path, number: Option<u32>) -> MoonResult<Option<(u64, String)>> {
 	let mut cmd = tokio::process::Command::new(host_gh());
+	cmd.current_dir(root.as_std_path()).args(["pr", "view"]);
+	if let Some(number) = number {
+		cmd.arg(number.to_string());
+	}
 	cmd
-		.current_dir(root.as_std_path())
-		.args(["pr", "view", "--json", "number,headRefOid,state"])
+		.args(["--json", "number,headRefOid,state"])
 		.env("GH_PROMPT_DISABLED", "1")
 		.env("LC_ALL", "C")
 		.stdin(std::process::Stdio::null())
@@ -4873,11 +4975,11 @@ async fn gh_pr_head(root: &Utf8Path) -> MoonResult<Option<(u64, String)>> {
 }
 
 /// Forgejo counterpart of [`gh_pr_head`]: the open PR whose head
-/// ref is the current branch. API failures are real errors (auth /
-/// network problems must surface, not read as "no PR"); an empty
-/// match is `Ok(None)`.
-async fn forgejo_pr_head(remote: &ForgeRemote, branch: &str) -> MoonResult<Option<(u64, String)>> {
-	if branch.is_empty() {
+/// ref is the current branch, or the open PR `number` when given.
+/// API failures are real errors (auth / network problems must
+/// surface, not read as "no PR"); an empty match is `Ok(None)`.
+async fn forgejo_pr_head(remote: &ForgeRemote, branch: &str, number: Option<u32>) -> MoonResult<Option<(u64, String)>> {
+	if number.is_none() && branch.is_empty() {
 		return Ok(None);
 	}
 	let prs = forgejo_list_open_prs(remote, BRANCH_LIST_PR_CAP)
@@ -4886,7 +4988,10 @@ async fn forgejo_pr_head(remote: &ForgeRemote, branch: &str) -> MoonResult<Optio
 	Ok(
 		prs
 			.into_iter()
-			.find(|pr| pr.head_ref == branch)
+			.find(|pr| match number {
+				Some(number) => pr.number == u64::from(number),
+				None => pr.head_ref == branch,
+			})
 			.filter(|pr| !pr.head_sha.is_empty())
 			.map(|pr| (pr.number, pr.head_sha)),
 	)
@@ -4925,8 +5030,8 @@ async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -
 		return Ok(PublishReviewResult::NoPr { branch });
 	};
 	let head = match remote.kind {
-		ForgeKind::GitHub => gh_pr_head(root).await?,
-		ForgeKind::Forgejo => forgejo_pr_head(&remote, &branch).await?,
+		ForgeKind::GitHub => gh_pr_head(root, request.pr_number).await?,
+		ForgeKind::Forgejo => forgejo_pr_head(&remote, &branch, request.pr_number).await?,
 	};
 	let Some((number, head_sha)) = head else {
 		return Ok(PublishReviewResult::NoPr { branch });
@@ -4994,23 +5099,37 @@ async fn run_publish_pr_review(root: &Utf8Path, request: PublishReviewRequest) -
 		}
 	}
 
-	if review_comments.is_empty() {
-		// Nothing placed — don't post an empty review. Report all as
-		// lost so the UI keeps them and explains why.
+	let body = request.body.as_ref().filter(|b| !b.trim().is_empty());
+	// Drafts that all failed to place must not turn into a bare
+	// verdict; a comment-only review with neither comments nor a
+	// summary has nothing to say. Report the drafts as lost so the UI
+	// keeps them and explains why.
+	let nothing_to_post = review_comments.is_empty()
+		&& (!request.comments.is_empty() || (request.event == ReviewEvent::Comment && body.is_none()));
+	if nothing_to_post {
 		return Ok(PublishReviewResult::Published {
 			posted: 0,
 			lost,
 			review_url: String::new(),
 		});
 	}
+	if request.event == ReviewEvent::RequestChanges && body.is_none() {
+		return Err(MoonError::invalid("Requesting changes needs a summary."));
+	}
 
-	// 3. Post one atomic COMMENT review. Both forges take the same
-	//    top-level payload shape (`commit_id` / `event` / `body` /
-	//    `comments`); only the transport differs.
+	// 3. Post one atomic review. Both forges take the same top-level
+	//    payload shape (`commit_id` / `event` / `body` / `comments`);
+	//    the transport and the approval's event name differ.
+	let event = match (request.event, remote.kind) {
+		(ReviewEvent::Comment, _) => "COMMENT",
+		(ReviewEvent::RequestChanges, _) => "REQUEST_CHANGES",
+		(ReviewEvent::Approve, ForgeKind::GitHub) => "APPROVE",
+		(ReviewEvent::Approve, ForgeKind::Forgejo) => "APPROVED",
+	};
 	let mut payload = serde_json::Map::new();
 	payload.insert("commit_id".to_owned(), serde_json::Value::String(head_sha.clone()));
-	payload.insert("event".to_owned(), serde_json::Value::String("COMMENT".to_owned()));
-	if let Some(body) = request.body.as_ref().filter(|b| !b.trim().is_empty()) {
+	payload.insert("event".to_owned(), serde_json::Value::String(event.to_owned()));
+	if let Some(body) = body {
 		payload.insert("body".to_owned(), serde_json::Value::String(body.clone()));
 	}
 	let posted_count = review_comments.len() as u32;
@@ -5984,6 +6103,10 @@ fn is_safe_rev(rev: &str) -> bool {
 	if rev == "HEAD" {
 		return true;
 	}
+	is_full_sha(rev)
+}
+
+fn is_full_sha(rev: &str) -> bool {
 	rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -10418,6 +10541,25 @@ mod tests {
 		assert!(!is_safe_rev("--upload-pack=evil"));
 		assert!(!is_safe_rev("0123456789abcdef")); // too short
 		assert!(!is_safe_rev("0123456789abcdef0123456789abcdef0123456g")); // non-hex
+	}
+
+	#[test]
+	fn is_full_sha_rejects_head_and_abbreviations() {
+		assert!(is_full_sha("0123456789abcdef0123456789abcdef01234567"));
+		assert!(!is_full_sha("HEAD"));
+		assert!(!is_full_sha("0123456"));
+		assert!(!is_full_sha("--upload-pack=evil"));
+	}
+
+	#[test]
+	fn pull_request_refspecs_name_both_ends_in_full() {
+		assert_eq!(
+			pull_request_refspecs(42, "release/1.x"),
+			[
+				"+refs/pull/42/head:refs/moon/pr/42",
+				"+refs/heads/release/1.x:refs/remotes/origin/release/1.x"
+			]
+		);
 	}
 
 	#[test]

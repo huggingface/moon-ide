@@ -15,6 +15,7 @@
 	import { pathPicker } from './lib/pathPicker.svelte';
 	import RemoteStatusOverlay from './lib/components/RemoteStatusOverlay.svelte';
 	import CoderPanel from './lib/components/CoderPanel.svelte';
+	import FilesPanel from './lib/components/FilesPanel.svelte';
 	import BottomPanel from './lib/components/BottomPanel.svelte';
 	import { workspace } from './lib/state.svelte';
 	import { coder } from './lib/coder.svelte';
@@ -39,8 +40,10 @@
 
 	let sidebarWidth = $state(280);
 	let coderPanelWidth = $state(600);
+	let filesPanelWidth = $state(280);
 	let resizing = $state(false);
 	let resizingCoderPanel = $state(false);
+	let resizingFilesPanel = $state(false);
 	let resizingBottom = $state(false);
 
 	// True when the keyboard event originated in a surface where
@@ -254,6 +257,13 @@
 				workspace.openBranchSwitcher();
 				return;
 			}
+			if (event.shiftKey && key === 'g') {
+				// GitHub inbox (ADR 0112). `openInboxTab` flashes when
+				// there is no folder to host the tab.
+				event.preventDefault();
+				workspace.openInboxTab();
+				return;
+			}
 			if (event.shiftKey && key === 'd') {
 				// Git: Toggle Diff View. Hidden by the command's
 				// own visibility check when there's nothing to
@@ -400,7 +410,7 @@
 			// shortcut without us caring about layout.
 			if (key === '0') {
 				event.preventDefault();
-				workspace.requestSidebarFocus();
+				workspace.focusFilesPanel();
 				return;
 			}
 		};
@@ -528,6 +538,26 @@
 		window.addEventListener('pointermove', onMove);
 		window.addEventListener('pointerup', onUp);
 	}
+
+	function startFilesPanelResize(event: PointerEvent) {
+		// The panel is anchored to the window's right edge, so
+		// dragging its handle left grows it.
+		resizingFilesPanel = true;
+		const startX = event.clientX;
+		const startW = filesPanelWidth;
+
+		const onMove = (e: PointerEvent) => {
+			const next = startW - (e.clientX - startX);
+			filesPanelWidth = Math.max(180, Math.min(500, next));
+		};
+		const onUp = () => {
+			resizingFilesPanel = false;
+			window.removeEventListener('pointermove', onMove);
+			window.removeEventListener('pointerup', onUp);
+		};
+		window.addEventListener('pointermove', onMove);
+		window.addEventListener('pointerup', onUp);
+	}
 </script>
 
 {#if !workspace.hydrated}
@@ -555,9 +585,10 @@
 			tabindex="-1"
 			onpointerdown={startResize}
 		></div>
-		<!-- Coder sits between the sidebar and the editor area: sessions
-			 are the primary surface, files and browser tabs the
-			 reference material beside them. -->
+		<!-- Coder sits between the sidebar and the editor area: the
+			 sidebar lists the sessions, this panel shows the open one,
+			 and files and browser tabs are the reference material
+			 beside it. -->
 		{#if coder.panelVisible}
 			<aside class="coder-panel" style:width="{coderPanelWidth}px">
 				<CoderPanel />
@@ -599,6 +630,22 @@
 				</div>
 			{/if}
 		</main>
+		<!-- The file tree, opt-in at the far right. Needs a folder:
+			 without one there is no tree to show. -->
+		{#if workspace.filesPanelVisible && workspace.activeFolder}
+			<div
+				class="resize"
+				class:active={resizingFilesPanel}
+				role="separator"
+				aria-orientation="vertical"
+				aria-label="Resize files panel"
+				tabindex="-1"
+				onpointerdown={startFilesPanelResize}
+			></div>
+			<aside class="files-panel" style:width="{filesPanelWidth}px">
+				<FilesPanel />
+			</aside>
+		{/if}
 	</div>
 	<BrowserFrames />
 	<ImageLightbox />
@@ -619,57 +666,59 @@
 <RemoteStatusOverlay />
 
 <style>
+	/* The columns are separate rounded panels on a darker canvas. The
+	   resize handles are the gaps between them. */
 	.app {
 		display: flex;
 		height: calc(100vh - 24px);
 		overflow: hidden;
+		padding: var(--m-gap) var(--m-gap) 0;
+		background: var(--m-canvas);
 	}
 
-	.sidebar {
-		flex-shrink: 0;
-		background: var(--m-bg-1);
-		border-right: 1px solid var(--m-border);
+	.sidebar,
+	.coder-panel,
+	.files-panel,
+	.main {
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-lg);
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
 	}
+	.sidebar,
+	.coder-panel,
+	.files-panel {
+		flex-shrink: 0;
+		background: var(--m-bg-1);
+	}
+	.main {
+		flex: 1;
+		min-width: 0;
+		background: var(--m-bg);
+	}
 
 	.resize {
-		width: 4px;
-		margin-left: -2px;
+		flex-shrink: 0;
+		width: var(--m-gap);
 		cursor: col-resize;
 		background: transparent;
+		border-radius: var(--m-radius-pill);
 		z-index: 5;
 	}
 	/* Horizontal splitter between the editor area and the bottom
-	   panel. Same hit-target bleed trick as the vertical handles
-	   so it's grabbable without snagging the tab strip. */
+	   panel. It bleeds over both so it's grabbable without snagging
+	   the tab strip. */
 	.bottom-resize {
 		width: auto;
 		height: 4px;
 		margin: -2px 0;
+		border-radius: 0;
 		cursor: row-resize;
 	}
 	.resize:hover,
 	.resize.active {
 		background: var(--m-accent);
-	}
-
-	.main {
-		flex: 1;
-		min-width: 0;
-		display: flex;
-		flex-direction: column;
-		background: var(--m-bg);
-	}
-
-	.coder-panel {
-		flex-shrink: 0;
-		background: var(--m-bg-1);
-		border-right: 1px solid var(--m-border);
-		overflow: hidden;
-		display: flex;
-		flex-direction: column;
 	}
 
 	.editor-area {
@@ -701,9 +750,9 @@
 		background: var(--m-bg-2);
 		border: 1px solid var(--m-border-strong);
 		color: var(--m-fg);
-		padding: 8px 12px;
-		border-radius: 6px;
-		box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+		padding: var(--m-space-2) var(--m-space-3);
+		border-radius: var(--m-radius-md);
+		box-shadow: var(--m-shadow-pop);
 		max-width: 480px;
 	}
 </style>

@@ -120,7 +120,7 @@
 		display: flex;
 		gap: 8px;
 		align-items: baseline;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		flex-wrap: wrap;
 	}
 	.wf-url {
@@ -146,18 +146,18 @@
 		font-variant-numeric: tabular-nums;
 	}
 	.wf-error {
-		font-size: 11px;
-		color: var(--m-error, #d34c4c);
+		font-size: var(--m-text-xs);
+		color: var(--m-danger);
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		padding: 6px 8px;
 	}
 	.wf-body {
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		padding: 8px 12px;
 		max-height: 480px;
 		overflow: auto;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 	}
 </style>

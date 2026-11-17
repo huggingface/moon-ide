@@ -29,6 +29,8 @@ import {
 	type LspFileChangeKind,
 	type LspStatusEvent,
 	type PublishReviewResult,
+	type PullRequestDetail,
+	type ReviewEvent,
 	type ReviewComment,
 	type ReviewedFile,
 	type ReviewSide,
@@ -61,7 +63,11 @@ import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/
 import { fileKindFor, isPreviewKind, type FileKind, type PreviewKind } from './util/fileKind';
 import { isMarkdownPath } from './util/markdown';
 import { isReviewPath, REVIEW_PATH } from './util/reviewPath';
+import { INBOX_PATH, isInboxPath } from './util/inboxPath';
+import { inbox } from './inbox.svelte';
+import { sessionDismissals } from './sessionDismissals.svelte';
 import { commitPath, isCommitPath, shaFromCommitPath } from './util/commitPath';
+import { isPrPath, numberFromPrPath, prPath, prTabName } from './util/prPath';
 import { browserIdFromPath, browserPath, browserTabName, isBrowserPath } from './util/browserPath';
 import { wireBrowserBridge } from './browserBridge';
 
@@ -343,6 +349,10 @@ class FolderState {
 	// `refreshReviewedFiles` drops entries whose file changed.
 	// Persisted in `FolderSession.reviewed_files`. Never published.
 	reviewedFiles = $state<ReviewedFile[]>([]);
+	// The open PR for this folder's branch (ADR 0113), kept across
+	// review-tab remounts so reopening doesn't shift the diff down
+	// while it reloads. Not persisted.
+	pullRequest = $state<PullRequestDetail | null>(null);
 
 	constructor(public readonly folderPath: string) {}
 }
@@ -564,14 +574,20 @@ class WorkspaceState {
 	// lives here — not in Editor.svelte — so non-editor surfaces (file tree,
 	// command palette, future shortcuts) can request it uniformly.
 	focusTick = $state(0);
-	// Sibling tickers for the sidebar (file tree) and status bar. F6 /
-	// Ctrl+0 / Esc-from-tree all just bump these and the relevant
-	// component pulls focus in. Same pattern as `focusTick`; keeping
-	// the tickers in WorkspaceState (rather than passing component
-	// refs around) lets every region focus-shift call site stay
-	// declarative.
+	// Sibling tickers for the sidebar (sessions list), the files
+	// panel (file tree) and the status bar. F6 / Ctrl+0 just bump
+	// these and the relevant component pulls focus in. Same pattern
+	// as `focusTick`; keeping the tickers in WorkspaceState (rather
+	// than passing component refs around) lets every region
+	// focus-shift call site stay declarative.
 	sidebarFocusTick = $state(0);
+	filesFocusTick = $state(0);
 	statusFocusTick = $state(0);
+
+	/** Whether the files panel (the file tree, at the window's right
+	 *  edge) is on screen. Persisted as
+	 *  `AppState.files_panel_visible`. */
+	filesPanelVisible = $state(false);
 
 	// "Scroll-to-section" signal for the Review changes pseudo-tab.
 	// When the review tab is active in some pane and the user clicks
@@ -628,6 +644,28 @@ class WorkspaceState {
 	// All comment CRUD proxies the active folder's `FolderState`, the
 	// same shape as the `compareBaseline` / `reviewRestore` proxies.
 	// Every mutation persists the session so drafts survive a restart.
+
+	/** The open PR for the active folder's branch, when known. */
+	get pullRequest(): PullRequestDetail | null {
+		return this.activeFolderState?.pullRequest ?? null;
+	}
+
+	/**
+	 * Re-read the active folder's PR (description, checks, threads,
+	 * moonbot notes). A folder with no PR, a non-GitHub remote or no
+	 * `gh` ends up with `null`; the review tab works without it.
+	 */
+	async refreshPullRequest(): Promise<void> {
+		const fs = this.activeFolderState;
+		if (!fs) {
+			return;
+		}
+		try {
+			fs.pullRequest = await ipc.pullRequest.current();
+		} catch {
+			fs.pullRequest = null;
+		}
+	}
 
 	/** Comment drafts for the active folder. Empty when no folder. */
 	get reviewComments(): readonly ReviewComment[] {
@@ -736,15 +774,16 @@ class WorkspaceState {
 	 * the "lost" ids) are deleted locally — drafts only live until
 	 * they're on GitHub. Returns the backend result so the dialog can
 	 * report posted / lost / no-PR. `null` when there's no active
-	 * folder or no comments to publish.
+	 * folder, or nothing to say: a comment-only review with neither
+	 * drafts nor a summary. An approval can be empty.
 	 */
-	async publishReview(body: string | null): Promise<PublishReviewResult | null> {
+	async publishReview(body: string | null, event: ReviewEvent = 'comment'): Promise<PublishReviewResult | null> {
 		const fs = this.activeFolderState;
-		if (!fs || fs.reviewComments.length === 0) {
+		if (!fs || (fs.reviewComments.length === 0 && event === 'comment' && body === null)) {
 			return null;
 		}
 		const comments = [...fs.reviewComments];
-		const result = await ipc.fs.publishPrReview({ body, comments });
+		const result = await ipc.fs.publishPrReview({ body, comments, event, prNumber: null });
 		if (result.kind === 'published' && this.activeFolderState === fs) {
 			// Drop the comments that posted; keep the lost ones as
 			// local drafts so the user can retry / re-place them.
@@ -918,6 +957,17 @@ class WorkspaceState {
 	 * whenever the backend snapshot lands on `this.workspace`.
 	 */
 	activeFolderPath: string | null = $derived(this.workspace?.active_folder ?? null);
+
+	/**
+	 * The project the active folder belongs to: the folder itself,
+	 * or the project a worktree folder was made from. What a pull
+	 * request tab is about, whichever checkout it was opened in.
+	 */
+	activeProjectPath: string | null = $derived.by(() => {
+		const active = this.activeFolderPath;
+		const entry = this.workspace?.folders.find((folder) => folder.path === active);
+		return entry?.origin.kind === 'worktree' ? entry.origin.parentPath : active;
+	});
 
 	/**
 	 * Display name of the workspace this window belongs to —
@@ -1480,28 +1530,20 @@ class WorkspaceState {
 	/**
 	 * Discard a worktree-backed session folder (ADR 0028): prune the
 	 * git worktree and unbind it. The branch is kept — it's the
-	 * deliverable, left for a PR. `git worktree remove` refuses a
-	 * dirty worktree without `--force`, so a first failure prompts a
-	 * second confirm before forcing.
+	 * deliverable, left for a PR — so a clean worktree goes without
+	 * asking. `git worktree remove` refuses a dirty one without
+	 * `--force`; only then is there something to lose, and a confirm.
 	 */
 	async discardWorktree(path: string) {
 		const folder = this.workspace?.folders.find((f) => f.path === path);
 		if (!folder || folder.origin.kind !== 'worktree') {
 			return;
 		}
-		const branch = folder.origin.branch;
-		const ok = await confirm(
-			`Discard worktree on ${branch}?\n\nThe branch is kept — only the working copy is removed, so you can still open a PR from it later.`,
-			{ title: 'Discard worktree', okLabel: 'Discard', cancelLabel: 'Cancel' },
-		);
-		if (!ok) {
-			return;
-		}
 		try {
 			await this.pruneWorktree(path, false);
 		} catch (firstErr) {
 			// Most likely the worktree has uncommitted or untracked
-			// changes (git refuses without --force). Re-confirm, then
+			// changes (git refuses without --force). Confirm, then
 			// force. Any other error surfaces here too — the message
 			// carries git's own stderr so the user knows what broke.
 			const forceOk = await confirm(
@@ -1834,10 +1876,14 @@ class WorkspaceState {
 		// ms on a large session; no reason to gate the first paint on
 		// them — empty panes fill in as each file loads.
 		this.hydrated = true;
-		// Restore the coder panel's visibility before binding its
-		// change handler so hydration itself doesn't trigger a save.
-		coder.panelVisible = state.coder_panel_visible;
-		coder.bindOnPanelVisibleChange(() => this.persistAppState());
+		this.filesPanelVisible = state.files_panel_visible;
+		// Per-workspace, like the terminals below: both come from
+		// `session.json`.
+		inbox.hydrate(session?.inbox ?? { watched_authors: [], snoozed: [] });
+		inbox.bindOnChange(() => this.persistAppState());
+		sessionDismissals.hydrate(session?.dismissed_coder_sessions ?? []);
+		sessionDismissals.bindOnChange(() => this.persistAppState());
+		inbox.start();
 		// Same for the bottom panel — visibility and height. Log
 		// streams aren't persisted (they back onto running processes
 		// that don't survive a launch); terminal restore recipes
@@ -2521,6 +2567,8 @@ class WorkspaceState {
 				// `session_save` merge keeps this frontend-owned
 				// field verbatim.
 				terminals: terminal.serialisePersisted(),
+				inbox: inbox.serialise(),
+				dismissed_coder_sessions: sessionDismissals.serialise(),
 			};
 			// `workspaces` and `coder` are written through their
 			// own paths (the `workspace_*` and `coder_*` commands).
@@ -2531,7 +2579,7 @@ class WorkspaceState {
 				workspaces: [],
 				theme: this.theme,
 				bottom_panel: bottomPanel.serialise(),
-				coder_panel_visible: coder.panelVisible,
+				files_panel_visible: this.filesPanelVisible,
 				coder: { last_session_by_folder: {} },
 				diff_layout: this.diffLayout,
 			};
@@ -2744,7 +2792,7 @@ class WorkspaceState {
 	private gitExistingPrUrlInFlight = false;
 
 	/**
-	 * SCM-filter toggle: when on, the sidebar swaps the regular
+	 * SCM-filter toggle: when on, the files panel swaps the regular
 	 * file tree for a changes-only view (only paths that appear in
 	 * `gitStatusEntries` with non-`ignored` status, fully expanded).
 	 * Click on a row in that view opens the file in diff mode.
@@ -2759,6 +2807,10 @@ class WorkspaceState {
 
 	toggleScmFilter() {
 		this.scmFilterOn = !this.scmFilterOn;
+		// The filtered tree is what turning the filter on asks for.
+		if (this.scmFilterOn) {
+			this.setFilesPanelVisible(true);
+		}
 	}
 
 	/**
@@ -3641,6 +3693,11 @@ class WorkspaceState {
 				continue;
 			}
 			if (file.kind !== 'text' || file.isDeleted) {
+				continue;
+			}
+			// Pseudo-tabs (review, inbox, commit, untitled) have no
+			// file behind them to re-read.
+			if (isSyntheticBufferPath(file.path)) {
 				continue;
 			}
 			// External buffers don't belong to the active folder's
@@ -4656,6 +4713,68 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Open (or focus) the GitHub inbox pseudo-tab (ADR 0112) in the
+	 * active folder's tab strip. Same synthetic-`OpenFile` shape as
+	 * the review tab; `InboxView` reads everything from the `inbox`
+	 * store, so the tab shows the same list in every folder.
+	 */
+	openInboxTab(side: SplitSide = this.focusedSide) {
+		if (!this.workspace) {
+			this.flash('Open a folder before opening the inbox.');
+			return;
+		}
+		const path = INBOX_PATH;
+		if (!this.openFiles.some((f) => f.path === path)) {
+			const file: OpenFile = {
+				path,
+				name: 'Inbox',
+				kind: 'text',
+				isUntitled: false,
+				text: '',
+				previewUrl: '',
+				loadedFingerprint: fingerprint(''),
+				loadedMtimeMs: null,
+				isDirty: false,
+				isDeleted: false,
+				isExternal: false,
+				pendingEdit: null,
+				previewToken: 0,
+			};
+			this.openFiles = [...this.openFiles, file];
+		}
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(path)) {
+			this.setTabsFor(side, [...tabs, path]);
+		}
+		this.setActive(path, side);
+	}
+
+	/**
+	 * Open a pull request for review from the inbox: put its head
+	 * branch in a worktree of `folderPath` (or reuse the checkout that
+	 * already has it), make that folder active, and show its changes
+	 * against the default branch. The project's own checkout is left
+	 * alone, so several pull requests can be open side by side.
+	 */
+	async openPrForReview(folderPath: string, branch: string): Promise<boolean> {
+		try {
+			const opened = await ipc.inbox.openPr(folderPath, branch);
+			await this.adoptWorkspaceSnapshot(opened.workspace);
+			this.persistAppState();
+			await this.setActiveFolder(opened.folderPath);
+			if (this.activeFolderPath !== opened.folderPath) {
+				return false;
+			}
+			this.setCompareBaseline('default');
+			this.openReviewTab();
+			return true;
+		} catch (err) {
+			this.flash(`Could not open the pull request: ${formatError(err)}`);
+			return false;
+		}
+	}
+
+	/**
 	 * Toggle the Review changes pseudo-tab on the focused side.
 	 *
 	 * - Off → on: same as [`openReviewTab`].
@@ -4708,6 +4827,41 @@ class WorkspaceState {
 			const file: OpenFile = {
 				path,
 				name: subject.length > 0 ? subject : sha.slice(0, 7),
+				kind: 'text',
+				isUntitled: false,
+				text: '',
+				previewUrl: '',
+				loadedFingerprint: fingerprint(''),
+				loadedMtimeMs: null,
+				isDirty: false,
+				isDeleted: false,
+				isExternal: false,
+				pendingEdit: null,
+				previewToken: 0,
+			};
+			this.openFiles = [...this.openFiles, file];
+		}
+		const tabs = this.tabsFor(side);
+		if (!tabs.includes(path)) {
+			this.setTabsFor(side, [...tabs, path]);
+		}
+		this.setActive(path, side);
+	}
+
+	/**
+	 * Open (or focus) a pull request's pseudo-tab in the active
+	 * folder's tab strip. Needs no checkout of the branch: `PrView`
+	 * reads the pull request and its diff from the number in the
+	 * path, against the active folder's repository. Same
+	 * synthetic-`OpenFile` shape as `openCommitTab`.
+	 */
+	openPrTab(number: number, title: string, side: SplitSide = this.focusedSide) {
+		const path = prPath(number);
+		const existing = this.openFiles.find((f) => f.path === path);
+		if (!existing) {
+			const file: OpenFile = {
+				path,
+				name: prTabName(number, title),
 				kind: 'text',
 				isUntitled: false,
 				text: '',
@@ -4981,6 +5135,10 @@ class WorkspaceState {
 			this.openReviewTab(side);
 			return;
 		}
+		if (isInboxPath(path)) {
+			this.openInboxTab(side);
+			return;
+		}
 		if (isBrowserPath(path)) {
 			// Nav-history replay: only a tab the registry still has
 			// can come back (a closed one is gone for good).
@@ -4996,6 +5154,15 @@ class WorkspaceState {
 			const sha = shaFromCommitPath(path);
 			if (sha !== null) {
 				this.openCommitTab(sha, '', side);
+			}
+			return;
+		}
+		if (isPrPath(path)) {
+			// Same rebuild-on-demand as the commit tab; the title is
+			// not known here, so a reopened tab is named by number.
+			const number = numberFromPrPath(path);
+			if (number !== null) {
+				this.openPrTab(number, '', side);
 			}
 			return;
 		}
@@ -6590,6 +6757,30 @@ class WorkspaceState {
 		this.sidebarFocusTick += 1;
 	}
 
+	setFilesPanelVisible(visible: boolean) {
+		if (this.filesPanelVisible === visible) {
+			return;
+		}
+		this.filesPanelVisible = visible;
+		this.persistAppState();
+	}
+
+	toggleFilesPanel() {
+		this.setFilesPanelVisible(!this.filesPanelVisible);
+	}
+
+	/** Open the files panel if needed and move focus into its tree.
+	 *  With no folder there is no tree, so focus goes to the sidebar's
+	 *  add-folder button instead. */
+	focusFilesPanel() {
+		if (this.activeFolder === null) {
+			this.requestSidebarFocus();
+			return;
+		}
+		this.setFilesPanelVisible(true);
+		this.filesFocusTick += 1;
+	}
+
 	requestStatusFocus() {
 		this.statusFocusTick += 1;
 	}
@@ -7292,12 +7483,20 @@ function isGitStatePath(path: string): boolean {
 /** True for any synthetic path that doesn't back onto a real
  *  on-disk file under a bound folder — `untitled:N` unsaved
  *  buffers, the `review://` pseudo-tab, `commit://<sha>` per-
- *  commit diff tabs, and `browser://<n>` browser tabs. Used by every gate that would otherwise route
+ *  commit diff tabs, `pr://<number>` pull request tabs,
+ *  `browser://<n>` browser tabs, and the `inbox://` tab. Used by every gate that would otherwise route
  *  to the host's filesystem (LSP, blame, HEAD fetch, persistence,
  *  format-on-save, …) so we don't fire IPCs that are guaranteed to
  *  fail or, worse, silently match the wrong file. */
 export function isSyntheticBufferPath(path: string): boolean {
-	return isUntitledPath(path) || isReviewPath(path) || isCommitPath(path) || isBrowserPath(path);
+	return (
+		isUntitledPath(path) ||
+		isReviewPath(path) ||
+		isCommitPath(path) ||
+		isPrPath(path) ||
+		isBrowserPath(path) ||
+		isInboxPath(path)
+	);
 }
 
 /**

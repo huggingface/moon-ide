@@ -1412,17 +1412,27 @@ path). A user rename wins over an auto-rename still in flight.
 
 ### Sidebar UI
 
-Two views sharing the coder panel:
+The sessions list is in the sidebar, under source control, and stays
+visible while a session is open in the coder panel
+([ADR 0114](decisions/0114-sessions-in-the-sidebar.md)):
 
-- **Session view** — transcript + composer, with a sticky
-  `← Sessions | <title> | +` strip. Default view when a session
-  exists. A coordinator (orchestrator) session — `mode:
+- **Session view** (coder panel) — transcript + composer under a
+  `<title> | actions` strip. With no session open the panel shows an
+  empty state with a "New session" button. A coordinator (orchestrator) session — `mode:
 "coordinator"` on the header (ADR 0030) — shows a `coordinator`
   badge left of the title and a coordinator-specific empty-state
   hint ("delegates each task to a worker in its own worktree");
   the worktree chip renders the same as on a regular session.
-- **Sessions list** — a row per persisted session (title + relative
-  time), with hover affordances for "open trace" and delete
+- **Sessions list** (sidebar) — a row per persisted session of the
+  active folder's project (title + relative time), the open one
+  marked current, grouped under "Needs you" (waiting on input, last turn
+  failed or interrupted, finished and unseen), "Running" and
+  "Earlier", newest first within each and empty groups omitted; a
+  bar on the row's left edge carries the same state. A failed,
+  interrupted or finished row can be dismissed to "Earlier" until
+  it has new activity
+  ([ADR 0114](decisions/0114-sessions-in-the-sidebar.md)). With hover
+  affordances for "open trace" and delete
   (confirmed), plus the per-row status cues described above. A
   coordinator row carries a short `coord` badge after the title so
   orchestrator sessions are visually distinct from hand-started
@@ -1433,7 +1443,7 @@ Two views sharing the coder panel:
   prose are matched — reasoning, tool calls and tool results mention
   so many paths and identifiers that code-ish queries hit everything.
 
-`+` from either view opens a fresh empty session with focus in the
+`+` (on the sessions list or the session strip) opens a fresh empty session with focus in the
 composer; empty sessions don't persist until the first message. The
 sparkles button beside `+` opens a fresh **coordinator** session
 instead.
@@ -2409,14 +2419,15 @@ otherwise) and in moon-base (built from source); see ADR 0029 for the
 ## UI placement
 
 A resizable column between the sidebar and the editor area
-([ADR 0111](decisions/0111-coder-in-the-middle.md)): sessions are the
-primary surface, files and browser tabs sit to their right. Whether
-it is open lives on `AppState.coder_panel_visible` and restores
-across launches; its width does not. Toggleable from the status bar,
-the command palette (`Coder: Show / Hide Panel`) and `Ctrl+L`.
+([ADR 0111](decisions/0111-coder-in-the-middle.md)) holding the open
+session; the sessions list is in the sidebar
+([ADR 0114](decisions/0114-sessions-in-the-sidebar.md)). The panel is
+open at every launch and its width is not persisted. Toggleable for
+the run from the status bar, the command palette (`Coder: Show / Hide
+Panel`) and `Ctrl+L`.
 
-Top-to-bottom: identity card (when signed in) → session list /
-sticky session header → transcript → session controls → composer.
+Top-to-bottom: identity (when signed in) → session header →
+transcript → session controls → composer.
 Empty states: "Sign in with Hugging Face" when signed out; identity
 card + "+ New session" when signed in with no session.
 

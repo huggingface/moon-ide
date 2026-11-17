@@ -18,6 +18,7 @@
 	import { container } from '../container.svelte';
 	import { workspace } from '../state.svelte';
 	import { containerCwdFor, openContainerTerminal, openHostTerminal } from '../openTerminal';
+	import TerminalIcon from './icons/TerminalIcon.svelte';
 
 	type Props = {
 		// Affects layout only — the popover anchors above the
@@ -101,7 +102,7 @@
 		onclick={toggle}
 	>
 		{#if variant === 'compact'}
-			<span class="icon" aria-hidden="true">▣</span>
+			<span class="icon" aria-hidden="true"><TerminalIcon size={12} /></span>
 		{:else}
 			<span class="icon" aria-hidden="true">+</span>
 			<span class="label">Terminal</span>
@@ -135,46 +136,49 @@
 	}
 	.trigger {
 		font: inherit;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		line-height: 1;
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
+		gap: var(--m-space-1);
 		background: transparent;
 		color: var(--m-fg-muted);
-		border: 1px solid transparent;
-		border-radius: 3px;
-		padding: 2px 8px;
+		border: none;
+		border-radius: var(--m-radius-md);
+		padding: 0 var(--m-space-2);
 		cursor: pointer;
+		height: var(--m-icon-btn);
 	}
 	.trigger:hover {
-		background: var(--m-bg-overlay);
-		border-color: var(--m-border);
+		background: var(--m-wash-hover);
 		color: var(--m-fg);
 	}
 	.trigger.compact {
-		padding: 2px 6px;
+		padding: 0 var(--m-space-2);
+		height: 20px;
+		border-radius: var(--m-radius-sm);
 	}
 	.icon {
+		display: inline-flex;
 		font-size: 12px;
 		line-height: 1;
 	}
 	.label {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 	}
 	.menu {
 		position: absolute;
 		right: 0;
 		min-width: 220px;
 		background: var(--m-bg-2);
-		border: 1px solid var(--m-border-strong);
-		border-radius: 6px;
-		padding: 4px;
-		box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-lg);
+		padding: var(--m-space-1);
+		box-shadow: var(--m-shadow-pop);
 		z-index: 30;
 		display: flex;
 		flex-direction: column;
-		gap: 2px;
+		gap: 1px;
 	}
 	.above .menu {
 		bottom: 100%;
@@ -190,30 +194,29 @@
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 2px;
-		padding: 6px 8px;
+		padding: 6px var(--m-space-2);
 		background: transparent;
 		color: var(--m-fg);
-		border: 1px solid transparent;
-		border-radius: 4px;
+		border: none;
+		border-radius: var(--m-radius-md);
 		cursor: pointer;
 		text-align: left;
 	}
 	.item:hover:not(:disabled) {
-		background: var(--m-bg-overlay);
-		border-color: var(--m-border);
+		background: var(--m-bg-3);
 	}
 	.item:disabled {
 		color: var(--m-fg-subtle);
 		cursor: not-allowed;
 	}
 	.item-title {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		font-weight: 500;
 	}
 	.item-sub {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
-		font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+		font-family: var(--m-font-mono);
 		max-width: 100%;
 		white-space: nowrap;
 		overflow: hidden;

@@ -4,6 +4,7 @@
 	import { container, containerStateLabel } from '../container.svelte';
 	import { companion } from '../companion.svelte';
 	import ContainerPanel from './ContainerPanel.svelte';
+	import PhoneIcon from './icons/PhoneIcon.svelte';
 	import TerminalLauncher from './TerminalLauncher.svelte';
 	import ThemePicker from './ThemePicker.svelte';
 	import TransferStack from './TransferStack.svelte';
@@ -330,7 +331,7 @@
 						: 'Companion bridge not running'}
 			onclick={() => companion.toggle()}
 		>
-			<span class="icon" aria-hidden="true">☏</span>
+			<span class="icon" aria-hidden="true"><PhoneIcon size={12} /></span>
 			<span class="pip" class:on={companion.active} class:pip-warn={companion.remoteErrored}></span>
 			companion{companion.connectedPhoneCount > 0 ? ` (${companion.connectedPhoneCount})` : ''}
 		</button>
@@ -351,6 +352,19 @@
 			<span class="pip" class:on={coder.signedIn}></span>
 			coder
 		</button>
+		<!-- Files panel toggle: the file tree, at the window's right
+			 edge. Hidden with no folder, when there is no tree. -->
+		{#if workspace.activeFolder}
+			<button
+				type="button"
+				class="files"
+				class:active={workspace.filesPanelVisible}
+				title="Files panel (Ctrl+0 to focus)"
+				onclick={() => workspace.toggleFilesPanel()}
+			>
+				files
+			</button>
+		{/if}
 		<!-- Theme picker popover. Three options: System (OS-driven),
 			 Light, Dark. The trigger label reflects the stored choice
 			 and its `title` tooltip also exposes the currently-
@@ -370,17 +384,12 @@
 		left: 0;
 		right: 0;
 		height: 24px;
-		background: var(--m-bg-1);
-		/* The 2px workspace-coloured stripe is the status bar's share
-		   of the identity tint (ADR 0047): always visible, far from
-		   the red/green git + diagnostics pips it must not compete
-		   with, and quieter than tinting the whole bar. */
-		border-top: 2px solid var(--m-ws-accent);
+		background: var(--m-canvas);
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		padding: 0 8px;
-		font-size: 11px;
+		padding: 0 var(--m-space-2);
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
 		z-index: 10;
 	}
@@ -388,13 +397,14 @@
 	.right {
 		display: flex;
 		align-items: center;
-		gap: 12px;
+		gap: 2px;
 		min-width: 0;
 	}
 	.item {
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		overflow: hidden;
+		padding: 0 var(--m-space-2);
 	}
 	.path {
 		max-width: 60ch;
@@ -405,26 +415,30 @@
 		font-variant-numeric: tabular-nums;
 		cursor: help;
 	}
-	.coder {
+	.coder,
+	.files {
 		font: inherit;
 		color: var(--m-fg-muted);
 		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 4px;
-		padding: 0 6px;
-		height: 18px;
-		line-height: 18px;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		padding: 0 var(--m-space-2);
+		height: 20px;
+		line-height: 20px;
 		display: flex;
 		align-items: center;
-		gap: 5px;
+		gap: 6px;
 		cursor: pointer;
 	}
-	.coder:hover {
-		background: var(--m-bg-overlay);
+	.coder:hover,
+	.files:hover {
+		background: var(--m-wash-hover);
 		color: var(--m-fg);
 	}
-	.coder.active {
+	.coder.active,
+	.files.active {
 		color: var(--m-fg);
+		background: var(--m-wash-selected);
 	}
 	.container-wrap {
 		position: relative;
@@ -435,25 +449,26 @@
 		font: inherit;
 		color: var(--m-fg-muted);
 		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 4px;
-		padding: 0 6px;
-		height: 18px;
-		line-height: 18px;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		padding: 0 var(--m-space-2);
+		height: 20px;
+		line-height: 20px;
 		display: flex;
 		align-items: center;
-		gap: 5px;
+		gap: 6px;
 		cursor: pointer;
 	}
 	.container:hover {
-		background: var(--m-bg-overlay);
+		background: var(--m-wash-hover);
 		color: var(--m-fg);
 	}
 	.container.active {
 		color: var(--m-fg);
-		background: var(--m-bg-overlay);
+		background: var(--m-wash-selected);
 	}
 	.container .icon {
+		display: inline-flex;
 		font-size: 12px;
 		line-height: 1;
 	}
@@ -468,7 +483,7 @@
 		background: var(--m-success);
 	}
 	.pip.pip-warn {
-		background: var(--m-warning, #d4a017);
+		background: var(--m-warning);
 	}
 	/* Container pip colour-codes the high-level state. Same palette
 	   as the ContainerPanel header so the two read as one signal. */
@@ -476,7 +491,7 @@
 		background: var(--m-fg-subtle);
 	}
 	.pip-creating {
-		background: var(--m-warning, #d4a017);
+		background: var(--m-warning);
 		animation: pulse 1.6s ease-in-out infinite;
 	}
 	.pip-running {
@@ -508,7 +523,8 @@
 	.diag {
 		display: inline-flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-2);
+		padding: 0 var(--m-space-2);
 	}
 	.diag-chip {
 		display: inline-flex;
@@ -539,14 +555,14 @@
 	   buttons; today every render has it set. */
 	.lsp-status {
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
-		background: var(--m-bg-overlay);
-		border: 1px solid transparent;
-		border-radius: 4px;
-		padding: 0 6px;
-		line-height: 18px;
-		height: 18px;
+		background: transparent;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		padding: 0 var(--m-space-2);
+		line-height: 20px;
+		height: 20px;
 		display: inline-flex;
 		align-items: center;
 		cursor: pointer;
@@ -559,7 +575,7 @@
 		color: var(--m-danger);
 	}
 	.lsp-status:hover {
-		border-color: var(--m-border-strong);
+		background: var(--m-wash-hover);
 	}
 	.lsp-status:focus-visible {
 		outline: 1px solid var(--m-accent);

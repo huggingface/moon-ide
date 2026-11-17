@@ -5,6 +5,7 @@
 	import { isMarkdownPath } from '../util/markdown';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
+	import CloseIcon from './icons/CloseIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
 	import { formatError } from '../protocol';
 
@@ -623,7 +624,9 @@
 				{#if file.isDirty}
 					<span class="dirty" aria-label="unsaved changes">●</span>
 				{/if}
-				<button type="button" class="close" aria-label="Close tab" onclick={(e) => close(e, file.path)}>×</button>
+				<button type="button" class="close" aria-label="Close tab" onclick={(e) => close(e, file.path)}>
+					<CloseIcon size={12} />
+				</button>
 			</div>
 		{/each}
 	</div>
@@ -702,14 +705,14 @@
 	.strip {
 		display: flex;
 		align-items: stretch;
-		height: 32px;
-		background: var(--m-bg-1);
+		height: 36px;
+		background: var(--m-bg);
 		border-bottom: 1px solid var(--m-border);
 		flex-shrink: 0;
 	}
 	.tabs {
 		display: flex;
-		align-items: stretch;
+		align-items: center;
 		flex: 1;
 		min-width: 0;
 		overflow-x: auto;
@@ -722,6 +725,8 @@
 		this becomes a discoverability issue we'll add an overflow
 		menu, not the bar back. */
 		scrollbar-width: none;
+		gap: 2px;
+		padding: 0 6px;
 	}
 	.tabs::-webkit-scrollbar {
 		display: none;
@@ -729,41 +734,49 @@
 	.tab {
 		display: inline-flex;
 		align-items: center;
-		gap: 6px;
-		padding: 0 8px 0 12px;
+		gap: var(--m-space-1);
+		padding: 0 var(--m-space-1) 0 10px;
 		border: none;
-		border-right: 1px solid var(--m-border);
-		border-radius: 0;
+		border-radius: var(--m-radius-md);
 		background: transparent;
 		color: var(--m-fg-muted);
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		cursor: pointer;
 		white-space: nowrap;
-		height: 100%;
+		height: 26px;
 		position: relative;
 		/* Click-and-drag should reorder the tab, not select its label. */
 		user-select: none;
 		-webkit-user-select: none;
+		flex-shrink: 0;
 	}
 	.tab:hover {
 		color: var(--m-fg);
-		background: var(--m-bg-overlay);
+		background: var(--m-bg-1);
 	}
 	.tab.active {
-		background: var(--m-bg);
+		background: var(--m-bg-2);
 		color: var(--m-fg);
-		/* Workspace identity tint rather than the neutral accent —
-		   the active tab sits dead-centre in the user's view, so
-		   it's the cheapest always-on "which workspace" reminder
-		   (ADR 0047). */
-		box-shadow: inset 0 -2px 0 var(--m-ws-accent);
 	}
-	/* Same tab is "active" in the unfocused split: keep the body
-	highlighted (so the user can still tell which tab is current over
-	there) but mute the accent underline — only the focused pane owns
-	the "where typing goes" signal. */
+	/* The accent cue: a short underline in the workspace's identity
+	   colour (ADR 0047), resting on the strip's hairline. */
+	.tab.active::after {
+		content: '';
+		position: absolute;
+		left: var(--m-space-2);
+		right: var(--m-space-2);
+		bottom: -5px;
+		height: 2px;
+		border-radius: var(--m-radius-pill);
+		background: var(--m-ws-accent);
+	}
+	.tab.active-blurred::after {
+		background: var(--m-fg-subtle);
+	}
+	/* The same tab is "active" in the unfocused split: it keeps its
+	   pill, but the underline goes grey. Only the focused pane owns
+	   the "where typing goes" signal. */
 	.tab.active-blurred {
-		box-shadow: inset 0 -2px 0 var(--m-fg-subtle);
 		color: var(--m-fg-muted);
 	}
 	.tab.dragging {
@@ -775,18 +788,21 @@
 	.tab.drop-before::before {
 		content: '';
 		position: absolute;
-		top: 0;
-		bottom: 0;
-		left: -1px;
+		top: 2px;
+		bottom: 2px;
+		left: -2px;
 		width: 2px;
 		background: var(--m-accent);
 		pointer-events: none;
+		border-radius: var(--m-radius-pill);
 	}
 	.tabs.drop-end::after {
 		content: '';
 		flex: 0 0 2px;
-		align-self: stretch;
+		align-self: center;
 		background: var(--m-accent);
+		height: 22px;
+		border-radius: var(--m-radius-pill);
 	}
 	.name {
 		font-family: var(--m-font-ui);
@@ -796,11 +812,11 @@
 	   the edge; the strip's overflow-x scrolls if the tab grows. */
 	.rename-input {
 		font-family: var(--m-font-ui);
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg);
 		background: var(--m-bg-3);
 		border: 1px solid var(--m-accent);
-		border-radius: 3px;
+		border-radius: var(--m-radius-sm);
 		padding: 1px 4px;
 		width: 16ch;
 		min-width: 8ch;
@@ -808,35 +824,39 @@
 	}
 	.dirty {
 		color: var(--m-warning);
-		font-size: 10px;
+		font-size: 9px;
 		line-height: 1;
 	}
 	.pending-edit {
 		/* Forwarded `$GIT_EDITOR` request — a container terminal
 		   is blocked on this buffer. See ADR 0021. */
-		background: var(--m-accent);
-		color: var(--m-bg);
+		background: var(--m-accent-tint);
+		color: var(--m-accent);
 		font-family: var(--m-font-ui);
-		font-size: 10px;
-		line-height: 1;
-		padding: 1px 4px;
-		border-radius: 2px;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		font-size: var(--m-text-xs);
+		line-height: 16px;
+		padding: 0 6px;
+		border-radius: var(--m-radius-pill);
 	}
 	.close {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 16px;
-		height: 16px;
-		border-radius: 3px;
+		width: 18px;
+		height: 18px;
+		border-radius: var(--m-radius-sm);
 		color: var(--m-fg-subtle);
 		font-size: 14px;
 		line-height: 1;
 		background: transparent;
 		border: none;
 		padding: 0;
+		opacity: 0;
+	}
+	.tab:hover .close,
+	.tab.active .close,
+	.close:focus-visible {
+		opacity: 1;
 	}
 	.close:hover {
 		background: var(--m-bg-3);
@@ -850,47 +870,43 @@
 		display: flex;
 		align-items: center;
 		gap: 2px;
-		padding: 4px 8px;
+		padding: 0 var(--m-space-2);
 		flex-shrink: 0;
-		border-left: 1px solid var(--m-border);
 	}
 	.view-btn {
 		font-family: var(--m-font-ui);
-		font-size: 11px;
+		font-size: var(--m-text-sm);
 		font-weight: 500;
 		color: var(--m-fg-muted);
 		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 3px;
-		padding: 2px 8px;
+		border: none;
+		border-radius: var(--m-radius-md);
+		padding: 0 10px;
 		cursor: pointer;
 		user-select: none;
 		-webkit-user-select: none;
+		height: 26px;
 	}
 	.view-btn:hover {
 		color: var(--m-fg);
-		background: var(--m-bg-overlay);
+		background: var(--m-bg-1);
 	}
 	.view-btn.selected {
 		color: var(--m-fg);
-		background: var(--m-bg-3);
-		border-color: var(--m-border);
+		background: var(--m-bg-2);
 	}
-	/* Icon-only button alongside the Source/Diff text buttons. Same
-	   hit-target height as `.view-btn` (24px = 11px text + 6px+6px pad
-	   + 1+1px border equivalents) so the row stays aligned, but a
-	   square footprint instead of text padding. */
+	/* Icon-only button alongside the Source/Diff text buttons. */
 	.view-icon-btn {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 22px;
-		height: 22px;
-		margin-left: 4px;
+		width: 26px;
+		height: 26px;
+		margin-left: 2px;
 		color: var(--m-fg-muted);
 		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 3px;
+		border: none;
+		border-radius: var(--m-radius-md);
 		padding: 0;
 		cursor: pointer;
 		user-select: none;
@@ -898,7 +914,7 @@
 	}
 	.view-icon-btn:hover {
 		color: var(--m-fg);
-		background: var(--m-bg-overlay);
+		background: var(--m-bg-2);
 	}
 	.view-icon-btn:active {
 		background: var(--m-bg-3);

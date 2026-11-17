@@ -210,7 +210,7 @@
 		display: flex;
 		gap: 8px;
 		align-items: baseline;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	/* Path is a clickable button (via `.tool-link`); we set
 	   layout / typography here only and let the global link
@@ -243,11 +243,11 @@
 		display: flex;
 		align-items: stretch;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		max-height: 360px;
 		overflow: auto;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 	}
 	.rf-line-numbers {

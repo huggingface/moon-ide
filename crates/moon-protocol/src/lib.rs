@@ -15,6 +15,7 @@ pub mod error;
 pub mod focus_socket;
 pub mod fs;
 pub mod git;
+pub mod inbox;
 pub mod logs;
 pub mod lsp;
 pub mod ports;

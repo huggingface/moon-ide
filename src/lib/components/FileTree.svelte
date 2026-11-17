@@ -1,3 +1,10 @@
+<script lang="ts" module>
+	// The last files-focus tick a tree acted on. Shared by every
+	// instance so a tree mounted later (folder switch, panel reopened)
+	// doesn't replay a request that was already served.
+	let handledFocusTick = 0;
+</script>
+
 <script lang="ts">
 	// Heads up: Svelte's compiler lexes this file's script body as
 	// raw text looking for a closing script tag, and it will mistake
@@ -30,7 +37,7 @@
 		 * `'changes'` renders only paths with a non-ignored git
 		 * status entry, fully expanded, and clicks open in diff
 		 * mode. Used by the SCM panel's changes-only filter — the
-		 * sidebar mounts both modes simultaneously and toggles
+		 * files panel mounts both modes simultaneously and toggles
 		 * visibility, so each tree's expansion state survives
 		 * round-trips through the toggle.
 		 */
@@ -47,7 +54,7 @@
 	// this gate every tab switch would re-run the per-mode click
 	// policy in `activateRowFromTree` — flipping a modified file into
 	// diff mode just because the user clicked its tab while the
-	// changes-mode tree was the visible sidebar. Real user clicks
+	// changes-mode tree was the visible tree. Real user clicks
 	// reach `activateRowFromTree` through the wrapper-level
 	// `onTreeClick` handler, which already covers every click
 	// (including the already-selected-row case Pierre's selection
@@ -104,6 +111,22 @@
 [data-item-section='decoration'] {
 	color: ${CONFLICT_BADGE_COLOR};
 	font-weight: 700;
+}
+/* The search box takes the IDE's input metrics and focus style
+   (accent border, no ring) instead of the library's taller box
+   with a 2px outline. */
+[data-file-tree-search-container] {
+	margin-bottom: 8px;
+}
+[data-file-tree-search-input] {
+	height: 28px;
+	line-height: 26px;
+	margin-block: 0;
+}
+[data-file-tree-search-input]:focus-visible,
+[data-file-tree-search-input][data-file-tree-search-input-fake-focus='true'] {
+	outline: none;
+	border-color: var(--trees-focus-ring-color);
 }
 `;
 
@@ -1815,11 +1838,12 @@
 	}
 
 	// Pull DOM focus onto a tree row when WorkspaceState bumps the
-	// sidebar focus tick (F6 cycle, Ctrl+0). Pierre's rows live inside
+	// files focus tick (F6 cycle, Ctrl+0). Pierre's rows live inside
 	// a Shadow DOM on the `<file-tree-container>` host, so a light-DOM
-	// `querySelector` from Sidebar.svelte never finds them — only the
-	// header button is reachable from there, which is exactly the
-	// "Open folder" detour the user complained about.
+	// `querySelector` from the panel never finds them. Ctrl+0 on a
+	// closed panel bumps the tick before this tree exists, so the
+	// request is matched against `handledFocusTick` rather than
+	// against what the tick was at mount.
 	//
 	// Strategy: ask Pierre to put logical focus on the closest visible
 	// row to the active file (or the existing focused/first row when
@@ -1828,8 +1852,8 @@
 	// and call DOM `focus()` on that button. That makes arrow keys
 	// fire on the row directly, the way Pierre's keymap expects.
 	$effect(() => {
-		const focusTick = workspace.sidebarFocusTick;
-		if (focusTick === 0) {
+		const focusTick = workspace.filesFocusTick;
+		if (focusTick === handledFocusTick) {
 			return;
 		}
 		// Active path is read but must not be tracked: this effect's
@@ -1846,6 +1870,7 @@
 		if ((mode === 'changes') !== filterOn) {
 			return;
 		}
+		handledFocusTick = focusTick;
 		void pullFocusIntoTree(target);
 	});
 
@@ -2082,7 +2107,7 @@
 	 * whether selection changed.
 	 */
 	function onTreeClick(event: MouseEvent) {
-		// Sidebar's `pointer-events: none` on the hidden pane
+		// FilesPanel's `pointer-events: none` on the hidden pane
 		// already blocks real user clicks from reaching the
 		// off-screen tree, but mirroring the visibility check here
 		// keeps the contract uniform with `onSelectionChange` —

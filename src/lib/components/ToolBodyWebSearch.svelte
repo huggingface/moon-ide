@@ -143,7 +143,7 @@
 		flex-wrap: wrap;
 		gap: 8px;
 		align-items: baseline;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.ws-query {
 		flex: 0 1 auto;
@@ -152,7 +152,7 @@
 		color: var(--m-fg);
 		background: var(--m-bg);
 		padding: 1px 6px;
-		border-radius: 3px;
+		border-radius: var(--m-radius-sm);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -163,18 +163,18 @@
 		color: var(--m-fg-subtle);
 	}
 	.ws-empty {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		font-style: italic;
 		padding: 6px 8px;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 	}
 	.ws-error {
-		font-size: 11px;
-		color: var(--m-error, #d34c4c);
+		font-size: var(--m-text-xs);
+		color: var(--m-danger);
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		padding: 6px 8px;
 	}
 	.ws-hits {
@@ -185,7 +185,7 @@
 		flex-direction: column;
 		gap: 8px;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		padding: 8px;
 		max-height: 420px;
 		overflow: auto;
@@ -201,7 +201,7 @@
 		border: 0;
 		padding: 0;
 		text-align: left;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		font-weight: 600;
 		color: var(--m-accent, var(--m-fg));
 		cursor: pointer;

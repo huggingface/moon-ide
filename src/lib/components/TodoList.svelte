@@ -51,14 +51,14 @@
 		padding: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
+		gap: var(--m-space-1);
 	}
 	.todo-item {
 		display: flex;
 		align-items: flex-start;
-		gap: 6px;
+		gap: var(--m-space-2);
 		min-width: 0;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		line-height: 1.45;
 		color: var(--m-fg-muted);
 	}

@@ -9,19 +9,23 @@
 	// has no obvious order. Same click-outside + Esc dismissal
 	// pattern as `TerminalLauncher`.
 
+	import type { Component } from 'svelte';
 	import { workspace } from '../state.svelte';
 	import type { ThemeMode } from '../protocol';
+	import ContrastIcon from './icons/ContrastIcon.svelte';
+	import MoonIcon from './icons/MoonIcon.svelte';
+	import SunIcon from './icons/SunIcon.svelte';
 
 	type Option = {
 		id: ThemeMode;
 		label: string;
-		icon: string;
+		icon: Component<{ size?: number }>;
 	};
 
 	const OPTIONS: Option[] = [
-		{ id: 'system', label: 'System', icon: '◐' },
-		{ id: 'light', label: 'Light', icon: '☀' },
-		{ id: 'dark', label: 'Dark', icon: '☾' },
+		{ id: 'system', label: 'System', icon: ContrastIcon },
+		{ id: 'light', label: 'Light', icon: SunIcon },
+		{ id: 'dark', label: 'Dark', icon: MoonIcon },
 	];
 
 	let open = $state(false);
@@ -84,7 +88,11 @@
 
 <div class="picker" bind:this={rootEl}>
 	<button bind:this={triggerEl} type="button" class="trigger" class:open title={triggerTitle} onclick={toggle}>
-		<span class="icon" aria-hidden="true">{activeOption?.icon}</span>
+		<span class="icon" aria-hidden="true">
+			{#if activeOption}
+				<activeOption.icon size={12} />
+			{/if}
+		</span>
 		<span class="label">{activeOption?.label.toLowerCase()}</span>
 	</button>
 	{#if open}
@@ -98,7 +106,7 @@
 					aria-checked={workspace.theme === option.id}
 					onclick={() => pick(option.id)}
 				>
-					<span class="item-icon" aria-hidden="true">{option.icon}</span>
+					<span class="item-icon" aria-hidden="true"><option.icon size={12} /></span>
 					<span class="item-title">{option.label}</span>
 					{#if option.id === 'system'}
 						<span class="item-sub">{workspace.effectiveTheme}</span>
@@ -118,27 +126,28 @@
 		font: inherit;
 		color: var(--m-fg-muted);
 		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 4px;
-		padding: 0 6px;
-		height: 18px;
-		line-height: 18px;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		padding: 0 var(--m-space-2);
+		height: 20px;
+		line-height: 20px;
 		display: inline-flex;
 		align-items: center;
-		gap: 5px;
+		gap: 6px;
 		cursor: pointer;
 	}
 	.trigger:hover,
 	.trigger.open {
-		background: var(--m-bg-overlay);
+		background: var(--m-wash-hover);
 		color: var(--m-fg);
 	}
 	.icon {
+		display: inline-flex;
 		font-size: 12px;
 		line-height: 1;
 	}
 	.label {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.menu {
 		position: absolute;
@@ -147,41 +156,43 @@
 		margin-bottom: 6px;
 		min-width: 180px;
 		background: var(--m-bg-2);
-		border: 1px solid var(--m-border-strong);
-		border-radius: 6px;
-		padding: 4px;
-		box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-lg);
+		padding: var(--m-space-1);
+		box-shadow: var(--m-shadow-pop);
 		z-index: 30;
 		display: flex;
 		flex-direction: column;
-		gap: 2px;
+		gap: 1px;
 	}
 	.item {
 		font: inherit;
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		padding: 6px 8px;
+		gap: var(--m-space-2);
+		padding: 0 var(--m-space-2);
 		background: transparent;
 		color: var(--m-fg);
-		border: 1px solid transparent;
-		border-radius: 4px;
+		border: none;
+		border-radius: var(--m-radius-md);
 		cursor: pointer;
 		text-align: left;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
+		height: 28px;
 	}
 	.item:hover {
-		background: var(--m-bg-overlay);
-		border-color: var(--m-border);
+		background: var(--m-bg-3);
 	}
 	.item.selected {
-		background: var(--m-bg-overlay);
+		background: var(--m-bg-3);
 		color: var(--m-fg);
 	}
 	.item.selected .item-title {
 		font-weight: 500;
 	}
 	.item-icon {
+		display: inline-flex;
+		justify-content: center;
 		width: 14px;
 		text-align: center;
 		font-size: 12px;
@@ -194,7 +205,7 @@
 		flex: 1;
 	}
 	.item-sub {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
 	}
 </style>

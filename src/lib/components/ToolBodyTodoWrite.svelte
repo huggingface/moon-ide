@@ -125,19 +125,19 @@
 		margin-top: 4px;
 	}
 	.todo-empty {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		font-style: italic;
 		padding: 6px 8px;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 	}
 	.todo-list {
 		list-style: none;
 		margin: 0;
 		padding: 4px 0;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
@@ -147,7 +147,7 @@
 		align-items: baseline;
 		gap: 8px;
 		padding: 2px 8px;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		line-height: 1.4;
 	}
 	.todo-glyph {

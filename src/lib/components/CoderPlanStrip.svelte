@@ -109,25 +109,29 @@
 	.plan-strip {
 		display: flex;
 		flex-direction: column;
-		gap: 6px;
+		gap: var(--m-space-1);
 		min-width: 0;
 	}
 	.plan-strip-list {
 		max-height: 240px;
 		overflow: auto;
-		padding: 2px 2px 4px;
+		padding: var(--m-space-2) var(--m-space-3);
+		background: var(--m-bg-2);
+		border-radius: var(--m-radius-lg);
 	}
 	.plan-strip-bar {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		gap: var(--m-space-2);
 		min-width: 0;
-		padding: 0;
+		padding: 0 var(--m-space-1);
 		border: none;
 		background: none;
 		font: inherit;
 		text-align: left;
 		cursor: pointer;
+		min-height: 22px;
+		border-radius: var(--m-radius-md);
 	}
 	/* The chain keeps its size and the step text takes what's left;
 	   only a very long plan squeezes the connectors (down to 2px).
@@ -142,10 +146,11 @@
 		overflow: hidden;
 	}
 	.connector {
-		flex: 0 1 10px;
+		flex: 0 1 auto;
 		min-width: 2px;
 		height: 1.5px;
 		background: var(--m-border);
+		width: 10px;
 	}
 	.connector.settled {
 		background: var(--m-accent);
@@ -158,7 +163,7 @@
 		width: var(--step);
 		height: var(--step);
 		border-radius: 50%;
-		border: 1.5px solid var(--m-border-strong, var(--m-fg-subtle));
+		border: 1.5px solid var(--m-border-strong);
 		color: var(--m-bg);
 	}
 	.step svg {
@@ -221,7 +226,7 @@
 	.count {
 		flex: 0 0 auto;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		font-variant-numeric: tabular-nums;
 		color: var(--m-fg-subtle);
 	}
@@ -231,7 +236,7 @@
 		overflow: hidden;
 		white-space: nowrap;
 		text-overflow: ellipsis;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-muted);
 	}
 	.status.complete {

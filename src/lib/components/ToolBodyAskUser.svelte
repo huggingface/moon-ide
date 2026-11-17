@@ -290,15 +290,15 @@
 {/if}
 
 <style>
-	/* Free-flowing layout: no card background of its own (the row
-	   already provides one), full message-column width, generous
-	   vertical rhythm so a multi-question prompt reads like a form
-	   rather than a cramped popover. */
+	/* No surface of its own (the row provides the card), full
+	   message-column width, generous vertical rhythm so a
+	   multi-question prompt reads like a form rather than a cramped
+	   popover. */
 	.ask-form {
 		display: flex;
 		flex-direction: column;
-		gap: 14px;
-		margin-top: 6px;
+		gap: var(--m-space-3);
+		margin-top: var(--m-space-1);
 	}
 	.ask-form.submitting {
 		opacity: 0.6;
@@ -310,7 +310,7 @@
 		gap: 6px;
 	}
 	.ask-question-text {
-		font-size: 12px;
+		font-size: var(--m-text-md);
 		font-weight: 500;
 		color: var(--m-fg);
 		line-height: 1.4;
@@ -321,26 +321,27 @@
 	.ask-options {
 		display: flex;
 		flex-direction: column;
-		gap: 3px;
+		gap: 1px;
+		margin: 0 calc(-1 * var(--m-space-2));
 	}
 	.ask-option {
 		display: flex;
 		align-items: flex-start;
-		gap: 8px;
+		gap: var(--m-space-2);
 		width: 100%;
 		box-sizing: border-box;
-		padding: 6px 8px;
-		font-size: 12px;
+		padding: 6px var(--m-space-2);
+		font-size: var(--m-text-md);
 		line-height: 1.4;
 		text-align: left;
 		color: var(--m-fg);
 		background: transparent;
 		border: none;
-		border-radius: 5px;
+		border-radius: var(--m-radius-md);
 		cursor: pointer;
 	}
 	.ask-option:hover:not(:disabled) {
-		background: var(--m-bg-hover, color-mix(in srgb, var(--m-fg) 6%, transparent));
+		background: var(--m-bg-3);
 	}
 	.ask-option:disabled {
 		cursor: default;
@@ -351,13 +352,13 @@
 		flex: 0 0 auto;
 		width: 13px;
 		height: 13px;
-		margin-top: 1px;
-		border: 1.5px solid var(--m-border-strong, var(--m-border));
+		margin-top: 2px;
+		border: 1.5px solid var(--m-border-strong);
 		border-radius: 50%;
 		box-sizing: border-box;
 	}
 	.ask-marker.multi {
-		border-radius: 3px;
+		border-radius: var(--m-radius-sm);
 	}
 	.ask-option.selected .ask-marker {
 		border-color: var(--m-accent);
@@ -378,14 +379,14 @@
 		width: 100%;
 		box-sizing: border-box;
 		margin-top: 2px;
-		padding: 5px 8px;
-		font-size: 12px;
+		padding: 5px var(--m-space-2);
+		font-size: var(--m-text-md);
 		font-family: inherit;
 		line-height: 1.4;
 		color: var(--m-fg);
 		background: var(--m-bg);
 		border: 1px solid var(--m-border);
-		border-radius: 5px;
+		border-radius: var(--m-radius-md);
 		resize: vertical;
 		min-height: 28px;
 		field-sizing: content;
@@ -400,31 +401,34 @@
 	.ask-actions {
 		display: flex;
 		align-items: center;
-		gap: 10px;
+		gap: var(--m-space-3);
 		margin-top: 2px;
 	}
 	.ask-submit {
-		padding: 5px 14px;
-		font-size: 12px;
-		font-weight: 500;
-		color: var(--m-accent-fg, #fff);
+		padding: 0 var(--m-space-4);
+		font-size: var(--m-text-sm);
+		font-weight: 600;
+		color: var(--m-bg);
 		background: var(--m-accent);
 		border: none;
-		border-radius: 5px;
+		border-radius: var(--m-radius-md);
 		cursor: pointer;
+		height: var(--m-control-h);
+	}
+	.ask-submit:hover:not(:disabled) {
+		background: var(--m-accent-strong);
 	}
 	.ask-submit:disabled {
 		opacity: 0.5;
 		cursor: default;
 	}
 	.ask-skip-hint {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
-		font-style: italic;
 	}
 	/* Settled summary: also free-flowing, no box. */
 	.ask-settled {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-subtle);
 		margin-top: 4px;
 	}
@@ -440,7 +444,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 1px;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 	}
 	.ask-q {
 		color: var(--m-fg-subtle);

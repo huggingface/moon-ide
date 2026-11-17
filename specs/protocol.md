@@ -35,6 +35,23 @@ STATUS: partial — Phase 0 ships fs operations via Tauri commands. Streams (`fs
 - `editor.save({ id })`
 - `editor.close({ id })`
 
+### `pr.*` (ADR 0113)
+
+- `pr_current() -> PullRequestDetail | null` — the open GitHub PR for the active folder's branch: description (minus moonbot's notes block), state, review decision, checks, the parsed notes and the review threads. `null` when there is no PR, the remote isn't GitHub, or `gh` can't answer.
+
+- `pr_open({ number }) -> PrOpened` — pull request `number` of the active folder's repository, without a checkout ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)): fetches its head into `refs/moon/pr/<number>` and returns the detail, the merge base with the base branch, and the files changed between the two. Both revisions can then be read with `fs_git_ref_content`. Errors when the fetch fails or `gh` cannot describe the PR.
+- `fs_publish_pr_review`'s request takes an optional `prNumber`: the review goes to that PR instead of the current branch's.
+
+Shapes: [`crates/moon-protocol/src/review.rs`](../crates/moon-protocol/src/review.rs).
+
+### `inbox.*` (ADR 0112)
+
+- `inbox_fetch({ watchedAuthors }) -> InboxSnapshot` — one poll of GitHub through the host's `gh`, limited to the bound folders' GitHub repositories (echoed in `repos`; empty means nothing was asked). Never errors for GitHub's sake: `status` reports a missing or logged-out `gh`, and `failures` lists the sources whose rows are absent from this snapshot.
+- `inbox_mark_read({ threadId })` — marks a notification thread read.
+- `inbox_open_pr({ folderPath, branch }) -> { workspace, folderPath }` — makes `branch` available for review without moving the project's checkout: returns the bound worktree already on it, the project itself when it is on it, or a new worktree under `<project>/.worktrees/`. `folderPath` must be a project folder, not a worktree.
+
+Shapes: [`crates/moon-protocol/src/inbox.rs`](../crates/moon-protocol/src/inbox.rs).
+
 ### `git.*` (Phase 5), `lsp.*` (Phase 4), `coder.*` (Phase 6), `term.*` (Phase 3), `lint.*` (Phase 8)
 
 Defined per-phase. Each follows the same pattern: requests with structured params, streaming events for long-lived subscriptions.

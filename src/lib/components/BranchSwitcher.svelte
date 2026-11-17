@@ -272,7 +272,7 @@
 	<div class="backdrop" role="presentation" onclick={onBackdrop} tabindex="-1">
 		<div class="palette" role="dialog" aria-label="Switch branch">
 			<div class="row">
-				<span class="prefix">⎇</span>
+				<span class="prefix"><BranchIcon size={14} /></span>
 				<input
 					bind:this={inputEl}
 					type="text"
@@ -420,6 +420,8 @@
 		border-bottom: 1px solid var(--m-border);
 	}
 	.prefix {
+		display: inline-flex;
+		justify-content: center;
 		color: var(--m-fg-subtle);
 		font-family: var(--m-font-mono);
 		font-size: 14px;

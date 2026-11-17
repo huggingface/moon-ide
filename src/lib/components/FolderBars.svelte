@@ -4,6 +4,9 @@
 	import { projectCompose, projectComposeStateLabel } from '../projectCompose.svelte';
 	import { workspace } from '../state.svelte';
 	import BranchIcon from './icons/BranchIcon.svelte';
+	import ChevronDownIcon from './icons/ChevronDownIcon.svelte';
+	import ChevronRightIcon from './icons/ChevronRightIcon.svelte';
+	import CloseIcon from './icons/CloseIcon.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
 	import QuestionBubbleIcon from './icons/QuestionBubbleIcon.svelte';
@@ -199,7 +202,13 @@
 					<span class="chev branch-glyph" aria-hidden="true"><BranchIcon size={12} /></span>
 					<span class="name">{row.branch}</span>
 				{:else}
-					<span class="chev" aria-hidden="true">{isActive ? '▾' : '▸'}</span>
+					<span class="chev" aria-hidden="true">
+						{#if isActive}
+							<ChevronDownIcon size={12} />
+						{:else}
+							<ChevronRightIcon size={12} />
+						{/if}
+					</span>
 					<span class="name">{folder.name}</span>
 				{/if}
 				{#if agentAwaitingInput}
@@ -307,7 +316,7 @@
 					void workspace.removeFolder(folder.path);
 				}}
 			>
-				×
+				<CloseIcon size={14} />
 			</button>
 			{#if popoverOpen && hasCompose}
 				<ProjectComposePopover
@@ -336,40 +345,48 @@
 	.bars {
 		list-style: none;
 		margin: 0;
-		padding: 0;
+		padding: 0 var(--m-space-2) var(--m-space-2);
 		display: flex;
 		flex-direction: column;
 		flex-shrink: 0;
-		border-bottom: 1px solid var(--m-border);
+		gap: 1px;
 	}
 	.bar {
 		position: relative;
 		display: flex;
 		align-items: stretch;
-		min-height: 28px;
-		border-bottom: 1px solid var(--m-border);
+		min-height: var(--m-row-h);
+		border-radius: var(--m-radius-md);
 	}
-	.bar:last-of-type {
-		border-bottom: none;
-	}
-	/* Active folder: a workspace-tinted fill + a solid spine on the
-	   left edge. `--m-ws-accent` carries the workspace's identity
-	   colour (ADR 0047) — this is the strongest "which workspace am
-	   I in" signal since the bar sits at the top of the sidebar.
-	   The old 3%-white wash was barely distinguishable from the
-	   inactive grey — especially for the muted worktree rows. */
+	/* Active folder: the selected-row tone every sidebar list uses. */
 	.bar.active {
-		background: var(--m-ws-accent-soft);
-		box-shadow: inset 2px 0 0 var(--m-ws-accent);
+		background: var(--m-bg-3);
+	}
+	/* The accent cue: the workspace's identity colour (ADR 0047) on a
+	   short rounded spine and on the chevron, instead of a tinted
+	   fill across the whole row. */
+	.bar.active::before {
+		content: '';
+		position: absolute;
+		left: 0;
+		top: 7px;
+		bottom: 7px;
+		width: 3px;
+		border-radius: var(--m-radius-pill);
+		background: var(--m-ws-accent);
+	}
+	.bar:not(.active):hover {
+		background: var(--m-bg-2);
+	}
+	.bar.active .chev {
+		color: var(--m-ws-accent);
 	}
 	/* Worktree-backed session folders (ADR 0028) render nested under
 	   their parent: indented, muted, with a branch glyph. */
 	.bar.worktree .bar-button {
-		padding-left: 22px;
+		padding-left: 26px;
 		color: var(--m-fg-muted);
 	}
-	/* When the worktree row is the active one, un-mute it so the
-	   accent fill reads as a real selection rather than dim grey. */
 	.bar.worktree.active .bar-button {
 		color: var(--m-fg);
 	}
@@ -378,7 +395,7 @@
 	}
 	.bar.worktree .name {
 		font-family: var(--m-font-mono, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-sm);
 	}
 	.branch-glyph {
 		display: inline-flex;
@@ -391,27 +408,33 @@
 		min-width: 0;
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-2);
 		background: transparent;
 		border: none;
-		color: var(--m-fg);
+		color: var(--m-fg-muted);
 		text-align: left;
 		font: inherit;
-		padding: 0 8px;
+		padding: 0 var(--m-space-2);
 		cursor: pointer;
 		overflow: hidden;
+		border-radius: var(--m-radius-md);
+		font-weight: 500;
 	}
 	.bar-button:hover {
-		background: var(--m-bg-2);
+		background: transparent;
+		color: var(--m-fg);
 	}
 	.bar.active .bar-button {
 		font-weight: 600;
+		color: var(--m-fg);
 	}
 	.chev {
-		width: 10px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 12px;
 		flex-shrink: 0;
-		color: var(--m-fg-muted);
-		font-size: 10px;
+		color: var(--m-fg-subtle);
 		text-align: center;
 	}
 	/* Agent-state glyph — an AI sparkle (or question bubble) right
@@ -488,7 +511,7 @@
 		align-items: center;
 		gap: 4px;
 		padding: 0 6px;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		font-variant-numeric: tabular-nums;
 		line-height: 1;
 		pointer-events: auto;
@@ -513,20 +536,21 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 22px;
-		height: 100%;
+		width: 24px;
+		height: auto;
 		background: transparent;
 		border: none;
 		padding: 0;
 		cursor: pointer;
 		color: var(--m-fg-muted);
+		border-radius: var(--m-radius-md);
 	}
 	.indicator.placeholder {
 		cursor: default;
 	}
 	.indicator:not(.placeholder):hover,
 	.indicator.open {
-		background: var(--m-bg-1);
+		background: var(--m-bg-overlay);
 	}
 	/* Per-state colouring for the container icon. Mirrors the
 	   state-text colours used by the workspace status pip +
@@ -578,7 +602,7 @@
 	   hover and vanish when the mouse leaves the row. */
 	.merge-worktree {
 		flex-shrink: 0;
-		width: 22px;
+		width: 24px;
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -590,6 +614,8 @@
 		cursor: pointer;
 		opacity: 0;
 		transition: opacity 80ms;
+		border-radius: var(--m-radius-md);
+		padding: 0;
 	}
 	.bar:hover .merge-worktree,
 	.merge-worktree:focus-visible {
@@ -597,11 +623,12 @@
 	}
 	.merge-worktree:hover {
 		color: var(--m-accent);
-		background: var(--m-bg-1);
+		background: var(--m-bg-overlay);
 	}
 	.remove {
 		flex-shrink: 0;
-		width: 22px;
+		width: 24px;
+		padding: 0;
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -613,6 +640,7 @@
 		cursor: pointer;
 		opacity: 0;
 		transition: opacity 80ms;
+		border-radius: var(--m-radius-md);
 	}
 	/* Hover-reveal the `×`. Keep it permanently visible while focused
 	   so keyboard users can find it without hunting. */
@@ -622,7 +650,7 @@
 	}
 	.remove:hover {
 		color: var(--m-danger);
-		background: var(--m-bg-1);
+		background: var(--m-bg-overlay);
 	}
 	.add {
 		display: flex;
@@ -631,25 +659,27 @@
 		flex: 1;
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-2);
 		background: transparent;
 		border: none;
-		color: var(--m-fg-muted);
+		color: var(--m-fg-subtle);
 		font: inherit;
 		text-align: left;
-		padding: 6px 8px;
+		padding: 0 var(--m-space-2);
 		cursor: pointer;
+		height: var(--m-row-h);
+		border-radius: var(--m-radius-md);
 	}
 	.add-button:hover {
 		background: var(--m-bg-2);
 		color: var(--m-fg);
 	}
 	.plus {
-		width: 10px;
+		width: 12px;
 		flex-shrink: 0;
 		text-align: center;
 		font-size: 14px;
-		font-weight: 600;
+		font-weight: 500;
 	}
 	.add-label {
 		flex: 1;

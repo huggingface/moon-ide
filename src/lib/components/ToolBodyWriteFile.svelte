@@ -169,13 +169,11 @@
 		display: flex;
 		gap: 8px;
 		align-items: baseline;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.wf-verb {
 		flex: 0 0 auto;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		font-size: 10px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.wf-path {
@@ -195,11 +193,11 @@
 		display: flex;
 		align-items: stretch;
 		background: var(--m-bg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		max-height: 360px;
 		overflow: auto;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 	}
 	.wf-line-numbers {

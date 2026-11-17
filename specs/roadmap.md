@@ -22,6 +22,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 4     | LSP                             | in progress |
 | 5     | Git layer                       | in progress |
 | 5.7   | Review comments                 | implemented |
+| 5.8   | GitHub inbox                    | implemented |
 | 6     | Coder (in-process AI agent)     | scaffolded  |
 | 7     | Multi-repo + cross-repo queries | scaffolded  |
 | 8     | Linting / formatting            | scaffolded  |
@@ -114,6 +115,14 @@ Sub-phase work breakdown, tree-marker contract, what's landed, and outstanding w
 A per-folder **review state** layered on the [Review changes tab](test-plans/0074-review-changes-tab.md): inline review comments (local-first, publishable to a GitHub PR as one review once the branch is up) and reviewed-file "Viewed" marks for reviewing a large diff across several sittings. Comments are session drafts anchored by content (so they survive edits and rebases), reconciled against the PR head SHA at publish time to handle commit drift, posted via `gh`, then cleared locally. Reviewed-file marks are content-pinned (blob SHA) so a new commit touching a ticked file auto-un-ticks just that file. Architectural spec: [review-comments.md](review-comments.md). Decision: [ADR 0027 — local-first review comments](decisions/0027-review-comments.md). Sub-phase work breakdown: [roadmaps/phase-05.7-review-comments.md](roadmaps/phase-05.7-review-comments.md).
 
 **Acceptance** (per sub-phase): persisted `ReviewComment` + `ReviewedFile` schema + per-folder CRUD plumbed through `WorkspaceState` (5.7.0); inline composer + anchored comment widgets + per-section "Viewed" checkbox in `ReviewSection`, with content-fingerprint re-anchoring (stale state for lost anchors) and content-pinned reviewed marks that auto-clear on drift (5.7.1); `WorkspaceHost::publish_pr_review` shelling out to `gh` — resolve PR head, reconcile drift, post one atomic `COMMENT` review, clear published comments locally, surface lost/no-PR states (5.7.2). Deferred (threading / replies / resolve, displaying others' comments, GitLab/Bitbucket, `gh pr create`, APPROVE / REQUEST_CHANGES) — see [review-comments.md § "What this deliberately doesn't do"](review-comments.md#what-this-deliberately-doesnt-do).
+
+## Phase 5.8 — GitHub inbox
+
+A tab listing the pull requests and notification threads that want the user in the workspace's repositories, with CI and review state, a watched-authors list, and Enter to open a PR's review in its own worktree. Design and rejected alternatives: [ADR 0112](decisions/0112-github-inbox.md); behaviour: [`frontend.md` § Inbox tab](frontend.md#inbox-tab).
+
+A PR opens in a tab without a checkout ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)) that carries the PR itself — description, checks, review threads, moonbot's notes under their lines — and can approve or request changes ([ADR 0113](decisions/0113-pr-context-in-review-tab.md)); a worktree or an agent on the PR's branch is one click from there.
+
+**Acceptance**: for the workspace's repositories, the tab replaces github.com/notifications?query=is:unread and a PR list filtered by author for day-to-day triage; opening a PR never moves the project's checkout, the active folder within a project, or the open coder session; a moonbot PR can be reviewed and approved without opening GitHub.
 
 ## Phase 6 — Coder (in-process AI agent)
 

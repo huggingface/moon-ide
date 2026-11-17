@@ -15,7 +15,7 @@ STATUS: partial — Phase 0 ships file tree + single editor + tabs scaffolding.
 
 ```
 src/
-├── App.svelte                  Root layout: sidebar | coder | editor area | status bar
+├── App.svelte                  Root layout: sidebar | coder | editor area | files (optional) | status bar
 ├── main.ts                     Mount + global setup
 ├── styles.css                  CSS variables (theme tokens) + a small reset
 ├── lib/
@@ -120,6 +120,7 @@ Different jobs, different tools:
 - **Working-tree diff** (modified-file `View diff`, deleted files): `@codemirror/merge`'s `MergeView` — two CodeMirror editors side by side, sharing the regular editor's language / theme / editorconfig stack. Left side (`HEAD`) is read-only, right side (working tree) is editable so the user can fix things up directly inside the diff. `Ctrl+S` writes the right-hand buffer back through the normal `saveActive` path.
 - **Unified layout** (working-tree diff only, so far): `@codemirror/merge`'s `unifiedMergeView` — one editable editor on the working text with deleted lines shown inline (syntax-highlighted) and a per-chunk "Revert". Toggled by the **Unified** button next to Diff in the tab strip or `Toggle Unified / Side-by-side Diff`; the preference is app-wide and persisted (`AppState.diff_layout`). Panes narrower than 720px show unified whatever the preference, since two columns are unreadable there. Switching rebuilds the view and keeps caret + scroll via the view-state snapshot. Deleted lines are widgets, so they can't be selected and can't carry review comments (the working pane's comments are unaffected). Review and commit views stay side by side until there's a need.
 - **Hide-whitespace toggle** (review tab + working-tree diff): `workspace.ignoreWhitespace`, **default-on** and persisted per folder (`FolderSession.ignore_whitespace`, same reasoning as `compare_baseline`); palette `Toggle Whitespace in Diffs`, banner pill in the review tab. When on, the `diffConfig.override` wrapper in `editor/diffWhitespace.ts` drops changes whose A/B texts differ only in whitespace — `git diff -w` semantics, string literals included — so line tints, chunk highlights, collapse placeholders, and chunk navigation all agree. Flips reconfigure the live MergeView in place (no remount; docs/folds/selections survive).
+- **Pull-request context** in the review tab: when the branch has an open GitHub PR, a panel above the sections shows its description, state, review decision and checks, with moonbot's notes and the open review threads as a jump list; threads and line-bound notes also render under their lines in the diff, read-only. The publish dialog takes a verdict (comment / approve / request changes). See [ADR 0113](decisions/0113-pr-context-in-review-tab.md).
 - **Read-only diffs** (commit detail, SCM review panel, PR hover): same `@codemirror/merge` engine, configured with both sides read-only. Avoids carrying two diff renderers around.
 - **Review changes pseudo-tab** (`review://default-branch`, see Phase 5 §5.4): same `@codemirror/merge` engine, stacked one `MergeView` per changed file inside a single scrollable container; each section lazy-mounts on `IntersectionObserver` hit so opening a 100-file branch stays snappy. Long unchanged runs collapse behind `… N unchanged lines` placeholders, each annotated with the enclosing definition (function / class / method) of the code that follows — GitHub's `@@`-header trick — via the `editor/diffCollapseContext.ts` view plugin. The symbol comes from a text heuristic (nearest shallower definition-looking line), not LSP, so it stays in step with the tab's deliberately-silent broker; it produces no label rather than a wrong one when it can't find a convincing match. **Left side (base / `HEAD`) is read-only; right side (working tree) is editable** for everything except `deleted` rows, matching the working-tree-diff surface above. Edits route through `workspace.updateText` against a lazily-attached `OpenFile`; `Ctrl+S` from inside a section saves the underlying file via `saveReviewSection` (the global Ctrl+S handler delegates when the active tab is the synthetic `review://` buffer and a section has focus). Ctrl/Cmd-click goto-definition is wired on the right side with a lazy first-modifier-hover attach (the section calls `ensureBackingBuffer` only when the user is actually probing it, so broker traffic stays proportional to user intent); the jump itself routes through `workspace.jumpTo`, which opens the target as a regular editor tab in the same pane — exactly the "leave review mode and land on the function" behaviour. Hover / completion / diagnostics still aren't wired (they'd require eager `didOpen` on every visible section); click the section header's path to open the file as a regular tab when those are wanted.
 - **Editable merge conflicts**: handled in the regular CM editor (not a MergeView) by the `editor/conflictMarkers.ts` extension. It decorates the `<<<<<<<` / `|||||||` / `=======` / `>>>>>>>` block in place and overlays an inline `Accept current` / `Accept incoming` / `Accept both` widget on the opening marker line. Same keybindings, theme, selection, undo stack as any other buffer — the conflict surface is just the regular editor with extra decoration. Gated on `gitStatusEntries[path].status === 'conflicted'` so files that happen to contain marker syntax (this very document, test fixtures) stay inert. The full conflict-resolution flow (SCM panel reshape, abort, auto-stage on save, commit-merge with soft-warn on residual markers) lives in Phase 5 §5.6.
@@ -145,6 +146,23 @@ The split matters because Pierre Diffs is display-only — forcing it to also ed
 
 `browser://<id>` synthetic tabs (`BrowserView.svelte`): URL bar, reload, open-in-system-browser, and an `<iframe>` on the URL resolved by `browser_resolve_url` — unchanged for host URLs, a loopback tunnel into the workspace shell for container ones. The tab set is a mirror of the backend registry (`browser:tabs` event), which the coder's browser tools and the user's own actions both mutate. `browserBridge.ts` relays the coder's `browser:page_request`s into the iframe's injected page bridge over `postMessage` and reports in-page navigation back to the registry. Not persisted. See [ADR 0088](decisions/0088-in-ide-browser-tab.md).
 
+### Inbox tab
+
+`inbox://github` (`InboxView.svelte`; opened with `Ctrl+Shift+G`, the Inbox button at the top of the sidebar, or `Inbox: Open GitHub Inbox`) lists the pull requests and notification threads that want the user in the workspace's GitHub repositories. See [ADR 0112](decisions/0112-github-inbox.md) for the sources and why.
+
+- **One list**, newest first, each item once. Toggle chips above it (Unread, Review requested, Watched, Mentioned, Mine, each with a count, and Snoozed when anything is) filter it: none selected shows every item that isn't snoozed, several show their union. The selection is not persisted.
+- **Row**: unread dot, state icon (open / draft / merged / closed PR, issue, other), title, number, repository and author, tags for why it is listed (the notification reason for an unread item), then `+added −removed`, comment count, review decision, check rollup, author avatar, age.
+- **Keys** (focus in the list): `j` / `k` or arrows move, `Enter` opens the selected PR in a PR tab (other subjects open on GitHub), `o` opens it on GitHub, `e` marks its thread read, `s` / `w` snooze it until 08:00 tomorrow / next Monday (or wake it), `r` refreshes, `/` focuses the filter, `1`–`5` toggle the chips and `0` clears them. Double-click is Enter; single click selects.
+- **Snoozed** items leave the list and the button's counts until their time; the Snoozed chip shows them. Snoozes are local to the workspace; GitHub is not told, so the thread stays unread there. New activity does not wake an item early.
+- **Filter** matches every typed word against title, repository, author, branch and `#number`.
+- **Watching** lists the watched authors; add a login or `name[bot]`, remove with the chip's ×. The list is per workspace.
+- The sidebar's Inbox button carries three counts: unread, waiting for review, and open from watched authors (snoozed items excluded).
+- One list per window: the tab shows the same content whichever folder's tab strip holds it, and is not restored at launch.
+
+### Pull request tab
+
+`pr://<number>` (`PrView.svelte`), opened from the inbox, shows a pull request of the active folder's repository without checking it out ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)): the PR panel, then a read-only diff per changed file from the merge base to the PR head, with review threads and moonbot's notes under their lines. The header carries **Review** (verdict and summary), **Check out in a worktree** and **Start an agent on it**; the last two are disabled for a fork PR. Not restored at launch.
+
 ### Editor context menu
 
 Right-clicking inside the main `Editor` opens a small `ContextMenu.svelte` popover (the same component the tab strip and file tree use, portaled onto `document.body` so it isn't clipped by the editor's `overflow: hidden`). Opening the menu first moves the caret to the click position unless the click landed inside the current selection, so the entries target what the user right-clicked on. It carries **Rename symbol** (drives the same LSP F2 flow via `triggerRename`; greyed out for buffers with no LSP server, i.e. `lspLanguageFor(path) === null`) and **Copy repo link**, the latter operating on the lines under the current selection (or the caret line when nothing is selected). It routes through `ipc.fs.gitPermalink` → `WorkspaceHost::git_permalink`, which builds a permalink pinned to the current commit SHA (so the link is stable across later commits, matching GitHub's own "Copy permalink") — `blob/<HEAD-sha>/<path>#L<a>-L<b>` on GitHub, `src/commit/<HEAD-sha>/…` on Forgejo (see [ADR 0073](decisions/0073-forgejo-support.md)). The menu is suppressed for untitled / external / `review://` buffers — a permalink makes no sense there, so the platform menu shows instead.
@@ -162,6 +180,8 @@ Planned shape (not yet built): a per-file `ViewPlugin` subscribes to moon-core's
 Git blame is shaped the same way: a `ViewPlugin` that reads per-line blame from moon-core and decorates the gutter with a soft right-aligned annotation. Both ride the same infra that discard-changes already uses (workspace state → IPC → rust core → surface).
 
 ## File tree
+
+The tree lives in the optional files panel at the far right of the window, closed by default ([ADR 0114](decisions/0114-sessions-in-the-sidebar.md)). `Ctrl+0`, the status bar's `files` entry, `Files: Show / Hide Panel` and turning on the source-control changes-only filter open it; the open state persists (`AppState.files_panel_visible`).
 
 `@pierre/trees` `FileTree` class is instantiated in `FileTree.svelte`'s `onMount`. Mounted into a div via `tree.render({ containerWrapper })`. Selection and double-click are wired to `workspace.openFile(path)`. The component cleans up via `tree.cleanUp()` in `onDestroy`.
 
@@ -185,6 +205,10 @@ The user picks one of three modes in the status-bar theme picker — **System**,
 - Live OS-theme flips go through the same platform split. On Linux a tokio task in the desktop shell subscribes to `Settings.receive_color_scheme_changed` via ashpd and re-broadcasts each change as the `system:theme-changed` Tauri event, which the frontend `listen`s for. On macOS / Windows `getCurrentWindow().onThemeChanged` fires directly on the webview, so the Linux watcher compiles to a no-op there. `matchMedia` is left wired as a last-resort fallback for non-Tauri dev shells (vite-only).
 - Surfaces that can't read CSS variables (CodeMirror's `dark: boolean` build-time flag, xterm.js's option-bag palette) have their own `$effect` blocks keyed on `effectiveTheme` and reconfigure when it flips.
 
+### Shape, spacing and type tokens
+
+`--m-radius-{sm,md,pill}`, `--m-space-{1..4}` (4 / 8 / 12 / 16 px) and `--m-text-{xs,sm,md,lg}` (11 / 12 / 13 / 15 px) are the scale for new components, and `Pill.svelte` is the one pill. They arrived with the inbox tab; older components still carry literal values and move over as they are touched, not in a sweep. `--m-text-prose` (14 px) is the coder transcript's reading size; its column is capped at 860 px and centred, with the composer on the same column. Icons are SVG components under `components/icons/`; a few Unicode glyphs remain (context-menu check marks, arrows in labels).
+
 ### Workspace colour scheme
 
 Each workspace's badge colour (`WorkspaceMeta.color`, else the hash-derived hue) drives a full per-workspace colour scheme so multiple open windows are distinguishable at a glance — see [ADR 0047](decisions/0047-workspace-chrome-tint.md). At hydrate, JS derives the whole `--m-*` surface/border/text/accent token set from the colour's hue and writes it on `:root` (dark values on the plain names, light on `*-light` twins; `:root.light` re-points the plain names at the twins, so theme flips stay pure CSS). Surfaces get the hue at low saturation, text stays neutral, and `--m-accent` carries the hue at full voice so every existing accent consumer follows for free. Warning re-pins to amber unless the workspace hue is amber itself. Syntax highlighting (`--m-syntax-*`) and ANSI terminal colours are deliberately untouched.
@@ -200,5 +224,9 @@ Cm6 default keymap + a small layer of app-level shortcuts wired in `App.svelte`:
 - `Cmd/Ctrl+S` — save active file
 - `Cmd/Ctrl+P` — quick open (Phase 1)
 - `Cmd/Ctrl+Shift+P` — command palette (Phase 1)
+- `Cmd/Ctrl+L` — show / hide the coder panel (or attach the selection to its composer)
+- `Cmd/Ctrl+Shift+G` — GitHub inbox
+- `Cmd/Ctrl+0` — open the files panel and focus the tree
+- `F6` / `Shift+F6` — cycle focus: sidebar (sessions search), editor panes, bottom panel, files panel when open, status bar
 
 Linux uses `Ctrl`; macOS `Cmd`. We test for `navigator.platform`.

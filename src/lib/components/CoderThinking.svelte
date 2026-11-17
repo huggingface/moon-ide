@@ -59,38 +59,42 @@
 </details>
 
 <style>
-	/* Match the parent panel's `.thinking` styling — kept as a
-	   sibling here because Svelte's `:global` would leak across
-	   every `.thinking` instance, and we explicitly want the
-	   parent's CSS to win when this component is dropped into the
-	   coder panel today. The parent rules in `CoderPanel.svelte`
-	   stay the source of truth; the duplicates below only cover
-	   the standalone case (testbeds, future placements). */
+	/* The reasoning trace reads as an aside: a quiet disclosure line,
+	   and when open, muted text set off by a rule on the left instead
+	   of a box. */
 	.thinking {
-		font-size: 12px;
-		background: var(--m-bg-overlay);
-		border-radius: 6px;
-		padding: 6px 10px;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-muted);
 	}
 	.thinking summary {
 		cursor: pointer;
-		font-size: 11px;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-subtle);
 		user-select: none;
+		line-height: 22px;
+		width: fit-content;
+	}
+	.thinking summary::first-letter {
+		text-transform: uppercase;
+	}
+	.thinking summary::marker {
+		font-size: 10px;
+	}
+	.thinking summary:hover {
+		color: var(--m-fg-muted);
 	}
 	.thinking[open] summary {
-		margin-bottom: 4px;
-		border-bottom: 1px solid var(--m-border);
-		padding-bottom: 4px;
+		margin-bottom: var(--m-space-1);
 	}
 	.thinking-body {
-		font-size: 12px;
+		font-size: var(--m-text-md);
 		line-height: 1.5;
 		color: var(--m-fg-muted);
 		max-height: 320px;
 		overflow-y: auto;
+		margin-left: 3px;
+		padding-left: var(--m-space-3);
+		border-left: 2px solid var(--m-border);
+		margin-bottom: var(--m-space-1);
 	}
 </style>

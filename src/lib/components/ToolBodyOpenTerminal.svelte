@@ -83,7 +83,7 @@
 		gap: 8px;
 		align-items: baseline;
 		margin-top: 4px;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.ot-cmd {
 		flex: 1 1 auto;
@@ -112,12 +112,12 @@
 	.ot-output {
 		background: var(--m-bg);
 		color: var(--m-fg);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		padding: 6px 8px;
 		max-height: 240px;
 		overflow: auto;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 		margin: 4px 0 0;
 		white-space: pre-wrap;
@@ -125,7 +125,7 @@
 	}
 	.ot-error {
 		margin-top: 4px;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-danger);
 	}
 </style>

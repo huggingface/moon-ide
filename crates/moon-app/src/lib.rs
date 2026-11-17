@@ -24,6 +24,7 @@ mod editorconfig;
 mod events;
 mod fs;
 pub mod fs_watcher;
+mod inbox;
 mod lifecycle;
 pub mod logs;
 pub mod lsp;
@@ -104,6 +105,7 @@ impl AppCore {
 		}
 		route!(
 			fs,
+			inbox,
 			search,
 			editorconfig,
 			session,

@@ -22,6 +22,7 @@
 	import { hasGotoModifier, lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspLanguageFor } from '../editor/lspLanguage';
 	import { commentsForSide, reanchorComments, ReviewWiring } from '../editor/reviewComments';
+	import { annotationsFor, PrAnnotationWiring } from '../editor/prAnnotations';
 	import type { EditorConfig, GitFileStatus, ReviewSide } from '../protocol';
 
 	type Props = {
@@ -141,6 +142,13 @@
 	const wiringA = wiringFor('base');
 	const wiringB = wiringFor('working');
 
+	// Review threads and moonbot notes from the branch's PR, shown
+	// under their lines (ADR 0113). Read-only, unlike the drafts above.
+	const prWiringA = new PrAnnotationWiring();
+	const prWiringB = new PrAnnotationWiring();
+	const baseAnnotations = $derived(annotationsFor(workspace.pullRequest, path, 'base'));
+	const workingAnnotations = $derived(annotationsFor(workspace.pullRequest, path, 'working'));
+
 	// This section's comments, split by side. Reactive off the
 	// workspace store so a create / edit / delete repaints the cards.
 	const baseComments = $derived(commentsForSide(workspace.reviewCommentsForPath(path), 'base'));
@@ -208,6 +216,8 @@
 					detachGotoAttach = null;
 					wiringA.detach();
 					wiringB.detach();
+					prWiringA.detach();
+					prWiringB.detach();
 					merge?.destroy();
 					merge = undefined;
 					clearOurSelection();
@@ -224,6 +234,8 @@
 			detachGotoAttach = null;
 			wiringA.detach();
 			wiringB.detach();
+			prWiringA.detach();
+			prWiringB.detach();
 			merge?.destroy();
 			merge = undefined;
 			clearOurSelection();
@@ -394,6 +406,12 @@
 	$effect(() => {
 		wiringB.syncComments(workingComments);
 	});
+	$effect(() => {
+		prWiringA.sync(baseAnnotations);
+	});
+	$effect(() => {
+		prWiringB.sync(workingAnnotations);
+	});
 
 	// After a (re)build or a doc change settles, persist any comment
 	// whose fingerprint re-anchored to a new line so the stored hint
@@ -454,6 +472,7 @@
 			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			// Review comments on the base (deleted / old) side.
 			wiringA.extension(baseComments),
+			prWiringA.extension(baseAnnotations),
 			...readOnlyA,
 		];
 
@@ -581,6 +600,7 @@
 			// editability so a `deleted` row's right pane (empty) still
 			// no-ops cleanly rather than swallowing the chord.
 			wiringB.extension(workingComments),
+			prWiringB.extension(workingAnnotations),
 			...gotoExt,
 			...editingExtensions,
 			// Selection-publish + edit-publish hook on the working-
@@ -663,6 +683,8 @@
 		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
 		wiringA.attach(merge.a);
 		wiringB.attach(merge.b);
+		prWiringA.attach(merge.a);
+		prWiringB.attach(merge.b);
 
 		// One-shot listener that attaches the backing buffer (and
 		// thus issues LSP `didOpen`) the moment the user holds the

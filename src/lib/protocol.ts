@@ -351,6 +351,65 @@ export type ReviewedFile = {
 export type PublishReviewRequest = {
 	body: string | null;
 	comments: ReviewComment[];
+	event: ReviewEvent;
+	/** Pull request to post to; `null` is the current branch's. */
+	prNumber: number | null;
+};
+
+/** Verdict a published review carries. Mirrors
+ * `moon_protocol::review::ReviewEvent`. */
+export type ReviewEvent = 'comment' | 'approve' | 'request_changes';
+
+export type PrCheckState = 'success' | 'failure' | 'pending' | 'skipped';
+
+export type PrCheck = { name: string; state: PrCheckState; url: string | null };
+
+/** A nit moonbot keeps in the PR description. `line` is 1-based in
+ * the head version of `path`, `null` for a whole-file note. */
+export type PrMinorNote = { path: string; line: number | null; text: string };
+
+export type PrThreadComment = { author: string | null; body: string; createdAt: string; url: string };
+
+/** A review thread. `line` is `null` once the code under it changed. */
+export type PrThread = {
+	path: string;
+	line: number | null;
+	side: ReviewSide;
+	resolved: boolean;
+	outdated: boolean;
+	comments: PrThreadComment[];
+};
+
+/** The open pull request for a folder's branch. Mirrors
+ * `moon_protocol::review::PullRequestDetail`. */
+export type PullRequestDetail = {
+	number: number;
+	title: string;
+	url: string;
+	/** Markdown, without moonbot's minor-notes block. */
+	body: string;
+	state: InboxItemState;
+	author: string | null;
+	review: InboxReview | null;
+	baseRef: string;
+	headRef: string;
+	headSha: string;
+	/** The head branch lives in a fork: `origin` has no such branch. */
+	isCrossRepository: boolean;
+	checks: PrCheck[];
+	minorNotes: PrMinorNote[];
+	/** Short SHA the notes' line numbers refer to. */
+	minorNotesSha: string | null;
+	threads: PrThread[];
+};
+
+/** A pull request opened in its own tab, without a checkout: the
+ * detail and the diff from `mergeBase` to its head. Mirrors
+ * `moon_protocol::review::PrOpened`. */
+export type PrOpened = {
+	detail: PullRequestDetail;
+	mergeBase: string;
+	files: GitStatusEntry[];
 };
 
 /**
@@ -999,7 +1058,27 @@ export type WorkspaceSession = {
 	 * this workspace's `moon-ws-<id>-dev-1` — so it lives in
 	 * `session.json`, not the machine-global `state.json`. */
 	terminals: PersistedTerminal[];
+	/** What the user told the GitHub inbox. Frontend-owned. */
+	inbox: InboxState;
+	/** Coder sessions set aside from "Needs you". Frontend-owned. */
+	dismissed_coder_sessions: DismissedCoderSession[];
 };
+
+/** What the user told the inbox. Mirrors
+ * `moon_protocol::session::InboxState`. */
+export type InboxState = {
+	/** Authors whose open PRs the inbox lists: logins, or bots as
+	 * `name[bot]`. */
+	watched_authors: string[];
+	snoozed: InboxSnooze[];
+};
+
+/** An inbox item hidden until `until` (RFC 3339). */
+export type InboxSnooze = { id: string; until: string };
+
+/** A coder session dismissed from "Needs you". Holds while the
+ * session's `updated_at_ms` is unchanged. */
+export type DismissedCoderSession = { id: string; updated_at_ms: number };
 
 /** One terminal tab's restore recipe. Mirrors
  * `moon_protocol::session::PersistedTerminal`. */
@@ -1102,14 +1181,75 @@ export type AppState = {
 	workspaces: WorkspaceMeta[];
 	theme: ThemeMode;
 	bottom_panel: BottomPanelAppState;
-	/** Whether the coder panel was open at last shutdown. */
-	coder_panel_visible: boolean;
+	/** Whether the files panel (the file tree, at the window's right
+	 * edge) was open at last shutdown. */
+	files_panel_visible: boolean;
 	coder: CoderAppState;
 	/** How diffs render; narrow panes show unified regardless. */
 	diff_layout: DiffLayout;
 };
 
 export type DiffLayout = 'split' | 'unified';
+
+/** Why an item is in the inbox. Mirrors `moon_protocol::inbox::InboxSource`. */
+export type InboxSource = 'review_requested' | 'watched' | 'mentioned' | 'mine' | 'notification';
+
+export type InboxItemKind = 'pull_request' | 'issue' | 'other';
+export type InboxItemState = 'open' | 'draft' | 'merged' | 'closed';
+export type InboxReview = 'approved' | 'changes_requested' | 'review_required';
+export type InboxCi = 'success' | 'failure' | 'pending';
+
+export type InboxNotification = {
+	threadId: string;
+	/** GitHub's reason string, verbatim (`review_requested`, `mention`, …). */
+	reason: string;
+	updatedAt: string;
+};
+
+/** One pull request or notification thread. Mirrors
+ * `moon_protocol::inbox::InboxItem`. */
+export type InboxItem = {
+	/** `owner/name#123` for a PR or issue, `thread:<id>` otherwise. */
+	id: string;
+	kind: InboxItemKind;
+	repo: string;
+	number: number | null;
+	title: string;
+	url: string;
+	/** `null` when unknown (issues and other subjects aren't hydrated). */
+	state: InboxItemState | null;
+	author: string | null;
+	authorAvatarUrl: string | null;
+	/** RFC 3339. */
+	updatedAt: string;
+	headRef: string | null;
+	baseRef: string | null;
+	isCrossRepository: boolean;
+	additions: number | null;
+	deletions: number | null;
+	commentCount: number | null;
+	review: InboxReview | null;
+	ci: InboxCi | null;
+	sources: InboxSource[];
+	notification: InboxNotification | null;
+};
+
+/** One poll of GitHub; partial when `failures` is non-empty. Mirrors
+ * `moon_protocol::inbox::InboxSnapshot`. */
+export type InboxSnapshot = {
+	status: { kind: 'ok' } | { kind: 'gh_missing' } | { kind: 'gh_not_authed' };
+	viewer: string;
+	items: InboxItem[];
+	/** Bound project folders that are GitHub repositories. */
+	repos: { repo: string; folderPath: string }[];
+	failures: { source: InboxSource; detail: string }[];
+};
+
+/** Result of `inbox_open_pr`. */
+export type InboxOpenedPr = {
+	workspace: Workspace;
+	folderPath: string;
+};
 
 /** Bottom-panel chrome state — visibility + height only. Tab
  * contents aren't persisted here: log streams back onto running
@@ -1227,7 +1367,7 @@ export const defaultAppState: AppState = {
 	workspaces: [],
 	theme: 'system',
 	bottom_panel: { visible: false, height: 240 },
-	coder_panel_visible: false,
+	files_panel_visible: false,
 	coder: { last_session_by_folder: {} },
 	diff_layout: 'split',
 };

@@ -39,6 +39,33 @@
 	font-display: swap;
 }
 
+/* Bundled Inter (variable weight, SIL OFL 1.1, see
+   `assets/fonts/inter/LICENSE.txt`) for the same reason as the mono
+   font: without it the UI falls back to whatever `system-ui` is on
+   the host, which on Linux varies from distro to distro. Latin and
+   Latin Extended subsets only; other scripts fall through to the
+   system font. */
+@font-face {
+	font-family: 'Inter';
+	src: url('./assets/fonts/inter/Inter-Variable-latin.woff2') format('woff2');
+	font-weight: 100 900;
+	font-style: normal;
+	font-display: swap;
+	unicode-range:
+		U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC,
+		U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: 'Inter';
+	src: url('./assets/fonts/inter/Inter-Variable-latin-ext.woff2') format('woff2');
+	font-weight: 100 900;
+	font-style: normal;
+	font-display: swap;
+	unicode-range:
+		U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020,
+		U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
 /* Theme tokens. Override in light mode by toggling the `.light` class on :root. */
 :root {
 	/* Tells the user agent which palette to use for *native* widgets
@@ -70,13 +97,55 @@
 	--m-success: #5fd6a3;
 	--m-warning: #f0b86e;
 	--m-danger: #ff7a8a;
+	/* A merged pull request: the one forge state with no twin above. */
+	--m-merged: #b392f0;
+
+	/* Shape, spacing and type scale. New components take these
+	   instead of literal px; older ones move over as they are
+	   touched. */
+	--m-radius-sm: 4px;
+	--m-radius-md: 7px;
+	--m-radius-lg: 10px;
+	--m-radius-pill: 999px;
+	/* Space between the window's panels, and the canvas showing
+	   through it. Derived from `--m-bg` so it follows the workspace
+	   colour scheme. */
+	--m-gap: 6px;
+	--m-canvas: color-mix(in srgb, var(--m-bg) 55%, #000);
+	--m-space-1: 4px;
+	--m-space-2: 8px;
+	--m-space-3: 12px;
+	--m-space-4: 16px;
+	--m-text-xs: 11px;
+	--m-text-sm: 12px;
+	--m-text-md: 13px;
+	--m-text-lg: 15px;
+	/* Long-form reading text (the coder transcript's message bodies). */
+	--m-text-prose: 14px;
+	/* Shared control metrics: a sidebar list row, an input or button
+	   beside one, a square icon button. */
+	--m-row-h: 28px;
+	--m-control-h: 28px;
+	--m-icon-btn: 24px;
+	/* The accent as a wash, for a selected control that should still
+	   read as quiet. */
+	--m-accent-tint: color-mix(in srgb, var(--m-accent) 14%, transparent);
+	/* Hover and selected washes for controls that sit on more than
+	   one surface (the status bar on the canvas, launchers in a
+	   panel strip), where a fixed `--m-bg-N` step would be wrong on
+	   one of them. */
+	--m-wash-hover: color-mix(in srgb, var(--m-fg) 7%, transparent);
+	--m-wash-selected: color-mix(in srgb, var(--m-fg) 12%, transparent);
+	/* Elevation for anything floating over a panel: menus, popovers,
+	   the jump-to-latest pill. */
+	--m-shadow-pop: 0 8px 24px color-mix(in srgb, #000 32%, transparent);
 
 	/* Workspace identity tint (ADR 0047). Alias of `--m-accent` for
-	   surfaces whose job is workspace identity (folder bar, active
-	   tab, status-bar stripe) as opposed to generic interactivity —
-	   both resolve to the workspace-derived accent at runtime, but
-	   the separate name keeps a future "decouple identity from
-	   interactive accent" change to a one-line edit. */
+	   surfaces whose job is workspace identity (the active folder's
+	   spine, the active tab's underline) as opposed to generic
+	   interactivity — both resolve to the workspace-derived accent
+	   at runtime, but the separate name keeps a future "decouple
+	   identity from interactive accent" change to a one-line edit. */
 	--m-ws-accent: var(--m-accent);
 	--m-ws-accent-soft: rgba(126, 163, 255, 0.22);
 
@@ -120,22 +189,23 @@
 	--trees-bg-override: var(--m-bg-1);
 	--trees-fg-override: var(--m-fg);
 	--trees-fg-muted-override: var(--m-fg-muted);
-	--trees-bg-muted-override: var(--m-bg-overlay);
+	--trees-bg-muted-override: var(--m-bg-2);
 	--trees-search-bg-override: var(--m-bg-2);
 	--trees-search-fg-override: var(--m-fg);
-	--trees-selected-bg-override: rgba(126, 163, 255, 0.18);
+	/* Rows follow the sidebar's lists: hover one surface step up,
+	   selected two, same corner radius. */
+	--trees-selected-bg-override: var(--m-bg-3);
 	--trees-selected-fg-override: var(--m-fg);
-	--trees-selected-focused-border-color-override: var(--m-accent);
+	--trees-selected-focused-border-color-override: color-mix(in srgb, var(--m-accent) 55%, transparent);
 	--trees-border-color-override: var(--m-border);
+	--trees-border-radius-override: var(--m-radius-md);
 	--trees-focus-ring-color-override: var(--m-accent);
-	/* Tighten the tree's outer left/right inset. Pierre's default
-	   is 16px, which leaves a wide empty gutter to the left of
-	   every row in our narrow sidebar; 6px keeps the focus ring
-	   from clipping against the sidebar edge while reclaiming
-	   ~20px of horizontal space for filenames. */
-	--trees-padding-inline-override: 6px;
+	/* The tree's outer left/right inset, matching the sidebar's
+	   rows. Pierre's default is 16px, which leaves a wide empty
+	   gutter beside every row in a narrow panel. */
+	--trees-padding-inline-override: var(--m-space-2);
 
-	--m-font-ui: -apple-system, 'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
+	--m-font-ui: 'Inter', -apple-system, system-ui, 'Segoe UI', Roboto, sans-serif;
 	/* Fantasque Sans Mono is bundled (see the `@font-face` block at
 	   the top of this file), so the first family in the stack is
 	   guaranteed to load. The remaining fallbacks stay as a safety
@@ -178,6 +248,9 @@
 	--m-accent: var(--m-accent-light, #4360c8);
 	--m-accent-strong: var(--m-accent-strong-light, #2a3fa1);
 	--m-warning: var(--m-warning-light, #b45309);
+	--m-merged: #8250df;
+	--m-canvas: var(--m-bg-3);
+	--m-shadow-pop: 0 8px 24px color-mix(in srgb, #000 14%, transparent);
 	--m-editor-selection: var(--m-editor-selection-light, rgba(67, 96, 200, 0.15));
 	--m-ws-accent-soft: var(--m-ws-accent-soft-light, rgba(67, 96, 200, 0.16));
 	--m-editor-bg: var(--m-bg);
@@ -230,7 +303,7 @@ button {
 	color: inherit;
 	background: transparent;
 	border: 1px solid transparent;
-	border-radius: 4px;
+	border-radius: var(--m-radius-md);
 	padding: 4px 10px;
 	cursor: pointer;
 	/* Button labels are not content; click-dragging across them to "select"
@@ -254,12 +327,17 @@ button:focus-visible {
 ::-webkit-scrollbar-track {
 	background: transparent;
 }
+/* The thumb is a slim pill inset in its 10px track: the transparent
+   border is the inset, and the clip keeps the fill off it. */
 ::-webkit-scrollbar-thumb {
 	background: var(--m-border);
-	border-radius: 5px;
+	background-clip: padding-box;
+	border: 2px solid transparent;
+	border-radius: var(--m-radius-pill);
 }
 ::-webkit-scrollbar-thumb:hover {
 	background: var(--m-border-strong);
+	background-clip: padding-box;
 }
 
 /* Shared rendered-Markdown styles.

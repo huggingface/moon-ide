@@ -7,6 +7,16 @@
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { coder, compactionProgressLabel, type CoderRow } from '../coder.svelte';
 	import { groupToolRows, type TranscriptItem } from '../toolGroups';
+	import {
+		goToSessionBranch,
+		isCoordinatorSession,
+		openSessionTrace,
+		openSessionTraceOnHub,
+		sessionBranch,
+		startNewCoordinatorSession,
+		startNewSession,
+		worktreeFolderForBranch,
+	} from '../sessionActions';
 
 	type ToolGroupItem = Extract<TranscriptItem, { kind: 'group' }>;
 	import { frontendLog } from '../logs.svelte';
@@ -39,6 +49,7 @@
 	import ContextRing from './ContextRing.svelte';
 	import PlanUsageMeter from './PlanUsageMeter.svelte';
 	import CoderPlanStrip from './CoderPlanStrip.svelte';
+	import SessionRenameInput from './SessionRenameInput.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import MicIcon from './icons/MicIcon.svelte';
@@ -49,25 +60,19 @@
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import BranchIcon from './icons/BranchIcon.svelte';
 	import CoordinatorIcon from './icons/CoordinatorIcon.svelte';
-	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
 	import CloudSyncIcon from './icons/CloudSyncIcon.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
-	import ListIcon from './icons/ListIcon.svelte';
 	import FileIcon from './icons/FileIcon.svelte';
-	import TrashIcon from './icons/TrashIcon.svelte';
 	import CodeIcon from './icons/CodeIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
 	import EditIcon from './icons/EditIcon.svelte';
 	import ReplayIcon from './icons/ReplayIcon.svelte';
 	import DisconnectIcon from './icons/DisconnectIcon.svelte';
+	import CloseIcon from './icons/CloseIcon.svelte';
+	import ChevronDownIcon from './icons/ChevronDownIcon.svelte';
+	import ChevronRightIcon from './icons/ChevronRightIcon.svelte';
 	import { ipc } from '../ipc';
-	import {
-		formatError,
-		type FileSearchResult,
-		type CoderSessionSummary,
-		type FleetMember,
-		type WorkerLinkState,
-	} from '../protocol';
+	import { formatError, type FileSearchResult, type FleetMember, type WorkerLinkState } from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
@@ -210,7 +215,7 @@
 		if (!ctrl || event.shiftKey || event.altKey || event.key.toLowerCase() !== 'f') {
 			return;
 		}
-		if (coder.view === 'list') {
+		if (coder.view === 'empty') {
 			return;
 		}
 		const target = event.target;
@@ -713,92 +718,12 @@
 				]),
 	]);
 
-	function hubRowState(sessionId: string): 'idle' | 'syncing' | 'synced' | 'failed' {
-		const s = coder.hubSyncState[sessionId];
-		if (!s) {
-			return coder.hubBucket?.uploaded[sessionId] ? 'synced' : 'idle';
-		}
-		return s.phase;
-	}
-
-	function hubRowTitle(sessionId: string): string {
-		const bucket = coder.hubBucket;
-		if (!bucket) {
-			return 'Upload to Hugging Face';
-		}
-		const target = `${bucket.namespace}/${bucket.name}`;
-		const live = coder.hubSyncState[sessionId];
-		if (live?.phase === 'syncing') {
-			return `Uploading to ${target}…`;
-		}
-		if (live?.phase === 'failed') {
-			return `Upload failed: ${live.error}`;
-		}
-		const marker = bucket.uploaded[sessionId];
-		if (marker || live?.phase === 'synced') {
-			return `Synced to ${target}`;
-		}
-		return `Upload to ${target}`;
-	}
-
-	async function onUploadSession(event: MouseEvent, sessionId: string): Promise<void> {
-		event.stopPropagation();
-		try {
-			await coder.uploadSessionToHub(sessionId);
-		} catch (err) {
-			workspace.flash(`Hub upload failed: ${formatError(err)}`);
-		}
-	}
-
-	/**
-	 * Open the trace's Hub URL in the host's default browser
-	 * (plain click) or copy it to the clipboard (Alt-click).
-	 * Surfaced per-session only when the session has been
-	 * uploaded — i.e. there's an `uploaded[id]` marker on the
-	 * bucket binding. The button is hidden in any other state, so
-	 * a click should never land here without a valid URL, but we
-	 * still surface the typed error as a flash for safety.
-	 */
-	async function onOpenTraceOnHub(event: MouseEvent, sessionId: string): Promise<void> {
-		event.stopPropagation();
-		let url: string;
-		try {
-			url = await coder.hubSessionUrl(sessionId);
-		} catch (err) {
-			workspace.flash(`Could not resolve Hub URL: ${formatError(err)}`);
-			return;
-		}
-		if (event.altKey) {
-			// Prefer the Tauri clipboard plugin: `navigator.clipboard`
-			// is unreliable on WebKitGTK (silently no-ops when the
-			// triggering element isn't a focused input), and Alt-click
-			// fires on a button that doesn't take focus. Fall back to
-			// `navigator.clipboard` only if the plugin call throws,
-			// and surface a flash on hard failure rather than
-			// swallowing — matches the `Copy path` pattern in
-			// EditorTabs / FileTree.
-			try {
-				await clipboardWriteText(url);
-				workspace.flash('Trace URL copied to clipboard.');
-			} catch {
-				try {
-					await navigator.clipboard.writeText(url);
-					workspace.flash('Trace URL copied to clipboard.');
-				} catch {
-					workspace.flash('Could not copy trace URL.');
-				}
-			}
-			return;
-		}
-		void openUrl(url);
-	}
-
 	// Keep the store's `composerEl` reference in sync with the
 	// live textarea node — the store needs it so Ctrl+L can
 	// insert an `@`-token at the caret without prop-drilling a
 	// callback. Setting / clearing happens on every mount and
 	// unmount of the textarea (it remounts when the user swaps
-	// between session view and the sessions list).
+	// between the session view and the empty view).
 	$effect(() => {
 		coder.composerEl = composer ?? null;
 		return () => {
@@ -1652,6 +1577,12 @@
 		// model); Escape wipes the command draft. An unresolvable
 		// leading `/` never mounts the menu, so those drafts keep
 		// plain send behaviour.
+		//
+		// A window-level shortcut can unmount the panel (Ctrl+L)
+		// before the same keystroke reaches this handler.
+		if (!composer?.isConnected) {
+			return;
+		}
 		if (slashMenuVisible) {
 			const matches = slashState?.stage === 'command' ? slashCommandMatches.length : slashArgMatches.length;
 			if (event.key === 'ArrowDown' && matches > 0) {
@@ -2617,48 +2548,12 @@
 		return `${min}m ${sec.toString().padStart(2, '0')}s`;
 	}
 
-	async function onNewSession(): Promise<void> {
-		await coder.newSession();
-		// Land focus in the composer so a fresh session is one
-		// keystroke away from being filled in.
-		await tick();
-		composer?.focus();
-	}
-
-	async function onNewCoordinatorSession(): Promise<void> {
-		await coder.newCoordinatorSession();
-		await tick();
-		composer?.focus();
-	}
-
-	// Creating a worktree is slow (git worktree add + lock, and a
-	// container repair when the workspace is containerised), so the
-	// button shows a spinner + disables until it lands — otherwise a
-	// click looks like it did nothing for a second or two.
+	// Moving a session into a worktree is slow (git worktree add +
+	// lock, and a container repair when the workspace is
+	// containerised), so the button shows a spinner + disables until
+	// it lands — otherwise a click looks like it did nothing for a
+	// second or two.
 	let creatingWorktree = $state(false);
-
-	const worktreeButtonTitle = $derived(
-		creatingWorktree
-			? 'Creating isolated worktree…'
-			: `New isolated session — a new branch off ${workspace.gitBranch.defaultBranchRemoteRef ?? 'the default branch'}, in its own git worktree under the project`,
-	);
-
-	async function onNewWorktreeSession(): Promise<void> {
-		// Spin up an isolated session in its own git worktree
-		// (ADR 0028) so it can't collide with other agents in this
-		// folder. The folder bar grows a nested row for the worktree.
-		if (creatingWorktree) {
-			return;
-		}
-		creatingWorktree = true;
-		try {
-			await workspace.newCoderWorktreeSession();
-		} finally {
-			creatingWorktree = false;
-		}
-		await tick();
-		composer?.focus();
-	}
 
 	// The in-session worktree button **moves** the open session into a
 	// worktree (ADR 0028), keeping its conversation. On a non-default
@@ -2696,8 +2591,8 @@
 			return 'This session already runs in its own worktree';
 		}
 		if (coder.rows.length === 0) {
-			// Nothing to carry over: same as the sessions-list button
-			// (ADR 0093).
+			// Nothing to carry over: same as the sessions list's
+			// isolated-session button (ADR 0093).
 			return `Move this session into its own git worktree, on a new branch off ${workspace.gitBranch.defaultBranchRemoteRef ?? 'the default branch'}`;
 		}
 		const branch = workspace.gitBranch.name;
@@ -2709,58 +2604,6 @@
 			: `Move this session into its own git worktree, keeping branch ${branch} (resets this folder to the default branch)`;
 	});
 
-	async function onPickSession(id: string): Promise<void> {
-		await coder.openSession(id);
-		await tick();
-		composer?.focus();
-	}
-
-	// Sessions-list transcript search. The query goes to the backend
-	// (`coder_search_sessions` scans the on-disk JSONL transcripts —
-	// summaries carry no transcript text) which returns matching
-	// session ids; we filter the already-loaded list by id. `null`
-	// matches = no active filter (empty query). Debounced so a fast
-	// typist doesn't fan out one disk scan per keystroke.
-	let sessionSearch = $state('');
-	let sessionSearchMatches = $state<Set<string> | null>(null);
-
-	$effect(() => {
-		const query = sessionSearch.trim();
-		// Depend on the active folder too: the backend searches *its*
-		// active folder, so a folder switch must re-run the search
-		// rather than filter the new folder's list with stale ids.
-		void coder.activeFolderPath;
-		if (query === '') {
-			sessionSearchMatches = null;
-			return;
-		}
-		const timer = setTimeout(async () => {
-			try {
-				const ids = await ipc.coder.searchSessions(query);
-				// Drop stale responses: only apply if the query the
-				// round-trip was issued for is still what's typed.
-				if (sessionSearch.trim() === query) {
-					sessionSearchMatches = new Set(ids);
-				}
-			} catch (err) {
-				frontendLog('moon-ide', 'warn', `coder: session search failed: ${formatError(err)}`);
-			}
-		}, 200);
-		return () => clearTimeout(timer);
-	});
-
-	const filteredSessions = $derived.by(() => {
-		const sessions = coder.sessions;
-		const matches = sessionSearchMatches;
-		if (sessions === null) {
-			return null;
-		}
-		if (matches === null) {
-			return sessions;
-		}
-		return sessions.filter((s) => matches.has(s.id));
-	});
-
 	// Summary of the session currently visible in this folder's panel.
 	// `coder.activeSession` is null right after a session is created
 	// (it's only populated on load), so resolve from the list by the
@@ -2769,59 +2612,6 @@
 	const visibleSessionSummary = $derived(
 		coder.sessions?.find((s) => s.id === coder.current.visibleSessionId) ?? coder.activeSession,
 	);
-
-	// Click on a session's branch chip (ADR 0028). For a regular
-	// A session is associated with a **branch** (ADR 0028): the branch
-	// its work was committed onto, or its worktree's branch if it
-	// hasn't committed yet. Prefer the committed one — it tracks the
-	// live branch after a commit-on-new-branch.
-	function sessionBranch(session: CoderSessionSummary): string | null {
-		return session.committed_branch ?? session.worktree_branch ?? null;
-	}
-
-	// A coordinator (orchestrator) session — ADR 0030. The backend
-	// stamps `mode: "coordinator"` on the header; this lets the
-	// session-bar title + the sessions-list row badge it so the
-	// "New coordinator session" button is visibly distinct from a
-	// plain new session. `null` (no summary yet) is not one.
-	function isCoordinatorSession(session: CoderSessionSummary | null): boolean {
-		return session?.mode === 'coordinator';
-	}
-
-	// The bound worktree folder currently checked out on `branch`, if
-	// any. Resolved live (not from which header field set it), so it's
-	// correct after a branch is moved into / out of a worktree.
-	function worktreeFolderForBranch(branch: string | null): string | null {
-		if (branch === null) {
-			return null;
-		}
-		return (
-			workspace.workspace?.folders.find((f) => f.origin.kind === 'worktree' && f.origin.branch === branch)?.path ?? null
-		);
-	}
-
-	// Click on a session's branch chip: go to wherever the branch
-	// lives. If it's checked out in a worktree, focus that worktree
-	// folder (the file tree / SCM follow; the per-project session list
-	// stays put). Otherwise `git switch` the project's main checkout to
-	// it (git refuses + flashes on a dirty tree) — never a worktree,
-	// whose session would silently find another branch's code.
-	async function onSessionBranchChip(session: CoderSessionSummary): Promise<void> {
-		const branch = sessionBranch(session);
-		if (branch === null) {
-			return;
-		}
-		const worktreePath = worktreeFolderForBranch(branch);
-		if (worktreePath !== null) {
-			await workspace.setActiveFolder(worktreePath);
-			return;
-		}
-		const origin = workspace.activeFolder?.origin;
-		if (origin?.kind === 'worktree') {
-			await workspace.setActiveFolder(origin.parentPath);
-		}
-		await workspace.switchToBranch({ kind: 'local', name: branch });
-	}
 
 	/** Disconnect the visible session from its coordinator (ADR
 	 *  0052). No confirm dialog: nothing is lost — the session keeps
@@ -2841,63 +2631,9 @@
 		}
 	}
 
-	// Inline session rename — one at a time, from a list row's pencil
-	// or a double-click on the in-session title.
+	// Inline rename of the visible session, from the session bar's
+	// pencil. Keyed by id so a session swap mid-rename drops the input.
 	let renamingId = $state<string | null>(null);
-	let renameText = $state('');
-
-	function startRename(event: MouseEvent, id: string, title: string): void {
-		event.stopPropagation();
-		renamingId = id;
-		renameText = title;
-	}
-
-	async function commitRename(): Promise<void> {
-		const id = renamingId;
-		renamingId = null;
-		const title = renameText.trim();
-		if (id === null || title.length === 0) {
-			return;
-		}
-		try {
-			await coder.renameSession(id, title);
-		} catch (err) {
-			workspace.flash(`Could not rename session: ${formatError(err)}`);
-		}
-	}
-
-	function onRenameKeydown(event: KeyboardEvent): void {
-		if (event.key === 'Enter') {
-			event.preventDefault();
-			void commitRename();
-			return;
-		}
-		if (event.key === 'Escape') {
-			event.preventDefault();
-			event.stopPropagation();
-			renamingId = null;
-		}
-	}
-
-	function focusAndSelect(node: HTMLInputElement): void {
-		node.focus();
-		node.select();
-	}
-
-	async function onDeleteSession(event: MouseEvent, id: string, title: string): Promise<void> {
-		// Stop the click from propagating into the row's "open"
-		// button — without this, deleting a session would also
-		// open it for a brief moment.
-		event.stopPropagation();
-		const ok = await confirm(`Delete session "${title || '(untitled)'}"? This cannot be undone.`, {
-			title: 'Delete session',
-			kind: 'warning',
-		});
-		if (!ok) {
-			return;
-		}
-		await coder.deleteSession(id);
-	}
 
 	/** Revert the visible session back to just before the user
 	 *  message with `rowId`, discarding it and everything after.
@@ -2957,28 +2693,6 @@
 	 *  nothing is lost (same posture as replay-from-message). */
 	async function onResumeFromAssistant(rowId: string): Promise<void> {
 		await coder.resumeFromAssistant(rowId);
-	}
-
-	/** Open a session's raw JSONL trace in the editor as a host-direct
-	 *  file (same machinery as Ctrl+O for files outside the workspace).
-	 *  Works for parent sessions and sub-agent ids alike — both live
-	 *  under the active folder's slug on disk. The trace lives on the
-	 *  *host* `XDG_DATA_HOME` even when the project is running in a
-	 *  container, which is exactly what the host-direct file path
-	 *  delivers.
-	 *
-	 *  Empty / never-persisted sessions surface as a flash via the
-	 *  backend's `not found` error; the user can keep working. */
-	async function onOpenTrace(event: MouseEvent | null, id: string): Promise<void> {
-		event?.stopPropagation();
-		let path: string;
-		try {
-			path = await ipc.coder.sessionJsonlPath(id);
-		} catch (err) {
-			workspace.flash(`Could not open trace: ${formatError(err)}`);
-			return;
-		}
-		await workspace.openHostFile(path);
 	}
 
 	function baseName(path: string): string {
@@ -3090,32 +2804,6 @@
 
 	function unescapeXmlAttr(s: string): string {
 		return s.replaceAll('&quot;', '"').replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
-	}
-
-	const RELATIVE_FORMATTER = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
-
-	function formatRelative(ms: number): string {
-		const diff = Date.now() - ms;
-		// Coarse buckets — sessions usually span minutes to days,
-		// not seconds. "2m" / "3h" without pulling in date-fns.
-		const seconds = Math.round(diff / 1000);
-		if (seconds < 60) {
-			return RELATIVE_FORMATTER.format(-seconds, 'second');
-		}
-		const minutes = Math.round(seconds / 60);
-		if (minutes < 60) {
-			return RELATIVE_FORMATTER.format(-minutes, 'minute');
-		}
-		const hours = Math.round(minutes / 60);
-		if (hours < 24) {
-			return RELATIVE_FORMATTER.format(-hours, 'hour');
-		}
-		const days = Math.round(hours / 24);
-		if (days < 30) {
-			return RELATIVE_FORMATTER.format(-days, 'day');
-		}
-		const months = Math.round(days / 30);
-		return RELATIVE_FORMATTER.format(-months, 'month');
 	}
 
 	// Short wall-clock label (e.g. "14:32") for the hover-revealed
@@ -3252,233 +2940,25 @@
 				<p class="error">{coder.signInError}</p>
 			{/if}
 		</div>
-	{:else if coder.view === 'list'}
-		<!-- Sessions list view. Sticky header has the "+" button; the
-			 list itself takes care of empty state. -->
-		<div class="sessions">
-			<header class="sessions-header">
-				<span class="section-title">Sessions</span>
-				<div class="header-actions">
-					<button
-						type="button"
-						class="icon"
-						class:creating={creatingWorktree}
-						onclick={onNewWorktreeSession}
-						disabled={creatingWorktree}
-						title={worktreeButtonTitle}
-						aria-label="New isolated session"
-					>
-						<BranchIcon />
-					</button>
-					<button
-						type="button"
-						class="icon"
-						onclick={onNewCoordinatorSession}
-						title="New coordinator session — an orchestrator that spawns and manages worker agents"
-						aria-label="New coordinator session"
-					>
-						<CoordinatorIcon />
-					</button>
-					<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
-						<PlusIcon />
-					</button>
-				</div>
-			</header>
-			{#if coder.sessions === null}
-				<p class="hint">Loading sessions…</p>
-			{:else if coder.sessions.length === 0}
-				<p class="hint">
-					No sessions yet. Click <strong>+</strong> above (or send a prompt) to start a fresh conversation.
-				</p>
-			{:else}
-				{@const visibleSessions = filteredSessions ?? []}
-				<input
-					type="search"
-					class="session-search"
-					placeholder="Search transcripts…"
-					aria-label="Search session transcripts"
-					bind:value={sessionSearch}
-					spellcheck="false"
-					autocomplete="off"
-				/>
-				{#if visibleSessions.length === 0}
-					<p class="hint">No sessions match “{sessionSearch.trim()}”.</p>
-				{:else}
-					<ul class="session-list">
-						{#each visibleSessions as session (session.id)}
-							{@const isVisible = coder.currentSession.activeSession?.id === session.id}
-							{@const isAwaitingInput = coder.current.isSessionAwaitingInput(session.id)}
-							{@const isRunning = !isAwaitingInput && coder.current.isSessionRunning(session.id)}
-							{@const isFinished = !isAwaitingInput && !isRunning && coder.current.isSessionAttention(session.id)}
-							{@const isFailed = !isAwaitingInput && !isRunning && Boolean(session.last_error)}
-							{@const isInterrupted = !isAwaitingInput && !isRunning && !isFailed && Boolean(session.interrupted)}
-							<li
-								class="session-row"
-								class:active={isVisible}
-								class:awaiting={isAwaitingInput}
-								class:running={isRunning}
-								class:finished={isFinished}
-							>
-								{#if renamingId === session.id}
-									<div class="session-pick">
-										<div class="session-title">{@render renameInput()}</div>
-									</div>
-								{:else}
-									<button
-										type="button"
-										class="session-pick"
-										onclick={() => onPickSession(session.id)}
-										title={isAwaitingInput
-											? 'Agent needs your input — click to answer'
-											: isRunning
-												? 'Session is running — click to follow'
-												: isFailed
-													? 'Last turn failed — open to retry'
-													: isInterrupted
-														? 'Turn never finished (restart/stop) — open to relaunch'
-														: isFinished
-															? 'Finished while you were away — click to open'
-															: 'Open session'}
-									>
-										<div class="session-title">
-											{#if isAwaitingInput}
-												<span class="awaiting-dot" aria-hidden="true"></span>
-											{:else if isRunning}
-												<span class="running-dot" aria-hidden="true"></span>
-											{:else if isFailed}
-												<span class="failed-dot" aria-hidden="true">!</span>
-											{:else if isInterrupted}
-												<span class="interrupted-dot" aria-hidden="true">!</span>
-											{:else if isFinished}
-												<span class="finished-dot" aria-hidden="true"></span>
-											{/if}
-											<span class="session-title-text" title={session.title || '(untitled)'}
-												>{session.title || '(untitled)'}</span
-											>
-
-											{#if isCoordinatorSession(session)}
-												<span
-													class="session-mode-badge coordinator"
-													title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
-												>
-											{/if}
-										</div>
-										<div class="session-meta">
-											{#if isAwaitingInput}
-												<span class="awaiting-label">needs input</span>
-												<span class="session-meta-sep">·</span>
-											{:else if isRunning}
-												<span class="running-label">running…</span>
-												<span class="session-meta-sep">·</span>
-											{:else if isFailed}
-												<span class="failed-label">last turn failed</span>
-												<span class="session-meta-sep">·</span>
-											{:else if isInterrupted}
-												<span class="interrupted-label">interrupted</span>
-												<span class="session-meta-sep">·</span>
-											{:else if isFinished}
-												<span class="finished-label">finished</span>
-												<span class="session-meta-sep">·</span>
-											{/if}
-											{formatRelative(session.updated_at_ms)}
-										</div>
-									</button>
-								{/if}
-								{#if sessionBranch(session)}
-									{@const branch = sessionBranch(session)}
-									{@const inWorktree = worktreeFolderForBranch(branch) !== null}
-									<button
-										type="button"
-										class="session-branch-chip"
-										class:worktree={inWorktree}
-										title={inWorktree
-											? `Go to the worktree on ${branch}`
-											: `Switch the project's main checkout to ${branch}`}
-										aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
-										onclick={() => void onSessionBranchChip(session)}
-									>
-										<BranchIcon size={11} />
-										<span class="chip-name">{branch}</span>
-									</button>
-								{/if}
-								<button
-									type="button"
-									class="icon session-row-action"
-									title="Open trace in editor"
-									aria-label="Open trace in editor"
-									onclick={(event) => onOpenTrace(event, session.id)}
-								>
-									<CodeIcon />
-								</button>
-								{#if coder.hubBucket}
-									{@const phase = hubRowState(session.id)}
-									<button
-										type="button"
-										class="icon session-row-action hub-action"
-										class:syncing={phase === 'syncing'}
-										class:synced={phase === 'synced'}
-										class:failed={phase === 'failed'}
-										title={hubRowTitle(session.id)}
-										aria-label={hubRowTitle(session.id)}
-										onclick={(event) => onUploadSession(event, session.id)}
-										disabled={phase === 'syncing'}
-									>
-										<CloudUploadIcon />
-									</button>
-									{#if coder.hubBucket.uploaded[session.id]}
-										<button
-											type="button"
-											class="icon session-row-action"
-											title="Open trace on Hugging Face (Alt-click to copy URL)"
-											aria-label="Open trace on Hugging Face"
-											onclick={(event) => onOpenTraceOnHub(event, session.id)}
-										>
-											<ExternalLinkIcon />
-										</button>
-									{/if}
-								{/if}
-								<button
-									type="button"
-									class="icon session-row-action"
-									title="Rename session"
-									aria-label="Rename session"
-									onclick={(event) => startRename(event, session.id, session.title)}
-								>
-									<EditIcon size={12} />
-								</button>
-								<button
-									type="button"
-									class="icon session-row-action"
-									title="Delete session"
-									aria-label="Delete session"
-									onclick={(event) => onDeleteSession(event, session.id, session.title)}
-								>
-									<TrashIcon />
-								</button>
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			{/if}
+	{:else if coder.view === 'empty'}
+		<div class="empty">
+			<p class="empty-lede">No session open. Pick one from the sidebar, or start a new one.</p>
+			<button type="button" class="primary" onclick={startNewSession}>New session</button>
 		</div>
 	{:else if coder.view === 'session'}
-		<!-- Sticky in-session header: a small back-to-list affordance,
-			 the session title (centre, prominent), and the "+ new"
-			 button. Both buttons inherit `.icon`'s muted styling so
-			 the title stays the visual focus — this strip is for
-			 navigation, not headline content. -->
+		<!-- Sticky in-session header: the session title (centre,
+			 prominent) and the session's actions. The buttons inherit
+			 `.icon`'s muted styling so the title stays the visual
+			 focus. -->
 		<header class="session-bar">
-			<button
-				type="button"
-				class="icon"
-				onclick={() => coder.showSessionsList()}
-				title="Back to sessions"
-				aria-label="Back to sessions"
-			>
-				<ListIcon />
-			</button>
 			{#if visibleSessionSummary && renamingId === visibleSessionSummary.id}
-				<span class="session-bar-title">{@render renameInput()}</span>
+				<span class="session-bar-title">
+					<SessionRenameInput
+						id={visibleSessionSummary.id}
+						title={visibleSessionSummary.title}
+						onDone={() => (renamingId = null)}
+					/>
+				</span>
 			{:else}
 				<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
 					{#if isCoordinatorSession(coder.activeSession)}
@@ -3499,7 +2979,7 @@
 						class="icon"
 						title="Rename session"
 						aria-label="Rename session"
-						onclick={(event) => startRename(event, summary.id, summary.title)}
+						onclick={() => (renamingId = summary.id)}
 					>
 						<EditIcon size={12} />
 					</button>
@@ -3518,7 +2998,7 @@
 							? `Runs in a git worktree on ${branch} — click to open that checkout`
 							: `This session's work is on ${branch} — click to switch the project's main checkout to it`}
 						aria-label={inWorktree ? `Go to worktree on ${branch}` : `Switch to branch ${branch}`}
-						onclick={() => void onSessionBranchChip(summary)}
+						onclick={() => void goToSessionBranch(summary)}
 					>
 						<BranchIcon size={12} />
 						<span class="wt-branch">{branch}</span>
@@ -3556,7 +3036,7 @@
 				<button
 					type="button"
 					class="icon"
-					onclick={() => onOpenTrace(null, coder.activeSession!.id)}
+					onclick={() => openSessionTrace(coder.activeSession!.id)}
 					title="Open trace in editor"
 					aria-label="Open trace in editor"
 				>
@@ -3566,7 +3046,7 @@
 					<button
 						type="button"
 						class="icon"
-						onclick={(event) => onOpenTraceOnHub(event, coder.activeSession!.id)}
+						onclick={(event) => openSessionTraceOnHub(coder.activeSession!.id, event.altKey)}
 						title="Open trace on Hugging Face (Alt-click to copy URL)"
 						aria-label="Open trace on Hugging Face"
 					>
@@ -3588,13 +3068,13 @@
 			<button
 				type="button"
 				class="icon"
-				onclick={onNewCoordinatorSession}
+				onclick={startNewCoordinatorSession}
 				title="New coordinator session — an orchestrator that spawns and manages worker agents"
 				aria-label="New coordinator session"
 			>
 				<CoordinatorIcon />
 			</button>
-			<button type="button" class="icon" onclick={onNewSession} title="New session" aria-label="New session">
+			<button type="button" class="icon" onclick={startNewSession} title="New session" aria-label="New session">
 				<PlusIcon />
 			</button>
 		</header>
@@ -3737,7 +3217,7 @@
 								class="background-stop"
 								title="Stop this sub-agent"
 								aria-label="Stop sub-agent"
-								onclick={() => void coder.abortSubagent(sub.id)}>×</button
+								onclick={() => void coder.abortSubagent(sub.id)}><CloseIcon size={10} /></button
 							>
 						</span>
 					{/each}
@@ -3758,7 +3238,7 @@
 								class="background-stop"
 								title="Stop this process"
 								aria-label="Stop process"
-								onclick={() => void coder.stopActiveProcess(proc.id)}>×</button
+								onclick={() => void coder.stopActiveProcess(proc.id)}><CloseIcon size={10} /></button
 							>
 						</span>
 					{/each}
@@ -3825,7 +3305,7 @@
 								aria-label="Remove attachment"
 								onclick={() => coder.removeAttachment(attachment.id)}
 							>
-								×
+								<CloseIcon size={10} />
 							</button>
 						</div>
 					{/each}
@@ -3914,103 +3394,106 @@
 					{/if}
 				</div>
 			{/if}
-			<textarea
-				bind:this={composer}
-				use:textInputUndo
-				placeholder={coder.awaitingInput
-					? 'Answer the question above, or type here to skip and keep going…'
-					: coder.busy
-						? 'Steer the running turn (Enter to send, Esc to stop)…'
-						: coder.attachments.length > 0
-							? 'Ask about the attached selection…'
-							: `Ask ${coder.currentModelName ?? 'the coder'}… (@ to attach a file, paste images)`}
-				rows="3"
-				onkeydown={onComposerKey}
-				oninput={onComposerInput}
-				onpaste={onComposerPaste}
-				onblur={onComposerBlur}
-			></textarea>
-			<div class="composer-meta">
-				{#if coder.rows.length > 0}
-					<button
-						type="button"
-						class="ship-it"
-						title="Tell the agent to go ahead with what it proposed (anything typed in the composer is sent along)"
-						onclick={() => void sendNudge(GO_PROMPT)}
-					>
-						<PlayIcon size={12} />
-						Go
-					</button>
-					<button
-						type="button"
-						class="ship-it"
-						title="Tell the agent to land what it held back: commit, push, publish, open the PR (anything typed in the composer is sent along)"
-						onclick={() => void sendNudge(SHIP_IT_PROMPT)}
-					>
-						<RocketIcon size={12} />
-						Ship it
-					</button>
-					<button
-						type="button"
-						class="ship-it"
-						title="Ask the agent to show the result: open it in a browser tab, take a screenshot (anything typed in the composer is sent along)"
-						onclick={() => void sendNudge(SHOW_ME_PROMPT)}
-					>
-						<EyeIcon size={12} />
-						Show me
-					</button>
-				{/if}
-				<button
-					type="button"
-					class="voice"
-					class:recording={voiceState === 'recording'}
-					disabled={voiceState === 'transcribing'}
-					title={voiceState === 'recording'
-						? 'Stop and transcribe into the composer (Esc to discard)'
-						: voiceState === 'transcribing'
-							? 'Transcribing…'
-							: 'Dictate into the composer'}
-					aria-pressed={voiceState === 'recording'}
-					onclick={() => void toggleVoice()}
-				>
-					<MicIcon size={12} />
-					{#if voiceState === 'recording'}
-						Listening…
-					{:else if voiceState === 'transcribing'}
-						Transcribing…
-					{/if}
-				</button>
-				{#if showReasoningPick}
-					<span class="reasoning-pick">
+			<!-- One rounded box holds the prompt and its action row. -->
+			<div class="composer-box">
+				<textarea
+					bind:this={composer}
+					use:textInputUndo
+					placeholder={coder.awaitingInput
+						? 'Answer the question above, or type here to skip and keep going…'
+						: coder.busy
+							? 'Steer the running turn (Enter to send, Esc to stop)…'
+							: coder.attachments.length > 0
+								? 'Ask about the attached selection…'
+								: `Ask ${coder.currentModelName ?? 'the coder'}… (@ to attach a file, paste images)`}
+					rows="3"
+					onkeydown={onComposerKey}
+					oninput={onComposerInput}
+					onpaste={onComposerPaste}
+					onblur={onComposerBlur}
+				></textarea>
+				<div class="composer-meta">
+					{#if coder.rows.length > 0}
 						<button
 							type="button"
-							class="reasoning-button"
-							title="Model and reasoning effort for this session (the defaults for other sessions are in model settings)"
-							aria-haspopup="menu"
-							aria-expanded={reasoningMenuAnchor !== null}
-							onpointerdown={(e) => e.stopPropagation()}
-							onclick={toggleReasoningMenu}
+							class="ship-it"
+							title="Tell the agent to go ahead with what it proposed (anything typed in the composer is sent along)"
+							onclick={() => void sendNudge(GO_PROMPT)}
 						>
-							<span class="reasoning-model" class:session-pick={coder.sessionModel !== null}
-								>{coder.currentModelName ?? 'model'}</span
-							>
-							{#if showEffortChoices}
-								<span class="reasoning-sep" aria-hidden="true">·</span>
-								<span class="reasoning-effort" class:session-pick={reasoningEffort !== null}
-									>{reasoningEffort ?? defaultEffort ?? 'default'}</span
-								>
-							{/if}
-							<span class="reasoning-caret" aria-hidden="true">▾</span>
+							<PlayIcon size={12} />
+							Go
 						</button>
-					</span>
-					{#if reasoningMenuAnchor !== null}
-						<ContextMenu
-							items={reasoningMenuItems}
-							anchorRect={reasoningMenuAnchor}
-							onClose={() => (reasoningMenuAnchor = null)}
-						/>
+						<button
+							type="button"
+							class="ship-it"
+							title="Tell the agent to land what it held back: commit, push, publish, open the PR (anything typed in the composer is sent along)"
+							onclick={() => void sendNudge(SHIP_IT_PROMPT)}
+						>
+							<RocketIcon size={12} />
+							Ship it
+						</button>
+						<button
+							type="button"
+							class="ship-it"
+							title="Ask the agent to show the result: open it in a browser tab, take a screenshot (anything typed in the composer is sent along)"
+							onclick={() => void sendNudge(SHOW_ME_PROMPT)}
+						>
+							<EyeIcon size={12} />
+							Show me
+						</button>
 					{/if}
-				{/if}
+					<button
+						type="button"
+						class="voice"
+						class:recording={voiceState === 'recording'}
+						disabled={voiceState === 'transcribing'}
+						title={voiceState === 'recording'
+							? 'Stop and transcribe into the composer (Esc to discard)'
+							: voiceState === 'transcribing'
+								? 'Transcribing…'
+								: 'Dictate into the composer'}
+						aria-pressed={voiceState === 'recording'}
+						onclick={() => void toggleVoice()}
+					>
+						<MicIcon size={12} />
+						{#if voiceState === 'recording'}
+							Listening…
+						{:else if voiceState === 'transcribing'}
+							Transcribing…
+						{/if}
+					</button>
+					{#if showReasoningPick}
+						<span class="reasoning-pick">
+							<button
+								type="button"
+								class="reasoning-button"
+								title="Model and reasoning effort for this session (the defaults for other sessions are in model settings)"
+								aria-haspopup="menu"
+								aria-expanded={reasoningMenuAnchor !== null}
+								onpointerdown={(e) => e.stopPropagation()}
+								onclick={toggleReasoningMenu}
+							>
+								<span class="reasoning-model" class:session-pick={coder.sessionModel !== null}
+									>{coder.currentModelName ?? 'model'}</span
+								>
+								{#if showEffortChoices}
+									<span class="reasoning-sep" aria-hidden="true">·</span>
+									<span class="reasoning-effort" class:session-pick={reasoningEffort !== null}
+										>{reasoningEffort ?? defaultEffort ?? 'default'}</span
+									>
+								{/if}
+								<span class="reasoning-caret" aria-hidden="true"><ChevronDownIcon size={10} /></span>
+							</button>
+						</span>
+						{#if reasoningMenuAnchor !== null}
+							<ContextMenu
+								items={reasoningMenuItems}
+								anchorRect={reasoningMenuAnchor}
+								onClose={() => (reasoningMenuAnchor = null)}
+							/>
+						{/if}
+					{/if}
+				</div>
 			</div>
 		</div>
 	{:else if coder.view === 'subagent'}
@@ -4047,7 +3530,7 @@
 					<button
 						type="button"
 						class="icon"
-						onclick={() => onOpenTrace(null, subId)}
+						onclick={() => openSessionTrace(subId)}
 						title="Open trace in editor"
 						aria-label="Open trace in editor"
 					>
@@ -4085,14 +3568,16 @@
 		</div>
 		{#if transcript !== null}
 			<div class="composer">
-				<textarea
-					bind:value={subagentDraft}
-					placeholder={subagentRunning
-						? 'Steer the sub-agent… (Enter to send)'
-						: 'Follow up with the sub-agent… (Enter to send)'}
-					rows="2"
-					onkeydown={onSubagentComposerKey}
-				></textarea>
+				<div class="composer-box">
+					<textarea
+						bind:value={subagentDraft}
+						placeholder={subagentRunning
+							? 'Steer the sub-agent… (Enter to send)'
+							: 'Follow up with the sub-agent… (Enter to send)'}
+						rows="2"
+						onkeydown={onSubagentComposerKey}
+					></textarea>
+				</div>
 			</div>
 		{/if}
 	{/if}
@@ -4187,7 +3672,6 @@
 		 with the synthetic summary that the agent now sees in
 		 place of the older middle of the history. -->
 	<div class="row compaction" class:running={state.phase === 'running'}>
-		<div class="row-label">compaction</div>
 		{#if state.phase === 'running'}
 			{@const progress = compactionProgressLabel(state)}
 			<div class="bubble">
@@ -4209,19 +3693,6 @@
 			</details>
 		{/if}
 	</div>
-{/snippet}
-
-{#snippet renameInput()}
-	<input
-		class="session-rename"
-		type="text"
-		aria-label="Session title"
-		bind:value={renameText}
-		{@attach focusAndSelect}
-		onclick={(event) => event.stopPropagation()}
-		onkeydown={onRenameKeydown}
-		onblur={() => void commitRename()}
-	/>
 {/snippet}
 
 {#snippet toolGroupMarkup(item: ToolGroupItem, inParentTranscript: boolean)}
@@ -4251,7 +3722,13 @@
 			<span class="tool-status">{toolGroupStatus(item)}</span>
 			<span class="tool-elapsed" class:running={s.running > 0}>{fmtElapsed(toolGroupElapsed(item), s.running > 0)}</span
 			>
-			<span class="tool-group-chevron" aria-hidden="true">{open ? '▾' : '▸'}</span>
+			<span class="tool-group-chevron" aria-hidden="true">
+				{#if open}
+					<ChevronDownIcon size={12} />
+				{:else}
+					<ChevronRightIcon size={12} />
+				{/if}
+			</span>
 		</button>
 		{#if open}
 			{#if item.group === 'files' && s.files.length > 1}
@@ -4307,7 +3784,7 @@
 				{#if row.fromCoordinator}<span
 						class="coordinator-tag"
 						title="Sent by the coordinator that manages this worker, not by you">coordinator</span
-					>{:else}you{/if}{#if row.createdAt > 0}<time
+					>{/if}{#if row.createdAt > 0}<time
 						class="row-time"
 						datetime={new Date(row.createdAt).toISOString()}
 						title={formatFullTimestamp(row.createdAt)}>{formatClock(row.createdAt)}</time
@@ -4435,7 +3912,7 @@
 		{#if hasThinking || hasText}
 			<div class="row assistant">
 				<div class="row-label">
-					coder{#if row.createdAt > 0}<time
+					{#if row.createdAt > 0}<time
 							class="row-time"
 							datetime={new Date(row.createdAt).toISOString()}
 							title={formatFullTimestamp(row.createdAt)}>{formatClock(row.createdAt)}</time
@@ -4981,46 +4458,87 @@
 
 <style>
 	.panel {
-		display: flex;
-		flex-direction: column;
+		/* Widest the transcript and composer column grows; a wider
+		   panel centres it. */
+		--coder-reading-width: 860px;
+		display: grid;
 		height: 100%;
 		min-height: 0;
 		background: var(--m-bg-1);
 		color: var(--m-fg);
+		grid-template-columns: minmax(0, 1fr) auto;
+		grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+		container-type: inline-size;
 	}
 	.header {
-		flex-shrink: 0;
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		gap: 8px;
-		padding: 8px 12px;
-		border-bottom: 1px solid var(--m-border);
+		gap: var(--m-space-1);
+		padding: 0 var(--m-space-2) 0 0;
+		grid-row: 2;
+		grid-column: 2;
+		height: 40px;
+		position: relative;
 	}
-	/* Uppercase, letter-spaced, 11 px / muted; a status dot,
-	   identity, and a target chip layer on top. */
+	/* With a session open the title bar and this strip share one row:
+	   the session's title and actions on the left, the panel-wide
+	   status and settings on the right. The panel's own name would
+	   only repeat what the title says. */
+	.panel:has(> .session-bar) .label {
+		display: none;
+	}
+	/* No session open: this strip is the whole header. */
+	.panel:not(:has(> .session-bar)) .header {
+		grid-column: 1 / -1;
+		padding-left: var(--m-space-4);
+	}
+	/* A short rule sets the panel-wide strip apart from the session's
+	   own actions. */
+	.panel:has(> .session-bar) .header::before {
+		content: '';
+		width: 1px;
+		height: 16px;
+		margin: 0 var(--m-space-1);
+		background: var(--m-border);
+	}
+	/* The transcript scrolls under the header with no rule between
+	   them; a short fade keeps a half-cut line from butting against
+	   the title. */
+	.header::after,
+	.session-bar::after,
+	.find-bar::after {
+		content: '';
+		position: absolute;
+		top: 100%;
+		left: 0;
+		right: 0;
+		height: var(--m-space-3);
+		background: linear-gradient(var(--m-bg-1), transparent);
+		pointer-events: none;
+		z-index: 1;
+	}
 	.title {
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-1);
 		min-width: 0;
 		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		font-size: 11px;
+		font-size: var(--m-text-md);
 		color: var(--m-fg-muted);
 	}
 	.label {
 		color: var(--m-fg);
 	}
 	.who {
-		text-transform: none;
-		letter-spacing: 0;
 		font-weight: 400;
-		color: var(--m-fg-muted);
+		color: var(--m-fg-subtle);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		font-size: var(--m-text-xs);
+		max-width: 10ch;
+		padding: 0 var(--m-space-1);
 	}
 	/* Host-vs-container indicator chip. Same monitor / container
 	   glyphs the terminal tabs use (`TerminalTargetIcon`) so the
@@ -5036,30 +4554,30 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		gap: 2px;
+		gap: 3px;
 		color: var(--m-fg-subtle);
-		border: 1px solid var(--m-border);
-		border-radius: 3px;
-		padding: 1px 4px;
-		height: 18px;
+		border: none;
+		border-radius: var(--m-radius-md);
+		padding: 0;
+		height: var(--m-icon-btn);
 		cursor: pointer;
 		background: transparent;
+		min-width: var(--m-icon-btn);
 	}
 	.target:hover {
-		border-color: var(--m-border-strong, var(--m-border));
 		color: var(--m-fg);
+		background: var(--m-bg-3);
 	}
 	.target.container {
 		color: var(--m-success);
-		border-color: color-mix(in srgb, var(--m-success) 50%, transparent);
-		background: color-mix(in srgb, var(--m-success) 10%, transparent);
+		background: color-mix(in srgb, var(--m-success) 12%, transparent);
 	}
 	/* Off-default badge: a session deliberately pinned to host even
 	   though auto would have picked the container. */
 	.target.overridden {
-		color: var(--m-warning, var(--m-fg));
-		border-color: color-mix(in srgb, var(--m-warning, var(--m-fg)) 55%, transparent);
-		background: color-mix(in srgb, var(--m-warning, var(--m-fg)) 12%, transparent);
+		color: var(--m-warning);
+		background: color-mix(in srgb, var(--m-warning) 14%, transparent);
+		padding: 0 6px;
 	}
 	.override-dot {
 		width: 4px;
@@ -5069,33 +4587,35 @@
 	}
 	.target-popover {
 		position: absolute;
-		top: calc(100% + 4px);
-		left: 0;
+		top: calc(100% + 6px);
+		left: auto;
 		z-index: 30;
 		width: 248px;
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
-		padding: 4px;
+		padding: var(--m-space-1);
 		border: 1px solid var(--m-border);
-		border-radius: 6px;
-		background: var(--m-bg-elevated, var(--m-bg));
-		box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+		border-radius: var(--m-radius-lg);
+		background: var(--m-bg-2);
+		box-shadow: var(--m-shadow-pop);
+		right: 0;
+		font-weight: 400;
 	}
 	.target-popover .opt {
 		display: flex;
-		gap: 8px;
+		gap: var(--m-space-2);
 		align-items: flex-start;
-		padding: 6px 8px;
+		padding: 6px var(--m-space-2);
 		border: none;
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		background: transparent;
 		text-align: left;
 		cursor: pointer;
 		color: var(--m-fg);
 	}
 	.target-popover .opt:hover {
-		background: var(--m-bg-hover, color-mix(in srgb, var(--m-fg) 8%, transparent));
+		background: var(--m-bg-3);
 	}
 	.target-popover .opt-radio {
 		flex: none;
@@ -5103,11 +4623,11 @@
 		width: 12px;
 		height: 12px;
 		border-radius: 50%;
-		border: 1px solid var(--m-border-strong, var(--m-border));
+		border: 1px solid var(--m-border-strong);
 	}
 	.target-popover .opt.selected .opt-radio {
-		border-color: var(--m-accent, var(--m-fg));
-		background: radial-gradient(circle, var(--m-accent, var(--m-fg)) 0 3px, transparent 4px);
+		border-color: var(--m-accent);
+		background: radial-gradient(circle, var(--m-accent) 0 3px, transparent 4px);
 	}
 	.target-popover .opt-text {
 		display: flex;
@@ -5115,11 +4635,11 @@
 		gap: 2px;
 	}
 	.target-popover .opt-title {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		font-weight: 600;
 	}
 	.target-popover .opt-sub {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.35;
 		color: var(--m-fg-muted);
 	}
@@ -5130,42 +4650,55 @@
 	.actions {
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: 2px;
 	}
 	.stop {
 		font: inherit;
-		font-size: 11px;
-		color: var(--m-warning, #d4a017);
-		background: transparent;
-		border: 1px solid var(--m-warning, #d4a017);
-		border-radius: 3px;
-		padding: 0 8px;
-		height: 20px;
-		line-height: 18px;
+		font-size: var(--m-text-xs);
+		color: var(--m-warning);
+		background: color-mix(in srgb, var(--m-warning) 14%, transparent);
+		border: none;
+		border-radius: var(--m-radius-md);
+		padding: 0 var(--m-space-2);
+		height: 22px;
+		line-height: 22px;
 		cursor: pointer;
+		font-weight: 600;
+		margin: 0 var(--m-space-1);
 	}
 	.stop:hover {
-		background: color-mix(in srgb, var(--m-warning, #d4a017) 14%, transparent);
+		background: color-mix(in srgb, var(--m-warning) 24%, transparent);
 	}
 
 	.icon {
 		background: transparent;
 		border: 0;
 		color: var(--m-fg-muted);
-		padding: 2px 4px;
+		padding: 0 var(--m-space-1);
 		cursor: pointer;
 		display: inline-flex;
 		align-items: center;
+		min-width: var(--m-icon-btn);
+		height: var(--m-icon-btn);
+		justify-content: center;
+		flex-shrink: 0;
+		border-radius: var(--m-radius-md);
+		font-size: var(--m-text-sm);
 	}
 	.icon:hover {
 		color: var(--m-fg);
+		background: var(--m-bg-3);
+	}
+	.icon:disabled {
+		opacity: 0.4;
+		cursor: default;
+		background: transparent;
 	}
 	.icon.active {
 		color: var(--m-accent);
 	}
 	.icon.active:hover {
 		color: var(--m-accent);
-		filter: brightness(1.15);
 	}
 	/* Disconnected worker whose final turn still runs: warning tint
 	   so it reads as "pending, click to stop" rather than the plain
@@ -5187,29 +4720,53 @@
 			transform: rotate(360deg);
 		}
 	}
-	/* Sticky in-session header with "← Sessions" + title + "+
-	   new". */
+	/* Sticky in-session header: title + session actions. */
 	.session-bar {
-		flex-shrink: 0;
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		padding: 6px 12px;
-		border-bottom: 1px solid var(--m-border);
-		background: var(--m-bg-1);
+		gap: 2px;
+		padding: 0 var(--m-space-1) 0 var(--m-space-4);
+		grid-row: 2;
+		grid-column: 1;
+		min-width: 0;
+		height: 40px;
+		position: relative;
 	}
-	/* Both "back" and "new" sit on the strip as `.icon` buttons —
-	   their styles come from the shared `.icon` rule below. */
+	/* A text button in the bar (the sub-agent view's back link). */
+	.session-bar > .icon:first-child {
+		margin-left: calc(-1 * var(--m-space-2));
+		padding: 0 var(--m-space-2);
+	}
+	/* Too narrow for one row: the status strip goes back above the
+	   title. */
+	@container (max-width: 460px) {
+		.panel:has(> .session-bar) .header {
+			grid-row: 1;
+			grid-column: 1 / -1;
+			height: 32px;
+			padding-left: var(--m-space-3);
+		}
+		.session-bar {
+			grid-column: 1 / -1;
+			height: 32px;
+		}
+		.panel:has(> .session-bar) .header::before,
+		.panel:has(> .session-bar) .header::after {
+			content: none;
+		}
+	}
+	/* The actions sit on the strip as `.icon` buttons — their styles
+	   come from the shared `.icon` rule above. */
 	.session-bar-title {
 		flex: 1;
 		min-width: 0;
-		font-size: 12px;
-		font-weight: 500;
+		font-size: var(--m-text-md);
+		font-weight: 600;
 		color: var(--m-fg);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		text-align: center;
+		margin-right: var(--m-space-1);
 	}
 	/* The visible session's branch chip in the session bar (ADR
 	   0028). Click goes to wherever the branch lives — the worktree
@@ -5217,30 +4774,32 @@
 	   With the per-project session list, focusing a worktree keeps the
 	   transcript put, so this is safe to make clickable. */
 	.session-bar-worktree {
-		flex-shrink: 0;
+		flex-shrink: 1;
 		max-width: 12rem;
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		padding: 1px 7px;
-		border: 1px solid color-mix(in srgb, var(--m-accent) 45%, transparent);
-		border-radius: 999px;
-		background: transparent;
+		gap: var(--m-space-1);
+		padding: 0 var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-pill);
+		background: var(--m-accent-tint);
 		color: var(--m-accent);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		cursor: pointer;
+		height: 22px;
+		margin-right: var(--m-space-1);
+		min-width: 0;
 	}
 	.session-bar-worktree:hover {
-		background: var(--m-bg-3);
-		border-color: var(--m-accent);
+		background: color-mix(in srgb, var(--m-accent) 24%, transparent);
 	}
 	.session-bar-worktree.plain {
-		border-color: var(--m-border);
 		color: var(--m-fg-muted);
+		background: var(--m-bg-2);
 	}
 	.session-bar-worktree.plain:hover {
 		color: var(--m-fg);
-		border-color: var(--m-fg-muted);
+		background: var(--m-bg-3);
 	}
 	.session-bar-worktree .wt-branch {
 		overflow: hidden;
@@ -5248,350 +4807,44 @@
 		white-space: nowrap;
 		font-family: var(--m-font-mono, monospace);
 	}
-	/* Sessions list view. The section title + actions row stays
-	   glued to the top while the list scrolls underneath. */
-	.sessions {
-		flex: 1;
-		min-height: 0;
-		overflow-y: auto;
-		padding: 0 12px 12px;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-	.sessions-header {
-		position: sticky;
-		top: 0;
-		z-index: 1;
-		background: var(--m-bg-1);
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 8px;
-		margin: 0 -12px;
-		padding: 6px 12px;
-		border-bottom: 1px solid var(--m-border);
-	}
-	.section-title {
-		font-size: 11px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--m-fg-muted);
-	}
-	.header-actions {
-		display: flex;
-		align-items: center;
-		gap: 4px;
-	}
-	.session-search {
-		background: var(--m-bg-overlay);
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		color: var(--m-fg);
-		font-size: 12px;
-		padding: 4px 8px;
-	}
-	.session-search:focus {
-		outline: none;
-		border-color: color-mix(in srgb, var(--m-accent) 50%, transparent);
-	}
-	.session-list {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-	.session-row {
-		display: flex;
-		align-items: stretch;
-		border-radius: 4px;
-		border: 1px solid transparent;
-	}
-	.session-row:hover {
-		background: var(--m-bg-3);
-		border-color: var(--m-border);
-	}
-	.session-row.active {
-		background: color-mix(in srgb, var(--m-accent) 12%, transparent);
-		border-color: color-mix(in srgb, var(--m-accent) 50%, transparent);
-	}
-	.session-pick {
-		flex: 1;
-		min-width: 0;
-		text-align: left;
-		font: inherit;
-		color: inherit;
-		background: transparent;
-		border: 0;
-		cursor: pointer;
-		padding: 6px 8px;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-	}
-	.session-title {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: 12px;
-		color: var(--m-fg);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.session-title-text {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		min-width: 0;
-	}
 	/* Coordinator (orchestrator) mode badge — ADR 0030. Same pill
 	   shape as the sub-agent mode badge so the visual vocabulary
-	   is consistent across the panel. Rendered both in the sticky
-	   session-bar title (full word) and on each list row (short
-	   `coord` so it doesn't crowd the truncated title). */
+	   is consistent across the panel. Rendered in the sticky
+	   session-bar title (full word); the sidebar's sessions list
+	   carries its own short `coord` copy. */
 	.session-mode-badge {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
 		flex-shrink: 0;
-		padding: 1px 6px;
-		border-radius: 999px;
-		font-size: 10px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		line-height: 1.4;
+		padding: 0 6px;
+		border-radius: var(--m-radius-pill);
+		font-size: var(--m-text-xs);
+		font-weight: 500;
+		line-height: 16px;
 	}
 	.session-mode-badge.coordinator {
-		background: var(--m-accent);
-		color: var(--m-bg);
+		background: var(--m-accent-tint);
+		color: var(--m-accent);
 	}
-	/* In the session-bar title the badge sits left of the title
-	   text; give it a touch more breathing room than the list row. */
+	/* The badge sits left of the title text. */
 	.session-bar-title .session-mode-badge {
-		margin-right: 2px;
-	}
-	.session-meta {
-		display: flex;
-		align-items: center;
-		gap: 4px;
-		font-size: 11px;
-		color: var(--m-fg-subtle);
-	}
-	.session-row.running .running-label {
-		color: var(--m-accent);
-		font-weight: 500;
-	}
-	.session-row.awaiting .awaiting-label {
-		color: var(--m-accent);
-		font-weight: 500;
-	}
-	.session-row.finished .finished-label {
-		color: var(--m-warning);
-		font-weight: 500;
-	}
-	.session-row .session-meta-sep {
-		color: var(--m-fg-subtle);
-	}
-	/* Running pip — small accent dot that pulses while the bucket
-	   reports `busy`. The session list is the only surface where a
-	   user actively scans for "is anything still working?", and a
-	   pulsing dot beats a static badge for that question. */
-	.running-dot {
-		flex-shrink: 0;
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		background: var(--m-accent);
-		box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 60%, transparent);
-		animation: session-running-pulse 1.4s ease-in-out infinite;
-	}
-	@keyframes session-running-pulse {
-		0% {
-			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 60%, transparent);
-		}
-		70% {
-			box-shadow: 0 0 0 6px color-mix(in srgb, var(--m-accent) 0%, transparent);
-		}
-		100% {
-			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 0%, transparent);
-		}
-	}
-	/* Needs-input dot — a turn parked on an `ask_user` prompt,
-	   waiting for the human. Accent hue like the running dot (it's
-	   the same agent, still mid-turn) but a slower halo pulse so
-	   "waiting on you" reads calmer than the working dot's brisk
-	   pulse. Distinct from the static amber finished dot, which
-	   means "done, go look"; this means "blocked, go answer". */
-	.awaiting-dot {
-		flex-shrink: 0;
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		background: var(--m-accent);
-		box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 60%, transparent);
-		animation: session-awaiting-pulse 2.2s ease-in-out infinite;
-	}
-	@keyframes session-awaiting-pulse {
-		0% {
-			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 55%, transparent);
-		}
-		70% {
-			box-shadow: 0 0 0 5px color-mix(in srgb, var(--m-accent) 0%, transparent);
-		}
-		100% {
-			box-shadow: 0 0 0 0 color-mix(in srgb, var(--m-accent) 0%, transparent);
-		}
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.running-dot,
-		.awaiting-dot {
-			animation: none;
-		}
-	}
-	/* Finished marker — a static amber dot on a session whose turn
-	   ended while the user was looking at a different session (or
-	   the list / another folder). Mirrors the folder-bar's `.done`
-	   sparkle: same `--m-warning` hue, and deliberately *no* pulse
-	   — the work is done, so a static cue says "this one's waiting
-	   on you" without over-claiming attention. Clears when the row
-	   is opened. */
-	.finished-dot {
-		flex-shrink: 0;
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		background: var(--m-warning);
-	}
-	/* Failed-last-turn tell: red "!" so a coordinator fleet's dead
-	   workers stand out from finished ones at a glance. */
-	.failed-dot {
-		flex-shrink: 0;
-		color: var(--m-danger, #c62828);
-		font-weight: 700;
-		font-size: 12px;
-		line-height: 1;
-	}
-	.failed-label {
-		color: var(--m-danger, #c62828);
-		font-weight: 500;
-	}
-	/* Interrupted turn (restart/stop): amber sibling of failed. */
-	.interrupted-dot {
-		flex-shrink: 0;
-		color: var(--m-warning, #d4a017);
-		font-weight: 700;
-		font-size: 12px;
-		line-height: 1;
-	}
-	.interrupted-label {
-		color: var(--m-warning, #d4a017);
-		font-weight: 500;
-	}
-	.session-rename {
-		flex: 1 1 auto;
-		min-width: 0;
-		font: inherit;
-		color: var(--m-fg);
-		background: var(--m-bg);
-		border: 1px solid var(--m-accent);
-		border-radius: 3px;
-		padding: 0 4px;
-	}
-	.session-row-action {
-		opacity: 0;
-		transition: opacity 0.1s;
-	}
-	.session-row:hover .session-row-action,
-	.session-row:focus-within .session-row-action {
-		opacity: 1;
-	}
-	/* "Switch back to this session's branch" chip (ADR 0028). Always
-	   visible (unlike the hover-only icon actions) — the branch tie is
-	   the row's headline metadata, not a secondary action. */
-	.session-branch-chip {
-		display: inline-flex;
-		align-items: center;
-		/* The row is `align-items: stretch`; without this the chip
-		   grows to the full two-line row height. */
-		align-self: center;
-		gap: 4px;
-		flex-shrink: 0;
-		max-width: 11rem;
-		padding: 1px 6px;
-		border: 1px solid var(--m-border);
-		border-radius: 999px;
-		background: transparent;
-		color: var(--m-fg-muted);
-		font-size: 11px;
-		cursor: pointer;
-	}
-	.session-branch-chip:hover {
-		color: var(--m-fg);
-		border-color: var(--m-accent);
-		background: var(--m-bg-overlay);
-	}
-	/* Worktree (isolated) sessions read with a faint accent so the
-	   list distinguishes "branch lives in its own checkout" from a
-	   regular session's committed-branch tie. */
-	.session-branch-chip.worktree {
-		color: var(--m-accent);
-		border-color: color-mix(in srgb, var(--m-accent) 45%, transparent);
-	}
-	.session-branch-chip .chip-name {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		font-family: var(--m-font-mono, monospace);
-	}
-	.hub-action.synced {
-		opacity: 0.55;
-		color: var(--m-fg-muted);
-	}
-	.hub-action.synced:hover,
-	.session-row:hover .hub-action.synced,
-	.session-row:focus-within .hub-action.synced {
-		opacity: 1;
-	}
-	.hub-action.syncing {
-		opacity: 1;
-		color: var(--m-accent);
-		animation: hub-action-pulse 1.2s ease-in-out infinite;
-	}
-	.hub-action.failed {
-		opacity: 1;
-		color: var(--m-danger);
-	}
-	@keyframes hub-action-pulse {
-		0%,
-		100% {
-			filter: brightness(1);
-		}
-		50% {
-			filter: brightness(1.4);
-		}
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.hub-action.syncing {
-			animation: none;
-		}
+		margin-right: var(--m-space-1);
+		vertical-align: 1px;
 	}
 	.empty {
-		flex: 1;
 		display: flex;
 		flex-direction: column;
 		align-items: center;
 		justify-content: center;
-		gap: 14px;
+		gap: var(--m-space-4);
 		padding: 24px;
 		text-align: center;
+		grid-row: 4;
+		grid-column: 1 / -1;
 	}
 	.empty-lede {
-		font-size: 12px;
+		font-size: var(--m-text-md);
 		color: var(--m-fg-muted);
 		margin: 0;
 		max-width: 32ch;
@@ -5602,29 +4855,39 @@
 		background: var(--m-accent);
 		color: var(--m-bg);
 		border: 0;
-		border-radius: 4px;
-		padding: 8px 14px;
+		border-radius: var(--m-radius-md);
+		padding: 0 var(--m-space-4);
 		cursor: pointer;
+		height: 32px;
+		font-weight: 600;
 	}
 	.primary:hover:not(:disabled) {
-		filter: brightness(1.1);
+		background: var(--m-accent-strong);
 	}
 	.primary:disabled {
 		cursor: not-allowed;
-		opacity: 0.7;
+		opacity: 0.6;
 	}
 	.error {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		color: var(--m-danger);
 	}
 	.transcript {
-		flex: 1;
 		min-height: 0;
 		overflow-y: auto;
-		padding: 12px;
+		padding: var(--m-space-2) var(--m-space-4) var(--m-space-4);
+		/* Past the reading width the gutters take the slack, so the
+		   column stays centred and the scrollbar stays at the panel
+		   edge. The right gutter gives 10px back to that scrollbar
+		   (its width in `styles.css`), which keeps the column on the
+		   composer's. */
+		padding-left: max(var(--m-space-4), calc((100% - var(--coder-reading-width)) / 2));
+		padding-right: max(var(--m-space-4), calc((100% - var(--coder-reading-width)) / 2 - 10px));
 		display: flex;
 		flex-direction: column;
-		gap: 12px;
+		gap: var(--m-space-4);
+		grid-row: 4;
+		grid-column: 1 / -1;
 	}
 	/* Focusable only so clicks park keyboard focus here (Ctrl+F
 	   routing) — never a visible focus stop. */
@@ -5632,25 +4895,28 @@
 		outline: none;
 	}
 	.find-bar {
-		flex-shrink: 0;
 		display: flex;
 		align-items: center;
-		gap: 6px;
-		padding: 6px 10px;
-		border-bottom: 1px solid var(--m-border);
-		background: var(--m-bg-2);
-		font-size: 12px;
+		gap: 2px;
+		padding: 0 var(--m-space-2) var(--m-space-2) var(--m-space-3);
+		font-size: var(--m-text-sm);
+		grid-row: 3;
+		grid-column: 1 / -1;
+		position: relative;
+		z-index: 2;
+		background: var(--m-bg-1);
 	}
 	.find-bar input {
 		flex: 1;
 		min-width: 0;
-		padding: 3px 6px;
-		background: var(--m-bg-1);
+		padding: 0 var(--m-space-2);
+		background: var(--m-bg-2);
 		color: var(--m-fg);
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		font: inherit;
 		outline: none;
+		height: var(--m-control-h);
 	}
 	.find-bar input:focus {
 		border-color: var(--m-accent);
@@ -5662,17 +4928,14 @@
 		color: var(--m-fg-muted);
 		font-variant-numeric: tabular-nums;
 	}
-	.find-bar .icon:disabled {
-		opacity: 0.4;
-		cursor: default;
-	}
 	.find-close {
 		font-size: 15px;
 	}
 	.hint {
-		font-size: 12px;
+		font-size: var(--m-text-md);
 		color: var(--m-fg-subtle);
 		margin: 0;
+		line-height: 1.55;
 	}
 	/* Top-of-window affordance for the trailing render window. Sits
 	   above the oldest currently-mounted row when older history is
@@ -5683,18 +4946,18 @@
 		align-self: center;
 		flex-shrink: 0;
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
-		background: var(--m-bg-overlay);
-		border: 1px solid var(--m-border);
-		border-radius: 999px;
-		padding: 3px 12px;
+		background: var(--m-bg-2);
+		border: none;
+		border-radius: var(--m-radius-pill);
+		padding: 0 var(--m-space-3);
 		cursor: pointer;
+		height: 24px;
 	}
 	.load-older:hover {
 		color: var(--m-fg);
-		border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
-		background: color-mix(in srgb, var(--m-accent) 10%, transparent);
+		background: var(--m-bg-3);
 	}
 	/* "Jump to latest" escape hatch for a detached (bottom-clipped)
 	   window. Sticky to the bottom of the scroll viewport so it
@@ -5705,31 +4968,58 @@
 	   it overlap the last row's gap instead of pushing layout. */
 	.jump-latest {
 		position: sticky;
-		bottom: 8px;
+		bottom: var(--m-space-2);
 		align-self: center;
 		flex-shrink: 0;
 		margin-top: auto;
 		font: inherit;
-		font-size: 11px;
-		font-weight: 500;
+		font-size: var(--m-text-xs);
+		font-weight: 600;
 		color: var(--m-bg);
 		background: var(--m-accent);
 		border: 0;
-		border-radius: 999px;
-		padding: 5px 14px;
+		border-radius: var(--m-radius-pill);
+		padding: 0 var(--m-space-3);
 		cursor: pointer;
-		box-shadow: 0 4px 12px rgb(0 0 0 / 0.25);
+		box-shadow: var(--m-shadow-pop);
+		height: 26px;
 	}
 	.jump-latest:hover {
-		filter: brightness(1.1);
+		background: var(--m-accent-strong);
 	}
 	.row {
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
 	}
+	/* Blocks sit a full step apart; a run of tool calls closes up so
+	   it reads as one activity log. */
+	.transcript
+		> :is(.row-wrap:has(> .row.tool, > .tool-group), .row.tool, .tool-group)
+		+ :is(.row-wrap:has(> .row.tool, > .tool-group), .row.tool, .tool-group) {
+		margin-top: calc(2px - var(--m-space-4));
+	}
+	/* User turns are right-aligned bubbles. */
+	.row.user {
+		align-items: flex-end;
+		margin-bottom: var(--m-space-1);
+	}
+	/* The meta line (time, queue state, hover actions) hangs below a
+	   message, inside the gap to the next block, so revealing it on
+	   hover moves nothing. */
+	.row.user .row-label,
+	.row.assistant .row-label {
+		order: 1;
+		height: 0;
+		margin-top: -4px;
+		align-items: flex-start;
+		white-space: nowrap;
+	}
+	.row.assistant {
+		position: relative;
+	}
 	.row.notice {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		text-align: center;
 	}
@@ -5737,54 +5027,50 @@
 	   a summary line ("3 files changed") and a <pre> diff body.
 	   Styled to match the compaction disclosure's tone. */
 	.turn-diff {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-subtle);
 	}
 	.turn-diff > summary {
 		cursor: pointer;
 		display: flex;
 		align-items: center;
-		gap: 6px;
-		padding: 4px 0;
+		gap: var(--m-space-2);
+		padding: 0;
+		min-height: 26px;
 	}
 	.turn-diff .diff-files {
-		font-size: 11px;
-		color: var(--m-fg-muted);
+		font-size: var(--m-text-xs);
+		color: var(--m-fg-subtle);
 	}
 	.turn-diff .diff-content {
-		font-family: var(--m-mono, monospace);
+		font-family: var(--m-font-mono, monospace);
 		font-size: 11px;
 		line-height: 1.4;
 		color: var(--m-fg);
-		background: var(--m-bg-2);
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		padding: 8px;
+		background: var(--m-bg);
+		border-radius: var(--m-radius-md);
+		padding: var(--m-space-2) var(--m-space-3);
 		overflow-x: auto;
 		white-space: pre;
 		margin: 4px 0;
 	}
 	.turn-diff .diff-empty {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		padding: 4px 0;
 	}
 	.row-label {
 		display: flex;
 		align-items: center;
-		gap: 6px;
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
+		gap: var(--m-space-2);
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.row-time {
 		/* Per-message wall-clock time, revealed on row hover so
-			 the "you" / "coder" label stays uncluttered at rest.
-			 The full date is in the element's `title`. */
-		font-size: 10px;
-		text-transform: none;
-		letter-spacing: 0;
+			 the transcript stays uncluttered at rest. The full
+			 date is in the element's `title`. */
+		font-size: var(--m-text-xs);
 		font-variant-numeric: tabular-nums;
 		color: var(--m-fg-subtle);
 		opacity: 0;
@@ -5792,7 +5078,7 @@
 	}
 	.row:hover .row-time,
 	.row-label:focus-within .row-time {
-		opacity: 0.75;
+		opacity: 1;
 	}
 	.row-actions {
 		display: inline-flex;
@@ -5812,26 +5098,45 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		padding: 2px;
+		padding: 0;
 		border: none;
-		border-radius: 4px;
+		border-radius: var(--m-radius-sm);
 		background: transparent;
 		color: var(--m-fg-subtle);
 		cursor: pointer;
 		line-height: 0;
+		width: 18px;
+		height: 16px;
 	}
 	.row-action:hover {
-		background: var(--m-bg-overlay);
+		background: var(--m-bg-3);
 		color: var(--m-fg);
 	}
 	.bubble {
-		font-size: 13px;
+		font-size: var(--m-text-md);
 		line-height: 1.5;
 		white-space: pre-wrap;
 		word-break: break-word;
-		background: var(--m-bg-overlay);
-		border-radius: 6px;
-		padding: 8px 10px;
+		background: var(--m-bg-2);
+		border-radius: var(--m-radius-md);
+		padding: var(--m-space-2) var(--m-space-3);
+	}
+	/* Message prose reads a step larger than the chrome around it.
+	   `.markdown-body` carries its own line-height, hence the second
+	   rule. */
+	.assistant-bubble,
+	.user-md {
+		font-size: var(--m-text-prose);
+		line-height: 1.55;
+	}
+	.assistant-bubble :global(.markdown-body),
+	.user-md :global(.markdown-body) {
+		line-height: inherit;
+	}
+	/* Fenced code stays at its size from before the prose grew. */
+	.assistant-bubble :global(.markdown-body pre),
+	.user-md :global(.markdown-body pre) {
+		font-size: var(--m-text-sm);
 	}
 	/* Assistant replies render through `CoderMarkdown`, which emits
 	   real block-level HTML. `pre-wrap` on the bubble would
@@ -5841,38 +5146,31 @@
 	.assistant-bubble {
 		position: relative;
 		white-space: normal;
+		background: transparent;
+		border-radius: 0;
+		padding: 0;
 	}
-	/* Hover-revealed "Copy markdown" button anchored to the bubble's
-	   top-right corner. Stays out of the visual flow until the user
-	   actually hovers the bubble; positioned above the markdown
-	   article so it doesn't displace text. The fenced-code "Copy"
+	/* Hover-revealed "Copy markdown" button. Hangs under the reply's
+	   right end, in the gap to the next block and level with the
+	   meta line, so it covers no text. The fenced-code "Copy"
 	   buttons (`.md-copy-code` in `styles.css`) live inside each
-	   `<pre>` block separately, so the two affordances coexist
-	   without overlap when a code block sits at the very top of a
-	   reply. */
+	   `<pre>` block separately. */
 	.assistant-bubble .copy-md {
 		position: absolute;
-		top: 6px;
-		right: 6px;
-		padding: 2px 8px;
+		top: 100%;
+		right: 0;
+		padding: 0 var(--m-space-1);
 		font: inherit;
-		font-size: 11px;
-		color: var(--m-fg-muted);
-		/* Solid panel-elevation fill so the label doesn't bleed
-		   through the markdown text under the button. The bubble
-		   itself is `--m-bg-overlay` (a near-transparent rgba),
-		   so reusing it here would render the button see-through;
-		   `--m-bg-1` is the next elevation step and gives the
-		   button a clear plate against the bubble. */
-		background: var(--m-bg-1);
-		border: 1px solid var(--m-border);
-		border-radius: 3px;
+		font-size: var(--m-text-xs);
+		color: var(--m-fg-subtle);
+		background: transparent;
+		border: none;
+		border-radius: var(--m-radius-sm);
 		cursor: pointer;
 		opacity: 0;
-		transition:
-			opacity 120ms ease,
-			color 120ms ease,
-			border-color 120ms ease;
+		transition: opacity 120ms ease;
+		height: 16px;
+		line-height: 16px;
 	}
 	.assistant-bubble:hover .copy-md,
 	.assistant-bubble .copy-md:focus-visible {
@@ -5880,10 +5178,12 @@
 	}
 	.assistant-bubble .copy-md:hover {
 		color: var(--m-fg);
-		border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
+		background: var(--m-bg-3);
 	}
 	.row.user .bubble {
-		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+		background: var(--m-bg-3);
+		border-radius: var(--m-radius-lg);
+		max-width: 85%;
 	}
 	/* Markdown-rendered user bubbles: same
 	   `pre-wrap` opt-out as `.assistant-bubble` — the markdown
@@ -5903,82 +5203,84 @@
 		opacity: 0.55;
 	}
 	.row.user.queued .bubble {
-		background: color-mix(in srgb, var(--m-accent) 8%, transparent);
-		border: 1px dashed color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
-		padding: 7px 9px;
+		background: transparent;
+		border: 1px dashed var(--m-border-strong);
+		padding: 7px 11px;
 	}
 	.queued-tag {
-		margin-left: 6px;
-		padding: 1px 6px;
-		border-radius: 999px;
-		font-size: 9px;
-		letter-spacing: 0.04em;
-		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
-		color: var(--m-fg-muted);
-		text-transform: none;
+		margin-left: 0;
+		padding: 0 6px;
+		border-radius: var(--m-radius-pill);
+		font-size: var(--m-text-xs);
+		background: var(--m-accent-tint);
+		color: var(--m-accent);
 		font-weight: 500;
+		line-height: 16px;
 	}
 	/* Coordinator-sent message into a worker (ADR 0043 keeps the
 	   worker hooked up while the user can also message it, so the
-	   label distinguishes who is speaking). Accent pill in place
-	   of the "you" label, plus a faint accent tint on the bubble. */
+	   label distinguishes who is speaking). Accent pill on the
+	   meta line, plus a faint accent tint on the bubble. */
 	.coordinator-tag {
-		padding: 1px 6px;
-		border-radius: 999px;
-		font-size: 9px;
-		font-weight: 600;
-		letter-spacing: 0.06em;
-		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
+		padding: 0 6px;
+		border-radius: var(--m-radius-pill);
+		font-size: var(--m-text-xs);
+		font-weight: 500;
+		background: var(--m-accent-tint);
 		color: var(--m-accent);
+		line-height: 16px;
 	}
 	.row.subagent-report summary {
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-2);
 		cursor: pointer;
-		font-size: 11px;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-muted);
+		min-height: 26px;
 	}
 	.subagent-report-tag {
-		padding: 1px 6px;
-		border-radius: 999px;
-		font-size: 9px;
-		font-weight: 600;
-		letter-spacing: 0.06em;
-		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
+		padding: 0 6px;
+		border-radius: var(--m-radius-pill);
+		font-size: var(--m-text-xs);
+		font-weight: 500;
+		background: var(--m-accent-tint);
 		color: var(--m-accent);
+		line-height: 16px;
 	}
 	.subagent-report-tag.error {
-		background: color-mix(in srgb, var(--m-danger) 22%, transparent);
+		background: color-mix(in srgb, var(--m-danger) 16%, transparent);
 		color: var(--m-danger);
 	}
 	.subagent-report-id {
 		font-family: var(--m-font-mono, ui-monospace, monospace);
 		color: var(--m-fg-subtle);
+		font-size: var(--m-text-xs);
 	}
 	.row.subagent-report .bubble {
 		margin-top: 4px;
 	}
 	.background-process-output {
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		white-space: pre-wrap;
 		max-height: 320px;
 		overflow: auto;
+		background: var(--m-bg);
 	}
 	.row.user.from-coordinator .bubble {
-		background: color-mix(in srgb, var(--m-accent) 6%, transparent);
-		border-left: 2px solid color-mix(in srgb, var(--m-accent) 45%, var(--m-border));
+		background: var(--m-accent-tint);
 	}
 	.queued-go-now {
-		margin-left: 4px;
+		margin-left: 0;
 		font: inherit;
-		font-size: 9px;
+		font-size: var(--m-text-xs);
 		font-weight: 600;
 		color: var(--m-accent);
 		background: transparent;
 		border: 0;
-		padding: 1px 4px;
+		padding: 0 var(--m-space-1);
+		border-radius: var(--m-radius-sm);
 		cursor: pointer;
 
 		&:hover {
@@ -5988,13 +5290,14 @@
 	.pending-revert-bar {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		margin: 6px 0;
-		padding: 6px 10px;
-		border: 1px solid var(--m-warning, #d4a017);
-		border-radius: 6px;
-		color: var(--m-warning, #d4a017);
-		font-size: 12px;
+		gap: var(--m-space-2);
+		margin: 0;
+		padding: 6px var(--m-space-3);
+		border: none;
+		border-radius: var(--m-radius-md);
+		color: var(--m-warning);
+		font-size: var(--m-text-sm);
+		background: color-mix(in srgb, var(--m-warning) 12%, transparent);
 	}
 	/* Preview of what an uncommitted edit-and-resend would drop. */
 	.row-wrap.doomed {
@@ -6004,28 +5307,36 @@
 	.relaunch-bar {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		margin: 6px 0;
-		padding: 6px 10px;
-		border: 1px solid var(--m-warning, #d4a017);
-		border-radius: 6px;
-		color: var(--m-warning, #d4a017);
-		font-size: 12px;
+		gap: var(--m-space-2);
+		margin: 0;
+		padding: 6px var(--m-space-3);
+		border: none;
+		border-radius: var(--m-radius-md);
+		color: var(--m-warning);
+		font-size: var(--m-text-sm);
+		background: color-mix(in srgb, var(--m-warning) 12%, transparent);
 	}
 	.error-retry {
-		margin-left: 6px;
+		margin-left: var(--m-space-1);
 		font: inherit;
-		font-size: 9px;
+		font-size: var(--m-text-xs);
 		font-weight: 600;
 		color: var(--m-accent);
-		background: transparent;
+		background: var(--m-accent-tint);
 		border: 0;
-		padding: 1px 4px;
+		height: 20px;
+		padding: 0 var(--m-space-2);
+		border-radius: var(--m-radius-sm);
 		cursor: pointer;
 
 		&:hover {
 			color: var(--m-fg);
 		}
+	}
+	.pending-revert-bar .error-retry,
+	.relaunch-bar .error-retry {
+		margin-left: auto;
+		flex-shrink: 0;
 	}
 	/* Inline references attached to a user message. Sit just below
 	   the prose bubble and read as quiet "links" rather than
@@ -6035,26 +5346,27 @@
 	.user-refs {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 4px;
+		gap: var(--m-space-1);
+		justify-content: flex-end;
 	}
 	.user-ref {
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		padding: 2px 6px;
-		background: var(--m-bg-overlay);
+		gap: var(--m-space-1);
+		padding: 0 var(--m-space-2);
+		background: var(--m-bg-2);
 		color: var(--m-fg-muted);
-		border: 1px solid var(--m-border);
-		border-radius: 10px;
+		border: none;
+		border-radius: var(--m-radius-pill);
 		cursor: pointer;
 		max-width: 100%;
+		height: 22px;
 	}
 	.user-ref:hover {
 		color: var(--m-fg);
-		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
-		border-color: color-mix(in srgb, var(--m-accent) 40%, var(--m-border));
+		background: var(--m-bg-3);
 	}
 	.user-ref-label {
 		display: inline-flex;
@@ -6072,15 +5384,14 @@
 		flex-shrink: 0;
 	}
 	.row.error .bubble {
-		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
+		background: color-mix(in srgb, var(--m-danger) 12%, transparent);
 		color: var(--m-danger);
 	}
 	.row.error .error-card {
 		display: flex;
 		flex-direction: column;
-		gap: 6px;
+		gap: var(--m-space-2);
 		color: var(--m-fg);
-		border-left: 3px solid var(--m-danger);
 	}
 	.error-card-head {
 		display: flex;
@@ -6090,9 +5401,9 @@
 	}
 	.error-status {
 		flex-shrink: 0;
-		padding: 0 5px;
-		border-radius: 3px;
-		font-size: 11px;
+		padding: 0 6px;
+		border-radius: var(--m-radius-sm);
+		font-size: var(--m-text-xs);
 		font-weight: 600;
 		font-variant-numeric: tabular-nums;
 		color: var(--m-bg);
@@ -6108,11 +5419,11 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.error-prefix {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
 	}
 	.error-message {
@@ -6120,7 +5431,7 @@
 		overflow-wrap: anywhere;
 	}
 	.error-hint {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-muted);
 	}
 	.error-meta {
@@ -6128,7 +5439,7 @@
 		flex-wrap: wrap;
 		align-items: center;
 		gap: 4px 10px;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 
 		& code {
@@ -6141,7 +5452,7 @@
 		margin-left: auto;
 	}
 	.error-raw {
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 
 		& summary {
@@ -6161,9 +5472,10 @@
 		}
 	}
 	.row.compaction .bubble {
-		background: var(--m-bg-overlay);
-		color: var(--m-fg-muted);
-		font-style: italic;
+		background: transparent;
+		color: var(--m-fg-subtle);
+		padding: 0;
+		font-size: var(--m-text-sm);
 	}
 	.row.compaction.running .bubble {
 		animation: compaction-pulse 1.6s ease-in-out infinite;
@@ -6178,64 +5490,105 @@
 		}
 	}
 	.compaction-details {
-		font-size: 12px;
-		background: var(--m-bg-overlay);
-		border-radius: 6px;
-		padding: 6px 8px;
-		color: var(--m-fg-muted);
+		font-size: var(--m-text-sm);
+		background: transparent;
+		border-radius: var(--m-radius-md);
+		padding: 0;
+		color: var(--m-fg-subtle);
 	}
 	.compaction-details summary {
 		cursor: pointer;
-		color: var(--m-fg-muted);
+		color: var(--m-fg-subtle);
+		min-height: 26px;
+		display: flex;
+		align-items: center;
 	}
 	.compaction-details[open] summary {
-		margin-bottom: 6px;
+		margin-bottom: 0;
+	}
+	.compaction-details[open] {
+		background: var(--m-bg-2);
+		padding: 0 var(--m-space-3) var(--m-space-3);
+		color: var(--m-fg-muted);
+	}
+	/* Tool rows bleed one step into the transcript's padding, so the
+	   status dot lines up with the prose and the hover surface has
+	   room around the text. */
+	.row.tool {
+		margin: 0 calc(-1 * var(--m-space-2));
 	}
 	.row.tool details {
-		font-size: 12px;
-		background: var(--m-bg-overlay);
-		border-radius: 6px;
-		padding: 4px 8px;
+		font-size: var(--m-text-sm);
+		background: transparent;
+		border-radius: var(--m-radius-md);
+		padding: 0 var(--m-space-2);
 	}
-	/* `ask_user` renders an always-open prompt (no `<details>`,
-	   no heavy box) so it flows in the transcript like an assistant
-	   message rather than a collapsed tool row. Just a thin header
-	   line for identity, then the free-flowing form below. */
+	/* `ask_user` renders an always-open prompt (no `<details>`): the
+	   one tool row that is a card, because it is waiting on the
+	   user. A thin header line for identity, then the form. */
 	.row.tool.ask-user {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
+		margin: 0;
+		padding: var(--m-space-1) var(--m-space-3) var(--m-space-3);
+		background: var(--m-bg-2);
+		border-radius: var(--m-radius-lg);
 	}
 	.row.tool.ask-user .ask-user-header {
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-2);
 		color: var(--m-fg-muted);
-		min-height: 18px;
+		min-height: 26px;
 		line-height: 1.2;
+		padding: 0;
 	}
 	.row.tool details[open] {
-		padding: 6px 8px;
+		padding: 0 var(--m-space-2) var(--m-space-2);
+		background: var(--m-bg-2);
 	}
 	.row.tool.err details {
-		background: color-mix(in srgb, var(--m-danger) 12%, transparent);
+		background: transparent;
 	}
 	.row.tool summary {
 		cursor: pointer;
 		color: var(--m-fg-muted);
 		display: flex;
 		align-items: center;
-		gap: 6px;
-		min-height: 18px;
+		gap: var(--m-space-2);
+		min-height: 26px;
 		line-height: 1.2;
+		margin: 0 calc(-1 * var(--m-space-2));
+		padding: 0 var(--m-space-2);
+		border-radius: var(--m-radius-md);
 	}
-	/* Status dot: a 7px circle that flips colour with the tool's
+	.row.tool summary::-webkit-details-marker {
+		display: none;
+	}
+	.row.tool summary:hover {
+		background: var(--m-bg-2);
+	}
+	.row.tool summary:hover .tool-name,
+	.row.tool details[open] .tool-name {
+		color: var(--m-fg);
+	}
+	.row.tool details[open] > summary {
+		margin-bottom: var(--m-space-1);
+	}
+	/* A failed call is told by its dot and status word, not by a red
+	   slab across the transcript. */
+	.row.tool.err .tool-status,
+	.tool-group-summary.err .tool-status {
+		color: var(--m-danger);
+	}
+	/* Status dot: a small circle that flips colour with the tool's
 	   state — accent while the call is in flight, danger on
 	   error, otherwise a calm subtle fill. Reads as the row's
 	   primary identity at a glance, so the eye can scan a
 	   stack of tool rows by colour without parsing the words. */
 	.row.tool .tool-dot {
 		flex: 0 0 auto;
-		width: 7px;
-		height: 7px;
+		width: 6px;
+		height: 6px;
 		border-radius: 50%;
 		background: var(--m-fg-subtle);
 	}
@@ -6248,7 +5601,7 @@
 	}
 	.row.tool .tool-name {
 		flex: 0 0 auto;
-		color: var(--m-fg);
+		color: var(--m-fg-muted);
 		font-weight: 500;
 	}
 	/* Identifying-argument chip between the tool name and the
@@ -6265,8 +5618,8 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
-		color: var(--m-fg-muted);
+		font-size: var(--m-text-xs);
+		color: var(--m-fg-subtle);
 	}
 	/* Latest line of a running command's live output. Shares the
 	   row's flexible width with the hint; tinted so it reads as
@@ -6278,12 +5631,15 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 		font-style: italic;
 	}
 	.row.tool .tool-status {
 		flex: 0 0 auto;
+		color: var(--m-fg-subtle);
+		font-size: var(--m-text-xs);
+		margin-left: auto;
 	}
 	/* Tabular numerics on the elapsed counter so the trailing
 	   digits don't shift the layout while a running tool ticks
@@ -6293,7 +5649,7 @@
 	.row.tool .tool-elapsed {
 		flex: 0 0 auto;
 		color: var(--m-fg-subtle);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		font-variant-numeric: tabular-nums;
 	}
 	.row.tool .tool-elapsed.running {
@@ -6302,17 +5658,18 @@
 	/* Folded run of file / bash calls: one summary line shaped like
 	   a collapsed tool row; the member rows render below when open. */
 	.tool-group {
-		font-size: 12px;
-		background: var(--m-bg-overlay);
-		border-radius: 6px;
+		font-size: var(--m-text-sm);
+		background: transparent;
+		border-radius: var(--m-radius-md);
+		margin: 0 calc(-1 * var(--m-space-2));
 	}
 	.tool-group-summary {
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--m-space-2);
 		width: 100%;
 		min-height: 26px;
-		padding: 4px 8px;
+		padding: 0 var(--m-space-2);
 		border: none;
 		background: none;
 		color: var(--m-fg-muted);
@@ -6320,15 +5677,35 @@
 		line-height: 1.2;
 		text-align: left;
 		cursor: pointer;
+		border-radius: var(--m-radius-md);
+	}
+	.tool-group-summary:hover,
+	.tool-group.open {
+		background: var(--m-bg-2);
+	}
+	.tool-group-summary:hover .tool-name,
+	.tool-group.open > .tool-group-summary .tool-name {
+		color: var(--m-fg);
+	}
+	.tool-group-chevron {
+		color: var(--m-fg-subtle);
+	}
+	/* Inside an expanded group the surface is already raised, so the
+	   member rows step up once more. */
+	.tool-group-rows .row.tool {
+		margin: 0;
+	}
+	.tool-group-rows .row.tool summary:hover,
+	.tool-group-rows .row.tool details[open] {
+		background: var(--m-bg-3);
 	}
 	.tool-group-summary.err {
-		background: color-mix(in srgb, var(--m-danger) 12%, transparent);
-		border-radius: 6px;
+		background: none;
 	}
 	.tool-group .tool-dot {
 		flex: 0 0 auto;
-		width: 7px;
-		height: 7px;
+		width: 6px;
+		height: 6px;
 		border-radius: 50%;
 		background: var(--m-fg-subtle);
 	}
@@ -6340,7 +5717,7 @@
 	}
 	.tool-group-summary .tool-name {
 		flex: 0 0 auto;
-		color: var(--m-fg);
+		color: var(--m-fg-muted);
 		font-weight: 500;
 	}
 	.tool-group-summary .tool-hint {
@@ -6350,17 +5727,26 @@
 		white-space: nowrap;
 		text-overflow: ellipsis;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
+		color: var(--m-fg-subtle);
 	}
 	.tool-group-summary .tool-status,
 	.tool-group-diff,
 	.tool-group-chevron {
 		flex: 0 0 auto;
 	}
+	.tool-group-summary .tool-status {
+		margin-left: auto;
+		color: var(--m-fg-subtle);
+		font-size: var(--m-text-xs);
+	}
+	.tool-group-chevron {
+		display: inline-flex;
+	}
 	.tool-group-summary .tool-elapsed {
 		flex: 0 0 auto;
 		color: var(--m-fg-subtle);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		font-variant-numeric: tabular-nums;
 	}
 	.tool-group-summary .tool-elapsed.running {
@@ -6369,7 +5755,7 @@
 	.tool-group-diff,
 	.tool-group-files {
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.tool-group .add {
 		color: var(--m-success);
@@ -6380,12 +5766,12 @@
 	.tool-group-files {
 		list-style: none;
 		margin: 0;
-		padding: 2px 8px 6px 21px;
+		padding: 2px var(--m-space-2) 6px 22px;
 		color: var(--m-fg-muted);
 	}
 	.tool-group-files li {
 		display: flex;
-		gap: 6px;
+		gap: var(--m-space-2);
 	}
 	.tool-group-file {
 		min-width: 0;
@@ -6401,25 +5787,23 @@
 	.tool-group-rows {
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
-		padding: 0 6px 6px;
+		gap: 0;
+		padding: 0 var(--m-space-2) var(--m-space-1);
 	}
 	.row.tool .block-label {
-		margin-top: 6px;
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
+		margin-top: var(--m-space-2);
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.row.tool .block {
 		background: var(--m-bg);
 		color: var(--m-fg);
-		border-radius: 4px;
-		padding: 6px 8px;
+		border-radius: var(--m-radius-md);
+		padding: var(--m-space-2) var(--m-space-3);
 		max-height: 240px;
 		overflow: auto;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 		margin: 4px 0 0;
 		white-space: pre-wrap;
@@ -6434,18 +5818,18 @@
 	.row.tool .bash-block {
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
-		margin-top: 4px;
+		gap: var(--m-space-1);
+		margin-top: 0;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 	}
 	.row.tool .bash-cmd {
 		display: flex;
-		gap: 6px;
+		gap: var(--m-space-2);
 		background: var(--m-bg);
-		border-radius: 4px;
-		padding: 6px 8px;
+		border-radius: var(--m-radius-md);
+		padding: var(--m-space-2) var(--m-space-3);
 		white-space: pre-wrap;
 		word-break: break-word;
 	}
@@ -6461,8 +5845,8 @@
 	.row.tool .bash-stream {
 		background: var(--m-bg);
 		color: var(--m-fg);
-		border-radius: 4px;
-		padding: 6px 8px;
+		border-radius: var(--m-radius-md);
+		padding: var(--m-space-2) var(--m-space-3);
 		max-height: 240px;
 		overflow: auto;
 		margin: 0;
@@ -6479,18 +5863,15 @@
 		color: var(--m-danger);
 	}
 	.row.tool .bash-exit {
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
+		padding: 0 var(--m-space-1);
 	}
 	.row.tool .bash-exit.err {
 		color: var(--m-danger);
 	}
 	.row.tool .bash-target {
 		color: var(--m-fg-subtle);
-		text-transform: none;
-		letter-spacing: 0;
 	}
 	/* Collapsed sub-agent card. Renders inline under the parent's
 	   `task` tool row. Reads as a clickable "pop out"
@@ -6500,34 +5881,34 @@
 		appearance: none;
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
-		margin-top: 6px;
-		padding: 8px 10px;
-		background: var(--m-bg-overlay);
-		border: 1px solid var(--m-border);
-		border-radius: 6px;
+		gap: var(--m-space-1);
+		margin-top: 2px;
+		padding: var(--m-space-2) var(--m-space-3);
+		background: var(--m-bg-2);
+		border: 1px solid transparent;
+		border-radius: var(--m-radius-md);
 		color: var(--m-fg);
 		text-align: left;
 		font: inherit;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		cursor: pointer;
 	}
 	.subagent-card:hover {
-		background: var(--m-bg-2);
-		border-color: var(--m-border-strong, var(--m-border));
+		background: var(--m-bg-3);
+		border-color: transparent;
 	}
 	.subagent-card.running {
-		border-style: dashed;
+		border-color: color-mix(in srgb, var(--m-accent) 40%, transparent);
 	}
 	.subagent-card.err {
-		border-color: var(--m-danger);
+		border-color: transparent;
 		background: color-mix(in srgb, var(--m-danger) 10%, transparent);
 	}
 	.subagent-card-header {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		font-size: 11px;
+		gap: var(--m-space-2);
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-muted);
 	}
 	.subagent-folder {
@@ -6541,37 +5922,33 @@
 		white-space: nowrap;
 	}
 	.subagent-status {
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
+		font-size: var(--m-text-xs);
 	}
-	/* Mode pill: `agent` keeps the accent fill (full toolkit, can
-	   edit), `research` flips to a quieter neutral fill so the
-	   read-only constraint is visually distinct. Same shape as
-	   the SCM panel's changes badge for visual continuity. */
+	/* Mode pill: `agent` takes the accent tint (full toolkit, can
+	   edit), `research` a neutral fill so the read-only constraint
+	   is visually distinct. */
 	.subagent-mode {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
 		min-width: 0;
-		padding: 1px 6px;
-		border-radius: 999px;
-		background: var(--m-accent);
-		color: var(--m-bg);
-		font-size: 10px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
+		padding: 0 6px;
+		border-radius: var(--m-radius-pill);
+		background: var(--m-accent-tint);
+		color: var(--m-accent);
+		font-size: var(--m-text-xs);
+		font-weight: 500;
 		flex-shrink: 0;
+		line-height: 16px;
 	}
 	.subagent-mode.research {
-		background: var(--m-bg-3, var(--m-bg-2));
+		background: var(--m-bg-3);
 		color: var(--m-fg-muted);
 	}
 	.subagent-preview {
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		line-height: 1.4;
-		color: var(--m-fg);
+		color: var(--m-fg-muted);
 		display: -webkit-box;
 		-webkit-line-clamp: 2;
 		line-clamp: 2;
@@ -6582,7 +5959,7 @@
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		font-size: 10px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.subagent-open {
@@ -6591,19 +5968,19 @@
 	}
 	.tool-open-worker {
 		flex: 0 0 auto;
-		padding: 0 6px;
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		background: transparent;
+		padding: 0 var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: var(--m-bg-3);
 		color: var(--m-fg-muted);
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		white-space: nowrap;
 		cursor: pointer;
+		height: 20px;
 	}
 	.tool-open-worker:hover {
-		color: var(--m-fg);
-		border-color: var(--m-accent);
+		color: var(--m-accent);
 	}
 	/* Pre-first-round-trip placeholder — keeps the footer at a
 	   stable height while the sub-agent's first `token_usage`
@@ -6612,36 +5989,66 @@
 		opacity: 0.5;
 	}
 	.composer {
-		flex-shrink: 0;
-		border-top: 1px solid var(--m-border);
-		padding: 8px;
+		padding: 0 max(var(--m-space-3), calc((100% - var(--coder-reading-width)) / 2)) var(--m-space-3);
 		display: flex;
 		flex-direction: column;
-		gap: 6px;
+		gap: var(--m-space-2);
 		position: relative;
+		grid-row: 5;
+		grid-column: 1 / -1;
+	}
+	/* The prompt and its action row share one rounded box; the border
+	   is the box's, so focus lights the whole control. */
+	.composer-box {
+		display: flex;
+		flex-direction: column;
+		background: var(--m-bg-2);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-lg);
+		transition: border-color 120ms ease;
+	}
+	.composer-box:hover {
+		border-color: var(--m-border-strong);
+	}
+	.composer-box:focus-within {
+		border-color: var(--m-accent);
+	}
+	/* Same fade as under the header, for the transcript's lower edge. */
+	.composer::before {
+		content: '';
+		position: absolute;
+		bottom: 100%;
+		left: 0;
+		right: 0;
+		height: var(--m-space-3);
+		background: linear-gradient(transparent, var(--m-bg-1));
+		pointer-events: none;
+		z-index: 1;
 	}
 	.background-strip {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
-		gap: 4px;
-		font-size: 11px;
+		gap: var(--m-space-1);
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.background-item {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
+		gap: var(--m-space-1);
 		max-width: 240px;
-		padding: 1px 2px 1px 6px;
-		border: 1px solid var(--m-border);
-		border-radius: 999px;
+		padding: 0 2px 0 var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-pill);
 		color: var(--m-fg-muted);
+		height: 22px;
+		background: var(--m-bg-2);
 	}
 	.background-open {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
+		gap: 6px;
 		min-width: 0;
 		padding: 0;
 		border: none;
@@ -6689,24 +6096,33 @@
 		color: var(--m-fg-subtle);
 		font: inherit;
 		cursor: pointer;
-		border-radius: 999px;
+		border-radius: var(--m-radius-pill);
 	}
 	.background-stop {
-		padding: 0 5px;
+		display: inline-flex;
+		align-items: center;
+		align-self: center;
+		padding: 0;
+		justify-content: center;
+		width: 18px;
+		height: 18px;
 	}
 	.background-stop-all {
-		padding: 1px 6px;
+		padding: 0 var(--m-space-2);
+		height: 22px;
 	}
 	.background-stop:hover,
 	.background-stop-all:hover {
 		color: var(--m-danger);
-		background: var(--m-bg-2);
+		background: var(--m-bg-3);
 	}
 	.composer-meta {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		margin-top: -2px;
+		gap: 2px;
+		padding: 0 6px 6px;
+		flex-wrap: wrap;
+		row-gap: 2px;
 	}
 	.composer-meta .reasoning-pick {
 		margin-left: auto;
@@ -6717,26 +6133,30 @@
 		white-space: nowrap;
 		display: inline-flex;
 		align-items: center;
-		gap: 5px;
-		padding: 1px 6px;
+		gap: 6px;
+		padding: 0 6px;
 		background: transparent;
-		color: var(--m-fg-subtle);
-		border: 1px solid transparent;
-		border-radius: 4px;
+		color: var(--m-fg-muted);
+		border: none;
+		border-radius: var(--m-radius-md);
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-sm);
 		cursor: pointer;
+		height: var(--m-icon-btn);
+		min-width: var(--m-icon-btn);
+		justify-content: center;
 	}
 	.voice:hover:not(:disabled) {
-		color: var(--m-accent);
+		color: var(--m-fg);
+		background: var(--m-bg-3);
 	}
 	.voice:disabled {
 		cursor: progress;
 	}
 	.voice.recording {
 		color: var(--m-danger);
-		border-color: var(--m-danger);
 		animation: voice-pulse 1.2s ease-in-out infinite;
+		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
 	}
 	@keyframes voice-pulse {
 		50% {
@@ -6748,49 +6168,51 @@
 		white-space: nowrap;
 		display: inline-flex;
 		align-items: center;
-		gap: 5px;
-		padding: 1px 6px;
+		gap: 6px;
+		padding: 0 var(--m-space-2);
 		background: transparent;
-		color: var(--m-fg-subtle);
-		border: 1px solid transparent;
-		border-radius: 4px;
+		color: var(--m-fg-muted);
+		border: none;
+		border-radius: var(--m-radius-md);
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-sm);
 		cursor: pointer;
+		height: var(--m-icon-btn);
 	}
 	.ship-it:hover {
-		color: var(--m-accent);
-		border-color: color-mix(in srgb, var(--m-accent) 40%, transparent);
+		color: var(--m-fg);
+		background: var(--m-bg-3);
 	}
 	.reasoning-pick {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		font-size: 11px;
+		gap: var(--m-space-1);
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-subtle);
 	}
 	.reasoning-button {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
+		gap: var(--m-space-1);
 		min-width: 0;
 		max-width: 100%;
 		white-space: nowrap;
 		background: transparent;
 		color: var(--m-fg-muted);
-		border: 1px solid transparent;
-		border-radius: 4px;
+		border: none;
+		border-radius: var(--m-radius-md);
 		font: inherit;
-		padding: 1px 4px;
+		padding: 0 var(--m-space-2);
 		cursor: pointer;
+		height: var(--m-icon-btn);
 	}
 	.reasoning-button:hover,
 	.reasoning-button[aria-expanded='true'] {
-		border-color: var(--m-border);
 		color: var(--m-fg);
+		background: var(--m-bg-3);
 	}
 	.reasoning-caret {
-		font-size: 9px;
+		display: inline-flex;
 	}
 	.reasoning-sep {
 		color: var(--m-fg-subtle);
@@ -6811,43 +6233,45 @@
 	}
 	.mention-menu {
 		position: absolute;
-		left: 8px;
-		right: 8px;
-		bottom: calc(100% - 8px);
+		left: max(var(--m-space-3), calc((100% - var(--coder-reading-width)) / 2));
+		right: max(var(--m-space-3), calc((100% - var(--coder-reading-width)) / 2));
+		bottom: calc(100% + var(--m-space-1));
 		max-height: 240px;
 		overflow-y: auto;
 		background: var(--m-bg-2);
 		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		box-shadow: 0 4px 12px rgb(0 0 0 / 18%);
+		border-radius: var(--m-radius-lg);
+		box-shadow: var(--m-shadow-pop);
 		z-index: 10;
 		display: flex;
 		flex-direction: column;
-		padding: 4px;
+		padding: var(--m-space-1);
 		gap: 1px;
 	}
 	.mention-hint {
-		padding: 6px 8px;
-		font-size: 11px;
+		padding: 6px var(--m-space-2);
+		font-size: var(--m-text-sm);
 		color: var(--m-fg-muted);
 	}
 	.mention-row {
 		display: flex;
-		align-items: baseline;
-		gap: 8px;
-		padding: 4px 8px;
+		align-items: center;
+		gap: var(--m-space-2);
+		padding: 0 var(--m-space-2);
 		background: transparent;
 		border: 0;
-		border-radius: 3px;
+		border-radius: var(--m-radius-md);
 		color: var(--m-fg);
 		font: inherit;
-		font-size: 12px;
+		font-size: var(--m-text-sm);
 		cursor: pointer;
 		text-align: left;
 		min-width: 0;
+		min-height: 26px;
+		flex-shrink: 0;
 	}
 	.mention-row.active {
-		background: color-mix(in srgb, var(--m-accent) 18%, transparent);
+		background: var(--m-bg-3);
 	}
 	.mention-name {
 		flex-shrink: 0;
@@ -6855,7 +6279,7 @@
 	}
 	.mention-path {
 		color: var(--m-fg-muted);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -6864,25 +6288,27 @@
 	.attachments {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 4px;
+		gap: var(--m-space-1);
 	}
 	.attachment {
 		display: inline-flex;
 		align-items: stretch;
-		font-size: 11px;
-		background: var(--m-bg-overlay);
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
+		font-size: var(--m-text-xs);
+		background: var(--m-bg-2);
+		border: none;
+		border-radius: var(--m-radius-md);
 		max-width: 100%;
 		min-width: 0;
+		overflow: hidden;
+		min-height: 22px;
 	}
 	.attachment-open {
 		font: inherit;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		padding: 2px 4px 2px 6px;
+		gap: var(--m-space-1);
+		padding: 0 var(--m-space-1) 0 var(--m-space-2);
 		background: transparent;
 		border: 0;
 		color: var(--m-fg);
@@ -6891,7 +6317,7 @@
 		max-width: 220px;
 	}
 	.attachment-open:hover {
-		background: color-mix(in srgb, var(--m-accent) 14%, transparent);
+		background: var(--m-bg-3);
 	}
 	.attachment-label {
 		display: inline-flex;
@@ -6909,19 +6335,20 @@
 		flex-shrink: 0;
 	}
 	.attachment-remove {
+		display: inline-flex;
+		align-items: center;
 		font: inherit;
 		font-size: 13px;
 		line-height: 1;
-		color: var(--m-fg-muted);
+		color: var(--m-fg-subtle);
 		background: transparent;
 		border: 0;
-		border-left: 1px solid var(--m-border);
 		padding: 0 6px;
 		cursor: pointer;
 	}
 	.attachment-remove:hover {
-		color: var(--m-fg);
-		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
+		color: var(--m-danger);
+		background: var(--m-bg-3);
 	}
 	.attachment-image {
 		cursor: default;
@@ -6931,29 +6358,31 @@
 		width: 28px;
 		height: 28px;
 		object-fit: cover;
-		border-radius: 3px;
+		border-radius: var(--m-radius-sm);
 		flex-shrink: 0;
+		margin: 2px 0;
 	}
 	.attachment-terminal {
 		cursor: default;
 	}
 	.attachment-terminal-glyph {
-		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		font-family: var(--m-font-mono);
 		color: var(--m-fg-muted);
 		flex-shrink: 0;
 	}
 	.user-images {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 6px;
-		margin-top: 4px;
+		gap: var(--m-space-2);
+		margin-top: 0;
+		justify-content: flex-end;
 	}
 	.user-image {
 		display: inline-block;
 		max-width: 320px;
 		padding: 0;
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
+		border: none;
+		border-radius: var(--m-radius-md);
 		overflow: hidden;
 		background: none;
 		cursor: zoom-in;
@@ -6968,20 +6397,20 @@
 		width: 100%;
 		box-sizing: border-box;
 		resize: vertical;
-		min-height: 64px;
+		min-height: 56px;
 		max-height: 240px;
 		font: inherit;
-		font-size: 13px;
-		line-height: 1.4;
+		font-size: var(--m-text-prose);
+		line-height: 1.45;
 		color: var(--m-fg);
-		background: var(--m-bg);
-		border: 1px solid var(--m-border);
-		border-radius: 4px;
-		padding: 8px 10px;
+		background: transparent;
+		border: none;
+		border-radius: var(--m-radius-lg);
+		padding: 10px var(--m-space-3) var(--m-space-1);
+		display: block;
 	}
 	textarea:focus {
 		outline: none;
-		border-color: var(--m-accent);
 	}
 	textarea:disabled {
 		opacity: 0.7;

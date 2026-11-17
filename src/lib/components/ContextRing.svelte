@@ -196,7 +196,7 @@
 	.cache-tell {
 		font-size: 9px;
 		line-height: 1;
-		color: var(--m-fg-muted, #9aa3b9);
+		color: var(--m-fg-muted);
 		white-space: nowrap;
 	}
 	.track {
@@ -208,16 +208,16 @@
 	   the splash) — those values were what the old `--text-muted`
 	   alias was implicitly resolving to via the fallback. */
 	.tone-idle {
-		color: var(--m-fg-muted, #9aa3b9);
+		color: var(--m-fg-muted);
 	}
 	.tone-muted {
-		color: var(--m-fg-muted, #9aa3b9);
+		color: var(--m-fg-muted);
 	}
 	.tone-warning {
-		color: var(--m-warning, #d4a017);
+		color: var(--m-warning);
 	}
 	.tone-danger {
-		color: var(--m-danger, #c62828);
+		color: var(--m-danger);
 	}
 	.pulse {
 		animation: ring-pulse 1.6s ease-in-out infinite;

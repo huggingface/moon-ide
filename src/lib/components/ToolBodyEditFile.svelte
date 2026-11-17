@@ -170,13 +170,11 @@
 		display: flex;
 		gap: 8px;
 		align-items: baseline;
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 	}
 	.ef-verb {
 		flex: 0 0 auto;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		font-size: 10px;
+		font-size: var(--m-text-xs);
 		color: var(--m-fg-subtle);
 	}
 	.ef-verb.err {
@@ -184,10 +182,10 @@
 	}
 	.ef-error {
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 		padding: 6px 8px;
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		background: color-mix(in srgb, var(--m-danger) 14%, transparent);
 		color: var(--m-danger);
 		white-space: pre-wrap;
@@ -210,14 +208,14 @@
 		flex-direction: column;
 		gap: 2px;
 		font-family: var(--m-font-mono, ui-monospace, monospace);
-		font-size: 11px;
+		font-size: var(--m-text-xs);
 		line-height: 1.4;
 	}
 	.ef-side {
 		display: flex;
 		gap: 6px;
 		padding: 6px 8px;
-		border-radius: 4px;
+		border-radius: var(--m-radius-md);
 		max-height: 240px;
 		overflow: auto;
 	}
