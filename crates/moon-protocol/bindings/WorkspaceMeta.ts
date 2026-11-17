@@ -3,7 +3,7 @@ import type { RemoteTarget } from "./RemoteTarget";
 
 /**
  * Catalog entry for a workspace the user has on this machine.
- * Held in `AppState.workspaces` alongside theme + Slack creds —
+ * Held in `AppState.workspaces` alongside theme + coder settings —
  * distinct from the live [`Workspace`] snapshot, which carries
  * folder + active-folder state for the running process's
  * workspace.

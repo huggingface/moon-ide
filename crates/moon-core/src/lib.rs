@@ -15,8 +15,6 @@ pub mod host;
 pub mod lint_staged;
 pub mod logs;
 pub mod lsp;
-pub mod next_edit;
-pub mod next_edit_server;
 pub mod pre_save;
 pub mod search;
 pub mod session;
@@ -34,4 +32,3 @@ pub use workspace::{WorkspaceFolderEntry, WorkspaceRegistry};
 pub use worktree::{worktree_container_path, WORKTREES_DIR_NAME};
 
 pub use moon_protocol as protocol;
-pub use next_edit_server::NextEditServerSupervisor;

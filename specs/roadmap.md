@@ -27,7 +27,7 @@ The full phased plan. Update the **Status** column as phases land.
 | 8     | Linting / formatting            | scaffolded  |
 | 9     | Custom tool plugins             | scaffolded  |
 | 10    | Theming                         | scaffolded  |
-| 11    | Slack chat panel                | scaffolded  |
+| 11    | Slack chat panel                | removed     |
 | 12    | Innovation track                | open-ended  |
 | 13    | Mobile companion                | planned     |
 | 14    | Remote / relay bridge           | landed      |
@@ -133,7 +133,7 @@ Two sibling concerns ride this phase number; they ship independently.
 
 **Cross-folder search**: per-folder `tantivy` indices with a parallel query layer, a `workspace_list` / `workspace_grep` tool surface for the coder so it can target `@folder-name`. Independent of the multi-workspace work and gets its own roadmap doc when it grows past one paragraph.
 
-App state grows with both: per-workspace state moves into `<XDG_DATA_HOME>/moon-ide/workspaces/<id>/session.json`; the `AppState` struct in `moon-core` keeps only per-machine concerns (theme, AI creds, Slack token pointer, the list of known workspaces).
+App state grows with both: per-workspace state moves into `<XDG_DATA_HOME>/moon-ide/workspaces/<id>/session.json`; the `AppState` struct in `moon-core` keeps only per-machine concerns (theme, AI creds, the list of known workspaces).
 
 ## Phase 8 — Lint / format
 
@@ -163,9 +163,7 @@ User-facing model: themes are **machine-local**, picked from the status-bar them
 
 ## Phase 11 — Slack chat panel
 
-A right-side panel that DMs a Slack bot (defaults to Hugging Face's [Moonbot](https://github.com/huggingface/moon-bot), pluggable to any DM-able bot — Cursor, GitHub, etc.). One Slack thread = one bot session; we don't pretend to host the agent — we're a chat client over the Slack Web API. The bot has zero visibility into local IDE context; this is pure pass-through. Architectural spec: [slack-chat.md](slack-chat.md). Sub-phase work breakdown: [roadmaps/phase-11-slack-chat.md](roadmaps/phase-11-slack-chat.md).
-
-**Acceptance** (per sub-phase): Slack token + bot pick persist (11.0); read-only chat with Slack mrkdwn rendering (11.1 / 11.1.1); polling-driven thread updates + read receipts (11.2); send messages with reaction display (11.3 / 11.3.1); multi-bot panel (11.4). Deferred features (file attachments, AI session titles, hosted OAuth, etc.) live in [`slack-chat.md` § "What this phase deliberately doesn't do"](slack-chat.md#what-this-phase-deliberately-doesnt-do).
+Removed ([ADR 0111](decisions/0111-coder-in-the-middle.md)). It was a side panel that DMed a Slack bot over the Slack Web API.
 
 ## Phase 12 — Innovation track
 

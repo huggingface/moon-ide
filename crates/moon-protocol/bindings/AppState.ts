@@ -2,9 +2,6 @@
 import type { BottomPanelAppState } from "./BottomPanelAppState";
 import type { CoderAppState } from "./CoderAppState";
 import type { DiffLayout } from "./DiffLayout";
-import type { NextEditAppState } from "./NextEditAppState";
-import type { RightPanelKind } from "./RightPanelKind";
-import type { SlackAppState } from "./SlackAppState";
 import type { ThemeMode } from "./ThemeMode";
 import type { WorkspaceMeta } from "./WorkspaceMeta";
 
@@ -23,12 +20,6 @@ workspaces: Array<WorkspaceMeta>,
  */
 theme: ThemeMode, 
 /**
- * Per-machine, non-secret Slack panel state. The `xoxp-` token
- * itself never lives here — it stays in the OS keyring (see
- * `specs/slack-chat.md`).
- */
-slack: SlackAppState, 
-/**
  * Bottom-panel visibility + height. Hosts service-log streams and
  * (Phase 5) terminals, so it's worth restoring across launches —
  * users tend to live with it open or closed and resent the panel
@@ -36,23 +27,14 @@ slack: SlackAppState,
  */
 bottom_panel: BottomPanelAppState, 
 /**
- * Which surface — chat or coder — is mounted in the single
- * right-side panel slot. `None` means the slot is closed. Chat
- * and coder are mutually exclusive: opening one swaps the other
- * out rather than stacking. Persisted so the user lands back in
- * whichever surface they had open at last shutdown. Defaults to
- * `None` (closed) for first-run users.
+ * Whether the coder panel was open at last shutdown.
  */
-right_panel: RightPanelKind | null, 
+coder_panel_visible: boolean, 
 /**
  * Per-machine coder state — picks up where the user left off
  * without forcing them to navigate the sessions list again.
  */
 coder: CoderAppState, 
-/**
- * Local llama.cpp autocomplete: managed `llama-server` spawn fields + optional external HTTP base.
- */
-next_edit: NextEditAppState, 
 /**
  * How diffs render: two columns, or one with deletions inline.
  * Narrow panes show unified regardless.

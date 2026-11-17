@@ -479,7 +479,7 @@ security model, not two:
    Startup-only by design: enrollment bootstraps the trust that any
    on-demand path would itself need.
 3. IDE's "Connect to remote bridge" affordance (command palette entry,
-   not a keybinding — Ctrl+T is `next_edit_complete`) takes the bridge
+   not a keybinding) takes the bridge
    URL + code. The IDE **TOFU-pins the bridge cert** (same as a phone),
    presents the code, the bridge mints a long-lived **IDE token** in the
    bridge keyring at `service=moon-ide, account=companion-ides` (a 1:1

@@ -1,9 +1,8 @@
 //! Reactive state for the container status pip.
 //!
-//! Mirrors the structure of `slack.svelte.ts` — module-level
-//! singleton, `wireRuntime` for Tauri event subscriptions,
-//! `hydrate`/`refresh` entry points called from `WorkspaceState`
-//! and `App.svelte`.
+//! Module-level singleton, `wireRuntime` for Tauri event
+//! subscriptions, `hydrate`/`refresh` entry points called from
+//! `WorkspaceState` and `App.svelte`.
 //!
 //! Freshness is event-driven: the backend's docker-events
 //! watcher (`container_events.rs`) tails the daemon for the

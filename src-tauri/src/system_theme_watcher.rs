@@ -30,8 +30,7 @@ pub const SYSTEM_THEME_EVENT: &str = "system:theme-changed";
 pub fn spawn(app: AppHandle) {
 	// `tauri::async_runtime::spawn`, not `tokio::spawn`: `setup` runs
 	// before Tokio is bound to the current thread, so a bare
-	// `tokio::spawn` panics with "there is no reactor running". See
-	// the same note in `slack_poller::spawn` for the full story.
+	// `tokio::spawn` panics with "there is no reactor running".
 	tauri::async_runtime::spawn(async move {
 		run(app).await;
 	});

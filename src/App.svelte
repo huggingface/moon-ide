@@ -14,11 +14,9 @@
 	import PathPicker from './lib/components/PathPicker.svelte';
 	import { pathPicker } from './lib/pathPicker.svelte';
 	import RemoteStatusOverlay from './lib/components/RemoteStatusOverlay.svelte';
-	import ChatPanel from './lib/components/ChatPanel.svelte';
 	import CoderPanel from './lib/components/CoderPanel.svelte';
 	import BottomPanel from './lib/components/BottomPanel.svelte';
 	import { workspace } from './lib/state.svelte';
-	import { rightPanel } from './lib/rightPanel.svelte';
 	import { coder } from './lib/coder.svelte';
 	import { companion } from './lib/companion.svelte';
 	import { bottomPanel } from './lib/bottomPanel.svelte';
@@ -40,20 +38,14 @@
 	let prebootMode = $state(false);
 
 	let sidebarWidth = $state(280);
-	// The right-side slot is shared between chat and coder
-	// (`rightPanel.kind`); a single width covers either tenant. The
-	// coder panel ships a few extra header controls so its content
-	// reads better at a slightly wider default than chat alone
-	// needed, but the gap isn't worth the cost of two parallel
-	// sticky widths the user has to mentally model.
-	let rightPanelWidth = $state(380);
+	let coderPanelWidth = $state(600);
 	let resizing = $state(false);
-	let resizingRightPanel = $state(false);
+	let resizingCoderPanel = $state(false);
 	let resizingBottom = $state(false);
 
 	// True when the keyboard event originated in a surface where
 	// native word-motion (Alt+Arrow) is what the user actually
-	// wants — the command palette search, the Slack composer, any
+	// wants — the command palette search, the coder composer, any
 	// HTML form field. Used by the window-level Alt+Arrow handler
 	// to opt out so CM's own keymap / the browser default still
 	// runs in those cases. CM editors are NOT in this list by
@@ -145,7 +137,7 @@
 				// Alt+Z: toggle soft-wrap on every editor pane. Same
 				// keystroke VS Code / Cursor use, so muscle memory
 				// carries over. Skipped inside text inputs / textareas
-				// (palette, Slack composer, etc.) so a literal `z`
+				// (palette, coder composer, etc.) so a literal `z`
 				// with the Alt modifier still types in those surfaces
 				// — the editor itself doesn't have a competing native
 				// behaviour for Alt+Z, but inputs do (German layout
@@ -354,10 +346,6 @@
 				//   - else if any terminal pane has a non-empty
 				//     selection, fall back to that;
 				//   - otherwise just toggle coder visibility.
-				// Slack still has its status-bar pip + the
-				// speech-bubble swap icon in the coder header + the
-				// `chat.togglePanel` palette entry, so giving up its
-				// own Ctrl+L doesn't hide it from anybody.
 				event.preventDefault();
 				const editorSelection = workspace.activeSelection;
 				const terminalSelection = terminal.activeSelection;
@@ -523,21 +511,17 @@
 		window.addEventListener('pointerup', onUp);
 	}
 
-	function startRightPanelResize(event: PointerEvent) {
-		// Drag direction is mirrored vs. the sidebar handle: dragging
-		// the handle left grows the panel (it sits on the right edge
-		// of the editor area). One width covers both tenants of the
-		// right-side slot — see `rightPanelWidth`.
-		resizingRightPanel = true;
+	function startCoderPanelResize(event: PointerEvent) {
+		resizingCoderPanel = true;
 		const startX = event.clientX;
-		const startW = rightPanelWidth;
+		const startW = coderPanelWidth;
 
 		const onMove = (e: PointerEvent) => {
-			const next = startW - (e.clientX - startX);
-			rightPanelWidth = Math.max(240, Math.min(720, next));
+			const next = startW + (e.clientX - startX);
+			coderPanelWidth = Math.max(240, Math.min(1200, next));
 		};
 		const onUp = () => {
-			resizingRightPanel = false;
+			resizingCoderPanel = false;
 			window.removeEventListener('pointermove', onMove);
 			window.removeEventListener('pointerup', onUp);
 		};
@@ -571,6 +555,23 @@
 			tabindex="-1"
 			onpointerdown={startResize}
 		></div>
+		<!-- Coder sits between the sidebar and the editor area: sessions
+			 are the primary surface, files and browser tabs the
+			 reference material beside them. -->
+		{#if coder.panelVisible}
+			<aside class="coder-panel" style:width="{coderPanelWidth}px">
+				<CoderPanel />
+			</aside>
+			<div
+				class="resize"
+				class:active={resizingCoderPanel}
+				role="separator"
+				aria-orientation="vertical"
+				aria-label="Resize coder panel"
+				tabindex="-1"
+				onpointerdown={startCoderPanelResize}
+			></div>
+		{/if}
 		<main class="main">
 			{#if workspace.workspace}
 				<div class="editor-area">
@@ -598,28 +599,6 @@
 				</div>
 			{/if}
 		</main>
-		<!-- Single right-side slot. Chat and coder are mutually
-			 exclusive tenants of it (`rightPanel.kind`); both share
-			 the same width so toggling between them doesn't reflow
-			 the editor area. -->
-		{#if rightPanel.kind !== null}
-			<div
-				class="resize chat-resize"
-				class:active={resizingRightPanel}
-				role="separator"
-				aria-orientation="vertical"
-				aria-label="Resize side panel"
-				tabindex="-1"
-				onpointerdown={startRightPanelResize}
-			></div>
-			<aside class="right-panel" style:width="{rightPanelWidth}px">
-				{#if rightPanel.kind === 'chat'}
-					<ChatPanel />
-				{:else if rightPanel.kind === 'coder'}
-					<CoderPanel />
-				{/if}
-			</aside>
-		{/if}
 	</div>
 	<BrowserFrames />
 	<ImageLightbox />
@@ -662,13 +641,6 @@
 		background: transparent;
 		z-index: 5;
 	}
-	.chat-resize {
-		/* Splitter sits between the editor area and the chat panel.
-		   Bleed into both sides so the hit target is wide enough to
-		   grab without picking the editor scrollbar by accident. */
-		margin-left: -2px;
-		margin-right: -2px;
-	}
 	/* Horizontal splitter between the editor area and the bottom
 	   panel. Same hit-target bleed trick as the vertical handles
 	   so it's grabbable without snagging the tab strip. */
@@ -691,10 +663,10 @@
 		background: var(--m-bg);
 	}
 
-	.right-panel {
+	.coder-panel {
 		flex-shrink: 0;
 		background: var(--m-bg-1);
-		border-left: 1px solid var(--m-border);
+		border-right: 1px solid var(--m-border);
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;

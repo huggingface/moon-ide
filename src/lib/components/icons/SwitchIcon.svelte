@@ -1,6 +1,6 @@
 <script lang="ts">
 	// Two-direction arrows — "swap" / "switch between two things"
-	// glyph. Used by the chat panel's "switch bot" affordance.
+	// glyph.
 
 	type Props = { size?: number };
 	let { size = 14 }: Props = $props();

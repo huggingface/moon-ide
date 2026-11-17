@@ -1,6 +1,6 @@
 <script lang="ts">
 	// Box + arrow-out + line glyph — "disconnect / sign out / log
-	// off". Used by the chat panel's disconnect affordance.
+	// off".
 
 	type Props = { size?: number };
 	let { size = 14 }: Props = $props();

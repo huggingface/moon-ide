@@ -307,8 +307,8 @@ pub fn spawn_focus_listener(
 	// `tauri::async_runtime::spawn` rather than `tokio::spawn` —
 	// `setup` runs synchronously on a thread that isn't bound to
 	// Tokio's runtime, so a bare `tokio::spawn` panics with
-	// "there is no reactor running". Same trap the slack poller
-	// and system theme watcher have notes about. The Tauri wrapper
+	// "there is no reactor running". Same trap the system theme
+	// watcher has a note about. The Tauri wrapper
 	// still drops onto the same Tokio runtime; we just have to
 	// reach through `inner()` for the `AbortHandle` we cache in
 	// `AppState::focus_listener`.

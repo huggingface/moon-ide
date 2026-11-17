@@ -80,13 +80,6 @@ import type {
 	ReadFileResult,
 	BrowseResult,
 	RemoteStatus,
-	RightPanelKind,
-	SlackBotProfile,
-	SlackIdentity,
-	SlackMessage,
-	SlackSession,
-	SlackStatus,
-	SlackUserSummary,
 	StatResult,
 	SystemTheme,
 	TerminalOpenRequest,
@@ -94,11 +87,6 @@ import type {
 	WorkspaceMeta,
 	WorkspaceSession,
 	WriteFileResult,
-	NextEditCompleteParams,
-	NextEditCompleteResult,
-	NextEditProbeResult,
-	NextEditServerSnapshot,
-	NextEditServerStartParams,
 } from './protocol';
 
 // Single auditable surface for all workspace-process commands. Components
@@ -346,14 +334,6 @@ export const ipc = {
 		resize: (streamId: string, cols: number, rows: number) => call<void>('terminal_resize', { streamId, cols, rows }),
 		close: (streamId: string) => call<void>('terminal_close', { streamId }),
 	},
-	nextEdit: {
-		probe: (baseUrl: string) => local<NextEditProbeResult>('next_edit_probe', { baseUrl: baseUrl.trim() }),
-		complete: (params: NextEditCompleteParams) => local<NextEditCompleteResult>('next_edit_complete', { params }),
-		serverStart: (params: NextEditServerStartParams) =>
-			local<NextEditServerSnapshot>('next_edit_server_start', { params }),
-		serverStop: () => local<NextEditServerSnapshot>('next_edit_server_stop'),
-		serverStatus: () => local<NextEditServerSnapshot>('next_edit_server_status'),
-	},
 	logs: {
 		snapshot: (source: string) => call<LogEntry[]>('logs_snapshot', { source }),
 		sources: () => call<string[]>('logs_sources'),
@@ -431,23 +411,6 @@ export const ipc = {
 		// server has registered a watcher matching any of the
 		// paths.
 		notifyFilesChanged: (changes: readonly LspFileChange[]) => call<void>('lsp_notify_files_changed', { changes }),
-	},
-	slack: {
-		setToken: (token: string) => local<SlackIdentity>('slack_set_token', { token }),
-		status: () => local<SlackStatus>('slack_status'),
-		clearToken: () => local<void>('slack_clear_token'),
-		listDmBots: () => local<SlackBotProfile[]>('slack_list_dm_bots'),
-		selectBot: (profile: SlackBotProfile) => local<void>('slack_select_bot', { profile }),
-		clearBot: () => local<void>('slack_clear_bot'),
-		getActiveBot: () => local<SlackBotProfile | null>('slack_get_active_bot'),
-		setWindowFocused: (focused: boolean) => local<void>('slack_set_window_focused', { focused }),
-		listSessions: (channel: string) => local<SlackSession[]>('slack_list_sessions', { channel }),
-		getThread: (channel: string, threadTs: string) => local<SlackMessage[]>('slack_get_thread', { channel, threadTs }),
-		setActiveThread: (threadTs: string | null) => local<void>('slack_set_active_thread', { threadTs }),
-		getUser: (userId: string) => local<SlackUserSummary>('slack_get_user', { userId }),
-		markRead: (channel: string, ts: string) => local<void>('slack_mark_read', { channel, ts }),
-		postMessage: (channel: string, threadTs: string | null, text: string) =>
-			local<SlackMessage>('slack_post_message', { channel, threadTs, text }),
 	},
 	coder: {
 		status: () => call<CoderStatus>('coder_status'),
@@ -551,9 +514,6 @@ export const ipc = {
 			description: string;
 		}) => call<McpServerStatus[]>('coder_mcp_add_custom', { server }),
 		mcpRemoveCustom: (id: string) => call<McpServerStatus[]>('coder_mcp_remove_custom', { id }),
-	},
-	ui: {
-		setRightPanel: (kind: RightPanelKind | null) => local<void>('ui_set_right_panel', { kind }),
 	},
 	companion: {
 		status: () => local<CompanionStatus>('companion_status'),

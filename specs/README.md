@@ -8,7 +8,6 @@ Living design docs for moon-ide. Read these before changing the system. Update t
 - [protocol.md](protocol.md) — JSON-RPC schema between UI, local core, and remote agent
 - [containers.md](containers.md) — how containerised workspaces work end-to-end (Phase 2)
 - [editorconfig.md](editorconfig.md) — `.editorconfig` end-to-end model
-- [slack-chat.md](slack-chat.md) — Slack chat panel architecture
 - [companion.md](companion.md) — mobile companion app via the `moon-bridge` daemon (planned)
 - [frontend.md](frontend.md) — Svelte UI structure, state model, editor wiring
 - [roadmap.md](roadmap.md) — phased plan and current status (one paragraph per phase)

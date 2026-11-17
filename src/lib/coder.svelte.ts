@@ -44,7 +44,6 @@ import {
 	type RouterModel,
 	type SubagentMode,
 } from './protocol';
-import { rightPanel } from './rightPanel.svelte';
 import { frontendLog } from './logs.svelte';
 
 const CODER_EVENT_CHANNEL = 'coder:event';
@@ -166,8 +165,8 @@ export type CoderRow =
 	  };
 
 /** Which view of the Coder panel is mounted. `'list'` shows the
- *  sessions list (mirrors the Slack panel's "← Sessions" gesture);
- *  `'session'` shows an active session's transcript + composer;
+ *  sessions list; `'session'` shows an active session's transcript
+ *  + composer;
  *  `'subagent'` is the pop-out for a single sub-agent's full
  *  transcript — back-arrow returns to the parent's session. */
 export type CoderView = 'list' | 'session' | 'subagent';
@@ -717,11 +716,24 @@ export type HubSyncRowState =
 const NO_FOLDER_KEY = '';
 
 export class CoderPanelState {
-	/** Whether the right-side slot is currently mounted with the
-	 *  coder surface. Derived from the shared `rightPanel.kind` —
-	 *  chat and coder share one slot. */
-	get panelVisible(): boolean {
-		return rightPanel.kind === 'coder';
+	/** Whether the coder panel is on screen. Persisted as
+	 *  `AppState.coder_panel_visible`. */
+	panelVisible = $state(false);
+
+	/** Bound by `WorkspaceState.restoreAppState` so a flip triggers
+	 *  an `app_state_save`. Unset until hydration finishes. */
+	#onPanelVisibleChange: (() => void) | null = null;
+
+	bindOnPanelVisibleChange(handler: () => void): void {
+		this.#onPanelVisibleChange = handler;
+	}
+
+	setPanelVisible(visible: boolean): void {
+		if (this.panelVisible === visible) {
+			return;
+		}
+		this.panelVisible = visible;
+		this.#onPanelVisibleChange?.();
 	}
 
 	/** Latest `coder_status`. `null` before the first call. Global
@@ -1709,7 +1721,7 @@ export class CoderPanelState {
 	}
 
 	togglePanel(): void {
-		rightPanel.toggle('coder');
+		this.setPanelVisible(!this.panelVisible);
 	}
 
 	/** Open the panel + attach a file/range snapshot to the
@@ -1722,7 +1734,7 @@ export class CoderPanelState {
 	 *  attachment list stays clean. Always lands focus in the
 	 *  composer afterwards (via `composerFocusTick`). */
 	addAttachmentFromSelection(snapshot: { path: string; startLine: number; endLine: number; text: string }): void {
-		rightPanel.set('coder');
+		this.setPanelVisible(true);
 		this.view = 'session';
 		const token = formatAttachmentToken(snapshot.path, snapshot.startLine, snapshot.endLine);
 		const dup = this.attachments.find(
@@ -1773,7 +1785,7 @@ export class CoderPanelState {
 		if (text.length === 0) {
 			return;
 		}
-		rightPanel.set('coder');
+		this.setPanelVisible(true);
 		this.view = 'session';
 		const dup = this.attachments.find(
 			(a): a is TerminalAttachment =>
@@ -1847,7 +1859,7 @@ export class CoderPanelState {
 		source: string | null;
 		message: string;
 	}): void {
-		rightPanel.set('coder');
+		this.setPanelVisible(true);
 		this.view = 'session';
 		const token = formatAttachmentToken(args.path, args.startLine, args.endLine);
 		const dup = this.attachments.find(
@@ -1971,7 +1983,7 @@ export class CoderPanelState {
 		}
 		const mime = blob.type !== '' ? blob.type : 'image/png';
 		const dataUrl = await blobToDataUrl(blob);
-		rightPanel.set('coder');
+		this.setPanelVisible(true);
 		this.view = 'session';
 		this.attachments = [
 			...this.attachments,

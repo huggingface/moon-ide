@@ -15,8 +15,8 @@
 //! paired device can drive the coder, which can run anything via its
 //! `bash` tool, so there is no method-level fence behind it (see
 //! `specs/companion.md`). The token below is therefore a
-//! bearer credential — treat it like the HF / Slack tokens already in
-//! the keyring.
+//! bearer credential — treat it like the HF token already in the
+//! keyring.
 //!
 //! What's intentionally *not* here yet (lands with 13.2 / 13.3 proper):
 //! the WSS listener that checks a presented device token, the QR

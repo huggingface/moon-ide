@@ -19,8 +19,6 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::coder_models::CoderProviderConfig;
-use crate::next_edit::NextEditAppState;
-use crate::slack::SlackBotProfile;
 use crate::theme::ThemeMode;
 use crate::workspace::WorkspaceMeta;
 
@@ -48,28 +46,16 @@ pub struct AppState {
 	pub workspaces: Vec<WorkspaceMeta>,
 	/// Active UI theme. Per-machine; survives workspace switches.
 	pub theme: ThemeMode,
-	/// Per-machine, non-secret Slack panel state. The `xoxp-` token
-	/// itself never lives here — it stays in the OS keyring (see
-	/// `specs/slack-chat.md`).
-	pub slack: SlackAppState,
 	/// Bottom-panel visibility + height. Hosts service-log streams and
 	/// (Phase 5) terminals, so it's worth restoring across launches —
 	/// users tend to live with it open or closed and resent the panel
 	/// re-jumping to a default height every restart.
 	pub bottom_panel: BottomPanelAppState,
-	/// Which surface — chat or coder — is mounted in the single
-	/// right-side panel slot. `None` means the slot is closed. Chat
-	/// and coder are mutually exclusive: opening one swaps the other
-	/// out rather than stacking. Persisted so the user lands back in
-	/// whichever surface they had open at last shutdown. Defaults to
-	/// `None` (closed) for first-run users.
-	pub right_panel: Option<RightPanelKind>,
+	/// Whether the coder panel was open at last shutdown.
+	pub coder_panel_visible: bool,
 	/// Per-machine coder state — picks up where the user left off
 	/// without forcing them to navigate the sessions list again.
 	pub coder: CoderAppState,
-	/// Local llama.cpp autocomplete: managed `llama-server` spawn fields + optional external HTTP base.
-	#[serde(default)]
-	pub next_edit: NextEditAppState,
 	/// How diffs render: two columns, or one with deletions inline.
 	/// Narrow panes show unified regardless.
 	pub diff_layout: DiffLayout,
@@ -82,42 +68,6 @@ pub enum DiffLayout {
 	#[default]
 	Split,
 	Unified,
-}
-
-/// Surface mounted in the right-side panel. Chat and coder are
-/// mutually exclusive; this enum encodes the pick. The slot can also
-/// be closed entirely (`None` on `AppState::right_panel`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
-#[serde(rename_all = "snake_case")]
-pub enum RightPanelKind {
-	Chat,
-	Coder,
-}
-
-/// Slack-specific slice of [`AppState`]. Only stores derived,
-/// non-secret pointers so we can reload the chat panel on launch
-/// without re-running the bot picker. Panel visibility lives at the
-/// top level on [`AppState::right_panel`] — chat and coder share
-/// one slot.
-// See the note on [`AppState`] re: `deny_unknown_fields` and on-disk
-// state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export)]
-#[serde(default)]
-pub struct SlackAppState {
-	/// Bot the user picked from the DM list. `None` means "show the
-	/// picker on next chat-panel render". Cleared by an explicit "Pick
-	/// a different bot" gesture or when `auth.test` reports the token
-	/// is dead.
-	pub active_bot: Option<SlackBotProfile>,
-	/// `thread_ts` of the session the user last had open in the chat
-	/// panel. Restored on launch so reopening the panel jumps back
-	/// into the same conversation. Cleared on bot switch and on
-	/// disconnect — bot pick and active thread are coupled (the
-	/// thread lives inside the bot's DM channel, ID encoded in
-	/// `active_bot.dm_channel_id`).
-	pub active_thread_ts: Option<String>,
 }
 
 /// Coder-specific slice of [`AppState`].

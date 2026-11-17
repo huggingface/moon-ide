@@ -3647,7 +3647,6 @@ dependencies = [
  "futures-util",
  "gio",
  "hostname",
- "keyring",
  "libc",
  "moon-app",
  "moon-coder",
@@ -3655,10 +3654,8 @@ dependencies = [
  "moon-core",
  "moon-protocol",
  "moon-remote",
- "moon-slack",
  "moon-terminal",
  "notify-rust",
- "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
@@ -3725,20 +3722,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x25519-dalek",
-]
-
-[[package]]
-name = "moon-slack"
-version = "0.0.0"
-dependencies = [
- "keyring",
- "moon-protocol",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

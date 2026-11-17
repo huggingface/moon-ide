@@ -1015,27 +1015,6 @@ export type PersistedTerminal = {
 };
 
 /**
- * Slack-specific slice of [`AppState`]. Only stores derived,
- * non-secret pointers — the `xoxp-` token itself stays in the OS
- * keyring. Mirrors `moon_protocol::app_state::SlackAppState`.
- *
- * Right-panel visibility lives on [`AppState.right_panel`] now (chat
- * and coder share one slot); this slice no longer carries it.
- */
-export type SlackAppState = {
-	active_bot: SlackBotProfile | null;
-	active_thread_ts: string | null;
-};
-
-/**
- * Surface mounted in the right-side panel. Chat and coder are
- * mutually exclusive: opening one swaps the other out. The slot can
- * also be closed entirely (`null` on `AppState.right_panel`).
- * Mirrors `moon_protocol::app_state::RightPanelKind`.
- */
-export type RightPanelKind = 'chat' | 'coder';
-
-/**
  * Coder-specific slice of [`AppState`]. Only frontend-side
  * affordance pointers — actual session content lives under
  * `<XDG_DATA_HOME>/moon-ide/coder-sessions/<project-slug>/<id>.jsonl`.
@@ -1109,56 +1088,6 @@ export type CoderProviderConfig = {
 	has_api_key: boolean;
 };
 
-/** Local llama.cpp autocomplete. Mirrors `moon_protocol::next_edit::NextEditAppState`. */
-export type NextEditAppState = {
-	/** When non-empty, probes/completion use this URL; otherwise `http://{server_host}:{server_port}`. */
-	external_base_url: string;
-	/** Empty string means resolve `llama-server` from `PATH`. */
-	llama_binary: string;
-	/** Hugging Face repo id for `llama-server --hf-repo` (e.g. `sweepai/sweep-next-edit-1.5B`). */
-	hf_repo: string;
-	server_host: string;
-	server_port: number;
-	/** Managed server only: relaunch starts `llama-server` automatically. */
-	server_autostart: boolean;
-};
-
-export type NextEditServerStartParams = {
-	llamaBinary: string;
-	hfRepo: string;
-	serverHost: string;
-	serverPort: number;
-};
-
-export type NextEditServerSnapshot = {
-	running: boolean;
-	pid: number | null;
-	lastExitCode: number | null;
-	startError: string | null;
-	logTail: string[];
-};
-
-export type NextEditProbeKind = 'ready' | 'unreachable' | 'model_loading' | 'error';
-
-export type NextEditProbeResult = {
-	kind: NextEditProbeKind;
-	detail: string | null;
-};
-
-export type NextEditCompleteParams = {
-	baseUrl: string;
-	relativePath: string;
-	cursorLine: number;
-	documentText: string;
-	headText: string | null;
-};
-
-export type NextEditCompleteResult = {
-	replacement: string;
-	from_line: number;
-	to_line: number;
-};
-
 /**
  * Per-machine, per-user app state. There is intentionally no `Settings`
  * type — project-level code style lives in `.editorconfig` (Phase 1.5);
@@ -1172,11 +1101,10 @@ export type AppState = {
 	 * (`workspace_create` / `workspace_delete` / `workspace_rename`). */
 	workspaces: WorkspaceMeta[];
 	theme: ThemeMode;
-	slack: SlackAppState;
 	bottom_panel: BottomPanelAppState;
-	right_panel: RightPanelKind | null;
+	/** Whether the coder panel was open at last shutdown. */
+	coder_panel_visible: boolean;
 	coder: CoderAppState;
-	next_edit: NextEditAppState;
 	/** How diffs render; narrow panes show unified regardless. */
 	diff_layout: DiffLayout;
 };
@@ -1295,161 +1223,14 @@ export type TerminalClosed = {
 	code: number | null;
 };
 
-/** Default llama-server listen port (IANA dynamic range; avoids 8080 and similar). */
-export const DEFAULT_NEXT_EDIT_SERVER_PORT = 53281;
-export const DEFAULT_NEXT_EDIT_BASE_URL = `http://127.0.0.1:${DEFAULT_NEXT_EDIT_SERVER_PORT}`;
-/** Default Hugging Face repo for managed `llama-server --hf-repo`. */
-export const DEFAULT_NEXT_EDIT_HF_REPO = 'sweepai/sweep-next-edit-1.5B';
-
 export const defaultAppState: AppState = {
 	workspaces: [],
 	theme: 'system',
-	slack: { active_bot: null, active_thread_ts: null },
 	bottom_panel: { visible: false, height: 240 },
-	right_panel: null,
+	coder_panel_visible: false,
 	coder: { last_session_by_folder: {} },
-	next_edit: {
-		external_base_url: '',
-		llama_binary: '',
-		hf_repo: DEFAULT_NEXT_EDIT_HF_REPO,
-		server_host: '127.0.0.1',
-		server_port: DEFAULT_NEXT_EDIT_SERVER_PORT,
-		server_autostart: false,
-	},
 	diff_layout: 'split',
 };
-
-/**
- * Identifies the human whose token we hold, plus enough chrome
- * (workspace icon) for the chat-panel header. Mirrors
- * `moon_protocol::slack::SlackIdentity`.
- */
-export type SlackIdentity = {
-	user_id: string;
-	user_name: string;
-	team_id: string;
-	team: string;
-	url: string;
-	icon_url: string | null;
-};
-
-/**
- * A bot we can DM, discovered by scanning the user's own DM list (see
- * `specs/slack-chat.md#bot-resolution`). Mirrors
- * `moon_protocol::slack::SlackBotProfile`.
- */
-export type SlackBotProfile = {
-	user_id: string;
-	dm_channel_id: string;
-	username: string;
-	real_name: string;
-	display_name: string | null;
-	image_url: string | null;
-};
-
-/**
- * Lightweight connection probe for the chat panel. Mirrors
- * `moon_protocol::slack::SlackStatus`.
- */
-export type SlackStatus = {
-	connected: boolean;
-	identity: SlackIdentity | null;
-};
-
-/**
- * One row in the chat panel's session list — a top-level DM message
- * with (or capable of having) a thread under it. Mirrors
- * `moon_protocol::slack::SlackSession`.
- */
-export type SlackSession = {
-	thread_ts: string;
-	latest_ts: string;
-	preview: string;
-	reply_count: number;
-	user_id: string | null;
-};
-
-/**
- * One message inside a thread. Mirrors
- * `moon_protocol::slack::SlackMessage`.
- */
-export type SlackMessage = {
-	ts: string;
-	user_id: string | null;
-	text: string;
-	edited_ts: string | null;
-	is_bot: boolean;
-	actions: SlackAction[];
-	reactions: SlackReaction[];
-};
-
-/**
- * One link button extracted from an `actions` block at the bottom of
- * a message (moon-bot's "Response" / "Download" / "Session" footer).
- * Mirrors `moon_protocol::slack::SlackAction`.
- */
-export type SlackAction = {
-	label: string;
-	url: string;
-	style: string | null;
-};
-
-/**
- * One reaction group on a message. Mirrors
- * `moon_protocol::slack::SlackReaction`. `name` is the Slack
- * shortcode without colons (e.g. `"thumbsup"`); the renderer feeds
- * it through `slackEmoji.emojify` to get a Unicode glyph and falls
- * back to `:name:` for custom workspace emoji we can't resolve.
- */
-export type SlackReaction = {
-	name: string;
-	count: number;
-};
-
-/**
- * Trimmed user record used to render `<@U…>` mentions. Mirrors
- * `moon_protocol::slack::SlackUserSummary`. Cached per-user on the
- * frontend to avoid re-hitting `users.info` on every render — see
- * `userCache` in `slack.svelte.ts`.
- */
-export type SlackUserSummary = {
-	user_id: string;
-	name: string;
-	real_name: string;
-	display_name: string | null;
-	is_bot: boolean;
-};
-
-/**
- * Best human-readable label for a `users.info` summary. Same fallback
- * chain as [`botLabel`]: `display_name → real_name → username`.
- * Returned without the `@` prefix; rendering decides whether to add
- * one (mention pills do, message authorship lines don't).
- */
-export function userLabel(user: SlackUserSummary): string {
-	if (user.display_name && user.display_name.length > 0) {
-		return user.display_name;
-	}
-	if (user.real_name.length > 0) {
-		return user.real_name;
-	}
-	return user.name || user.user_id;
-}
-
-/**
- * Best human-readable label for a bot profile. Falls back through
- * `display_name → real_name → username` so the panel always shows
- * *something* even when Slack returns sparse metadata.
- */
-export function botLabel(profile: SlackBotProfile): string {
-	if (profile.display_name && profile.display_name.length > 0) {
-		return profile.display_name;
-	}
-	if (profile.real_name.length > 0) {
-		return profile.real_name;
-	}
-	return profile.username || profile.user_id;
-}
 
 /**
  * High-level state of the workspace's compose project. Mirrors

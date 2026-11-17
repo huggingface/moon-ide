@@ -36,8 +36,7 @@ mod serve;
 mod status;
 mod tls;
 
-/// Default LAN port. IANA dynamic range, adjacent to the next-edit
-/// server's 53281 so the two moon-ide listeners cluster.
+/// Default LAN port. IANA dynamic range.
 const DEFAULT_PORT: u16 = 53180;
 
 use std::net::{IpAddr, SocketAddr};

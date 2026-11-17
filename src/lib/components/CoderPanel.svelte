@@ -3097,8 +3097,7 @@
 	function formatRelative(ms: number): string {
 		const diff = Date.now() - ms;
 		// Coarse buckets — sessions usually span minutes to days,
-		// not seconds. Mirrors the chat panel's "2m" / "3h" feel
-		// without pulling in date-fns.
+		// not seconds. "2m" / "3h" without pulling in date-fns.
 		const seconds = Math.round(diff / 1000);
 		if (seconds < 60) {
 			return RELATIVE_FORMATTER.format(-seconds, 'second');
@@ -3254,9 +3253,8 @@
 			{/if}
 		</div>
 	{:else if coder.view === 'list'}
-		<!-- Sessions list view (mirrors the Slack panel's "← Sessions"
-			 affordance). Sticky header has the "+" button; the list
-			 itself takes care of empty state. -->
+		<!-- Sessions list view. Sticky header has the "+" button; the
+			 list itself takes care of empty state. -->
 		<div class="sessions">
 			<header class="sessions-header">
 				<span class="section-title">Sessions</span>
@@ -4999,11 +4997,8 @@
 		padding: 8px 12px;
 		border-bottom: 1px solid var(--m-border);
 	}
-	/* Mirror `ChatPanel`'s header font: uppercase, letter-spaced,
-	   11 px / muted. The coder panel layers a status dot, identity,
-	   and a target chip on top of that — uniform typography keeps
-	   the two right-slot tenants visually consistent without
-	   stripping the extra controls coder needs. */
+	/* Uppercase, letter-spaced, 11 px / muted; a status dot,
+	   identity, and a target chip layer on top. */
 	.title {
 		display: flex;
 		align-items: center;
@@ -5193,8 +5188,7 @@
 		}
 	}
 	/* Sticky in-session header with "← Sessions" + title + "+
-	   new". Mirrors the chat panel's `.thread-header` shape so
-	   the two right-slot tenants feel consistent. */
+	   new". */
 	.session-bar {
 		flex-shrink: 0;
 		display: flex;
@@ -5254,9 +5248,8 @@
 		white-space: nowrap;
 		font-family: var(--m-font-mono, monospace);
 	}
-	/* Sessions list view. Sticky header pattern matches the chat
-	   panel — the section title + actions row stays glued to the
-	   top while the list scrolls underneath. */
+	/* Sessions list view. The section title + actions row stays
+	   glued to the top while the list scrolls underneath. */
 	.sessions {
 		flex: 1;
 		min-height: 0;

@@ -26,7 +26,7 @@
 //! enrolled IDE can drive the coder, which runs anything via `bash`,
 //! so there is no method-level fence behind it (same threat model as
 //! the desktop). The token below is a bearer credential — treat it
-//! like the HF / Slack / companion-device tokens already in the keyring.
+//! like the HF / companion-device tokens already in the keyring.
 //!
 //! What's intentionally *not* here yet (lands with 14.1): the WSS
 //! listener that checks a presented IDE token, and the enrollment

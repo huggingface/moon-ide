@@ -19,7 +19,6 @@
 		lspHoverExtension,
 		offsetForLspPosition,
 	} from '../editor/lsp';
-	import { applyAutocompleteFromEditorView } from '../editor/autocompleteApply';
 	import { frontendLog } from '../logs.svelte';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspOverviewExtension } from '../editor/lspOverview';
@@ -117,7 +116,6 @@
 	// Each Editor instance owns one CM view that we re-target as the active file changes.
 	// We track the path the view currently holds so we know when to swap state.
 	let currentPath: string | null = null;
-	let lastHandledAutocompleteEditorTick = 0;
 
 	// Mirror `currentPath` onto the host element. Deliberately
 	// imperative (not a reactive attribute): it records which buffer
@@ -130,12 +128,6 @@
 		if (host) {
 			host.dataset.cmPath = currentPath ?? '';
 		}
-	}
-
-	function runAutocompleteFromShortcut(editorView: EditorView): boolean {
-		frontendLog('editor.completion', 'debug', 'Ctrl+T pressed → applying next-edit autocomplete');
-		void applyAutocompleteFromEditorView(editorView);
-		return true;
 	}
 
 	// Ctrl+Space breadcrumb for the diag-logs panel. We tap the
@@ -538,23 +530,6 @@
 		queueMicrotask(() => v.focus());
 	});
 
-	// Command palette: focus editor and run local autocomplete (same path as Ctrl+T).
-	$effect(() => {
-		const t = workspace.autocompleteEditorTick;
-		if (workspace.focusedSide !== side) {
-			return;
-		}
-		const v = view;
-		if (!v || t === 0 || t === lastHandledAutocompleteEditorTick) {
-			return;
-		}
-		lastHandledAutocompleteEditorTick = t;
-		queueMicrotask(() => {
-			v.focus();
-			void applyAutocompleteFromEditorView(v);
-		});
-	});
-
 	function baseExtensions() {
 		const ec = workspace.editorConfigFor(file.path);
 		return [
@@ -673,8 +648,7 @@
 			// Review comments: cards + hover "+" gutter + `Mod-Alt-c`,
 			// present only on reviewable branches (see `reviewEnabled`).
 			reviewCompartment.of(reviewEnabled ? reviewWiring.extension(reviewComments) : []),
-			// Ctrl+Space → LSP only. Local autocomplete (Ctrl+T / palette) patches
-			// the buffer directly — it is not a CodeMirror completion source.
+			// Ctrl+Space → LSP completion.
 			//
 			// `defaultKeymap: false` is load-bearing: with the default
 			// on, `autocompletion()` installs the upstream
@@ -693,8 +667,6 @@
 			}),
 			Prec.high(
 				keymap.of([
-					{ key: 'Ctrl-t', run: runAutocompleteFromShortcut },
-					{ mac: 'Ctrl-t', run: runAutocompleteFromShortcut },
 					// Tap on Ctrl+Space so the user can see it land
 					// in CodeMirror via the diag-logs panel.
 					// `logCtrlSpace` returns `false` so the keystroke

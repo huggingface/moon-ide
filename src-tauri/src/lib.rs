@@ -22,8 +22,6 @@ mod file_protocol;
 mod focus_socket;
 mod remote_bridge;
 mod remote_workspace;
-mod shutdown;
-mod slack_poller;
 mod state;
 mod system_theme_watcher;
 mod transfer;
@@ -36,7 +34,6 @@ use camino::Utf8PathBuf;
 use moon_coder::CoderHandle;
 use moon_core::app_state as core_app_state;
 use moon_protocol::workspace::validate_workspace_id;
-use moon_slack::{SlackClient, TokenStore};
 use state::{AppMode, AppState, Backend, PREBOOT_WORKSPACE_ID};
 use tauri::{Manager, RunEvent};
 use tokio::net::UnixListener;
@@ -142,25 +139,6 @@ pub fn run() {
 			commands::system::system_theme,
 			commands::editor_forward::editor_forward_finish,
 			commands::editor_forward::editor_forward_cancel,
-			commands::next_edit::next_edit_probe,
-			commands::next_edit::next_edit_complete,
-			commands::next_edit::next_edit_server_start,
-			commands::next_edit::next_edit_server_stop,
-			commands::next_edit::next_edit_server_status,
-			commands::slack::slack_set_token,
-			commands::slack::slack_status,
-			commands::slack::slack_clear_token,
-			commands::slack::slack_list_dm_bots,
-			commands::slack::slack_select_bot,
-			commands::slack::slack_clear_bot,
-			commands::slack::slack_get_active_bot,
-			commands::slack::slack_set_window_focused,
-			commands::slack::slack_list_sessions,
-			commands::slack::slack_get_thread,
-			commands::slack::slack_set_active_thread,
-			commands::slack::slack_get_user,
-			commands::slack::slack_mark_read,
-			commands::slack::slack_post_message,
 			commands::companion::companion_status,
 			commands::companion::companion_revoke_device,
 			commands::companion::companion_revoke_ide,
@@ -171,7 +149,6 @@ pub fn run() {
 			commands::companion::companion_pair_code,
 			commands::companion::companion_e2e_devices,
 			commands::companion::companion_e2e_revoke,
-			commands::ui::ui_set_right_panel,
 			commands::browser::browser_capture,
 			commands::voice::voice_start,
 			commands::voice::voice_stop,
@@ -297,19 +274,6 @@ pub fn run() {
 				);
 			}
 
-			// Build the shared client cell first, spawn the Slack
-			// poller against it, then hand the same Arc to AppState
-			// so commands and the poller always see the same live
-			// `Option<SlackClient>`.
-			let client_cell = std::sync::Arc::new(tokio::sync::RwLock::new(None::<SlackClient>));
-			let poller = slack_poller::spawn(
-				app.handle().clone(),
-				client_cell.clone(),
-				TokenStore,
-				config_dir.clone(),
-			);
-			let slack_state = state::SlackState::new(client_cell, poller.clone());
-
 			// A remote workspace (ADR 0095) runs on its server; this
 			// process only fronts it.
 			let remote = loaded_state
@@ -325,11 +289,8 @@ pub fn run() {
 						mode,
 						config_dir,
 						workspaces_dir,
-						slack_state,
 						listener: deferred_focus_listener,
 						editor_registry,
-						poller,
-						loaded_state,
 					},
 				);
 			}
@@ -484,7 +445,6 @@ pub fn run() {
 			let state = AppState::new(
 				config_dir.clone(),
 				workspaces_dir.clone(),
-				slack_state,
 				mode.clone(),
 				Backend::Local(core.clone()),
 			);
@@ -504,7 +464,7 @@ pub fn run() {
 			// session.json. Only meaningful in workspace mode;
 			// preboot has nothing to restore.
 			if matches!(state.mode, AppMode::Workspace { .. }) {
-				tauri::async_runtime::block_on(restore_session(&state, &workspace_id, &poller, &loaded_state));
+				tauri::async_runtime::block_on(restore_session(&state, &workspace_id));
 			}
 
 			// Agents open terminals through the registry they share
@@ -676,7 +636,11 @@ pub fn run() {
 						focus_socket::write_shutdown_sentinel(&state.workspaces_dir, id).await;
 						focus_socket::cleanup(&state.workspaces_dir, id).await;
 					}
-					shutdown::stop_all(&state).await;
+					// A remote workspace keeps running on its server when
+					// this window closes.
+					if let Some(core) = state.local_core() {
+						core.stop_all().await;
+					}
 					if let Some(id) = workspace_id.as_deref() {
 						focus_socket::clear_shutdown_sentinel(&state.workspaces_dir, id).await;
 					}
@@ -1212,11 +1176,8 @@ struct RemoteSetup {
 	mode: AppMode,
 	config_dir: Utf8PathBuf,
 	workspaces_dir: Utf8PathBuf,
-	slack_state: state::SlackState,
 	listener: Option<UnixListener>,
 	editor_registry: Arc<focus_socket::EditorRegistry>,
-	poller: slack_poller::PollerHandle,
-	loaded_state: moon_protocol::app_state::AppState,
 }
 
 /// Setup for a window fronting a remote workspace (ADR 0095): no local
@@ -1228,11 +1189,8 @@ fn setup_remote(app: &mut tauri::App, setup: RemoteSetup) -> Result<(), Box<dyn 
 		mode,
 		config_dir,
 		workspaces_dir,
-		slack_state,
 		listener,
 		editor_registry,
-		poller,
-		loaded_state,
 	} = setup;
 	let events: Arc<dyn moon_app::EventSink> = Arc::new(events::TauriEvents(app.handle().clone()));
 	// `AttachClient::spawn` needs the tokio runtime the setup hook
@@ -1249,12 +1207,12 @@ fn setup_remote(app: &mut tauri::App, setup: RemoteSetup) -> Result<(), Box<dyn 
 		)
 	});
 	let workspace_id = target.workspace.clone();
-	let state = AppState::new(config_dir, workspaces_dir, slack_state, mode, Backend::Remote(remote));
+	let state = AppState::new(config_dir, workspaces_dir, mode, Backend::Remote(remote));
 	if let Some(abort) = focus_listener_abort {
 		*state.focus_listener.blocking_lock() = Some(abort);
 	}
 	system_theme_watcher::spawn(app.handle().clone());
-	tauri::async_runtime::block_on(restore_session(&state, &workspace_id, &poller, &loaded_state));
+	tauri::async_runtime::block_on(restore_session(&state, &workspace_id));
 	app.manage(state);
 	tracing::info!(host = %target.host, workspace = %target.workspace, "moon-ide started as a remote front end");
 	Ok(())
@@ -1264,12 +1222,7 @@ fn setup_remote(app: &mut tauri::App, setup: RemoteSetup) -> Result<(), Box<dyn 
 /// owns. Best-effort: a missing or malformed `session.json`
 /// falls back to an empty workspace; the frontend's first
 /// persist tick re-saves a healthy copy.
-async fn restore_session(
-	state: &AppState,
-	workspace_id: &str,
-	poller: &slack_poller::PollerHandle,
-	loaded_state: &moon_protocol::app_state::AppState,
-) {
+async fn restore_session(state: &AppState, workspace_id: &str) {
 	let session = match moon_core::session::load(&state.workspaces_dir, workspace_id).await {
 		Ok(s) => s,
 		Err(e) => {
@@ -1291,34 +1244,5 @@ async fn restore_session(
 		);
 		let active_root = snap.active_folder.as_ref().map(std::path::PathBuf::from);
 		core.fs_watcher.set_root(active_root);
-	}
-
-	// Seed the poller from persisted UI state so a relaunch
-	// with the chat panel previously active resumes polling
-	// without waiting for the frontend to re-issue every
-	// setter.
-	poller.set_panel_visible(matches!(
-		loaded_state.right_panel,
-		Some(moon_protocol::app_state::RightPanelKind::Chat)
-	));
-	if let Some(bot) = loaded_state.slack.active_bot.as_ref() {
-		poller.set_active_channel(Some(bot.dm_channel_id.clone()));
-		poller.set_active_thread_ts(loaded_state.slack.active_thread_ts.clone());
-	}
-
-	poller.set_os_focused(true);
-
-	// Rehydrate the Slack client from the keyring if the user
-	// had previously connected. We don't validate the token at
-	// startup — `slack_status` will do that on the frontend's
-	// first poll, and clear the keyring entry if the token has
-	// gone bad.
-	match state.slack.tokens.load() {
-		Ok(Some(token)) => match SlackClient::new(token) {
-			Ok(client) => state.slack.set_client(client).await,
-			Err(e) => tracing::warn!(error = %e, "failed to build Slack client from stored token"),
-		},
-		Ok(None) => {}
-		Err(e) => tracing::warn!(error = %e, "failed to read Slack token from keyring"),
 	}
 }

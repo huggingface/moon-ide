@@ -1,10 +1,8 @@
 # Coder — the in-process AI coding agent
 
-The right-side coder panel is moon-ide's own coding agent. Unlike
-the [Slack chat panel](slack-chat.md) (a thin chat client over
-somebody else's bot), the coder owns its loop end-to-end: it talks
-to LLMs directly, dispatches its own tool calls, and routes every
-tool call through the active [`WorkspaceHost`](architecture.md#workspacehost-phase-2)
+The coder panel is moon-ide's own coding agent. It owns its loop
+end-to-end: it talks to LLMs directly, dispatches its own tool
+calls, and routes every tool call through the active [`WorkspaceHost`](architecture.md#workspacehost-phase-2)
 so a containerized workspace gets a containerized agent without
 extra plumbing.
 
@@ -128,7 +126,7 @@ Three control surfaces:
 - **Follow-up** (Alt+Enter while idle-but-just-finished): future —
   not implemented. Sending while idle starts a fresh turn.
 
-Keymap matches the Slack panel (Enter sends, Shift+Enter newline).
+Keymap: Enter sends, Shift+Enter newline.
 
 ## Authentication
 
@@ -155,8 +153,7 @@ Scopes asked upfront:
    (`grant_type=…:device_code`) until it returns `access_token`,
    `refresh_token`, `expires_in`.
 4. The triple persists to the OS keyring as one JSON blob under
-   `service=moon-ide`, `account=hf-oauth` (same keyring backend as
-   the Slack panel).
+   `service=moon-ide`, `account=hf-oauth`.
 5. The IDE pulls the user's profile (`/api/whoami-v2`) for the panel
    header; cached in `AppState.coder.identity`.
 
@@ -1415,7 +1412,7 @@ path). A user rename wins over an auto-rename still in flight.
 
 ### Sidebar UI
 
-Two views sharing the right-side slot (`rightPanel.kind === 'coder'`):
+Two views sharing the coder panel:
 
 - **Session view** — transcript + composer, with a sticky
   `← Sessions | <title> | +` strip. Default view when a session
@@ -2411,12 +2408,12 @@ otherwise) and in moon-base (built from source); see ADR 0029 for the
 
 ## UI placement
 
-A right-side panel docked to the editor area. Chat and coder are
-mutually exclusive tenants of a single right-side slot — one width,
-toggle between them; the mounted surface (or `null`) lives on
-`AppState.right_panel` and restores across launches. Toggleable from
-the status bar, the command palette (`Coder: Toggle Panel`), and the
-`F6` / `Shift+F6` focus rotation.
+A resizable column between the sidebar and the editor area
+([ADR 0111](decisions/0111-coder-in-the-middle.md)): sessions are the
+primary surface, files and browser tabs sit to their right. Whether
+it is open lives on `AppState.coder_panel_visible` and restores
+across launches; its width does not. Toggleable from the status bar,
+the command palette (`Coder: Show / Hide Panel`) and `Ctrl+L`.
 
 Top-to-bottom: identity card (when signed in) → session list /
 sticky session header → transcript → session controls → composer.
@@ -2501,8 +2498,6 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
   moon-core; the UI never touches LLMs directly.
 - [`protocol.md`](protocol.md) — `coder.*` methods replace the old
   `acp.*` sketch.
-- [`slack-chat.md`](slack-chat.md) — the "real agent in the IDE"
-  pointer re-points here.
 - [`containers.md`](containers.md) — the agent is a moon-core
   component in the Tauri shell; its bash / fs tools cross into the
   container the way the terminal does.

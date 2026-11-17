@@ -4,7 +4,6 @@ import { coder } from './coder.svelte';
 import { companion } from './companion.svelte';
 import { remoteConnect } from './remoteConnect.svelte';
 import { pathPicker } from './pathPicker.svelte';
-import { slack } from './slack.svelte';
 import { ipc } from './ipc';
 import { formatError, type FileSearchResult, type ContentSearchHit } from './protocol';
 import { isMarkdownPath } from './util/markdown';
@@ -397,11 +396,6 @@ export const builtInCommands: Command[] = [
 		run: () => workspace.setTheme('light'),
 	},
 	{
-		id: 'editor.autocomplete',
-		title: 'Editor: Autocomplete (Ctrl+T)',
-		run: () => workspace.requestAutocomplete(),
-	},
-	{
 		// `Focus File Tree` is the only discrete focus command — it
 		// always means the same thing wherever you invoke it from.
 		// The cycle commands (`F6` / `Shift+F6`) are intentionally
@@ -468,35 +462,6 @@ export const builtInCommands: Command[] = [
 		id: 'companion.connectRemote',
 		title: 'Companion: Connect to remote bridge…',
 		run: () => companion.openRemote(),
-	},
-	{
-		id: 'chat.togglePanel',
-		// Wording flips with panel state — same diagnostic value as
-		// the theme toggle, and means the user knows which way the
-		// command goes before clicking. No keyboard shortcut: Ctrl+L
-		// went to the coder panel (mirroring Cursor); slack reaches
-		// from the status-bar pip and the speech-bubble icon on the
-		// coder header.
-		title: () => (slack.panelVisible ? 'Chat: Hide Panel' : 'Chat: Show Panel'),
-		run: () => slack.togglePanel(),
-	},
-	{
-		id: 'chat.connect',
-		title: 'Chat: Connect Slack…',
-		// Only useful before the user has connected — once a token is
-		// in the keyring, the modal is replaced by the Disconnect
-		// affordance inside the panel itself.
-		visible: () => !slack.connected,
-		run: () => {
-			slack.setPanelVisible(true);
-			slack.openConnectModal();
-		},
-	},
-	{
-		id: 'chat.disconnect',
-		title: 'Chat: Disconnect Slack',
-		visible: () => slack.connected,
-		run: () => void slack.disconnect(),
 	},
 	{
 		id: 'markdown.togglePreview',

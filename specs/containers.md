@@ -10,7 +10,7 @@ the host's daemon**, declared in the project's own
 `docker-compose.yml`. Nothing is nested.
 
 The IDE itself does not move into the container. The Tauri shell,
-moon-core, Slack, the coder — everything that _is_ moon-ide — stays
+moon-core, the coder — everything that _is_ moon-ide — stays
 host-side. The container is a sandbox the IDE shells into to run
 project commands: `bun dev`, `cargo run`, etc. work the same on
 every machine without polluting the host's ports or global
@@ -461,7 +461,6 @@ output, which is what the coder's read-only `list_terminals` /
 | Concern                                        | Host (Tauri / moon-ide proper)             | Workspace `dev` container | Project service containers                                                                                                                                            |
 | ---------------------------------------------- | ------------------------------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | UI rendering, Tauri shell, IPC routing         | ✓                                          |                           |                                                                                                                                                                       |
-| Slack panel, Slack API calls                   | ✓                                          |                           |                                                                                                                                                                       |
 | Coder loop / LLM HTTP calls                    | ✓                                          |                           | Tools the loop dispatches (`bash`, `read_file`, …) cross to the container via `WorkspaceHost` exactly like the terminal does.                                         |
 | Git operations on the workspace                | ✓ (status, fetch, push/pull, blame, diffs) | ✓ (`commit` + its hooks)  | Commits route through `ShellTarget` so pre-commit hooks run with the container's toolchain ([ADR 0024](decisions/0024-git-commit-in-container.md)).                   |
 | `docker compose` lifecycle commands            | ✓ (drives the host's daemon)               |                           |                                                                                                                                                                       |

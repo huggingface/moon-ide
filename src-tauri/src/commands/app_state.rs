@@ -2,15 +2,8 @@
 //!
 //! AppState is split across multiple writers:
 //! - The frontend's persist path owns `theme`, `bottom_panel`
-//!   (visibility + height + the terminal restore list), `next_edit`
-//!   and `diff_layout`, and hits this `app_state_save` command on every
-//!   navigation.
-//! - The Slack tauri commands own `slack.*` and write via their own
-//!   load-mutate-save path (see `commands::slack`).
-//! - The right-panel pick (`right_panel`) is owned by the frontend
-//!   but written through the dedicated `ui_set_right_panel` command
-//!   so the slack poller can react synchronously to chat being
-//!   opened/closed without waiting for the next persist tick.
+//!   (visibility + height), `coder_panel_visible` and `diff_layout`,
+//!   and hits this `app_state_save` command on every navigation.
 //! - The coder slice (`coder.last_session_by_folder`) is owned by
 //!   the coder Tauri commands — set when `coder_open_session`
 //!   lands so the relaunch path can re-open the right session.
@@ -18,15 +11,13 @@
 //!   their own per-workspace `session.json` (see
 //!   `commands::session`), not in `AppState`.
 //!
-//! To stop the frontend's writes from clobbering the Slack slice
-//! (or vice versa), `app_state_save` merges: it takes everything
-//! from the payload **except** `workspaces`, `slack`,
-//! `right_panel`, and `coder`, all of which are preserved from
-//! disk verbatim. Anything the frontend sends in those fields
-//! is ignored on this path. The workspace catalog
-//! (`workspaces`) is bootstrap-and-eventually-IPC-owned (Phase
-//! 7.6); the frontend has no business mutating it through this
-//! generic save path.
+//! To stop the frontend's writes from clobbering the other writers'
+//! slices, `app_state_save` merges: it takes everything from the
+//! payload **except** `workspaces` and `coder`, which are preserved
+//! from disk verbatim. Anything the frontend sends in those fields
+//! is ignored on this path. The workspace catalog (`workspaces`) is
+//! owned by the `workspace_*` commands; the frontend has no business
+//! mutating it through this generic save path.
 
 use moon_core::app_state as core_app_state;
 use moon_protocol::app_state::AppState as AppStatePayload;
@@ -45,11 +36,10 @@ pub async fn app_state_save(state: State<'_, AppState>, app_state: AppStatePaylo
 	core_app_state::mutate(&state.config_dir, move |s| {
 		s.theme = app_state.theme;
 		s.bottom_panel = app_state.bottom_panel;
-		s.next_edit = app_state.next_edit;
+		s.coder_panel_visible = app_state.coder_panel_visible;
 		s.diff_layout = app_state.diff_layout;
-		// `workspaces`, `slack`, `right_panel`, `coder` are
-		// preserved from disk verbatim — owned by other writers,
-		// see the module docs above.
+		// `workspaces` and `coder` are preserved from disk verbatim
+		// — owned by other writers, see the module docs above.
 	})
 	.await
 }

@@ -5,9 +5,6 @@ import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
 import { setMarkdownRepoUrl } from './markdown';
 import {
-	DEFAULT_NEXT_EDIT_BASE_URL,
-	DEFAULT_NEXT_EDIT_HF_REPO,
-	DEFAULT_NEXT_EDIT_SERVER_PORT,
 	defaultEditorConfig,
 	formatError,
 	type AppState,
@@ -31,8 +28,6 @@ import {
 	type LspFileChange,
 	type LspFileChangeKind,
 	type LspStatusEvent,
-	type NextEditProbeResult,
-	type NextEditServerSnapshot,
 	type PublishReviewResult,
 	type ReviewComment,
 	type ReviewedFile,
@@ -62,8 +57,6 @@ import {
 } from './openTerminal';
 import { ports } from './ports.svelte';
 import { projectCompose } from './projectCompose.svelte';
-import { rightPanel } from './rightPanel.svelte';
-import { slack } from './slack.svelte';
 import { fingerprint, fingerprintEquals, type ContentFingerprint } from './util/hash';
 import { fileKindFor, isPreviewKind, type FileKind, type PreviewKind } from './util/fileKind';
 import { isMarkdownPath } from './util/markdown';
@@ -448,21 +441,6 @@ class WorkspaceState {
 	/** Diff rendering preference (persisted in app state). */
 	diffLayout = $state<DiffLayout>('split');
 
-	// Local autocomplete (llama.cpp / Sweep-style model). Persisted in AppState; probe runs on a timer.
-	nextEditExternalBaseUrl = $state('');
-	nextEditLlamaBinary = $state('');
-	nextEditHfRepo = $state(DEFAULT_NEXT_EDIT_HF_REPO);
-	nextEditServerHost = $state('127.0.0.1');
-	nextEditServerPort = $state(DEFAULT_NEXT_EDIT_SERVER_PORT);
-	nextEditProbe = $state<NextEditProbeResult | null>(null);
-	nextEditProbeInFlight = $state(false);
-	/** True while a local autocomplete `/completion` request is in flight. */
-	autocompleteInFlight = $state(false);
-	nextEditServerSnapshot = $state<NextEditServerSnapshot | null>(null);
-	nextEditServerActionInFlight = $state(false);
-	/** Managed llama-server only: persisted; IDE launch may auto-start. */
-	nextEditServerAutostart = $state(false);
-
 	// Resolved theme actually used to paint the UI. Reads
 	// `systemPrefersDark` when the user's choice is `'system'`, and
 	// their explicit choice otherwise. Editor / terminal / the `.light`
@@ -586,8 +564,6 @@ class WorkspaceState {
 	// lives here — not in Editor.svelte — so non-editor surfaces (file tree,
 	// command palette, future shortcuts) can request it uniformly.
 	focusTick = $state(0);
-	/** Bumped with [`requestAutocomplete`] so the focused editor runs autocomplete (Ctrl+T). */
-	autocompleteEditorTick = $state(0);
 	// Sibling tickers for the sidebar (file tree) and status bar. F6 /
 	// Ctrl+0 / Esc-from-tree all just bump these and the relevant
 	// component pulls focus in. Same pattern as `focusTick`; keeping
@@ -1851,21 +1827,6 @@ class WorkspaceState {
 
 		this.theme = state.theme;
 		this.diffLayout = state.diff_layout ?? 'split';
-		this.nextEditExternalBaseUrl = (state.next_edit.external_base_url ?? '').trim();
-		this.nextEditLlamaBinary = state.next_edit.llama_binary ?? '';
-		{
-			const raw = state.next_edit.hf_repo ?? '';
-			const trimmed = raw.trim();
-			this.nextEditHfRepo = trimmed.length > 0 ? trimmed : DEFAULT_NEXT_EDIT_HF_REPO;
-		}
-		this.nextEditServerHost =
-			state.next_edit.server_host?.trim().length > 0 ? state.next_edit.server_host.trim() : '127.0.0.1';
-		const listenPort = state.next_edit.server_port;
-		this.nextEditServerPort =
-			typeof listenPort === 'number' && Number.isFinite(listenPort) && listenPort >= 1 && listenPort <= 65535
-				? listenPort
-				: DEFAULT_NEXT_EDIT_SERVER_PORT;
-		this.nextEditServerAutostart = state.next_edit.server_autostart ?? false;
 		applyTheme(this.effectiveTheme);
 		// Flip `hydrated` before we start chewing on the persisted
 		// session so the main layout (Welcome or editor shell) paints
@@ -1873,13 +1834,10 @@ class WorkspaceState {
 		// ms on a large session; no reason to gate the first paint on
 		// them — empty panes fill in as each file loads.
 		this.hydrated = true;
-		// Restore the right-side slot pick first so chat/coder can
-		// hydrate against the right baseline. The slot may have been
-		// open at the last shutdown, in which case the relevant
-		// surface mounts (and runs its first probe) on this same
-		// paint without the user lifting a finger.
-		rightPanel.hydrate(state.right_panel);
-		slack.hydrate(state.slack);
+		// Restore the coder panel's visibility before binding its
+		// change handler so hydration itself doesn't trigger a save.
+		coder.panelVisible = state.coder_panel_visible;
+		coder.bindOnPanelVisibleChange(() => this.persistAppState());
 		// Same for the bottom panel — visibility and height. Log
 		// streams aren't persisted (they back onto running processes
 		// that don't survive a launch); terminal restore recipes
@@ -1891,10 +1849,6 @@ class WorkspaceState {
 		bottomPanel.hydrate(state.bottom_panel);
 		terminal.bindOnChange(() => this.persistAppState());
 		terminal.hydratePersisted(session?.terminals ?? []);
-		// Bind Tauri push events + window-focus listener once the
-		// Tauri runtime is up. Idempotent — `wireRuntime` early-returns
-		// on subsequent calls (HMR-safe).
-		void slack.wireRuntime();
 		// Same pattern for the coder loop's `coder:event` channel.
 		// Bind even when the user hasn't opened the panel yet so
 		// that an in-flight turn (e.g. resumed across HMR reloads)
@@ -1931,7 +1885,6 @@ class WorkspaceState {
 		// other future producer show up in the bottom-panel
 		// picker without the user having to open the panel first.
 		void diagLogs.start();
-		this.wireNextEditProbe();
 		this.wireGitAutoFetch();
 		// Subscribe to forwarded `$GIT_EDITOR` requests from
 		// in-container terminals so `git commit --amend` etc.
@@ -1939,7 +1892,6 @@ class WorkspaceState {
 		void this.wireEditorForward();
 		void this.wireBrowserTabs();
 		void this.wireNotificationFocus();
-		void this.refreshNextEditServerStatusThenMaybeAutostart();
 		// Terminal output rides on its own event channel —
 		// see `terminal.svelte.ts`. Wired once at startup so
 		// the first `+ Terminal` click responds without bus-bind
@@ -2205,22 +2157,6 @@ class WorkspaceState {
 		void openHostTerminal();
 	}
 
-	private nextEditProbeWired = false;
-
-	private wireNextEditProbe() {
-		if (this.nextEditProbeWired || typeof window === 'undefined') {
-			return;
-		}
-		this.nextEditProbeWired = true;
-		void this.refreshNextEditProbe();
-		window.addEventListener('focus', () => {
-			void this.refreshNextEditProbe();
-		});
-		window.setInterval(() => {
-			void this.refreshNextEditProbe();
-		}, 8000);
-	}
-
 	private gitAutoFetchWired = false;
 	private gitAutoFetchInFlight = false;
 	/** Throttle keyed by folder: a fetch in folder A must not
@@ -2309,7 +2245,7 @@ class WorkspaceState {
 		} else if (bound(req.folder)) {
 			folder = req.folder;
 		}
-		rightPanel.set('coder');
+		coder.setPanelVisible(true);
 		await coder.openSessionInFolder(folder, req.session_id);
 	}
 
@@ -2586,30 +2522,18 @@ class WorkspaceState {
 				// field verbatim.
 				terminals: terminal.serialisePersisted(),
 			};
-			// `workspaces`, `slack`, `right_panel`, and `coder` are
-			// written through their own paths (Phase 7.2 bootstrap
-			// + Phase 7.6 IPC for the workspace catalog; `slack_*`,
-			// `ui_set_right_panel`, `coder_*` Tauri commands for
-			// the rest). The backend's `app_state_save` ignores
-			// whatever we send for those fields and preserves the
-			// on-disk value. The placeholders satisfy the shared
-			// type only.
+			// `workspaces` and `coder` are written through their
+			// own paths (the `workspace_*` and `coder_*` commands).
+			// The backend's `app_state_save` ignores whatever we
+			// send for those fields and preserves the on-disk
+			// value. The placeholders satisfy the shared type only.
 			const payload: AppState = {
 				workspaces: [],
 				theme: this.theme,
-				slack: { active_bot: null, active_thread_ts: null },
 				bottom_panel: bottomPanel.serialise(),
-				right_panel: null,
+				coder_panel_visible: coder.panelVisible,
 				coder: { last_session_by_folder: {} },
 				diff_layout: this.diffLayout,
-				next_edit: {
-					external_base_url: this.nextEditExternalBaseUrl.trim(),
-					llama_binary: this.nextEditLlamaBinary.trim(),
-					hf_repo: this.nextEditHfRepo.trim(),
-					server_host: this.nextEditServerHost.trim() || '127.0.0.1',
-					server_port: this.nextEditServerPort,
-					server_autostart: this.nextEditServerAutostart,
-				},
 			};
 			// AppState + session writes are best-effort. A toast on
 			// every failure would be too noisy (this fires on every
@@ -6662,20 +6586,6 @@ class WorkspaceState {
 		this.focusTick += 1;
 	}
 
-	/** Focus the editor and run local autocomplete (direct apply; same as Ctrl+T). */
-	requestAutocomplete() {
-		this.requestEditorFocus();
-		this.autocompleteEditorTick += 1;
-	}
-
-	beginAutocompleteRequest() {
-		this.autocompleteInFlight = true;
-	}
-
-	endAutocompleteRequest() {
-		this.autocompleteInFlight = false;
-	}
-
 	requestSidebarFocus() {
 		this.sidebarFocusTick += 1;
 	}
@@ -7097,152 +7007,6 @@ class WorkspaceState {
 		this.theme = mode;
 		applyTheme(this.effectiveTheme);
 		this.persistAppState();
-	}
-
-	/** URL used for `GET /health` and `/completion`: external override, or derived from listen host/port. */
-	nextEditEffectiveHttpBase(): string {
-		const ext = this.nextEditExternalBaseUrl.trim();
-		if (ext.length > 0) {
-			return ext;
-		}
-		const h = this.nextEditServerHost.trim() || '127.0.0.1';
-		const p = this.nextEditServerPort;
-		if (p >= 1 && p <= 65535) {
-			return `http://${h}:${p}`;
-		}
-		return DEFAULT_NEXT_EDIT_BASE_URL;
-	}
-
-	setNextEditExternalBaseUrl(url: string) {
-		this.nextEditExternalBaseUrl = url.trim();
-		if (this.nextEditExternalBaseUrl.length > 0) {
-			this.nextEditServerAutostart = false;
-		}
-		this.persistAppState();
-		void this.refreshNextEditProbe();
-	}
-
-	setNextEditLlamaBinary(s: string) {
-		this.nextEditLlamaBinary = s;
-		this.persistAppState();
-	}
-
-	setNextEditHfRepo(s: string) {
-		this.nextEditHfRepo = s;
-		this.persistAppState();
-	}
-
-	setNextEditServerHost(s: string) {
-		this.nextEditServerHost = s.trim().length > 0 ? s.trim() : '127.0.0.1';
-		this.persistAppState();
-		void this.refreshNextEditProbe();
-	}
-
-	setNextEditServerPort(port: number) {
-		if (!Number.isFinite(port) || port < 1 || port > 65535) {
-			return;
-		}
-		this.nextEditServerPort = Math.floor(port);
-		this.persistAppState();
-		void this.refreshNextEditProbe();
-	}
-
-	async refreshNextEditServerStatus() {
-		try {
-			this.nextEditServerSnapshot = await ipc.nextEdit.serverStatus();
-		} catch {
-			this.nextEditServerSnapshot = null;
-		}
-	}
-
-	private async refreshNextEditServerStatusThenMaybeAutostart() {
-		await this.refreshNextEditServerStatus();
-		this.maybeAutostartNextEditServer();
-	}
-
-	/** After hydrate: start managed llama-server when the user left it enabled (non-external URL only). */
-	private maybeAutostartNextEditServer() {
-		if (!this.nextEditServerAutostart) {
-			return;
-		}
-		if (this.nextEditExternalBaseUrl.trim().length > 0) {
-			return;
-		}
-		if (!this.nextEditHfRepo.trim()) {
-			return;
-		}
-		if (this.nextEditServerSnapshot?.running) {
-			return;
-		}
-		void this.startNextEditServer();
-	}
-
-	async startNextEditServer() {
-		if (this.nextEditServerActionInFlight) {
-			return;
-		}
-		if (this.nextEditExternalBaseUrl.trim().length > 0) {
-			this.flash('Clear the external server URL (advanced) to start llama-server from moon-ide.');
-			return;
-		}
-		this.nextEditServerAutostart = true;
-		this.persistAppState();
-		this.nextEditServerActionInFlight = true;
-		try {
-			const snap = await ipc.nextEdit.serverStart({
-				llamaBinary: this.nextEditLlamaBinary.trim(),
-				hfRepo: this.nextEditHfRepo.trim(),
-				serverHost: this.nextEditServerHost.trim() || '127.0.0.1',
-				serverPort: this.nextEditServerPort,
-			});
-			this.nextEditServerSnapshot = snap;
-			if (snap.startError) {
-				this.flash(`llama-server: ${snap.startError}`);
-			}
-			void this.refreshNextEditProbe();
-		} catch (e) {
-			this.flash(`Could not start llama-server: ${formatError(e)}`);
-			void this.refreshNextEditServerStatus();
-		} finally {
-			this.nextEditServerActionInFlight = false;
-		}
-	}
-
-	async stopNextEditServer() {
-		if (this.nextEditServerActionInFlight) {
-			return;
-		}
-		this.nextEditServerAutostart = false;
-		this.persistAppState();
-		this.nextEditServerActionInFlight = true;
-		try {
-			this.nextEditServerSnapshot = await ipc.nextEdit.serverStop();
-			void this.refreshNextEditProbe();
-		} catch (e) {
-			this.flash(`Could not stop llama-server: ${formatError(e)}`);
-		} finally {
-			this.nextEditServerActionInFlight = false;
-		}
-	}
-
-	/** Probes `GET {base}/health` on the llama.cpp server. Best-effort. */
-	async refreshNextEditProbe() {
-		if (this.nextEditProbeInFlight) {
-			return;
-		}
-		this.nextEditProbeInFlight = true;
-		try {
-			const base = this.nextEditEffectiveHttpBase().trim();
-			if (base.length === 0) {
-				this.nextEditProbe = { kind: 'error', detail: 'Effective URL is empty' };
-				return;
-			}
-			this.nextEditProbe = await ipc.nextEdit.probe(base);
-		} catch (e) {
-			this.nextEditProbe = { kind: 'unreachable', detail: formatError(e) };
-		} finally {
-			this.nextEditProbeInFlight = false;
-		}
 	}
 
 	/**

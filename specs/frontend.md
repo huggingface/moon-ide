@@ -15,7 +15,7 @@ STATUS: partial — Phase 0 ships file tree + single editor + tabs scaffolding.
 
 ```
 src/
-├── App.svelte                  Root layout: sidebar | editor area | status bar
+├── App.svelte                  Root layout: sidebar | coder | editor area | status bar
 ├── main.ts                     Mount + global setup
 ├── styles.css                  CSS variables (theme tokens) + a small reset
 ├── lib/

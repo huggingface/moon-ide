@@ -13,10 +13,10 @@
 //! ## Concurrent writers
 //!
 //! Phase 7 ships one process per workspace. Every running `moon-ide`
-//! shares the same `state.json` (catalog, theme, slack slice, …) and
+//! shares the same `state.json` (catalog, theme, coder slice, …) and
 //! competes for it. Inside one process, several Tauri commands also
 //! race — periodic `bump_last_active`, the frontend's
-//! `app_state_save`, slack writes, etc. all do load → mutate → save.
+//! `app_state_save`, coder writes, etc. all do load → mutate → save.
 //!
 //! A naive `load()` then `save()` loses updates whenever two writers
 //! interleave: A reads, B reads, A writes, B writes — A's mutation

@@ -2,9 +2,9 @@
 //!
 //! Mapped to [`moon_protocol::MoonError`] at the Tauri command boundary
 //! so the UI renders coder failures in the same toast pipeline as
-//! every other command. The split is deliberate (mirror of the slack
-//! crate): `CoderError` carries provider-specific context for backend
-//! callers, `MoonError` flattens to a single display string.
+//! every other command. The split is deliberate: `CoderError` carries
+//! provider-specific context for backend callers, `MoonError` flattens
+//! to a single display string.
 
 use moon_protocol::MoonError;
 

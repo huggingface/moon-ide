@@ -7,7 +7,6 @@ members = [
 	"crates/moon-remote",
 	"crates/moon-bridge",
 	"crates/moon-coder",
-	"crates/moon-slack",
 	"crates/moon-container",
 	"crates/moon-terminal",
 	"crates/moon-app",
@@ -29,7 +28,6 @@ publish = false
 moon-core = { path = "crates/moon-core" }
 moon-protocol = { path = "crates/moon-protocol" }
 moon-coder = { path = "crates/moon-coder" }
-moon-slack = { path = "crates/moon-slack" }
 moon-container = { path = "crates/moon-container" }
 tempfile = "3.16"
 moon-terminal = { path = "crates/moon-terminal" }

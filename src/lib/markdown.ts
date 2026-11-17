@@ -50,8 +50,8 @@ import { ipc } from './ipc';
 // Two parser instances differ only in whether bare URLs become
 // links: file-content / docs (the default) keeps `linkify: false`
 // so we don't mangle text the author didn't mean as a URL; chat
-// transcripts (the `Linkified` variant, used by the coder + slack
-// surfaces) opts in because the model / sender will routinely
+// transcripts (the `Linkified` variant, used by the coder
+// surface) opts in because the model / sender will routinely
 // drop raw URLs into prose. Sharing the highlighter + link
 // renderer config below keeps the two surfaces visually identical
 // for everything else.
