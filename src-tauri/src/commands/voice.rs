@@ -148,8 +148,10 @@ fn wav_rms(bytes: &[u8]) -> Option<f64> {
 			// Recorders stopped mid-stream may leave the size unset.
 			let end = body.saturating_add(size).min(bytes.len());
 			let samples = bytes[body..end]
-				.chunks_exact(2)
-				.map(|pair| f64::from(i16::from_le_bytes([pair[0], pair[1]])));
+				.as_chunks::<2>()
+				.0
+				.iter()
+				.map(|pair| f64::from(i16::from_le_bytes(*pair)));
 			let (sum, count) = samples.fold((0.0, 0usize), |(sum, count), s| (sum + s * s, count + 1));
 			if count == 0 {
 				return Some(0.0);

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { CoderPanelState, renderPromptWithAttachments, type TerminalAttachment } from './coder.svelte';
+import {
+	CoderPanelState,
+	renderPromptWithAttachments,
+	stripOpenTerminals,
+	type TerminalAttachment,
+} from './coder.svelte';
 import type { CoderSessionSummary } from './protocol';
 
 const PARENT = '/repo';
@@ -177,5 +182,25 @@ describe('coordinatorBehind', () => {
 
 		coder.sessionStateFor(PARENT, 'mine').busy = true;
 		expect(coder.coordinatorBehind(PARENT, null, 'working')).toBeNull();
+	});
+});
+
+describe('stripOpenTerminals', () => {
+	const terminals = '<open_terminals>\n- `t1` — host shell in `/proj` (running)\n</open_terminals>';
+
+	it('removes a context block that only held the terminal list', () => {
+		expect(stripOpenTerminals(`fix it\n\n<context>\n${terminals}\n</context>`)).toBe('fix it');
+		expect(stripOpenTerminals(`<context>\n${terminals}\n</context>`)).toBe('');
+	});
+
+	it('keeps the attachments the user added', () => {
+		const selection = '<code_selection path="a.rs" lines="1">\nfn a() {}\n</code_selection>';
+		expect(stripOpenTerminals(`why?\n\n<context>\n${selection}\n${terminals}\n</context>`)).toBe(
+			`why?\n\n<context>\n${selection}\n</context>`,
+		);
+	});
+
+	it('leaves other prompts alone', () => {
+		expect(stripOpenTerminals('plain')).toBe('plain');
 	});
 });

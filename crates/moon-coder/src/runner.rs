@@ -4708,6 +4708,8 @@ impl CoderHandle {
 		// transcript would all show the newer message first.
 		drain_pending_steers(&rt, &sink).await;
 
+		let text = with_terminal_announcement(&self.state, &rt, &folder_path, text).await;
+
 		// Append the user message to in-memory chat history + the
 		// session JSONL. The disk write is best-effort: a failure
 		// only loses the user's prompt from the saved transcript,
@@ -7068,6 +7070,37 @@ impl Drop for RunningTurnGuard {
 	}
 }
 
+/// The folder a session's tools operate on: its git worktree when it
+/// has one and it is bound (ADR 0028), else the folder it is filed
+/// under.
+async fn session_routing_path(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	folder_path: &Utf8Path,
+) -> Utf8PathBuf {
+	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
+	match worktree_root {
+		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root.into(),
+		_ => folder_path.to_path_buf(),
+	}
+}
+
+/// `text` plus an `<open_terminals>` block when the project's
+/// terminals aren't what this conversation last told the model.
+/// Composer sends only: automated messages (`<background_result>`,
+/// coordinator steers) have their own exact shapes.
+async fn with_terminal_announcement(
+	state: &Arc<CoderState>,
+	rt: &Arc<SessionRuntime>,
+	folder_path: &Utf8Path,
+	text: String,
+) -> String {
+	let routing_path = session_routing_path(state, rt, folder_path).await;
+	let inventory = state.tools.terminal_inventory(&routing_path).await;
+	let session = rt.session.lock().await;
+	crate::terminal_context::announce(&text, &session.messages, inventory.as_deref()).unwrap_or(text)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
 	state: &Arc<CoderState>,
@@ -7091,11 +7124,7 @@ async fn run_turn(
 	// folder (`folder_path`) for persistence + events. Fall back to
 	// the parent when the worktree isn't bound — e.g. before
 	// startup re-binding lands (W.3) or if the user discarded it.
-	let worktree_root = rt.session.lock().await.header.worktree_root.clone();
-	let routing_path: Utf8PathBuf = match worktree_root {
-		Some(root) if state.workspaces.folder_for_path(&root).await.is_some() => root.into(),
-		_ => folder_path.to_path_buf(),
-	};
+	let routing_path = session_routing_path(state, rt, folder_path).await;
 	// The routing path is normally a bound folder; the exception is
 	// the scratch root of an empty workspace, which is never
 	// registered — `folder_entry_for` synthesises an entry for it.

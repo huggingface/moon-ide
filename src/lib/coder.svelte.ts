@@ -3121,7 +3121,7 @@ export class CoderPanelState {
 			if (!row || row.kind !== 'user') {
 				return;
 			}
-			this.draft = row.text;
+			this.draft = stripOpenTerminals(row.text);
 			this.attachments = [
 				...this.attachments,
 				...row.images.map(
@@ -4673,6 +4673,17 @@ export function renderPromptWithAttachments(
 	}
 	const context = `<context>\n${blocks.join('\n')}\n</context>`;
 	return text.length > 0 ? `${text}\n\n${context}` : context;
+}
+
+/** Drop the `<open_terminals>` element the backend adds to a prompt's
+ *  `<context>` block (and the block itself when nothing else is in
+ *  it). It describes the terminals at the moment that prompt was
+ *  sent, so a prompt going back into the composer must not carry it:
+ *  the backend adds a current one on send when needed. */
+export function stripOpenTerminals(text: string): string {
+	return text
+		.replace(/\n?<open_terminals>\n[\s\S]*?\n<\/open_terminals>/g, '')
+		.replace(/(?:\n\n)?<context>\n<\/context>\s*$/, '');
 }
 
 const REGEX_META_PATTERN = /[\\^$.*+?()[\]{}|]/g;

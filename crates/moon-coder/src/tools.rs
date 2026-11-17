@@ -1742,53 +1742,30 @@ impl ToolRegistry {
 	/// the tool list is rebuilt every turn, so that lands without
 	/// any special handling.
 	///
+	/// The definitions themselves are constant: which terminals are
+	/// open reaches the model through the conversation
+	/// ([`crate::terminal_context`]), never through a description.
+	/// Anything live in here would change `tools` between turns,
+	/// which misses the whole prompt cache and invalidates every
+	/// thinking block of the session (ADR 0110).
+	///
 	/// Scope is the session's folder: a worktree session sees its
 	/// worktree's terminals, its parent project's are somebody
 	/// else's business.
 	pub async fn terminal_definitions(&self, cx: &ToolContext) -> Vec<ToolDefinition> {
 		let folder = Utf8Path::new(cx.folder.folder.path.as_str());
-		let open = self.terminals.list_for_folder(folder).await;
+		let any_open = !self.terminals.list_for_folder(folder).await.is_empty();
 		// Write modes can open terminals (ADR 0090), and need the read
 		// pair in the same turn to watch what they started — the tool
 		// list is fixed for the turn, so it can't wait for one to exist.
 		let can_open = cx.mode.allows_writes() && self.terminals.spawner().is_some();
-		if open.is_empty() && !can_open {
+		if !any_open && !can_open {
 			return Vec::new();
 		}
-		let inventory = if open.is_empty() {
-			"(none)".to_owned()
-		} else {
-			open
-				.iter()
-				.map(|t| {
-					let state = match (t.running, t.exit_code) {
-						(true, _) => "running".to_owned(),
-						(false, Some(code)) => format!("exited {code}"),
-						(false, None) => "exited".to_owned(),
-					};
-					let owner = match &t.agent {
-						Some(agent) => format!(
-							" — opened by an agent as \"{}\" to run `{}`",
-							agent.title, agent.command
-						),
-						None => String::new(),
-					};
-					format!(
-						"- `{}` — {} shell in `{}` ({state}){owner}",
-						t.id,
-						t.kind.as_str(),
-						t.cwd
-					)
-				})
-				.collect::<Vec<_>>()
-				.join("\n")
-		};
 		let mut defs = vec![
 			ToolDefinition::function(
 				"list_terminals",
-				format!(
-					"List this project's terminals — the user's own and the ones agents opened with `open_terminal` — with each one's shell target, working directory, and whether its shell is still running. Use this to find the id to pass to `read_terminal`.\n\nCurrently open:\n{inventory}"
-				),
+				"List this project's terminals — the user's own and the ones agents opened with `open_terminal` — with each one's shell target, working directory, and whether its shell is still running. Use this to find the id to pass to `read_terminal`. The user's messages carry an `<open_terminals>` block whenever that list changed since the last one; this call returns it as it is right now.",
 				json!({
 					"type": "object",
 					"properties": {}
@@ -1796,9 +1773,7 @@ impl ToolRegistry {
 			),
 			ToolDefinition::function(
 				"read_terminal",
-				format!(
-					"Read the recent output of one of this project's terminals — what is actually on screen, with escape sequences applied and `\\r`-redrawn progress lines collapsed. Use it to see how a dev server, watcher, or test run is doing instead of starting a competing one with `bash`. When the user pastes terminal output into their message, the `<terminal_output>` block's `terminal_id` attribute is a valid id here — use it to read the live terminal instead of treating the paste as everything there is. Pass `wait_for` to block until some text shows up (e.g. a dev server's \"ready\" line). Read-only: this cannot type into a terminal. Terminals may contain output the user did not mean to share (tokens, secrets, unrelated projects) — read what you need for the task at hand and don't quote more of it back than necessary.\n\nCurrently open:\n{inventory}"
-				),
+				"Read the recent output of one of this project's terminals — what is actually on screen, with escape sequences applied and `\\r`-redrawn progress lines collapsed. Use it to see how a dev server, watcher, or test run is doing instead of starting a competing one with `bash`. When the user pastes terminal output into their message, the `<terminal_output>` block's `terminal_id` attribute is a valid id here — use it to read the live terminal instead of treating the paste as everything there is. Pass `wait_for` to block until some text shows up (e.g. a dev server's \"ready\" line). Read-only: this cannot type into a terminal. Terminals may contain output the user did not mean to share (tokens, secrets, unrelated projects) — read what you need for the task at hand and don't quote more of it back than necessary.",
 				json!({
 					"type": "object",
 					"properties": {
@@ -1879,6 +1854,40 @@ impl ToolRegistry {
 			}),
 		));
 		defs
+	}
+
+	/// The terminals open for `folder`, one line each, for the
+	/// `<open_terminals>` block ([`crate::terminal_context`]). `None`
+	/// when there are none.
+	pub async fn terminal_inventory(&self, folder: &Utf8Path) -> Option<String> {
+		let open = self.terminals.list_for_folder(folder).await;
+		if open.is_empty() {
+			return None;
+		}
+		let lines: Vec<String> = open
+			.iter()
+			.map(|t| {
+				let state = match (t.running, t.exit_code) {
+					(true, _) => "running".to_owned(),
+					(false, Some(code)) => format!("exited {code}"),
+					(false, None) => "exited".to_owned(),
+				};
+				let owner = match &t.agent {
+					Some(agent) => format!(
+						" — opened by an agent as \"{}\" to run `{}`",
+						agent.title, agent.command
+					),
+					None => String::new(),
+				};
+				format!(
+					"- `{}` — {} shell in `{}` ({state}){owner}",
+					t.id,
+					t.kind.as_str(),
+					t.cwd
+				)
+			})
+			.collect();
+		Some(lines.join("\n"))
 	}
 
 	/// Every terminal open for the session's folder.
@@ -5487,6 +5496,23 @@ mod tests {
 			let folders = tools.workspaces.folders().await;
 			let research = ToolContext::new(folders[0].clone(), CoderMode::Research);
 			assert!(tools.terminal_definitions(&research).await.is_empty());
+		}
+
+		/// A description that named the open terminals changed `tools`
+		/// whenever one opened or exited: a full prompt-cache miss, and
+		/// every thinking block of the session invalidated (ADR 0110).
+		#[tokio::test]
+		async fn definitions_do_not_change_with_the_open_terminals() {
+			let (paths, _dirs, terminals, tools, _spawner) = with_spawner().await;
+			let cx = cx_for(&tools, 0).await;
+			assert_eq!(tools.terminal_inventory(&paths[0]).await, None);
+			let before = serde_json::to_value(tools.terminal_definitions(&cx).await).unwrap();
+
+			terminals.register("t1", registration(&paths[0])).await;
+			let after = serde_json::to_value(tools.terminal_definitions(&cx).await).unwrap();
+			assert_eq!(before, after);
+			let inventory = tools.terminal_inventory(&paths[0]).await.expect("one terminal open");
+			assert!(inventory.contains("`t1`"), "{inventory}");
 		}
 
 		#[tokio::test]

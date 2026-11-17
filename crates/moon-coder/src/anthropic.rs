@@ -148,6 +148,9 @@ fn thinking_config_for(model: &str) -> Option<ThinkingConfig> {
 	Some(ThinkingConfig {
 		kind: "adaptive",
 		display: "summarized",
+		block_binding: BlockBinding {
+			prefix_mismatch_behavior: "drop_block",
+		},
 	})
 }
 
@@ -155,6 +158,11 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 const API_KEY_HEADER: &str = "x-api-key";
 const VERSION_HEADER: &str = "anthropic-version";
+const BETA_HEADER: &str = "anthropic-beta";
+
+/// Beta that unlocks `thinking.block_binding` on the request and
+/// `input_transformations` on the response. See [`BlockBinding`].
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 #[derive(Debug, Serialize)]
 struct Request<'a> {
@@ -181,6 +189,68 @@ struct ThinkingConfig {
 	#[serde(rename = "type")]
 	kind: &'static str,
 	display: &'static str,
+	block_binding: BlockBinding,
+}
+
+/// What the API does with a replayed thinking block whose prefix
+/// (`system`, `tools`, every earlier message) is no longer what it
+/// was signed against. The preserved-thinking models (Fable / Mythos
+/// 5.1+, Opus / Sonnet / Haiku 5.5) 400 the whole request by default
+/// with "The block is bound to a different conversation", which
+/// wedges the session for good: the stored history keeps the change.
+///
+/// We are not append-only — the system prompt follows the project's
+/// rules file and bound folders, the tool list follows settings, and
+/// compaction writes its own summary — so we ask for `drop_block`: the stale
+/// blocks are dropped server-side (unbilled) and the model carries on
+/// without that reasoning. Blocks produced after the change stay
+/// valid, so the cost is one loss per prefix change, not per request.
+/// ADR 0110.
+#[derive(Debug, Serialize)]
+struct BlockBinding {
+	prefix_mismatch_behavior: &'static str,
+}
+
+/// Attach the beta header [`BlockBinding`] needs. Only alongside a
+/// `thinking` object, so models we send no thinking to (Haiku, a
+/// non-Claude model behind an Anthropic-compatible endpoint) see the
+/// same request as before.
+fn with_thinking_beta(builder: reqwest::RequestBuilder, body: &Request<'_>) -> reqwest::RequestBuilder {
+	if body.thinking.is_none() {
+		return builder;
+	}
+	builder.header(BETA_HEADER, THINKING_BINDING_BETA)
+}
+
+/// Count the thinking blocks the API dropped from this request
+/// because their prefix changed, from the response's
+/// `input_transformations`. Read as loose JSON: this only feeds a
+/// log line, so an unexpected shape must not fail the response.
+/// Model- and organization-binding drops are the API's normal answer
+/// to a model switch and aren't counted.
+fn prefix_dropped_thinking_blocks(input_transformations: &serde_json::Value) -> usize {
+	let Some(entries) = input_transformations.as_array() else {
+		return 0;
+	};
+	entries
+		.iter()
+		.filter(|entry| {
+			entry.get("type").and_then(|v| v.as_str()) == Some("thinking_dropped")
+				&& entry.get("reason").and_then(|v| v.as_str()) == Some("prefix_binding_mismatch")
+		})
+		.count()
+}
+
+fn log_dropped_thinking(model: &str, input_transformations: &serde_json::Value) {
+	let dropped = prefix_dropped_thinking_blocks(input_transformations);
+	if dropped == 0 {
+		return;
+	}
+	tracing::debug!(
+		model,
+		dropped,
+		"anthropic dropped replayed thinking blocks: system prompt, tools or earlier messages changed since they were produced"
+	);
 }
 
 #[derive(Debug, Serialize)]
@@ -576,8 +646,8 @@ pub(crate) async fn chat_completion(
 	let builder = http
 		.post(&endpoint)
 		.header(API_KEY_HEADER, route.auth_token.as_deref().unwrap_or_default())
-		.header(VERSION_HEADER, ANTHROPIC_VERSION)
-		.json(&body);
+		.header(VERSION_HEADER, ANTHROPIC_VERSION);
+	let builder = with_thinking_beta(builder, &body).json(&body);
 	let response = send_with_rate_limit_retry(
 		&endpoint,
 		model,
@@ -600,6 +670,7 @@ pub(crate) async fn chat_completion(
 	}
 
 	let parsed: NonStreamResponse = crate::auth::decode_body(&endpoint, &text)?;
+	log_dropped_thinking(model, &parsed.input_transformations);
 	Ok(parsed.into_assistant_response())
 }
 
@@ -651,8 +722,8 @@ where
 		.post(&endpoint)
 		.header(API_KEY_HEADER, route.auth_token.as_deref().unwrap_or_default())
 		.header(VERSION_HEADER, ANTHROPIC_VERSION)
-		.header("accept", "text/event-stream")
-		.json(&body);
+		.header("accept", "text/event-stream");
+	let builder = with_thinking_beta(builder, &body).json(&body);
 	let response = send_with_rate_limit_retry(
 		&endpoint,
 		model,
@@ -674,18 +745,22 @@ where
 		return Err(CoderError::http(endpoint, status.as_u16(), text, request_id));
 	}
 
-	consume_stream(response, cancel, &mut on_event).await
+	consume_stream(response, model, cancel, &mut on_event).await
 }
 
 async fn consume_stream<F>(
 	response: reqwest::Response,
+	model: &str,
 	cancel: &tokio_util::sync::CancellationToken,
 	on_event: &mut F,
 ) -> Result<AssistantResponse, CoderError>
 where
 	F: FnMut(StreamEvent<'_>),
 {
-	let mut state = StreamState::default();
+	let mut state = StreamState {
+		model: model.to_owned(),
+		..StreamState::default()
+	};
 	let mut byte_stream = response.bytes_stream();
 	let mut sse_buf: Vec<u8> = Vec::new();
 
@@ -724,6 +799,8 @@ where
 
 #[derive(Default)]
 struct StreamState {
+	/// Requested model, for log lines only.
+	model: String,
 	content: String,
 	thinking: String,
 	tool_calls: Vec<ToolCallBuf>,
@@ -764,6 +841,7 @@ impl StreamState {
 	{
 		match event {
 			StreamEventBody::MessageStart { message } => {
+				log_dropped_thinking(&self.model, &message.input_transformations);
 				if let Some(usage) = message.usage {
 					self.usage = Some(merge_usage(self.usage, usage));
 				}
@@ -992,6 +1070,8 @@ enum StreamEventBody {
 struct StreamStartMessage {
 	#[serde(default)]
 	usage: Option<AnthropicUsage>,
+	#[serde(default)]
+	input_transformations: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1071,6 +1151,8 @@ struct NonStreamResponse {
 	usage: Option<AnthropicUsage>,
 	#[serde(default)]
 	stop_reason: Option<String>,
+	#[serde(default)]
+	input_transformations: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1595,6 +1677,7 @@ mod tests {
 							input_tokens: Some(100),
 							..Default::default()
 						}),
+						input_transformations: serde_json::Value::Null,
 					},
 				},
 				&mut |_| {},
@@ -2090,6 +2173,44 @@ mod tests {
 			assert_eq!(cfg.kind, "adaptive", "{model} should be adaptive");
 			assert_eq!(cfg.display, "summarized");
 		}
+	}
+
+	#[test]
+	fn thinking_config_asks_the_api_to_drop_prefix_mismatched_blocks() {
+		// Fable 5.2 400s ("bound to a different conversation") on a
+		// replayed block whose system prompt / tools changed, unless
+		// the request opts into `drop_block`.
+		let cfg = thinking_config_for("claude-fable-5-2").expect("fable 5.2 enables thinking");
+		assert_eq!(
+			serde_json::to_value(&cfg).unwrap(),
+			serde_json::json!({
+				"type": "adaptive",
+				"display": "summarized",
+				"block_binding": {"prefix_mismatch_behavior": "drop_block"},
+			})
+		);
+	}
+
+	#[test]
+	fn counts_only_prefix_mismatch_drops() {
+		let transformations = serde_json::json!([
+			{"type": "thinking_dropped", "reason": "prefix_binding_mismatch", "path": "messages.1.content.0"},
+			{"type": "thinking_dropped", "reason": "prefix_binding_mismatch", "path": "messages.3.content.0"},
+			{"type": "thinking_dropped", "reason": "model_binding_mismatch", "path": "messages.5.content.0"},
+			{"type": "something_new"},
+		]);
+		assert_eq!(prefix_dropped_thinking_blocks(&transformations), 2);
+		assert_eq!(prefix_dropped_thinking_blocks(&serde_json::Value::Null), 0);
+
+		let start: StreamEventBody = serde_json::from_value(serde_json::json!({
+			"type": "message_start",
+			"message": {"usage": {"input_tokens": 1}, "input_transformations": transformations},
+		}))
+		.unwrap();
+		let StreamEventBody::MessageStart { message } = start else {
+			panic!("expected message_start");
+		};
+		assert_eq!(prefix_dropped_thinking_blocks(&message.input_transformations), 2);
 	}
 
 	#[test]

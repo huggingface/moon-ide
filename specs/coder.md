@@ -343,6 +343,20 @@ Three contract points the native adapter must honour (details in
 3. **Survive reload.** Signed blocks persist into the session JSONL
    as moon-specific fields on the pi `thinking` content blocks, so a
    session reopened mid-tool-loop replays without a 400.
+4. **Stale blocks are dropped, not fatal.** The preserved-thinking
+   models (Fable / Mythos 5.1+, Opus / Sonnet / Haiku 5.5) bind each
+   block to its prefix — `system`, `tools`, every earlier message —
+   and 400 a replay whose prefix changed. Ours changes on purpose
+   when the project does (rules file, bound folders, MCP settings)
+   and when compaction rewrites history, so every request that
+   carries a `thinking` object also sets
+   `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`
+   under the `thinking-binding-controls-2026-08-01` beta: the session
+   loses that reasoning instead of dying. State that changes during
+   ordinary work must **not** live in the system prompt or a tool
+   description; it goes into the conversation
+   ([§ Reading the user's terminals](#reading-the-users-terminals)).
+   See [ADR 0110](decisions/0110-thinking-prefix-binding.md).
 
 `max_tokens` **fails open**: 32 K for everything except the families
 whose hard output cap is lower (Haiku, Claude 3), which get 8 K. The
@@ -576,6 +590,15 @@ server instead of starting a second one through `bash`.
   posture as the MCP meta-tools), except in write modes, where they
   ride along with `open_terminal` — the tool list is fixed per turn,
   so a terminal opened mid-turn must be readable in that turn.
+- **The list of open terminals rides in the user's prompt**, not in
+  the tool descriptions: a composer send whose project's terminals
+  differ from what the conversation last said gets an
+  `<open_terminals>` element in its trailing `<context>` block
+  (one line per terminal: id, target, cwd, running / exit code, and
+  the command for agent-opened ones; `(none)` once the last one
+  closes). It is stored with the message and hidden by the panel like
+  the rest of the block. Automated messages and sub-agent tasks carry
+  none; `list_terminals` is always the live answer.
 - **Output is what's on screen.** Each terminal keeps a bounded
   ring of raw PTY bytes (256 kB) which a read replays through a
   throwaway terminal emulator: escape sequences applied,
