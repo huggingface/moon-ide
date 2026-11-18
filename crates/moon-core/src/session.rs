@@ -115,6 +115,7 @@ mod tests {
 			forwarded_ports: Vec::new(),
 			coder_hub_bucket: None,
 			coder_mcp: Default::default(),
+			coder_instructions: String::new(),
 			compose_auto_resume: Default::default(),
 		}
 	}

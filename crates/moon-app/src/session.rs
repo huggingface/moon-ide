@@ -64,6 +64,7 @@ fn merge_frontend_session(existing: WorkspaceSession, frontend: WorkspaceSession
 		forwarded_ports: existing.forwarded_ports,
 		coder_hub_bucket: existing.coder_hub_bucket,
 		coder_mcp: existing.coder_mcp,
+		coder_instructions: existing.coder_instructions,
 		compose_auto_resume: existing.compose_auto_resume,
 	}
 }
@@ -114,6 +115,7 @@ mod tests {
 			forwarded_ports: Vec::new(),
 			coder_hub_bucket: None,
 			coder_mcp: Default::default(),
+			coder_instructions: String::new(),
 			compose_auto_resume: Default::default(),
 		}
 	}
@@ -139,6 +141,7 @@ mod tests {
 				enabled: vec!["playwright".into()],
 				custom: Vec::new(),
 			},
+			coder_instructions: "Keep PR descriptions short.".into(),
 			compose_auto_resume: {
 				let mut m = std::collections::BTreeMap::new();
 				m.insert("/home/me/work".to_string(), true);
@@ -234,11 +237,13 @@ mod tests {
 		payload.coder_provider_lock = None;
 		payload.compose_auto_resume = std::collections::BTreeMap::new();
 		payload.coder_mcp = Default::default();
+		payload.coder_instructions = String::new();
 		let merged = merge_frontend_session(existing.clone(), payload);
 		assert_eq!(merged.coder_hub_bucket, existing.coder_hub_bucket);
 		assert_eq!(merged.forwarded_ports, existing.forwarded_ports);
 		assert_eq!(merged.coder_provider_lock, existing.coder_provider_lock);
 		assert_eq!(merged.coder_mcp, existing.coder_mcp);
+		assert_eq!(merged.coder_instructions, existing.coder_instructions);
 		assert_eq!(merged.compose_auto_resume, existing.compose_auto_resume);
 	}
 }

@@ -1351,6 +1351,28 @@ impl CoderHandle {
 		self.state.tools.browser_tabs().clone()
 	}
 
+	/// The user's own instructions for the agent in this workspace
+	/// (`session.json`), as every session's system prompt carries
+	/// them.
+	pub async fn workspace_instructions(&self) -> moon_protocol::MoonResult<String> {
+		let id = self.state.workspaces.workspace_id().await;
+		let session = moon_core::session::load(&self.state.workspaces_dir, &id).await?;
+		Ok(session.coder_instructions)
+	}
+
+	/// Replace them; an empty text removes the section. Sessions pick
+	/// the change up on their next turn.
+	pub async fn set_workspace_instructions(&self, text: &str) -> moon_protocol::MoonResult<()> {
+		let id = self.state.workspaces.workspace_id().await;
+		let mut session = moon_core::session::load(&self.state.workspaces_dir, &id).await?;
+		let text = text.trim();
+		if session.coder_instructions == text {
+			return Ok(());
+		}
+		session.coder_instructions = text.to_owned();
+		moon_core::session::save(&self.state.workspaces_dir, &id, &session).await
+	}
+
 	/// This workspace's read-only Slack connection (ADR 0122): status,
 	/// connect and disconnect for the settings UI.
 	pub fn slack(&self) -> &crate::slack::SlackClient {
@@ -10793,6 +10815,14 @@ async fn refresh_system_prompt(
 	} else {
 		workspace_in_container_mode(&state.tools, force_host_bash, routing_path, &folders).await
 	};
+	let workspace_id = state.workspaces.workspace_id().await;
+	let instructions = match moon_core::session::load(&state.workspaces_dir, &workspace_id).await {
+		Ok(session) => session.coder_instructions,
+		Err(err) => {
+			tracing::warn!(error = %err, "system prompt: could not read the workspace's instructions");
+			String::new()
+		}
+	};
 	let prompt = compose_system_prompt(
 		&folders,
 		if scratch { None } else { Some(routing_path.as_str()) },
@@ -10800,6 +10830,7 @@ async fn refresh_system_prompt(
 		&state.folder_summaries,
 		container_mode,
 		mode,
+		&instructions,
 	)
 	.await;
 	let mut session = rt.session.lock().await;
@@ -10899,6 +10930,7 @@ async fn compose_system_prompt(
 	summaries: &Arc<FolderSummaryService>,
 	container_mode: bool,
 	mode: CoderMode,
+	workspace_instructions: &str,
 ) -> String {
 	let base = match mode {
 		CoderMode::Coordinator => crate::coordinator::COORDINATOR_SYSTEM_PROMPT,
@@ -10950,6 +10982,21 @@ async fn compose_system_prompt(
 			if !out.ends_with('\n') {
 				out.push('\n');
 			}
+		}
+	}
+
+	// What the user wrote for this workspace in the coder settings.
+	// Last of the instruction layers: it is theirs, and it spans
+	// projects whose own rules know nothing of each other.
+	if let Some(instructions) = capped_instructions(workspace_instructions) {
+		out.push('\n');
+		out.push_str("## Workspace instructions\n\n");
+		out.push_str(
+			"Written by the user for every session in this workspace. They override the project rules, the personal instructions and the base prompt above when those disagree.\n\n",
+		);
+		out.push_str(&instructions);
+		if !out.ends_with('\n') {
+			out.push('\n');
 		}
 	}
 
@@ -11176,6 +11223,24 @@ async fn read_personal_instructions(folder_root: &Utf8Path) -> Option<String> {
 		text.push_str("\n... (truncated)\n");
 	}
 	Some(text)
+}
+
+/// `text` as a prompt section body: `None` when blank, cut at
+/// [`AGENT_RULES_MAX_BYTES`] (on a character boundary) with the same
+/// sentinel as the rules files.
+fn capped_instructions(text: &str) -> Option<String> {
+	let text = text.trim();
+	if text.is_empty() {
+		return None;
+	}
+	if text.len() <= AGENT_RULES_MAX_BYTES {
+		return Some(text.to_owned());
+	}
+	let mut end = AGENT_RULES_MAX_BYTES;
+	while !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	Some(format!("{}\n\n... (truncated)\n", &text[..end]))
 }
 
 /// Drain `pending_steers` into `session.messages` and persist
@@ -13677,11 +13742,59 @@ mod tests {
 			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
 		));
 		let scratch = Utf8PathBuf::from("/home/dev");
-		let prompt = compose_system_prompt(&[], None, Some(scratch.as_path()), &summaries, false, CoderMode::Agent).await;
+		let prompt = compose_system_prompt(
+			&[],
+			None,
+			Some(scratch.as_path()),
+			&summaries,
+			false,
+			CoderMode::Agent,
+			"",
+		)
+		.await;
 		assert!(prompt.contains("## No folders bound"));
 		assert!(prompt.contains("/home/dev"));
 		assert!(!prompt.contains("## Bound folders"));
 		assert!(!prompt.contains("## Project rules"));
+	}
+
+	#[tokio::test]
+	async fn compose_system_prompt_carries_the_workspace_instructions() {
+		let cache = tempfile::TempDir::new().unwrap();
+		let summaries = Arc::new(FolderSummaryService::new(
+			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
+		));
+		let with = |text: &'static str| {
+			let summaries = summaries.clone();
+			async move { compose_system_prompt(&[], Some("/proj"), None, &summaries, false, CoderMode::Agent, text).await }
+		};
+		let prompt = with("  Keep PR descriptions short.\n").await;
+		assert!(prompt.contains("## Workspace instructions\n\n"));
+		assert!(prompt.ends_with("Keep PR descriptions short.\n"));
+		// A coordinator session gets them too.
+		let coordinator = compose_system_prompt(
+			&[],
+			Some("/proj"),
+			None,
+			&summaries,
+			false,
+			CoderMode::Coordinator,
+			"Be brief.",
+		)
+		.await;
+		assert!(coordinator.ends_with("Be brief.\n"));
+		// Nothing written, no section; and the prompt is the same as before.
+		assert!(!with("").await.contains("## Workspace instructions"));
+		assert_eq!(with(" \n").await, with("").await);
+	}
+
+	#[test]
+	fn overlong_instructions_are_cut_on_a_character_boundary() {
+		let text = "é".repeat(AGENT_RULES_MAX_BYTES);
+		let capped = capped_instructions(&text).unwrap();
+		assert!(capped.ends_with("... (truncated)\n"));
+		assert!(capped.len() <= AGENT_RULES_MAX_BYTES + 32);
+		assert_eq!(capped_instructions("  \n"), None);
 	}
 
 	#[tokio::test]
@@ -13690,7 +13803,7 @@ mod tests {
 		let summaries = Arc::new(FolderSummaryService::new(
 			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
 		));
-		let prompt = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, CoderMode::Agent).await;
+		let prompt = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, CoderMode::Agent, "").await;
 		assert!(!prompt.contains("## No folders bound"));
 	}
 
@@ -13719,7 +13832,16 @@ mod tests {
 			.unwrap();
 		let folders = registry.folders().await;
 
-		let prompt = compose_system_prompt(&folders, Some(wt.as_str()), None, &summaries, false, CoderMode::Agent).await;
+		let prompt = compose_system_prompt(
+			&folders,
+			Some(wt.as_str()),
+			None,
+			&summaries,
+			false,
+			CoderMode::Agent,
+			"",
+		)
+		.await;
 		assert!(
 			prompt.contains("## Personal coder instructions"),
 			"fallback section missing"
@@ -13728,7 +13850,16 @@ mod tests {
 
 		// Worktree-local copy takes precedence.
 		std::fs::write(wt.join(".moon/AGENTS.md").as_std_path(), "worktree-local rules\n").unwrap();
-		let prompt = compose_system_prompt(&folders, Some(wt.as_str()), None, &summaries, false, CoderMode::Agent).await;
+		let prompt = compose_system_prompt(
+			&folders,
+			Some(wt.as_str()),
+			None,
+			&summaries,
+			false,
+			CoderMode::Agent,
+			"",
+		)
+		.await;
 		assert!(prompt.contains("worktree-local rules"));
 		assert!(!prompt.contains("parent personal rules"));
 	}
@@ -14560,6 +14691,53 @@ mod tests {
 			"force_host_override must read the visible session's header"
 		);
 		assert_eq!(status.bash_target.as_deref(), Some("host"));
+	}
+
+	#[tokio::test]
+	async fn workspace_instructions_reach_a_sessions_system_prompt() {
+		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+
+		let folder_dir = tempfile::TempDir::new().unwrap();
+		let folder = Utf8PathBuf::from_path_buf(folder_dir.path().canonicalize().unwrap()).unwrap();
+		let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		registry.add_folder(folder.clone()).await.unwrap();
+		let data_dir = tempfile::TempDir::new().unwrap();
+		let coder = CoderHandle::new(
+			registry,
+			Utf8PathBuf::from_path_buf(data_dir.path().join("workspaces")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("coder-sessions")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("folder-summaries")).unwrap(),
+			CoderModels::default(),
+			Arc::new(moon_terminal::TerminalRegistry::default()),
+		)
+		.unwrap();
+		let rt = Arc::new(SessionRuntime::new(Session::new_blank()));
+		let prompt = || async {
+			refresh_system_prompt(&coder.state, &rt, &folder, false, true, CoderMode::Agent).await;
+			match rt.session.lock().await.messages.first() {
+				Some(ChatMessage::System { content }) => content.clone(),
+				_ => panic!("no system prompt"),
+			}
+		};
+
+		assert_eq!(coder.workspace_instructions().await.unwrap(), "");
+		assert!(!prompt().await.contains("## Workspace instructions"));
+
+		coder
+			.set_workspace_instructions("  Keep PR descriptions short.\n")
+			.await
+			.unwrap();
+		assert_eq!(
+			coder.workspace_instructions().await.unwrap(),
+			"Keep PR descriptions short."
+		);
+		// A session already open carries them from its next turn.
+		let with = prompt().await;
+		assert!(with.contains("## Workspace instructions\n\n"));
+		assert!(with.contains("Keep PR descriptions short.\n"));
+
+		coder.set_workspace_instructions("").await.unwrap();
+		assert!(!prompt().await.contains("## Workspace instructions"));
 	}
 
 	#[tokio::test]

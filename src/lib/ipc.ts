@@ -542,6 +542,10 @@ export const ipc = {
 		webSearchConfigured: () => call<boolean>('coder_web_search_configured'),
 		setWebSearchKey: (key: string) => call<void>('coder_set_web_search_key', { key }),
 		clearWebSearchKey: () => call<void>('coder_clear_web_search_key'),
+		/** The user's own instructions for the agent in this workspace,
+		 * part of every session's system prompt. */
+		getWorkspaceInstructions: () => call<string>('coder_get_workspace_instructions'),
+		setWorkspaceInstructions: (text: string) => call<void>('coder_set_workspace_instructions', { text }),
 		/** Read-only Slack for the agent, per workspace (ADR 0122). */
 		slackStatus: () => call<SlackStatus>('coder_slack_status'),
 		slackConnect: (token: string) => call<SlackConnection>('coder_slack_connect', { token }),

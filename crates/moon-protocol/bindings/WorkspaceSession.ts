@@ -78,6 +78,13 @@ coder_hub_bucket?: CoderHubBucket | null,
  */
 coder_mcp?: CoderMcpWorkspaceConfig, 
 /**
+ * The user's own instructions for the agent in this workspace,
+ * added to every session's system prompt ("keep PR descriptions
+ * short"). Backend-managed: `coder_set_workspace_instructions`
+ * is the only writer.
+ */
+coder_instructions?: string, 
+/**
  * Per-folder "this folder's `docker-compose.yml` project was
  * `Running` when the IDE quit last time" map, keyed by the
  * folder's absolute path. `AppCore::stop_all` populates

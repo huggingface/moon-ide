@@ -193,6 +193,12 @@ pub struct WorkspaceSession {
 	/// only writers. See [`crate::coder_mcp`].
 	#[serde(default, skip_serializing_if = "CoderMcpWorkspaceConfig::is_empty")]
 	pub coder_mcp: CoderMcpWorkspaceConfig,
+	/// The user's own instructions for the agent in this workspace,
+	/// added to every session's system prompt ("keep PR descriptions
+	/// short"). Backend-managed: `coder_set_workspace_instructions`
+	/// is the only writer.
+	#[serde(default, skip_serializing_if = "String::is_empty")]
+	pub coder_instructions: String,
 	/// Per-folder "this folder's `docker-compose.yml` project was
 	/// `Running` when the IDE quit last time" map, keyed by the
 	/// folder's absolute path. `AppCore::stop_all` populates

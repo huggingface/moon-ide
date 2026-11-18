@@ -708,6 +708,18 @@ impl BridgeRpcHandler for BridgeRpc {
 				self.coder.clear_web_search_key().map_err(|e| e.to_string())?;
 				to_value(&true)
 			}
+			"coder_get_workspace_instructions" => {
+				to_value(&self.coder.workspace_instructions().await.map_err(|e| e.to_string())?)
+			}
+			"coder_set_workspace_instructions" => {
+				let p: WorkspaceInstructionsParams = parse_params(params)?;
+				self
+					.coder
+					.set_workspace_instructions(&p.text)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&true)
+			}
 			// Read-only Slack for the agent (ADR 0122). The token lives
 			// in this host's keyring, per workspace.
 			"coder_slack_status" => to_value(&self.coder.slack().status().await.map_err(|e| e.to_string())?),
@@ -1055,6 +1067,11 @@ struct WebSearchKeyParams {
 }
 
 #[derive(serde::Deserialize)]
+struct WorkspaceInstructionsParams {
+	text: String,
+}
+
+#[derive(serde::Deserialize)]
 struct SlackConnectParams {
 	token: String,
 }
@@ -1276,6 +1293,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_web_search_configured",
 	"coder_set_web_search_key",
 	"coder_clear_web_search_key",
+	"coder_get_workspace_instructions",
+	"coder_set_workspace_instructions",
 	"coder_slack_status",
 	"coder_slack_connect",
 	"coder_slack_disconnect",

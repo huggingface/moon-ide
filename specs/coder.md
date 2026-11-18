@@ -913,7 +913,15 @@ Concatenated, in this order:
    gitignored, a worktree checkout never contains it: worktree
    sessions inherit the **parent project's** copy (a deliberately
    placed worktree-local file still wins).
-4. **Skills** discovered from `skills/`, `.claude/skills/`,
+4. **Workspace instructions** — what the user wrote under
+   _Instructions_ in the coder settings ("keep PR descriptions
+   short"), for every session of the workspace whatever its project.
+   Kept in the workspace's `session.json`, same cap. `.moon/AGENTS.md`
+   is per project and a file to go and edit; this is one text for the
+   whole workspace, edited where the models are picked. A change
+   reaches a session on its next turn. Sub-agents don't get it, as
+   they don't get the rules files.
+5. **Skills** discovered from `skills/`, `.claude/skills/`,
    `.cursor/skills*/`, `.agents/skills/` (`SKILL.md` with `name` +
    `description` frontmatter per the
    [agent-skills standard](https://agentskills.io)). Only the
@@ -2465,29 +2473,30 @@ card + "+ New session" when signed in with no session.
 
 Tauri commands in `src-tauri/src/commands/coder.rs`:
 
-| Command                                                 | Purpose                                                                                                                         |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `coder_start_device_flow()`                             | Returns `{ user_code, verification_uri, expires_in, interval }`; background poll runs in `moon-coder`                           |
-| `coder_status()`                                        | `{ signed_in, identity?, busy, bash_target?, force_host_override }` — coder-root visible session (ADR 0028)                     |
-| `coder_sign_out()`                                      | Drops keyring + identity                                                                                                        |
-| `coder_list_sessions()`                                 | Per-session summaries for the list view                                                                                         |
-| `coder_search_sessions(query)`                          | Ids of sessions whose title, user prompts or assistant prose contain the query (case-insensitive); powers the list's search box |
-| `coder_open_session(id?)`                               | Load `id`, or create a new session; returns the active id                                                                       |
-| `coder_delete_session(id)`                              | Removes JSONL (+ sub-agent subdir)                                                                                              |
-| `coder_session_jsonl_path(id)`                          | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                                            |
-| `coder_send(text, images, session_id?)`                 | Send / steer, targeted at the composer's session id (ADR 0066); `null` falls back to the visible session                        |
-| `coder_abort()`                                         | Cancels the visible session's in-flight turn                                                                                    |
-| `coder_continue_subagent(subagent_id, text)`            | Steers a running sub-agent, or resumes a finished one with a follow-up; `false` when nothing to continue                        |
-| `coder_abort_subagent(subagent_id)`                     | Cancels one sub-agent's own token; parent turn and siblings unaffected                                                          |
-| `coder_respond_to_prompt(call_id, response)`            | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                                                      |
-| `coder_revert_to_message(user_ordinal)`                 | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn                                 |
-| `coder_replay_from_message(user_ordinal)`               | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn                              |
-| `coder_resume_from_tool_call(tool_call_id)`             | Truncates to the issuing assistant message (kept), re-dispatches its tool calls, continues the turn. Refused mid-turn           |
-| `coder_rerun_tool_call(tool_call_id)`                   | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched                                        |
-| `coder_set_model(slug)` / `coder_set_model_settings(…)` | Model picks                                                                                                                     |
-| `coder_*_provider*` commands                            | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                                               |
-| `coder_set_sync_enabled(enabled)`                       | Per-workspace bucket-sync toggle                                                                                                |
-| `coder_mcp_*` commands                                  | MCP server rows, per-workspace enable toggle, custom-server add/remove (see [§ MCP servers](#mcp-servers))                      |
+| Command                                                                         | Purpose                                                                                                                          |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `coder_start_device_flow()`                                                     | Returns `{ user_code, verification_uri, expires_in, interval }`; background poll runs in `moon-coder`                            |
+| `coder_status()`                                                                | `{ signed_in, identity?, busy, bash_target?, force_host_override }` — coder-root visible session (ADR 0028)                      |
+| `coder_sign_out()`                                                              | Drops keyring + identity                                                                                                         |
+| `coder_list_sessions()`                                                         | Per-session summaries for the list view                                                                                          |
+| `coder_search_sessions(query)`                                                  | Ids of sessions whose title, user prompts or assistant prose contain the query (case-insensitive); powers the list's search box  |
+| `coder_open_session(id?)`                                                       | Load `id`, or create a new session; returns the active id                                                                        |
+| `coder_delete_session(id)`                                                      | Removes JSONL (+ sub-agent subdir)                                                                                               |
+| `coder_session_jsonl_path(id)`                                                  | Resolves a session id (parent or sub-agent) to its on-disk path; powers "open trace"                                             |
+| `coder_send(text, images, session_id?)`                                         | Send / steer, targeted at the composer's session id (ADR 0066); `null` falls back to the visible session                         |
+| `coder_abort()`                                                                 | Cancels the visible session's in-flight turn                                                                                     |
+| `coder_continue_subagent(subagent_id, text)`                                    | Steers a running sub-agent, or resumes a finished one with a follow-up; `false` when nothing to continue                         |
+| `coder_abort_subagent(subagent_id)`                                             | Cancels one sub-agent's own token; parent turn and siblings unaffected                                                           |
+| `coder_respond_to_prompt(call_id, response)`                                    | Resolves a parked `ask_user` prompt; returns `false` when nothing's parked                                                       |
+| `coder_revert_to_message(user_ordinal)`                                         | Truncates the visible session; returns the dropped prompt for edit-and-resend. Refused mid-turn                                  |
+| `coder_replay_from_message(user_ordinal)`                                       | Truncates to before the message, then re-sends the same prompt (re-run the turn). Refused mid-turn                               |
+| `coder_resume_from_tool_call(tool_call_id)`                                     | Truncates to the issuing assistant message (kept), re-dispatches its tool calls, continues the turn. Refused mid-turn            |
+| `coder_rerun_tool_call(tool_call_id)`                                           | Reapplies a recorded `write_file` / `edit_file` to disk (recovery); transcript untouched                                         |
+| `coder_set_model(slug)` / `coder_set_model_settings(…)`                         | Model picks                                                                                                                      |
+| `coder_*_provider*` commands                                                    | Custom-provider CRUD, probe, per-provider catalog, keyring-only API-key set/clear                                                |
+| `coder_set_sync_enabled(enabled)`                                               | Per-workspace bucket-sync toggle                                                                                                 |
+| `coder_mcp_*` commands                                                          | MCP server rows, per-workspace enable toggle, custom-server add/remove (see [§ MCP servers](#mcp-servers))                       |
+| `coder_get_workspace_instructions()` / `coder_set_workspace_instructions(text)` | The workspace's own lines in the system prompt (see [§ What the LLM sees as system prompt](#what-the-llm-sees-as-system-prompt)) |
 
 Push events: `coder:event` (every loop event, envelope-wrapped),
 `coder:signed_out`, `coder:sync_state`.

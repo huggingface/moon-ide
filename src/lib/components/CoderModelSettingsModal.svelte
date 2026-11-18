@@ -191,6 +191,34 @@
 	// competing with the catalog-search input visually — users
 	// were clicking the wrong one when filtering models.
 	let webKeyEditing = $state(false);
+	// Workspace instructions: one line until opened, like Slack below.
+	let instructionsDraft = $state<string | null>(null);
+	let instructionsBusy = $state(false);
+	let instructionsError = $state<string | null>(null);
+	const instructionsLines = $derived(
+		(coder.workspaceInstructions ?? '').split('\n').filter((line) => line.trim() !== '').length,
+	);
+
+	async function onSaveInstructions(): Promise<void> {
+		if (instructionsDraft === null) {
+			return;
+		}
+		instructionsBusy = true;
+		instructionsError = null;
+		try {
+			await coder.saveWorkspaceInstructions(instructionsDraft);
+			instructionsDraft = null;
+		} catch (err) {
+			instructionsError = formatError(err);
+		} finally {
+			instructionsBusy = false;
+		}
+	}
+
+	function focusInstructions(el: HTMLTextAreaElement) {
+		el.focus();
+	}
+
 	// Slack section state (ADR 0122). The token goes straight to the
 	// keyring through `connectSlack`; only the draft lives here.
 	let slackDraft = $state('');
@@ -405,6 +433,7 @@
 			void coder.loadModels();
 		}
 		void coder.loadWebSearchConfigured();
+		void coder.loadWorkspaceInstructions();
 		void coder.loadSlack();
 		void coder.loadMcpServers();
 	});
@@ -1972,6 +2001,67 @@
 				{/if}
 			</section>
 
+			<!-- The user's own lines in the system prompt of every
+				 session in this workspace. -->
+			<section class="web-key" aria-label="Workspace instructions">
+				{#if instructionsDraft === null}
+					<div class="web-key-summary">
+						<span class="label-name">Instructions</span>
+						{#if coder.workspaceInstructions !== null}
+							<span class="key-status" class:configured={instructionsLines > 0} class:missing={instructionsLines === 0}>
+								{instructionsLines === 0 ? 'none' : instructionsLines === 1 ? '1 line' : `${instructionsLines} lines`}
+							</span>
+						{/if}
+						<span class="flex-spacer"></span>
+						<button
+							type="button"
+							class="secondary"
+							onclick={() => (instructionsDraft = coder.workspaceInstructions ?? '')}
+							disabled={coder.workspaceInstructions === null}
+						>
+							{instructionsLines === 0 ? 'Add' : 'Edit'}
+						</button>
+					</div>
+				{:else}
+					<div class="label-row">
+						<span class="label-name">Instructions</span>
+						{#if workspace.workspaceName !== null}
+							<span class="mcp-workspace">for this workspace ({workspace.workspaceName})</span>
+						{/if}
+					</div>
+					<textarea
+						class="instructions-text"
+						rows="5"
+						bind:value={instructionsDraft}
+						placeholder="Keep PR descriptions short."
+						spellcheck="false"
+						disabled={instructionsBusy}
+						{@attach focusInstructions}
+					></textarea>
+					<div class="instructions-actions">
+						<span class="hint">
+							Added to the system prompt of every session in this workspace, after the projects' own
+							<code>AGENTS.md</code>. Sessions pick it up on their next turn.
+						</span>
+						<button
+							type="button"
+							class="secondary"
+							onclick={() => {
+								instructionsDraft = null;
+								instructionsError = null;
+							}}
+							disabled={instructionsBusy}
+						>
+							Cancel
+						</button>
+						<button type="button" class="primary" onclick={onSaveInstructions} disabled={instructionsBusy}>Save</button>
+					</div>
+					{#if instructionsError !== null}
+						<span class="error">{instructionsError}</span>
+					{/if}
+				{/if}
+			</section>
+
 			<!-- Slack, read-only and per workspace (ADR 0122): a user
 				 token in the OS keyring gives the agent `slack_search`
 				 and `slack_read`. Nothing here can post. -->
@@ -2648,6 +2738,36 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
+	}
+	.instructions-text {
+		min-height: 80px;
+		max-height: 40vh;
+		padding: 6px 8px;
+		border: 1px solid var(--m-border);
+		border-radius: 4px;
+		background: var(--m-bg-overlay);
+		color: var(--m-fg);
+		font: inherit;
+		font-size: 12px;
+		line-height: 1.5;
+		resize: vertical;
+	}
+	.instructions-text:focus {
+		outline: none;
+		border-color: var(--m-accent);
+	}
+	.instructions-actions {
+		display: flex;
+		align-items: flex-start;
+		gap: 6px;
+	}
+	.instructions-actions .hint {
+		flex: 1 1 auto;
+	}
+	.instructions-actions button {
+		flex: 0 0 auto;
+		padding: 2px 12px;
+		font-size: 11px;
 	}
 	.web-key-summary .label-name {
 		font-size: 12px;

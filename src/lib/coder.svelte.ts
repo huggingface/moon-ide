@@ -1247,6 +1247,21 @@ export class CoderPanelState {
 		}
 	}
 
+	/** The user's own instructions for the agent in this workspace,
+	 *  for the settings modal. `null` until first loaded. */
+	workspaceInstructions = $state<string | null>(null);
+
+	async loadWorkspaceInstructions(): Promise<void> {
+		this.workspaceInstructions = await ipc.coder.getWorkspaceInstructions();
+	}
+
+	/** Sessions carry the new text from their next turn on. */
+	async saveWorkspaceInstructions(text: string): Promise<void> {
+		const trimmed = text.trim();
+		await ipc.coder.setWorkspaceInstructions(trimmed);
+		this.workspaceInstructions = trimmed;
+	}
+
 	/** This workspace's read-only Slack connection (ADR 0122), for the
 	 *  settings modal. `null` until first loaded. */
 	slack = $state<SlackStatus | null>(null);

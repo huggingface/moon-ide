@@ -1564,6 +1564,18 @@ pub async fn coder_clear_web_search_key(app: &AppCore) -> Result<(), MoonError> 
 	app.coder.clear_web_search_key().map_err(MoonError::from)
 }
 
+/// The user's own instructions for the agent in this workspace, as
+/// the settings dialog edits them.
+pub async fn coder_get_workspace_instructions(app: &AppCore) -> Result<String, MoonError> {
+	app.coder.workspace_instructions().await
+}
+
+/// Replace them. Every session's system prompt carries the text from
+/// its next turn on; empty removes it.
+pub async fn coder_set_workspace_instructions(app: &AppCore, text: String) -> Result<(), MoonError> {
+	app.coder.set_workspace_instructions(&text).await
+}
+
 /// The Slack workspace this workspace's agents can read (ADR 0122),
 /// if it has a token, and the scopes a token needs. Errors when Slack
 /// no longer accepts the stored one.
@@ -1767,6 +1779,8 @@ crate::commands! {
 	coder_hub_session_url([app] session_id: String),
 	coder_set_web_search_key([app] key: String),
 	coder_clear_web_search_key([app]),
+	coder_get_workspace_instructions([app]),
+	coder_set_workspace_instructions([app] text: String),
 	coder_slack_status([app]),
 	coder_slack_connect([app] token: String),
 	coder_slack_disconnect([app]),

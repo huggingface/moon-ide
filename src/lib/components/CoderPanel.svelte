@@ -836,6 +836,26 @@
 		}
 	}
 
+	// An image takes its height when it has loaded, which is after
+	// the scroll that put the latest row in view: a session opened on
+	// screenshots would sit one image short of its end. No scroll
+	// event comes with that growth, so `stickyBottom` still says where
+	// the viewport was; the measured fallback covers the scroll event
+	// of our own write landing in between and reading the grown page.
+	function onTranscriptImageLoad(event: Event): void {
+		const image = event.target;
+		if (!scrollEl || bottomClip !== 0 || !(image instanceof HTMLImageElement)) {
+			return;
+		}
+		const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+		const before = distance - image.getBoundingClientRect().height;
+		if (!stickyBottom && before > STICKY_BOTTOM_THRESHOLD_PX) {
+			return;
+		}
+		stickyBottom = true;
+		scrollEl.scrollTop = scrollEl.scrollHeight;
+	}
+
 	/** Pull `WINDOW_GROW_STEP` older rows into the window. Below the
 	 *  `WINDOW_MAX` cap this just grows the span; at the cap it
 	 *  slides — the same number of rows are dropped off the bottom
@@ -1043,6 +1063,16 @@
 		visibleCount = INITIAL_WINDOW;
 		bottomClip = 0;
 		pendingAnchorNode = null;
+		// Where the previous session was left says nothing about this
+		// one: it opens on its latest row. Left as it was, a session
+		// read from further up carried "not at the bottom" over, and
+		// a longer session's rows then counted as arrivals to clip.
+		stickyBottom = true;
+		void tick().then(() => {
+			if (scrollEl && stickyBottom) {
+				scrollEl.scrollTop = scrollEl.scrollHeight;
+			}
+		});
 	});
 
 	// Streaming-growth signal. The reducer mutates rows in place
@@ -3058,7 +3088,13 @@
 		<!-- tabindex so a click in the transcript parks focus here,
 		     keeping a follow-up Ctrl+F routed to this panel's find
 		     bar instead of falling through to another surface. -->
-		<div class="transcript" bind:this={scrollEl} onscroll={onTranscriptScroll} tabindex="-1">
+		<div
+			class="transcript"
+			bind:this={scrollEl}
+			onscroll={onTranscriptScroll}
+			onloadcapture={onTranscriptImageLoad}
+			tabindex="-1"
+		>
 			{#if coder.rows.length === 0}
 				{#if visibleSessionSummary?.worktree_branch}
 					<p class="hint">
