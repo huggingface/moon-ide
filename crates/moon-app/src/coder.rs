@@ -451,15 +451,6 @@ pub async fn coder_new_session(app: &AppCore) -> Result<SessionSummary, MoonErro
 	app.coder.new_session().await.map_err(MoonError::from)
 }
 
-/// Start a fresh **coordinator** (orchestrator) session (ADR 0030).
-/// Same as `coder_new_session` but stamps `mode: "coordinator"` on the
-/// header so `run_turn` advertises the worker-management tools
-/// (`spawn_worker` / `observe_worker` / etc.) instead of `task` /
-/// `ask_user`, and seeds the coordinator system prompt.
-pub async fn coder_new_coordinator_session(app: &AppCore) -> Result<SessionSummary, MoonError> {
-	app.coder.new_coordinator_session().await.map_err(MoonError::from)
-}
-
 /// Where `session_id` stands relative to a coordinator fleet (ADR 0052
 /// / 0084): `none`, `attached`, or `disconnected` (cut, final turn
 /// still running). Drives the session bar's disconnect / stop button.
@@ -476,10 +467,10 @@ pub async fn coder_disconnect_worker(app: &AppCore, session_id: String) -> Resul
 	Ok(app.coder.disconnect_worker(&session_id).await)
 }
 
-/// Attach an existing session to a coordinator as a worker (ADR
+/// Attach an existing session to `coordinator_id` as its worker (ADR
 /// 0084) — the `/attach` composer command. Mounts either session
 /// from disk when needed; refuses when the target is still attached
-/// to a different coordinator.
+/// to another session, or when it would put a worker under a worker.
 pub async fn coder_attach_worker(
 	app: &AppCore,
 	coordinator_id: String,
@@ -575,14 +566,9 @@ pub async fn coder_new_worktree_session(
 	// Prerequisite #2 — promoted from a UI-only Tauri command to a
 	// client-callable method so an in-process orchestrator agent can
 	// mint workers via `spawn_worker` without going through the Tauri
-	// command layer). The UI path always mints an ordinary `Agent`
-	// worker; a coordinator is created the same way with `Coordinator`.
-	// `parent_folder: None` = UI-driven: the active folder at click
+	// command layer). `parent_folder: None` = UI-driven: the active folder at click
 	// time is the parent, and the new session becomes visible.
-	let (session, workspace) = app
-		.coder
-		.create_worktree_session(base_branch, None, moon_coder::tools::CoderMode::Agent, None)
-		.await?;
+	let (session, workspace) = app.coder.create_worktree_session(base_branch, None, None).await?;
 	Ok(NewWorktreeSession { workspace, session })
 }
 
@@ -1732,7 +1718,6 @@ crate::commands! {
 	coder_active_session([app]),
 	coder_last_opened_session([app]),
 	coder_new_session([app]),
-	coder_new_coordinator_session([app]),
 	coder_worker_link_state([app] session_id: String),
 	coder_disconnect_worker([app] session_id: String),
 	coder_attach_worker([app] coordinator_id: String, session_id: String),

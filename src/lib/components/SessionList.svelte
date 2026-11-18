@@ -8,12 +8,10 @@
 	import { formatError, type CoderSessionSummary } from '../protocol';
 	import {
 		goToSessionBranch,
-		isCoordinatorSession,
 		openSessionTrace,
 		openSessionTraceOnHub,
 		revealComposer,
 		sessionBranch,
-		startNewCoordinatorSession,
 		startNewSession,
 		worktreeFolderForBranch,
 	} from '../sessionActions';
@@ -32,7 +30,6 @@
 	import CheckIcon from './icons/CheckIcon.svelte';
 	import CloudUploadIcon from './icons/CloudUploadIcon.svelte';
 	import CodeIcon from './icons/CodeIcon.svelte';
-	import CoordinatorIcon from './icons/CoordinatorIcon.svelte';
 	import EditIcon from './icons/EditIcon.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
@@ -296,15 +293,6 @@
 				<button
 					type="button"
 					class="icon"
-					onclick={startNewCoordinatorSession}
-					title="New coordinator session — an orchestrator that spawns and manages worker agents"
-					aria-label="New coordinator session"
-				>
-					<CoordinatorIcon />
-				</button>
-				<button
-					type="button"
-					class="icon"
 					data-session-new
 					onclick={startNewSession}
 					title="New session"
@@ -387,12 +375,6 @@
 								<span class="session-title-text" title={session.title || '(untitled)'}
 									>{session.title || '(untitled)'}</span
 								>
-								{#if isCoordinatorSession(session)}
-									<span
-										class="session-mode-badge coordinator"
-										title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
-									>
-								{/if}
 							</button>
 						{/if}
 						<div class="session-foot">
@@ -685,23 +667,6 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		min-width: 0;
-	}
-	/* Coordinator (orchestrator) mode badge — ADR 0030. Short
-	   `coord` so it doesn't crowd the truncated title. */
-	.session-mode-badge {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		flex-shrink: 0;
-		padding: 0 6px;
-		border-radius: var(--m-radius-pill);
-		font-size: var(--m-text-xs);
-		font-weight: 500;
-		line-height: 16px;
-	}
-	.session-mode-badge.coordinator {
-		background: var(--m-accent-tint);
-		color: var(--m-accent);
 	}
 	.session-foot {
 		display: flex;

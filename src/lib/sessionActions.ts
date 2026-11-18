@@ -15,13 +15,6 @@ export function sessionBranch(session: CoderSessionSummary): string | null {
 	return session.committed_branch ?? session.worktree_branch ?? null;
 }
 
-// A coordinator (orchestrator) session — ADR 0030. The backend
-// stamps `mode: "coordinator"` on the header. `null` (no summary
-// yet) is not one.
-export function isCoordinatorSession(session: CoderSessionSummary | null): boolean {
-	return session?.mode === 'coordinator';
-}
-
 // The bound worktree folder currently checked out on `branch`, if
 // any. Resolved live (not from which header field set it), so it's
 // correct after a branch is moved into / out of a worktree.
@@ -124,10 +117,5 @@ export function revealComposer(): void {
 
 export async function startNewSession(): Promise<void> {
 	await coder.newSession();
-	revealComposer();
-}
-
-export async function startNewCoordinatorSession(): Promise<void> {
-	await coder.newCoordinatorSession();
 	revealComposer();
 }

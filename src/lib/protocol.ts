@@ -1815,8 +1815,7 @@ export type AttachWorkerOutcome =
 	| { outcome: 'attached' }
 	| { outcome: 'already_attached' }
 	| { outcome: 'attached_elsewhere'; coordinator: string }
-	| { outcome: 'not_a_coordinator' }
-	| { outcome: 'target_is_coordinator' };
+	| { outcome: 'would_nest' };
 
 /** Snapshot returned by `coder_status`. Mirrors `moon_coder::CoderStatus`. */
 export type CoderStatus = {
@@ -1946,14 +1945,12 @@ export type CoderEvent =
 			title: string;
 			created_at_ms: number;
 			updated_at_ms: number;
-			/** ADR 0028 / ADR 0030 optional fields, carried so a
-			 *  reopened worktree / coordinator session keeps its
-			 *  badge / chip / hint without waiting on a list
-			 *  refresh. All absent for an ordinary session. */
+			/** ADR 0028 optional fields, carried so a reopened
+			 *  worktree session keeps its chip / hint without waiting
+			 *  on a list refresh. Absent for an ordinary session. */
 			worktree_root?: string | null;
 			worktree_branch?: string | null;
 			committed_branch?: string | null;
-			mode?: string | null;
 	  }
 	| { kind: 'replay'; events: CoderEvent[]; in_flight: boolean }
 	| { kind: 'session_title_updated'; id: string; title: string }
@@ -2158,13 +2155,6 @@ export type CoderSessionSummary = {
 	 * the session's work is first committed.
 	 */
 	committed_branch?: string | null;
-	/**
-	 * Top-level session mode (ADR 0030). Absent for the default
-	 * `agent` mode; `"coordinator"` marks an orchestrator session.
-	 * Lets the sessions list badge a coordinator row. Mirrors the
-	 * header's `mode` field.
-	 */
-	mode?: string | null;
 	/** The coordinator that spawned this session, for a worker. */
 	orchestrator_session_id?: string | null;
 	/**

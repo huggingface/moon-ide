@@ -206,11 +206,6 @@
 	<div class="row head">
 		<button class="ghost back" onclick={() => app.closeWorkspace()}>←</button>
 		<strong class="workspace-name">{app.activeWorkspaceName}</strong>
-		<button
-			class="ghost coord-btn"
-			title="New coordinator session — an orchestrator that spawns and manages worker agents"
-			onclick={() => app.newCoordinatorSession()}>✦</button
-		>
 		<button class="primary" onclick={() => app.newSession()}>+ New</button>
 	</div>
 
@@ -903,10 +898,6 @@
 						}}
 					>
 						<span class="title-line">
-							{#if s.mode === 'coordinator'}<span
-									class="badge"
-									title="Coordinator — an orchestrator that spawns and manages worker agents">coord</span
-								>{/if}
 							<strong>{s.title || 'Untitled session'}</strong>
 						</span>
 						<span class="muted">{relativeTime(s.updated_at_ms)}</span>
@@ -1594,9 +1585,6 @@
 		color: inherit;
 		padding: 0;
 	}
-	/* Badge first, title second: the title truncates, so a badge
-	   after it would be the first thing ellipsised away on a phone
-	   with the long auto-generated titles the coder writes. */
 	.title-line {
 		display: flex;
 		align-items: center;
@@ -1616,11 +1604,5 @@
 		font-size: 1.1rem;
 		padding: 0.2rem 0.5rem;
 		border: none;
-	}
-	.coord-btn {
-		flex: none;
-		font-size: 1.1rem;
-		padding: 0.4rem 0.5rem;
-		line-height: 1;
 	}
 </style>

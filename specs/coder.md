@@ -640,8 +640,7 @@ ordinary terminal tab the user sees and owns
   terminals stay read-only.
 - **No duplicates.** `open_terminal` with a command an agent terminal
   in the project already runs returns that terminal (`reused: true`).
-- **Write modes only**; Research sub-agents and coordinators don't
-  get it.
+- **Write modes only**; Research sub-agents don't get it.
 
 ### Web search
 
@@ -903,7 +902,10 @@ today), it gets a one-time confirm — but `bash` itself is not gated.
 
 Concatenated, in this order:
 
-1. Hardcoded base prompt (workspace-aware).
+1. Hardcoded base prompt (workspace-aware), then a short **Workers**
+   section for a session that has the worker tools (every top-level
+   session but an attached worker,
+   [ADR 0125](decisions/0125-any-session-runs-workers.md)).
 2. **`AGENTS.md`** from the active workspace root (case-insensitive,
    `CLAUDE.md` fallback, AGENTS.md wins when both exist). Verbatim up
    to a 20 KB cap with a `… (truncated)` sentinel.
@@ -939,10 +941,21 @@ session has its own chat history, cancel handle, composer draft, and
 context ring; switching folders or sessions never touches another
 session's running turn.
 
+**Workers.** Any top-level session can run workers
+([ADR 0030](decisions/0030-orchestrator-sessions.md) as reshaped by
+[ADR 0125](decisions/0125-any-session-runs-workers.md)): peer
+top-level sessions it spawns (`spawn_worker`) or is handed (`/attach`),
+each by default in its own worktree and branch, which it observes,
+steers and lands, and whose events wake it. That session is the
+workers' **coordinator** — a role, not a kind of session: it keeps
+`task`, `ask_user` and the write tools. One level only: an attached
+worker has no worker tools and cannot be given workers; disconnected,
+it is an ordinary session again.
+
 Tools captured by a running turn close over the **session's bound
 folder**, not the live active folder — switching folders mid-turn
-cannot redirect tool calls. This includes the coordinator tools
-(ADR 0030): `spawn_worker` creates the worktree off and files the
+cannot redirect tool calls. This includes the worker tools:
+`spawn_worker` creates the worktree off and files the
 worker under the **coordinator's own project** by default, or under a
 different bound folder when `folder` is passed (e.g. one created by
 `init_repo` / `clone_repo`). With `worktree: false` the worker runs
@@ -1019,11 +1032,10 @@ completion; clicking the button a second time cancels that turn.
 
 The inverse is the **`/attach` composer command**
 ([ADR 0084](decisions/0084-composer-slash-commands.md)): attach an
-**existing** session to a coordinator as a worker — adopt a session
-the user has been driving, or re-attach a disconnected one. Typed in
-a coordinator's composer it picks the session to adopt; typed in an
-ordinary session it picks the coordinator to hand the session to
-(same operation, argument order flipped). After the attach the link
+**existing** session to the one it is typed in, as its worker — adopt
+a session the user has been driving, or re-attach a disconnected one.
+It is not offered in an attached worker, and a link that would put a
+worker under a worker is refused (ADR 0125). After the attach the link
 is indistinguishable from a spawned worker's: registry + dispatch
 feeder, `orchestrator_session_id` header stamp (rewritten on disk —
 attach targets an already-persisted session), a coordinator-side
@@ -1046,9 +1058,9 @@ never reaches the model. A leading `/` that resolves to no known
 command falls through to a plain send, so prose starting with `/`
 still works. **`/detach`** is the inverse: typed in an attached
 worker it disconnects that session (no argument — same as the session
-bar's disconnect button); typed in a coordinator it lists the
-coordinator's still-attached workers to pick from. It only appears in
-the menu where it can act. New commands ride the same rail when a
+bar's disconnect button); typed in a session that has attached
+workers it lists them to pick from. It only appears in the menu where
+it can act. New commands ride the same rail when a
 concrete need shows up.
 
 The session bar's fleet affordance follows a three-state probe
@@ -1154,7 +1166,7 @@ on demand for exactly that path. `bash` and relative paths run from
 home, absolute host paths work through the out-of-workspace arm
 (ADR 0025), and a scratch session never routes to the workspace shell
 container, never gets format-on-save, and reads no project rules. A
-scratch coordinator can bootstrap the workspace — `init_repo` /
+scratch session can bootstrap the workspace — `init_repo` /
 `clone_repo` land at `~/<name>` — after which the new folder's
 sessions are separate from the scratch ones (scratch sessions stay
 filed under home). See
@@ -1400,9 +1412,9 @@ records (and everything after), then mutates the existing runtime's
 orphan-recovery — the kept tool calls are about to be re-dispatched,
 not marked as interrupted). It fires a `SessionLoaded` + `Replay`
 (with `in_flight: true`) so the frontend clears and rebuilds to the
-checkpoint state — `SessionLoaded` carries the ADR 0028 / ADR 0030
-optional header fields (`worktree_branch`, `committed_branch`,
-`mode`) so the worktree chip and coordinator badge survive the
+checkpoint state — `SessionLoaded` carries the ADR 0028 optional
+header fields (`worktree_branch`, `committed_branch`) so the worktree
+chip survives the
 rebuild without waiting on a sessions-list refresh — then spawns
 the turn loop on the same runtime with
 the kept `Assistant`'s `tool_calls` as a resume parameter. The model
@@ -1456,11 +1468,7 @@ visible while a session is open in the coder panel
 
 - **Session view** (coder panel) — transcript + composer under a
   `<title> | actions` strip. With no session open the panel shows an
-  empty state with a "New session" button. A coordinator (orchestrator) session — `mode:
-"coordinator"` on the header (ADR 0030) — shows a `coordinator`
-  badge left of the title and a coordinator-specific empty-state
-  hint ("delegates each task to a worker in its own worktree");
-  the worktree chip renders the same as on a regular session.
+  empty state with a "New session" button.
 - **Sessions list** (sidebar) — a row per persisted session of the
   active folder's project (title + relative time), the open one
   marked current, grouped under "Needs you" (waiting on input, last turn
@@ -1471,10 +1479,7 @@ visible while a session is open in the coder panel
   it has new activity
   ([ADR 0114](decisions/0114-sessions-in-the-sidebar.md)). With hover
   affordances for "open trace" and delete
-  (confirmed), plus the per-row status cues described above. A
-  coordinator row carries a short `coord` badge after the title so
-  orchestrator sessions are visually distinct from hand-started
-  ones. A search box above the rows filters by transcript content:
+  (confirmed), plus the per-row status cues described above. A search box above the rows filters by transcript content:
   the debounced query goes to `coder_search_sessions`, which scans
   the on-disk JSONLs (summaries carry no transcript text) and
   returns matching ids. Only titles, user prompts and assistant
@@ -1482,9 +1487,7 @@ visible while a session is open in the coder panel
   so many paths and identifiers that code-ish queries hit everything.
 
 `+` (on the sessions list or the session strip) opens a fresh empty session with focus in the
-composer; empty sessions don't persist until the first message. The
-sparkles button beside `+` opens a fresh **coordinator** session
-instead.
+composer; empty sessions don't persist until the first message.
 
 ### Open the raw trace in the editor
 

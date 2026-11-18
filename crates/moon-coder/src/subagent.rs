@@ -594,9 +594,6 @@ async fn run_subagent_in_dir(
 		parent_session_id: Some(spec.parent_session_id.clone()),
 		parent_tool_call_id: Some(spec.parent_tool_call_id.clone()),
 		subagent_mode: Some(spec.mode.as_wire().to_string()),
-		// Sub-agents are never top-level, so they carry no top-level
-		// `mode` — their mode lives in `subagent_mode` above.
-		mode: None,
 		subagent_target_folder: if target_differs { Some(target_folder_path) } else { None },
 		// Sub-agents inherit the parent's **live** host-mode flag via
 		// `spec.force_host_bash`, not through the header: the header
@@ -1866,10 +1863,6 @@ pub(crate) fn build_subagent_system_prompt(mode: CoderMode, folder: &Arc<Workspa
 	let base = match mode {
 		CoderMode::Research => RESEARCH_SYSTEM_PROMPT,
 		CoderMode::Agent => AGENT_SYSTEM_PROMPT,
-		// `Coordinator` is a top-level mode (ADR 0030); sub-agents
-		// never run in it. Fall back to the agent prompt rather than
-		// `unreachable!` so a future call path can't panic a turn.
-		CoderMode::Coordinator => AGENT_SYSTEM_PROMPT,
 	};
 	let mut header = format!(
 		"## Task\n\n{task}\n\n## Working folder\n\n- **{name}** at `{path}`\n",

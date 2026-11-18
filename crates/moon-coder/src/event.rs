@@ -263,12 +263,11 @@ pub enum CoderEvent {
 	/// the new session's records into it. Carries a snapshot of
 	/// the active session's metadata so the sticky header can
 	/// render without a separate IPC round trip — including the
-	/// ADR 0028 / ADR 0030 optional fields the header badges off
-	/// (`worktree_branch`, `committed_branch`, `mode`), so a
-	/// reopened worktree / coordinator session keeps its badge /
-	/// chip / hint instead of losing them until the next list
-	/// refresh. All three elide for an ordinary session, keeping
-	/// the wire shape compact on the hot path.
+	/// ADR 0028 optional fields the header badges off
+	/// (`worktree_branch`, `committed_branch`), so a reopened
+	/// worktree session keeps its chip instead of losing it until
+	/// the next list refresh. They elide for an ordinary session,
+	/// keeping the wire shape compact on the hot path.
 	SessionLoaded {
 		id: String,
 		title: String,
@@ -280,8 +279,6 @@ pub enum CoderEvent {
 		worktree_branch: Option<String>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		committed_branch: Option<String>,
-		#[serde(default, skip_serializing_if = "Option::is_none")]
-		mode: Option<String>,
 	},
 
 	/// A batch of events delivered as one envelope. Used by session

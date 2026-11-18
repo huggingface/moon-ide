@@ -900,27 +900,11 @@ struct PendingSteer {
 }
 
 impl Session {
-	/// Make a fresh session shell in the default top-level `Agent`
-	/// mode — id allocated, title empty pending the first prompt,
-	/// no folder bound. The historical constructor; most sessions
-	/// are ordinary `agent` sessions.
+	/// Make a fresh session shell — id allocated, title empty pending
+	/// the first prompt, no folder bound.
 	fn new_blank() -> Self {
-		Self::new_blank_with_mode(CoderMode::Agent)
-	}
-
-	/// Make a fresh session shell in a given top-level mode. The
-	/// mode is stamped onto the header (as its wire string, elided
-	/// for the `Agent` default to stay byte-compatible with pre-6
-	/// sessions) and drives the tool-list + system-prompt selection
-	/// in `run_turn`. A `Coordinator` shell gets the coordinator
-	/// system prompt as its seed `messages` entry instead of the
-	/// base `Agent` prompt.
-	fn new_blank_with_mode(mode: CoderMode) -> Self {
 		let now = current_time_ms();
-		let system_prompt = match mode {
-			CoderMode::Agent | CoderMode::Research => PHASE_6_0_SYSTEM_PROMPT.to_string(),
-			CoderMode::Coordinator => crate::coordinator::COORDINATOR_SYSTEM_PROMPT.to_string(),
-		};
+		let system_prompt = PHASE_6_0_SYSTEM_PROMPT.to_string();
 		Self {
 			header: SessionHeader {
 				schema: SESSION_SCHEMA_VERSION,
@@ -948,11 +932,6 @@ impl Session {
 				parent_session_id: None,
 				parent_tool_call_id: None,
 				subagent_mode: None,
-				// Top-level mode stamp. Elided for `Agent` (the
-				// default) so ordinary sessions stay byte-
-				// compatible with pre-6 transcripts; `Some` for
-				// `Coordinator` so the load path picks it up.
-				mode: (mode != CoderMode::Agent).then(|| mode.as_wire().to_string()),
 				subagent_target_folder: None,
 				bash_target_override: None,
 				worktree_root: None,
@@ -985,7 +964,6 @@ impl Session {
 			worktree_root: self.header.worktree_root.clone(),
 			worktree_branch: self.header.worktree_branch.clone(),
 			committed_branch: self.header.committed_branch.clone(),
-			mode: self.header.mode.clone(),
 			orchestrator_session_id: self.header.orchestrator_session_id.clone(),
 			last_error: false,
 			interrupted: false,
@@ -2387,38 +2365,6 @@ impl CoderHandle {
 		Ok(summary)
 	}
 
-	/// Allocate a fresh **coordinator** session under the active
-	/// folder and make it the visible one (ADR 0030). Same shape as
-	/// `new_session` but builds from `new_blank_with_mode(Coordinator)`
-	/// so the header carries `mode: "coordinator"`, the system prompt
-	/// seed is the coordinator prompt, and `run_turn` advertises the
-	/// worker-management tools instead of `task` / `ask_user`.
-	pub async fn new_coordinator_session(&self) -> Result<SessionSummary, CoderError> {
-		let (fs, _) = self.state.active_folder_session().await?;
-		let blank = Session::new_blank_with_mode(CoderMode::Coordinator);
-		let summary = blank.summary();
-		let id = blank.header.id.clone();
-		let rt = Arc::new(SessionRuntime::new(blank));
-		fs.insert_runtime(id.clone(), rt).await;
-		fs.set_visible(id).await;
-		Ok(summary)
-	}
-
-	/// Folder-targeted [`Self::new_coordinator_session`] for the
-	/// bridge: allocate the coordinator session under the named
-	/// bound folder, mount its runtime, and **don't** make it the
-	/// folder's visible session — the phone tracks its own open
-	/// session and must not hijack what the desktop is looking at.
-	pub async fn new_coordinator_session_in(&self, folder: Option<&str>) -> Result<SessionSummary, CoderError> {
-		let (fs, _) = self.state.folder_session_or_active(folder).await?;
-		let blank = Session::new_blank_with_mode(CoderMode::Coordinator);
-		let summary = blank.summary();
-		let id = blank.header.id.clone();
-		let rt = Arc::new(SessionRuntime::new(blank));
-		fs.insert_runtime(id, rt).await;
-		Ok(summary)
-	}
-
 	/// Create a fresh session under the **active (parent) folder**
 	/// that routes its tools to an already-created git worktree at
 	/// `worktree_root` on `branch` (ADR 0028). The session stays
@@ -2482,10 +2428,6 @@ impl CoderHandle {
 	/// default. Ignored when `base_branch` is given: that session
 	/// continues an existing branch, which already has a name.
 	///
-	/// `mode` selects the new session's top-level mode — `Agent` for
-	/// an ordinary worker (the common case), `Coordinator` for a
-	/// sub-orchestrator.
-	///
 	/// `parent_folder` pins the project the worktree is created off
 	/// and the session list the worker is filed under. `None` means
 	/// UI-driven: resolve the active folder at call time and set the
@@ -2502,7 +2444,6 @@ impl CoderHandle {
 		&self,
 		base_branch: Option<String>,
 		branch_name: Option<String>,
-		mode: CoderMode,
 		parent_folder: Option<String>,
 	) -> Result<(SessionSummary, moon_protocol::workspace::Workspace), CoderError> {
 		use moon_core::host::WorktreeBranch;
@@ -2548,15 +2489,13 @@ impl CoderHandle {
 		};
 		let branch = spec.name().to_string();
 		let wt_entry = add_project_worktree(&self.state, &parent, spec).await?;
-		// Mint the session in the chosen mode and stamp the worktree
-		// routing. Builds from `new_blank_with_mode` so a coordinator
-		// worker gets its system-prompt seed; an ordinary worker is
-		// `Agent`. Filed under the resolved parent's coder root —
-		// never re-read from the active folder, which may have
-		// changed since `parent` was resolved.
+		// Mint the session and stamp the worktree routing. Filed
+		// under the resolved parent's coder root — never re-read
+		// from the active folder, which may have changed since
+		// `parent` was resolved.
 		let root = self.state.coder_root_of(parent).await;
 		let fs = self.state.folder_session_for(Utf8Path::new(&root.folder.path)).await;
-		let mut blank = Session::new_blank_with_mode(mode);
+		let mut blank = Session::new_blank();
 		// A named worker is titled after its name (ADR 0042): the
 		// sessions-list row reads `fix-login-redirect` from the moment
 		// it spawns, matching its branch chip, instead of a truncated
@@ -2599,7 +2538,7 @@ impl CoderHandle {
 			.ok_or_else(|| CoderError::Internal(format!("no bound folder at `{folder_path}`")))?;
 		let root = self.state.coder_root_of(folder.clone()).await;
 		let fs = self.state.folder_session_for(Utf8Path::new(&root.folder.path)).await;
-		let mut blank = Session::new_blank_with_mode(CoderMode::Agent);
+		let mut blank = Session::new_blank();
 		if let moon_protocol::workspace::FolderOrigin::Worktree { branch, .. } = &folder.folder.origin {
 			blank.header.worktree_root = Some(folder.folder.path.clone());
 			blank.header.worktree_branch = Some(branch.clone());
@@ -2625,7 +2564,6 @@ impl CoderHandle {
 		&self,
 		name: &str,
 		parent_folder: &str,
-		mode: CoderMode,
 	) -> Result<SessionSummary, CoderError> {
 		let parent = self
 			.state
@@ -2641,7 +2579,7 @@ impl CoderHandle {
 		})?;
 		let root = self.state.coder_root_of(parent.clone()).await;
 		let fs = self.state.folder_session_for(Utf8Path::new(&root.folder.path)).await;
-		let mut blank = Session::new_blank_with_mode(mode);
+		let mut blank = Session::new_blank();
 		// Same naming discipline as a worktree worker (ADR 0042):
 		// title + readable session id from the name; a pre-set
 		// title suppresses the auto-rename.
@@ -3328,7 +3266,6 @@ impl CoderHandle {
 			worktree_root: header.worktree_root.clone(),
 			worktree_branch: header.worktree_branch.clone(),
 			committed_branch: header.committed_branch.clone(),
-			mode: header.mode.clone(),
 		});
 		// The kept Assistant's tool_calls will be re-dispatched by
 		// the turn loop — don't emit `ToolCall` events for them in
@@ -3903,7 +3840,6 @@ impl CoderHandle {
 			worktree_root: header.worktree_root,
 			worktree_branch: header.worktree_branch,
 			committed_branch: header.committed_branch,
-			mode: header.mode,
 			orchestrator_session_id: header.orchestrator_session_id,
 			last_error: false,
 			interrupted: false,
@@ -4067,14 +4003,9 @@ impl CoderHandle {
 			records,
 			record_timestamps,
 		} = sessions::load(&dir, &id).await?;
-		// ADR 0065: fold the on-disk fleet for a coordinator remount
-		// (below).
-		let is_coordinator = CoderMode::from_top_level_wire(header.mode.as_deref()) == CoderMode::Coordinator;
-		let worker_fleet: Vec<String> = if is_coordinator {
-			fold_worker_fleet(&records)
-		} else {
-			Vec::new()
-		};
+		// ADR 0065: fold the on-disk fleet of a session that has
+		// workers, for its remount (below).
+		let worker_fleet = fold_worker_fleet(&records);
 
 		let RebuiltMessages {
 			mut messages,
@@ -4196,7 +4127,6 @@ impl CoderHandle {
 			worktree_root: header.worktree_root.clone(),
 			worktree_branch: header.worktree_branch.clone(),
 			committed_branch: header.committed_branch.clone(),
-			mode: header.mode.clone(),
 			orchestrator_session_id: header.orchestrator_session_id.clone(),
 			last_error: false,
 			interrupted: false,
@@ -4282,7 +4212,7 @@ impl CoderHandle {
 		// UI open first. Idempotent: `register` is set-insert, the
 		// feeder spawn is guarded, and a live process re-opening the
 		// session takes the already-mounted fast path above.
-		if !already_mounted && is_coordinator && !worker_fleet.is_empty() {
+		if !already_mounted && !worker_fleet.is_empty() {
 			let mut spawn_feeder = false;
 			{
 				let mut registry = self.state.coordinator_workers.write().await;
@@ -4344,7 +4274,6 @@ impl CoderHandle {
 				worktree_root: summary.worktree_root.clone(),
 				worktree_branch: summary.worktree_branch.clone(),
 				committed_branch: summary.committed_branch.clone(),
-				mode: summary.mode.clone(),
 			});
 		}
 		// Collect the entire replay into one `Vec` and ship it as a
@@ -4779,7 +4708,6 @@ impl CoderHandle {
 				worktree_root: summary.worktree_root.clone(),
 				worktree_branch: summary.worktree_branch.clone(),
 				committed_branch: summary.committed_branch.clone(),
-				mode: summary.mode.clone(),
 			});
 			sink.folder_scoped().send(CoderEvent::SessionListChanged);
 		}
@@ -5326,51 +5254,36 @@ impl CoderHandle {
 	/// the coordinator shouldn't reason as if the worker has already
 	/// seen it (it may not for a while — or ever, if the user pops
 	/// the queued row).
+	/// The session `session_id` is an attached worker of, if any.
+	///
+	/// The registry dies with the process, but a worker's header
+	/// carries the link (ADR 0065). So when the registry knows
+	/// nothing, the coordinator named there is quietly remounted —
+	/// its cold mount rebuilds its fleet, or proves this worker
+	/// detached — and the registry is asked again.
+	async fn attached_coordinator_of(&self, session_id: &str) -> Option<String> {
+		let registered = |registry: &CoordinatorRegistry| registry.orchestrator_of(session_id).map(str::to_string);
+		if let Some(id) = registered(&*self.state.coordinator_workers.read().await) {
+			return Some(id);
+		}
+		let (worker_rt, worker_folder) = self.state.runtime_for_session(session_id).await?;
+		let orch = worker_rt.session.lock().await.header.orchestrator_session_id.clone()?;
+		if self.state.runtime_for_session(&orch).await.is_none() {
+			let orch_folder = find_session_folder(&self.state, &orch)
+				.await
+				.unwrap_or_else(|| worker_folder.clone());
+			let _ = self.open_session_boxed(orch_folder.to_string(), orch.clone()).await;
+		}
+		registered(&*self.state.coordinator_workers.read().await)
+	}
+
 	async fn notify_coordinator_of_user_message(&self, session_id: &str, text: &str, queued: bool) {
 		let trimmed = text.trim();
 		if trimmed.is_empty() {
 			return;
 		}
-		let registered = self
-			.state
-			.coordinator_workers
-			.read()
-			.await
-			.orchestrator_of(session_id)
-			.map(str::to_string);
-		let orchestrator_id = match registered {
-			Some(id) => id,
-			// Restart fallback (ADR 0065): the registry died with the
-			// process, but the worker's header carries the link.
-			// Quietly remount the coordinator — its cold mount
-			// rebuilds the fleet (or proves this worker detached) —
-			// then re-consult the registry, which now reflects any
-			// persisted `WorkerDetached`.
-			None => {
-				let Some((worker_rt, worker_folder)) = self.state.runtime_for_session(session_id).await else {
-					return;
-				};
-				let Some(orch) = worker_rt.session.lock().await.header.orchestrator_session_id.clone() else {
-					return;
-				};
-				if self.state.runtime_for_session(&orch).await.is_none() {
-					let orch_folder = find_session_folder(&self.state, &orch)
-						.await
-						.unwrap_or_else(|| worker_folder.clone());
-					let _ = self.open_session_boxed(orch_folder.to_string(), orch.clone()).await;
-				}
-				match self
-					.state
-					.coordinator_workers
-					.read()
-					.await
-					.orchestrator_of(session_id)
-					.map(str::to_string)
-				{
-					Some(id) => id,
-					None => return,
-				}
-			}
+		let Some(orchestrator_id) = self.attached_coordinator_of(session_id).await else {
+			return;
 		};
 		let notice = if queued {
 			format!(
@@ -5574,7 +5487,6 @@ impl CoderHandle {
 				worktree_root: summary.worktree_root.clone(),
 				worktree_branch: summary.worktree_branch.clone(),
 				committed_branch: summary.committed_branch.clone(),
-				mode: summary.mode.clone(),
 			});
 			sink.folder_scoped().send(CoderEvent::SessionListChanged);
 		}
@@ -5807,7 +5719,7 @@ impl CoderHandle {
 		DisconnectWorkerOutcome::Disconnected
 	}
 
-	/// Attach an **existing** session to a coordinator as a worker
+	/// Attach an **existing** session to another as its worker
 	/// (ADR 0084) — the user-driven inverse of ADR 0052's
 	/// disconnect, and the adoption path `spawn_worker` never
 	/// covers. After it returns `Attached`, the link is
@@ -5823,22 +5735,16 @@ impl CoderHandle {
 	/// and re-linked.
 	pub async fn attach_worker(&self, coordinator_id: &str, worker_id: &str) -> Result<AttachWorkerOutcome, CoderError> {
 		if coordinator_id == worker_id {
-			return Ok(AttachWorkerOutcome::TargetIsCoordinator);
+			return Ok(AttachWorkerOutcome::WouldNest);
 		}
 		let (coordinator_rt, coordinator_folder) = self.mount_session_anywhere(coordinator_id).await?;
-		let coordinator_mode = {
-			let session = coordinator_rt.session.lock().await;
-			CoderMode::from_top_level_wire(session.header.mode.as_deref())
-		};
-		if coordinator_mode != CoderMode::Coordinator {
-			return Ok(AttachWorkerOutcome::NotACoordinator);
-		}
 		let (worker_rt, worker_folder) = self.mount_session_anywhere(worker_id).await?;
+		// One level only (ADR 0125): a worker has no workers. Both
+		// mounts above have rebuilt what the registry knows of them.
+		if self.attached_coordinator_of(coordinator_id).await.is_some()
+			|| self.state.coordinator_workers.read().await.attached_count(worker_id) > 0
 		{
-			let session = worker_rt.session.lock().await;
-			if CoderMode::from_top_level_wire(session.header.mode.as_deref()) == CoderMode::Coordinator {
-				return Ok(AttachWorkerOutcome::TargetIsCoordinator);
-			}
+			return Ok(AttachWorkerOutcome::WouldNest);
 		}
 		match self.state.coordinator_workers.read().await.ownership_of(worker_id) {
 			Some((owner, true)) if owner == coordinator_id => {
@@ -6118,11 +6024,11 @@ pub enum AttachWorkerOutcome {
 	/// user disconnects it there first; auto-stealing a live link
 	/// would silently break the other fleet's plan.
 	AttachedElsewhere { coordinator: String },
-	/// The named coordinator session isn't in coordinator mode.
-	NotACoordinator,
-	/// The session to attach is itself a coordinator (or the same
-	/// session as the coordinator) — fleets don't nest.
-	TargetIsCoordinator,
+	/// Refused: it would put a worker under a worker (ADR 0125). The
+	/// session to attach to is itself an attached worker, or the one
+	/// to attach has attached workers of its own, or both are the
+	/// same session.
+	WouldNest,
 }
 
 /// Outcome of [`CoderHandle::disconnect_worker`] (ADR 0052).
@@ -7216,35 +7122,27 @@ async fn run_turn(
 		.folder_entry_for(routing_path.as_str())
 		.await
 		.ok_or(CoderError::NoActiveFolder)?;
-	// Snapshot the top-level session mode once at turn-start (same
-	// posture as `models` above): a re-stamp mid-turn applies to
-	// the *next* turn. The mode drives both the `ToolContext` (so
-	// the dispatch-level write gate is right) and the tool-list
-	// composition below. The bash-target override is different: the
-	// runtime's **live** flag is shared into the context, so the
-	// host/container toggle re-routes the next tool dispatch of an
-	// in-flight turn (a long turn shouldn't pin the user to the
-	// wrong target).
-	let mode = {
-		let session = rt.session.lock().await;
-		CoderMode::from_top_level_wire(session.header.mode.as_deref())
-	};
+	// Whether this session may run workers: every top-level session
+	// may, unless it is itself someone's attached worker (ADR 0125 —
+	// one level, no chains). Snapshot at turn start: an attach or a
+	// disconnect mid-turn applies to the next one.
+	let manages_workers = CoderHandle { state: state.clone() }
+		.attached_coordinator_of(&sink.session_id)
+		.await
+		.is_none();
+	// The bash-target override is live, not a snapshot: the runtime's
+	// flag is shared into the context, so the host/container toggle
+	// re-routes the next tool dispatch of an in-flight turn (a long
+	// turn shouldn't pin the user to the wrong target).
 	let force_host_bash = rt.force_host_bash.load(std::sync::atomic::Ordering::Relaxed);
-	let mut cx = ToolContext::with_format_queue(folder_entry, mode, format_queue)
+	let mut cx = ToolContext::with_format_queue(folder_entry, CoderMode::Agent, format_queue)
 		.with_force_host_bash(rt.force_host_bash.clone())
-		.with_background(background);
-	// Tool list composition branches on the top-level session mode
-	// (ADR 0030). The historical shape — `definitions()` plus
-	// `task` plus `ask_user` — is the ordinary `Agent` mode.
-	// `Coordinator` swaps the parent-only tools: `spawn_worker` and
-	// the worker-management tools replace `task`/`ask_user`, and the
-	// coordinator can't mutate files directly (it must delegate),
-	// though the write tools stay advertised so the dispatch-level
-	// gate produces a clear `read_only_mode` error if the model
-	// tries. Sub-agents pick from the registry alone (no `task`),
-	// which is how the depth-1 cap is enforced — a sub-agent
-	// literally cannot describe a sub-sub-agent because the model
-	// never sees the tool.
+		.with_background(background)
+		.with_workers(manages_workers);
+	// On top of the registry's tools, a top-level session gets `task`
+	// and `ask_user`, and the worker tools unless it is a worker.
+	// Sub-agents pick from the registry alone, which is how their
+	// depth cap is enforced: the model never sees the tool.
 	let scratch = state.is_no_folder_root(&routing_path).await;
 	let mut tool_defs = state.tools.definitions();
 	// MCP meta-tools (ADR 0033): only present when the workspace
@@ -7255,33 +7153,16 @@ async fn run_turn(
 	// project has a terminal open, so an agent can read the dev
 	// server the user already started instead of racing it.
 	tool_defs.extend(state.tools.terminal_definitions(&cx).await);
-	if mode.allows_task_tool() {
-		tool_defs.push(task_tool_definition());
-		// Sub-agents are waited on / stopped through the registry's
-		// `check` / `stop` (ADR 0102); steering is theirs alone.
-		tool_defs.push(crate::subagent::task_steer_tool_definition());
-	}
-	if mode.allows_ask_user() {
-		tool_defs.push(ask_user_tool_definition());
-	}
-	if mode == CoderMode::Agent && !scratch {
+	tool_defs.push(task_tool_definition());
+	// Sub-agents are waited on / stopped through the registry's
+	// `check` / `stop` (ADR 0102); steering is theirs alone.
+	tool_defs.push(crate::subagent::task_steer_tool_definition());
+	tool_defs.push(ask_user_tool_definition());
+	if !scratch {
 		tool_defs.push(crate::worktree_tool::enter_worktree_tool_definition());
 	}
-	if mode == CoderMode::Coordinator {
-		tool_defs.push(crate::coordinator::spawn_worker_tool_definition());
-		tool_defs.push(crate::coordinator::observe_worker_tool_definition());
-		tool_defs.push(crate::coordinator::list_workers_tool_definition());
-		tool_defs.push(crate::coordinator::steer_worker_tool_definition());
-		tool_defs.push(crate::coordinator::abort_worker_tool_definition());
-		tool_defs.push(crate::coordinator::respond_to_worker_prompt_tool_definition());
-		tool_defs.push(crate::coordinator::review_worker_changes_tool_definition());
-		tool_defs.push(crate::coordinator::workspace_scm_status_tool_definition());
-		tool_defs.push(crate::coordinator::check_worker_base_tool_definition());
-		tool_defs.push(crate::coordinator::land_worker_tool_definition());
-		tool_defs.push(crate::coordinator::close_worker_tool_definition());
-		tool_defs.push(crate::coordinator::clone_repo_tool_definition());
-		tool_defs.push(crate::coordinator::init_repo_tool_definition());
-		tool_defs.push(crate::coordinator::add_folder_tool_definition());
+	if manages_workers {
+		tool_defs.extend(crate::coordinator::worker_tool_definitions());
 	}
 	// Compose a fresh system prompt and overwrite the session's
 	// `messages[0]`: the base prompt plus a "Bound folders"
@@ -7295,7 +7176,7 @@ async fn run_turn(
 	// (empty workspace) passes `None` — no project rules to read,
 	// and its "no folders bound" section is written from the
 	// scratch root instead.
-	refresh_system_prompt(state, rt, &routing_path, scratch, force_host_bash, mode).await;
+	refresh_system_prompt(state, rt, &routing_path, scratch, force_host_bash, manages_workers).await;
 	// Before the first round-trip, so the model reads it before acting.
 	notice_worktree_branch_drift(state, rt, sink).await;
 	// Schedule background regeneration for any bound folder whose
@@ -8072,16 +7953,22 @@ async fn dispatch_tool_calls(
 					let routing_path = Utf8PathBuf::from(entry.folder.path.clone());
 					cx.folder = entry;
 					let force_host = rt.force_host_bash.load(std::sync::atomic::Ordering::Relaxed);
-					refresh_system_prompt(state, rt, &routing_path, false, force_host, cx.mode).await;
+					refresh_system_prompt(state, rt, &routing_path, false, force_host, cx.manages_workers).await;
 					Ok(result)
 				}
 				Err(err) => Err(err),
 			}
+		} else if !cx.manages_workers && crate::coordinator::is_worker_tool(&call.function.name) {
+			// Not advertised to a worker; this answers a call made
+			// from memory of a time before it was attached.
+			Err(CoderError::invalid_args(
+				&call.function.name,
+				"this session is another session's worker, and a worker cannot run workers of its own",
+			))
 		} else if call.function.name == "spawn_worker" {
-			// Coordinator-only (ADR 0030). Mints a peer
-			// top-level session in a worktree + seeds it with
-			// the task. Returns a handle (session id), not a
-			// blocking result — the worker runs detached.
+			// Mints a peer top-level session in a worktree + seeds
+			// it with the task. Returns a handle (session id), not
+			// a blocking result — the worker runs detached.
 			handle_spawn_worker(state, sink, &call.id, &args).await
 		} else if call.function.name == "observe_worker" {
 			handle_observe_worker(state, &args).await
@@ -8886,24 +8773,17 @@ async fn handle_spawn_worker(
 		}
 		None => sink.folder().to_string(),
 	};
-	// Mint the worker as an ordinary `Agent` session — in a worktree
-	// (the default) or in place against the target folder itself
-	// (ADR 0070). A sub-orchestrator would pass `Coordinator` here,
-	// but that's a later-scale concern; v1 workers are plain agents.
+	// Mint the worker — in a worktree (the default) or in place
+	// against the target folder itself (ADR 0070).
 	let handle = CoderHandle { state: state.clone() };
 	let summary = if use_worktree {
 		handle
-			.create_worktree_session(
-				parsed.base_branch,
-				Some(parsed.name),
-				CoderMode::Agent,
-				Some(parent_folder.clone()),
-			)
+			.create_worktree_session(parsed.base_branch, Some(parsed.name), Some(parent_folder.clone()))
 			.await?
 			.0
 	} else {
 		handle
-			.create_in_place_worker_session(&parsed.name, &parent_folder, CoderMode::Agent)
+			.create_in_place_worker_session(&parsed.name, &parent_folder)
 			.await?
 	};
 	// `target_folder` is the worktree path the worker operates
@@ -10807,7 +10687,7 @@ async fn refresh_system_prompt(
 	routing_path: &Utf8Path,
 	scratch: bool,
 	force_host_bash: bool,
-	mode: CoderMode,
+	manages_workers: bool,
 ) {
 	let folders = state.workspaces.folders().await;
 	let container_mode = if scratch {
@@ -10829,7 +10709,7 @@ async fn refresh_system_prompt(
 		if scratch { Some(routing_path) } else { None },
 		&state.folder_summaries,
 		container_mode,
-		mode,
+		manages_workers,
 		&instructions,
 	)
 	.await;
@@ -10900,11 +10780,8 @@ async fn kick_off_summary_refresh(state: &Arc<CoderState>, _sink: &FolderEventSi
 /// Build the parent's system prompt. Sections are concatenated in
 /// this order:
 ///
-/// 1. Base text — [`PHASE_6_0_SYSTEM_PROMPT`] for the ordinary
-///    `Agent` mode, the coordinator system prompt for
-///    `Coordinator` mode (ADR 0030). `Research` is a sub-agent-only
-///    mode and never reaches this top-level composer; if it ever
-///    does, it falls back to the agent prompt.
+/// 1. Base text ([`PHASE_6_0_SYSTEM_PROMPT`]), then the workers
+///    section for a session that has the worker tools (ADR 0125).
 /// 2. **Project rules** — verbatim contents of `AGENTS.md` (or
 ///    `CLAUDE.md` as a fallback) from the *active* folder root.
 ///    Projects that came from the Claude / Anthropic ecosystem
@@ -10929,20 +10806,21 @@ async fn compose_system_prompt(
 	scratch_root: Option<&Utf8Path>,
 	summaries: &Arc<FolderSummaryService>,
 	container_mode: bool,
-	mode: CoderMode,
+	manages_workers: bool,
 	workspace_instructions: &str,
 ) -> String {
-	let base = match mode {
-		CoderMode::Coordinator => crate::coordinator::COORDINATOR_SYSTEM_PROMPT,
-		// `Research` is sub-agent-only; a top-level research session
-		// shouldn't exist, but fall back to the agent prompt rather
-		// than panic a turn if one ever does.
-		CoderMode::Agent | CoderMode::Research => PHASE_6_0_SYSTEM_PROMPT,
-	};
-	let mut out = String::with_capacity(base.len() + 1024);
+	let base = PHASE_6_0_SYSTEM_PROMPT;
+	let mut out = String::with_capacity(base.len() + 4096);
 	out.push_str(base);
 	if !out.ends_with('\n') {
 		out.push('\n');
+	}
+	// Right after the base text, of which it is part for every
+	// session that has the worker tools: the rest of the prompt
+	// keeps the same prefix whatever the project.
+	if manages_workers {
+		out.push('\n');
+		out.push_str(crate::coordinator::WORKERS_PROMPT_SECTION);
 	}
 
 	if let Some(active) = active_path {
@@ -13742,16 +13620,7 @@ mod tests {
 			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
 		));
 		let scratch = Utf8PathBuf::from("/home/dev");
-		let prompt = compose_system_prompt(
-			&[],
-			None,
-			Some(scratch.as_path()),
-			&summaries,
-			false,
-			CoderMode::Agent,
-			"",
-		)
-		.await;
+		let prompt = compose_system_prompt(&[], None, Some(scratch.as_path()), &summaries, false, true, "").await;
 		assert!(prompt.contains("## No folders bound"));
 		assert!(prompt.contains("/home/dev"));
 		assert!(!prompt.contains("## Bound folders"));
@@ -13766,26 +13635,33 @@ mod tests {
 		));
 		let with = |text: &'static str| {
 			let summaries = summaries.clone();
-			async move { compose_system_prompt(&[], Some("/proj"), None, &summaries, false, CoderMode::Agent, text).await }
+			async move { compose_system_prompt(&[], Some("/proj"), None, &summaries, false, true, text).await }
 		};
 		let prompt = with("  Keep PR descriptions short.\n").await;
 		assert!(prompt.contains("## Workspace instructions\n\n"));
 		assert!(prompt.ends_with("Keep PR descriptions short.\n"));
-		// A coordinator session gets them too.
-		let coordinator = compose_system_prompt(
-			&[],
-			Some("/proj"),
-			None,
-			&summaries,
-			false,
-			CoderMode::Coordinator,
-			"Be brief.",
-		)
-		.await;
-		assert!(coordinator.ends_with("Be brief.\n"));
+		// A worker gets them too.
+		let worker = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, false, "Be brief.").await;
+		assert!(worker.ends_with("Be brief.\n"));
 		// Nothing written, no section; and the prompt is the same as before.
 		assert!(!with("").await.contains("## Workspace instructions"));
 		assert_eq!(with(" \n").await, with("").await);
+	}
+
+	#[tokio::test]
+	async fn compose_system_prompt_tells_all_but_workers_about_workers() {
+		let cache = tempfile::TempDir::new().unwrap();
+		let summaries = Arc::new(FolderSummaryService::new(
+			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
+		));
+		let with = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, true, "").await;
+		let without = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, false, "").await;
+		assert!(with.contains("\n## Workers\n"));
+		assert!(with.contains("spawn_worker"));
+		assert!(!without.contains("## Workers"));
+		assert!(!without.contains("spawn_worker"));
+		// Same text first, so the two differ by the section alone.
+		assert!(with == format!("{without}\n{}", crate::coordinator::WORKERS_PROMPT_SECTION));
 	}
 
 	#[test]
@@ -13803,7 +13679,7 @@ mod tests {
 		let summaries = Arc::new(FolderSummaryService::new(
 			Utf8PathBuf::from_path_buf(cache.path().to_path_buf()).unwrap(),
 		));
-		let prompt = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, CoderMode::Agent, "").await;
+		let prompt = compose_system_prompt(&[], Some("/proj"), None, &summaries, false, true, "").await;
 		assert!(!prompt.contains("## No folders bound"));
 	}
 
@@ -13832,16 +13708,7 @@ mod tests {
 			.unwrap();
 		let folders = registry.folders().await;
 
-		let prompt = compose_system_prompt(
-			&folders,
-			Some(wt.as_str()),
-			None,
-			&summaries,
-			false,
-			CoderMode::Agent,
-			"",
-		)
-		.await;
+		let prompt = compose_system_prompt(&folders, Some(wt.as_str()), None, &summaries, false, true, "").await;
 		assert!(
 			prompt.contains("## Personal coder instructions"),
 			"fallback section missing"
@@ -13850,16 +13717,7 @@ mod tests {
 
 		// Worktree-local copy takes precedence.
 		std::fs::write(wt.join(".moon/AGENTS.md").as_std_path(), "worktree-local rules\n").unwrap();
-		let prompt = compose_system_prompt(
-			&folders,
-			Some(wt.as_str()),
-			None,
-			&summaries,
-			false,
-			CoderMode::Agent,
-			"",
-		)
-		.await;
+		let prompt = compose_system_prompt(&folders, Some(wt.as_str()), None, &summaries, false, true, "").await;
 		assert!(prompt.contains("worktree-local rules"));
 		assert!(!prompt.contains("parent personal rules"));
 	}
@@ -13931,7 +13789,6 @@ mod tests {
 			parent_session_id: None,
 			parent_tool_call_id: None,
 			subagent_mode: None,
-			mode: None,
 			subagent_target_folder: None,
 			bash_target_override: None,
 			worktree_root: None,
@@ -14713,7 +14570,7 @@ mod tests {
 		.unwrap();
 		let rt = Arc::new(SessionRuntime::new(Session::new_blank()));
 		let prompt = || async {
-			refresh_system_prompt(&coder.state, &rt, &folder, false, true, CoderMode::Agent).await;
+			refresh_system_prompt(&coder.state, &rt, &folder, false, true, true).await;
 			match rt.session.lock().await.messages.first() {
 				Some(ChatMessage::System { content }) => content.clone(),
 				_ => panic!("no system prompt"),
@@ -14738,6 +14595,69 @@ mod tests {
 
 		coder.set_workspace_instructions("").await.unwrap();
 		assert!(!prompt().await.contains("## Workspace instructions"));
+	}
+
+	#[tokio::test]
+	async fn workers_stay_one_level_deep() {
+		keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+
+		let folder_dir = tempfile::TempDir::new().unwrap();
+		let folder = Utf8PathBuf::from_path_buf(folder_dir.path().canonicalize().unwrap()).unwrap();
+		let registry = Arc::new(WorkspaceRegistry::new("test-workspace".into()));
+		registry.add_folder(folder.clone()).await.unwrap();
+		let data_dir = tempfile::TempDir::new().unwrap();
+		let coder = CoderHandle::new(
+			registry,
+			Utf8PathBuf::from_path_buf(data_dir.path().join("workspaces")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("coder-sessions")).unwrap(),
+			Utf8PathBuf::from_path_buf(data_dir.path().join("folder-summaries")).unwrap(),
+			CoderModels::default(),
+			Arc::new(moon_terminal::TerminalRegistry::default()),
+		)
+		.unwrap();
+		let fs = coder.state.folder_session_for(&folder).await;
+		let mut ids = Vec::new();
+		for _ in 0..3 {
+			let blank = Session::new_blank();
+			let id = blank.header.id.clone();
+			fs.insert_runtime(id.clone(), Arc::new(SessionRuntime::new(blank)))
+				.await;
+			ids.push(id);
+		}
+		let [lead, worker, other] = [&ids[0], &ids[1], &ids[2]];
+
+		// Any session can take another as its worker: no mode to be in.
+		assert_eq!(coder.attached_coordinator_of(worker).await, None);
+		assert_eq!(
+			coder.attach_worker(lead, worker).await.unwrap(),
+			AttachWorkerOutcome::Attached
+		);
+		assert_eq!(
+			coder.attached_coordinator_of(worker).await.as_deref(),
+			Some(lead.as_str())
+		);
+		assert_eq!(coder.attached_coordinator_of(lead).await, None);
+
+		// Not under a worker, not a session that has workers, not itself.
+		for (owner, target) in [(worker, other), (other, lead), (lead, lead)] {
+			assert_eq!(
+				coder.attach_worker(owner, target).await.unwrap(),
+				AttachWorkerOutcome::WouldNest,
+				"{owner} <- {target}"
+			);
+		}
+		assert_eq!(coder.attached_coordinator_of(other).await, None);
+
+		// Disconnected, the worker is the user's again and may lead.
+		assert_eq!(
+			coder.disconnect_worker(worker).await,
+			DisconnectWorkerOutcome::Disconnected
+		);
+		assert_eq!(coder.attached_coordinator_of(worker).await, None);
+		assert_eq!(
+			coder.attach_worker(worker, other).await.unwrap(),
+			AttachWorkerOutcome::Attached
+		);
 	}
 
 	#[tokio::test]

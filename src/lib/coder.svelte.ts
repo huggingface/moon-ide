@@ -2288,19 +2288,6 @@ export class CoderPanelState {
 		}
 	}
 
-	/** Start a fresh **coordinator** (orchestrator) session (ADR 0030).
-	 *  Same as `newSession` but the backend stamps `mode: "coordinator"`
-	 *  so `run_turn` advertises the worker-management tools and seeds
-	 *  the coordinator system prompt. */
-	async newCoordinatorSession(): Promise<void> {
-		try {
-			const summary = await ipc.coder.newCoordinatorSession();
-			this.installCreatedSession(summary);
-		} catch (err) {
-			this.rows = [{ kind: 'error', id: `local-${Date.now()}`, text: formatError(err) }];
-		}
-	}
-
 	/** Install a session that was just minted backend-side into the
 	 *  active folder's panel state: make it visible, flip to the
 	 *  transcript view, and zero its bucket. Shared by [`newSession`]
@@ -2326,9 +2313,8 @@ export class CoderPanelState {
 		// Keep the created summary as the bucket's active summary. The
 		// on-disk session list won't include this session until its
 		// first turn persists it (ADR 0028), so this is the only
-		// source for the header's coordinator badge (ADR 0030), the
-		// mode-specific empty-state hint, and the worktree chip until
-		// the user sends a prompt.
+		// source for the empty-state hint and the worktree chip
+		// until the user sends a prompt.
 		session.activeSession = summary;
 		// Fresh sessions always start in Auto bash-target mode
 		// (ADR 0022) — re-probe so the header pip drops a stale
@@ -2384,22 +2370,20 @@ export class CoderPanelState {
 		return null;
 	}
 
-	/** Attach an existing session to a coordinator as a worker (the
+	/** Attach an existing session to another as its worker (the
 	 *  `/attach` composer command, ADR 0084). Returns a user-facing
 	 *  line for the caller to flash. */
 	async attachWorker(coordinatorId: string, sessionId: string): Promise<string> {
 		const result = await ipc.coder.attachWorker(coordinatorId, sessionId);
 		switch (result.outcome) {
 			case 'attached':
-				return 'Session attached to the coordinator.';
+				return 'Session attached as a worker.';
 			case 'already_attached':
-				return 'Session is already attached to this coordinator.';
+				return 'Session is already a worker of this one.';
 			case 'attached_elsewhere':
-				return `Session is still attached to coordinator ${result.coordinator} — disconnect it there first.`;
-			case 'not_a_coordinator':
-				return 'That session is not a coordinator.';
-			case 'target_is_coordinator':
-				return 'Coordinators cannot be attached as workers.';
+				return `Session is still a worker of ${result.coordinator} — disconnect it there first.`;
+			case 'would_nest':
+				return "Workers can't have workers: one of the two sessions is already in a fleet.";
 		}
 		// The switch is exhaustive over today's wire union; a newer IDE
 		// core could still send an outcome this build doesn't know.
@@ -4131,9 +4115,9 @@ export class CoderPanelState {
 					title: event.title,
 					created_at_ms: event.created_at_ms,
 					updated_at_ms: event.updated_at_ms,
-					// Carry the ADR 0028 / ADR 0030 optional fields
-					// so the worktree chip + coordinator badge +
-					// empty-state hint survive a reload instead of
+					// Carry the ADR 0028 optional fields so the
+					// worktree chip + empty-state hint survive a
+					// reload instead of
 					// blanking until the next list refresh. The wire
 					// shape elides them for an ordinary session; the
 					// summary type is `string | null` (no
@@ -4142,7 +4126,6 @@ export class CoderPanelState {
 					worktree_root: event.worktree_root ?? null,
 					worktree_branch: event.worktree_branch ?? null,
 					committed_branch: event.committed_branch ?? null,
-					mode: event.mode ?? null,
 				};
 				if (!isWorker) {
 					folder.view = 'session';

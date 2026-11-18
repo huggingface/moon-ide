@@ -169,22 +169,3 @@ a {
 .pip.live {
 	background: var(--ok);
 }
-
-/* Coordinator (orchestrator) mode badge — ADR 0030. Small pill
-   before the session title so an orchestrator session is visually
-   distinct from a hand-started one on the phone. Mirrors the
-   desktop panel's `.session-mode-badge`. */
-.badge {
-	display: inline-flex;
-	flex: none;
-	align-items: center;
-	padding: 0 0.4rem;
-	border-radius: 999px;
-	background: var(--accent);
-	color: var(--bg);
-	font-size: 0.65rem;
-	font-weight: 700;
-	text-transform: uppercase;
-	letter-spacing: 0.06em;
-	vertical-align: middle;
-}

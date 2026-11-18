@@ -486,7 +486,6 @@ export const ipc = {
 		activeSession: () => call<CoderSessionSummary | null>('coder_active_session'),
 		lastOpenedSession: () => call<string | null>('coder_last_opened_session'),
 		newSession: () => call<CoderSessionSummary>('coder_new_session'),
-		newCoordinatorSession: () => call<CoderSessionSummary>('coder_new_coordinator_session'),
 		workerLinkState: (sessionId: string) => call<WorkerLinkState>('coder_worker_link_state', { sessionId }),
 		disconnectWorker: (sessionId: string) => call<DisconnectWorkerOutcome>('coder_disconnect_worker', { sessionId }),
 		attachWorker: (coordinatorId: string, sessionId: string) =>

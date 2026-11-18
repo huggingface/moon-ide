@@ -8,11 +8,9 @@
 	import { groupToolRows, type TranscriptItem } from '../toolGroups';
 	import {
 		goToSessionBranch,
-		isCoordinatorSession,
 		openSessionTrace,
 		openSessionTraceOnHub,
 		sessionBranch,
-		startNewCoordinatorSession,
 		startNewSession,
 		worktreeFolderForBranch,
 	} from '../sessionActions';
@@ -57,7 +55,6 @@
 	import SettingsIcon from './icons/SettingsIcon.svelte';
 	import PlusIcon from './icons/PlusIcon.svelte';
 	import BranchIcon from './icons/BranchIcon.svelte';
-	import CoordinatorIcon from './icons/CoordinatorIcon.svelte';
 	import CloudSyncIcon from './icons/CloudSyncIcon.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
 	import FileIcon from './icons/FileIcon.svelte';
@@ -1357,16 +1354,18 @@
 	// resolves to no known command falls through to a normal send —
 	// prose that happens to start with `/` still goes to the model.
 	type SlashCommand = { name: 'attach' | 'detach'; hint: string };
-	const visibleIsCoordinator = $derived(isCoordinatorSession(coder.activeSession));
-	// `/detach` only where it can do something: in a coordinator
-	// (pick a worker to drop) or in a session that is currently an
-	// attached worker (drop itself — no argument).
+	// A session that is someone's worker has no workers of its own
+	// (ADR 0125): there `/attach` isn't offered and `/detach` drops
+	// the session itself. Anywhere else `/attach` takes a session as
+	// a worker of this one, and `/detach` shows once it has some.
+	const visibleIsWorker = $derived(workerLink === 'attached');
 	const slashCommands = $derived.by((): SlashCommand[] => {
-		const cmds: SlashCommand[] = [{ name: 'attach', hint: 'Attach a session to a coordinator fleet' }];
-		if (visibleIsCoordinator) {
+		if (visibleIsWorker) {
+			return [{ name: 'detach', hint: 'Disconnect this session from its coordinator' }];
+		}
+		const cmds: SlashCommand[] = [{ name: 'attach', hint: 'Attach a session to this one as a worker' }];
+		if ((fleet?.length ?? 0) > 0) {
 			cmds.push({ name: 'detach', hint: 'Disconnect one of your workers' });
-		} else if (workerLink === 'attached') {
-			cmds.push({ name: 'detach', hint: 'Disconnect this session from its coordinator' });
 		}
 		return cmds;
 	});
@@ -1395,20 +1394,22 @@
 		if (slashState?.stage !== 'arg') {
 			return null;
 		}
-		if (slashState.command === 'attach') {
-			return 'attach';
+		if (visibleIsWorker) {
+			return null;
 		}
-		if (slashState.command === 'detach' && visibleIsCoordinator) {
-			return 'detach';
+		if (slashState.command === 'attach' || slashState.command === 'detach') {
+			return slashState.command;
 		}
 		return null;
 	});
-	// A coordinator's attached workers, fetched when `/detach ` needs
-	// them (the registry is backend-only; no summary marks workers).
+	// The visible session's attached workers, fetched while a slash
+	// menu is open (the registry is backend-only; no summary marks
+	// workers).
+	const slashOpen = $derived(slashState !== null);
 	let fleet = $state<FleetMember[] | null>(null);
 	$effect(() => {
 		const visible = coder.activeSession;
-		if (slashArgCommand !== 'detach' || visible === null) {
+		if (!slashOpen || visibleIsWorker || visible === null) {
 			fleet = null;
 			return;
 		}
@@ -1423,11 +1424,9 @@
 		};
 	});
 	type SlashPick = { id: string; label: string; detail: string };
-	// Arg-stage candidates. `/attach` is direction-aware: typed in a
-	// coordinator it lists attachable (non-coordinator) sessions;
-	// typed elsewhere it lists coordinators to hand this session to —
-	// same backend call, argument order flipped. `/detach` in a
-	// coordinator lists its attached workers.
+	// Arg-stage candidates: `/attach` lists the project's other
+	// sessions (the core refuses one that would nest), `/detach` this
+	// session's attached workers.
 	const slashArgMatches = $derived.by((): SlashPick[] => {
 		const visible = coder.activeSession;
 		if (slashState?.stage !== 'arg' || visible === null) {
@@ -1437,16 +1436,12 @@
 		const matchesQuery = (label: string, id: string) =>
 			q.length === 0 || label.toLowerCase().includes(q) || id.toLowerCase().startsWith(q);
 		if (slashArgCommand === 'attach') {
-			const wantCoordinators = !visibleIsCoordinator;
+			const mine = new Set((fleet ?? []).map((member) => member.id));
 			return (coder.sessions ?? [])
-				.filter((s) => s.id !== visible.id && isCoordinatorSession(s) === wantCoordinators)
+				.filter((s) => s.id !== visible.id && !mine.has(s.id))
 				.filter((s) => matchesQuery(s.title, s.id))
 				.slice(0, 8)
-				.map((s) => ({
-					id: s.id,
-					label: s.title || s.id,
-					detail: `${isCoordinatorSession(s) ? 'coordinator · ' : ''}${s.id}`,
-				}));
+				.map((s) => ({ id: s.id, label: s.title || s.id, detail: s.id }));
 		}
 		if (slashArgCommand === 'detach') {
 			return (fleet ?? [])
@@ -1463,7 +1458,7 @@
 		if (coder.sessions === null) {
 			return 'Loading sessions…';
 		}
-		return visibleIsCoordinator ? 'No attachable session in this project' : 'No coordinator session in this project';
+		return 'No other session in this project';
 	});
 	const slashMenuVisible = $derived(
 		(slashState?.stage === 'command' && slashCommandMatches.length > 0) || slashArgCommand !== null,
@@ -1482,18 +1477,16 @@
 		}
 	});
 
-	/** Execute `/attach` with the picked session id. Direction
-	 *  depends on where it was typed (see `slashArgMatches`). */
+	/** Execute `/attach`: the picked session becomes a worker of the
+	 *  visible one. */
 	async function runSlashAttach(targetId: string): Promise<void> {
 		const visible = coder.activeSession;
 		if (visible === null) {
 			return;
 		}
-		const coordinatorId = visibleIsCoordinator ? visible.id : targetId;
-		const workerId = visibleIsCoordinator ? targetId : visible.id;
 		coder.draft = '';
 		try {
-			workspace.flash(await coder.attachWorker(coordinatorId, workerId));
+			workspace.flash(await coder.attachWorker(visible.id, targetId));
 		} catch (err) {
 			workspace.flash(`Attach failed: ${formatError(err)}`);
 		} finally {
@@ -1501,8 +1494,8 @@
 		}
 	}
 
-	/** Execute `/detach`: the named worker (typed in a coordinator)
-	 *  or the visible session itself. Same path as the session bar's
+	/** Execute `/detach`: the named worker, or the visible session
+	 *  itself when it is one. Same path as the session bar's
 	 *  disconnect button (ADR 0052). */
 	async function runSlashDetach(workerId: string): Promise<void> {
 		coder.draft = '';
@@ -1517,7 +1510,7 @@
 			}
 			// Argument-less form: `/detach` in a worker session acts
 			// on itself immediately.
-			if (cmd.name === 'detach' && !visibleIsCoordinator && coder.activeSession !== null) {
+			if (cmd.name === 'detach' && visibleIsWorker && coder.activeSession !== null) {
 				void runSlashDetach(coder.activeSession.id);
 				return;
 			}
@@ -2967,12 +2960,6 @@
 				</span>
 			{:else}
 				<span class="session-bar-title" title={coder.activeSession?.title ?? ''}>
-					{#if isCoordinatorSession(coder.activeSession)}
-						<span
-							class="session-mode-badge coordinator"
-							title="Coordinator — an orchestrator that spawns and manages worker agents">coordinator</span
-						>
-					{/if}
 					{coder.activeSession?.title || 'New session'}
 				</span>
 				{#if visibleSessionSummary && coder.sessions?.some((s) => s.id === visibleSessionSummary.id)}
@@ -3071,15 +3058,6 @@
 			>
 				<BranchIcon />
 			</button>
-			<button
-				type="button"
-				class="icon"
-				onclick={startNewCoordinatorSession}
-				title="New coordinator session — an orchestrator that spawns and manages worker agents"
-				aria-label="New coordinator session"
-			>
-				<CoordinatorIcon />
-			</button>
 			<button type="button" class="icon" onclick={startNewSession} title="New session" aria-label="New session">
 				<PlusIcon />
 			</button>
@@ -3101,13 +3079,6 @@
 						Isolated session in its own git worktree on <code>{visibleSessionSummary.worktree_branch}</code>. The
 						agent's edits and commits stay on that branch and don't touch your main checkout — the worktree shows as a
 						nested folder in the bar above. Send a prompt to start.
-					</p>
-				{:else if isCoordinatorSession(visibleSessionSummary)}
-					<p class="hint">
-						Coordinator session — an orchestrator that spawns and manages worker agents. It can't edit files itself; it
-						delegates each task to a worker in its own git worktree. Describe a goal (e.g. <em
-							>look at the open GitHub issues and open a PR for each</em
-						>) and it will decompose it into worker tasks.
 					</p>
 				{:else}
 					<p class="hint">
@@ -4818,31 +4789,6 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		font-family: var(--m-font-mono, monospace);
-	}
-	/* Coordinator (orchestrator) mode badge — ADR 0030. Same pill
-	   shape as the sub-agent mode badge so the visual vocabulary
-	   is consistent across the panel. Rendered in the sticky
-	   session-bar title (full word); the sidebar's sessions list
-	   carries its own short `coord` copy. */
-	.session-mode-badge {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		flex-shrink: 0;
-		padding: 0 6px;
-		border-radius: var(--m-radius-pill);
-		font-size: var(--m-text-xs);
-		font-weight: 500;
-		line-height: 16px;
-	}
-	.session-mode-badge.coordinator {
-		background: var(--m-accent-tint);
-		color: var(--m-accent);
-	}
-	/* The badge sits left of the title text. */
-	.session-bar-title .session-mode-badge {
-		margin-right: var(--m-space-1);
-		vertical-align: 1px;
 	}
 	.empty {
 		display: flex;

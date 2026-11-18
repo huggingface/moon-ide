@@ -190,9 +190,6 @@ export type SessionSummary = {
 	worktree_root?: string | null;
 	/** Branch of that worktree (`moon/agent-…` / `moon/<name>`). */
 	worktree_branch?: string | null;
-	/** Top-level session mode (ADR 0030); absent for the default
-	 * `agent` mode, `"coordinator"` for an orchestrator session. */
-	mode?: string | null;
 	/** True when the session's last conversational record is a
 	 * persisted turn error — badge it in the list so the user
 	 * knows which sessions (esp. coordinator workers) to retry. */
@@ -2027,33 +2024,6 @@ class CompanionState {
 			const summary = await this.#call<SessionSummary>(
 				this.activeWorkspace,
 				'coder_new_session',
-				{ folder: this.activeFolder },
-				this.activeIde,
-			);
-			this.sessions = [summary, ...this.sessions];
-			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
-			this.activeSession = summary.id;
-			this.rows = [];
-			this.busy = false;
-			this.awaitingInput = false;
-			this.pendingPrompt = null;
-			this.error = null;
-		} catch (e) {
-			this.error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	/** Create a coordinator session (ADR 0030) — an orchestrator
-	 * that spawns and manages worker agents in git worktrees. Can't
-	 * edit files itself; delegates each task to a worker. */
-	async newCoordinatorSession(): Promise<void> {
-		if (!this.activeWorkspace) {
-			return;
-		}
-		try {
-			const summary = await this.#call<SessionSummary>(
-				this.activeWorkspace,
-				'coder_new_coordinator_session',
 				{ folder: this.activeFolder },
 				this.activeIde,
 			);

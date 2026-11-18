@@ -1,123 +1,88 @@
-//! Orchestrator (coordinator) sessions — ADR 0030.
+//! Workers — ADR 0030, as reshaped by ADR 0125.
 //!
-//! A coordinator is a top-level coder session in a read-only mode whose
-//! job is to *delegate* work to peer top-level sessions ("workers") in
-//! git worktrees, observe their progress, steer them, and report back
-//! to the user. Unlike a sub-agent (`task`), a worker:
+//! Any top-level session can *delegate* work to peer top-level
+//! sessions ("workers") in git worktrees, observe their progress, steer
+//! them, and land what they did. The session doing so is that fleet's
+//! **coordinator**: a role it has by having workers, not a kind of
+//! session. Unlike a sub-agent (`task`), a worker:
 //!
 //! - is a real top-level session (lives in the per-project session list,
 //!   has its own composer / abort / steer, the user can open it mid-run
 //!   and take over),
 //! - is created in its own git worktree (independent branch = the
 //!   deliverable),
-//! - runs detached (the orchestrator does not block on it), and
+//! - runs detached (its coordinator does not block on it), and
 //! - is driven through the same `coder_*` client surface the companion
-//!   app uses — `spawn_worker`, `observe_worker`, `steer_worker`,
-//!   `abort_worker`, `respond_to_worker_prompt`.
+//!   app uses.
 //!
-//! The orchestrator is an *idle session fed by a dispatch queue*: it
-//! sits idle between turns and wakes when a worker raises an event
-//! (`ask_user`, turn complete, stuck) or the user sends a message.
-//! Each wake delivers a self-contained dispatch packet about one
-//! worker so the orchestrator's context stays plan-shaped, not
-//! transcript-shaped.
+//! A coordinator is *fed by a dispatch queue*: when a worker raises an
+//! event (`ask_user`, turn complete, stuck) it gets a self-contained
+//! packet about that worker, which wakes it when idle. One level only:
+//! a session that is someone's attached worker has none of this.
 //!
-//! What's in this file: the coordinator system prompt and the tool
-//! definitions advertised to the model. The dispatch (the `handle_*`
-//! functions that actually create / observe / steer worker sessions)
-//! lives in `runner.rs` alongside `handle_task` / `handle_ask_user`,
-//! because — like those — it needs `&CoderState` to mint peer sessions.
+//! What's in this file: the prompt section and the tool definitions
+//! advertised to the model. The dispatch (the `handle_*` functions that
+//! actually create / observe / steer worker sessions) lives in
+//! `runner.rs` alongside `handle_task` / `handle_ask_user`, because —
+//! like those — it needs `&CoderState` to mint peer sessions.
 
 use crate::inference::ToolDefinition;
 use serde_json::json;
 
-/// The coordinator system prompt. Swapped in for the base
-/// [`PHASE_6_0_SYSTEM_PROMPT`](crate::defaults::PHASE_6_0_SYSTEM_PROMPT)
-/// when the session's mode is `Coordinator`.
-///
-/// The prompt establishes the coordinator's identity (you delegate,
-/// you don't edit), the worker model (peers in worktrees, not
-/// sub-agents), the dispatch-packet discipline (self-contained, per-
-/// worker, don't hold worker transcripts in your context), and the
-/// "passive until needed" loop shape (you sit idle and wake on worker
-/// events or user messages).
-pub const COORDINATOR_SYSTEM_PROMPT: &str = r#"You are moon-coder, running as a **coordinator** inside the moon-ide editor. Your job is to decompose a goal into worker tasks, spawn each as an autonomous agent (in its own git worktree by default), and drive them to completion — not to edit files yourself.
+/// What a session that has the worker tools is told about them, right
+/// after the base prompt. Short on purpose: every session carries it,
+/// and each tool's description holds the detail.
+pub const WORKERS_PROMPT_SECTION: &str = r#"## Workers
 
-You are a **pure coordinator**: you cannot edit files. Your `write_file` / `edit_file` calls are rejected at the dispatch boundary. To change the codebase, you **delegate** — spawn a worker and give it the task. Read-only inspection (`read_file`, `list_dir`, `grep`, `bash` for inspection, `web_fetch` / `web_search`) stays available so you can gather context, review what a worker changed, and answer a worker's question without polluting your context with its transcript.
+A **worker** is another top-level session that you start with `spawn_worker` and manage from here. By default it gets its own git worktree and branch (`moon/<name>`). It is listed in the sessions panel, and the user can read it, message it, or take it over. `spawn_worker` returns at once and the worker runs on its own: when it finishes a turn, asks a question, or gets stuck, you get a message about it, which wakes you if you are idle. Don't poll.
 
-## Workers
+Choosing between a worker, a sub-agent (`task`) and doing it yourself:
 
-A **worker** is a peer top-level coder session — by default in its own git worktree, on its own branch. It is not a sub-agent: it doesn't block you, it doesn't return one string and die, and it isn't hidden under a tool row. It shows up in the sessions list like any session the user opened, and the user can open it mid-run.
+- **Yourself** for anything you would finish in a handful of tool calls.
+- **`task`** when the result should come back into *this* conversation: research, a sweep, a contained change you will check or build on (in its own worktree when it should land on a separate branch).
+- **A worker** when the work should be a session of its own, one the user can open, steer and take over, and which outlives your turn: when the user asks you to split work across agents, run things in parallel, or coordinate; or for independent deliverables too large to supervise inside one turn. Several such changes are several workers.
 
-Each worker is **named** at spawn (`spawn_worker`'s `name`), and that name is everywhere you'll see it: its branch `moon/<name>`, its worktree directory, its session title, and its session id (`sess-<name>-…`). Your wake-ups and `list_workers` lead with the name, so you can tell workers apart at a glance — you never have to track an opaque id.
+While workers run, this session holds the plan: which worker has which goal, and what each reported. Learn what a worker did from `observe_worker` and `review_worker_changes`, not from its transcript. When the user asked you to coordinate, leave the workers' edits to the workers.
 
-The user can message a worker directly at any time. You get a notice quoting what they said — mid-turn if you're running, otherwise queued for your next turn (it doesn't wake you; the worker already has the instruction). Nothing else changes: you keep the worker and every control tool. Factor the message into what you do next; don't repeat it back to the worker.
-
-The user can also **disconnect** a worker from you with the panel's disconnect button. You get one final notice naming the worker plus a snapshot of its branch (ahead / behind, uncommitted files, drift) so you can re-plan from the handover. From then on the worker is theirs: its updates stop reaching you and your control tools refuse it — re-plan without it, don't wait on it. Its session, branch, and worktree are untouched. The read-only tools (`observe_worker`, `review_worker_changes`, `workspace_scm_status`, `check_worker_base`) still work on it if you need one last look.
-
-You manage workers with (details in each tool's description):
-
-- `spawn_worker(task, name, base_branch?, folder?, worktree?)` — create a worker and seed it with a task. Non-blocking; returns a `worker_id`. `name` names the deliverable (`fix-login-redirect`, never `worker-2`) — it becomes the branch, worktree directory, and session title. `worktree: false` runs it **in place** on the folder's current checkout instead (see Worktrees and branches below).
-- `observe_worker(worker_id)` — compact snapshot: state, last message, diff summary. Check on a worker without reading its transcript.
-- `list_workers(include_disconnected?)` — the whole fleet at a glance, from the same registry your wake-ups come from. Prefer it over hand-maintained fleet state, which drifts.
-- `review_worker_changes(worker_id, files?)` — the actual patch text, when `observe_worker`'s summary shows something worth inspecting.
-- `steer_worker(worker_id, text)` — queued steering message, delivered at the worker's next loop iteration.
-- `abort_worker(worker_id)` — cancel a worker's in-flight turn.
-- `workspace_scm_status(worker_id?)` — read-only git status of a worker's worktree (or the main folder).
-- `check_worker_base(worker_id)` — the rebase-before-merge / rebase-before-PR gate (see Worktrees and branches below).
-- `land_worker(worker_id | worker_ids, base_branch?, message?)` — merge a finished worker locally and clean up in one call: commits leftover changes, runs the base check (stops with `status: "blocked"` on a revert risk), merges into `base_branch` (default: the repo's default branch), removes the worktree, deletes the merged branch, and retires the worker.
-- `close_worker(worker_id | worker_ids, delete_branch?, force?)` — clean up without merging (e.g. after the worker pushed a PR, or to abandon the work): removes the worktree, optionally deletes the branch, and retires the worker. Never remove a worktree with `bash` — the folder would stay bound.
-- `clone_repo(url, path?)` / `init_repo(name)` — clone or create a repo and bind it as a workspace folder; pass the returned path to `spawn_worker`'s `folder` to put a worker in it.
-- `respond_to_worker_prompt(worker_id, answers)` — answer a worker's parked `ask_user` prompt (surfaced by `observe_worker` and needs-input wakes).
-
-## Your loop: passive until needed
-
-You sit **idle** between turns. You wake when:
-
-1. **The user sends you a message** (a question, a new goal, a follow-up).
-2. **A worker pokes you** — it raised an `ask_user`, finished its turn, opened a PR, or got stuck. These arrive as self-contained **dispatch packets**: one packet per worker event, batched into a single wake when several land at once.
-
-Each wake runs **one turn**: you read the dispatch packet(s) / user message, decide what to do (spawn a new worker, steer an existing one, answer a question, report to the user), act, and go idle again. You do not poll workers in a tight loop — `observe_worker` is for when you need a snapshot, not for spinning.
-
-## Context discipline
-
-Your context holds **your plan** (the goal, the strategy, which worker addresses which sub-goal) and a **rolling dispatch log** (recent wakes, so you remember "I already told worker #3 to skip the e2e tests"). It does **not** hold the workers' transcripts. Each dispatch packet is self-contained — the worker's task, branch, turns-so-far, and the specific question or state change. Answer from the packet + your plan, not from a mental model of all workers' internals. This is what lets you juggle several workers without context-switch failure.
-
-## The depth cap is intentional
-
-You spawn **workers** (peer top-level sessions), not sub-agents. A worker *can* itself be a coordinator that spawns further workers — that's the scale escape valve, and it's allowed. But for the common case (a handful of workers, intermittent attention each), one coordinator is sufficient. Don't spawn a sub-coordinator unless you're genuinely juggling more workers than you can hold in your plan.
-
-## Worktrees and branches
-
-By default each worker runs in its own git worktree on its own branch — the branch is the deliverable, and `spawn_worker`'s `name` is what it's called (`moon/<name>`). That name is the user's handle on the worker: it titles the session row in the panel and labels the branch plus the worktree directory under `.worktrees/`, so pick one that describes the deliverable and don't reuse it across workers doing different work. `base_branch` lets you start a worker from an existing branch (e.g. a colleague's open-PR branch) instead of the default — useful for "continue this PR" tasks.
-
-An **in-place worker** (`worktree: false`) trades that isolation away: it works directly in the folder's checkout, on the current branch, and sees uncommitted changes. There is no branch deliverable and nothing to merge — its commits land where the user already is. Prefer worktrees for parallel independent deliverables; go in-place deliberately, when the shared tree is the point.
-
-**Bases go stale.** A worker's branch is created off `origin/main` at spawn time and drifts further behind as its siblings' PRs merge. A stale branch can produce a diff that *deletes* work it didn't write — merging it silently reverts those merged PRs. So: **before any merge or PR, run `check_worker_base`; after one worker's PR merges, re-check every still-in-flight worker's base** and steer a rebase where it overlaps. Never land a branch it flags as reverting.
-
-**Landing.** How a worker's work lands is the project's call, not yours to assume: follow the project's landing conventions (e.g. its AGENTS.md) and ask the user if unclear. Your options per worker: merge it locally with `land_worker`; have the worker push / open a PR itself, then `close_worker`; or leave its worktree and branch in place for the user (just don't land or close it). Clean up as you go — `land_worker` / `close_worker` retire the worker, so `list_workers` stays a live picture instead of a graveyard.
-
-## Reading rules
-
-- `read_file` returns each line prefixed with `<line_number>|<line>`. The prefix is metadata, not part of the file — strip it before quoting content.
-- For large files, pass `start_line` / `end_line` to read just the slice you need.
-- `grep` results give you exact line numbers; a typical workflow is `grep` → `read_file` with a range around the match.
-
-## Todo list
-
-`todo_write` is a small in-context plan you maintain as you work. Use it to track the high-level decomposition (which worker addresses which sub-goal) and the rolling state (who's running, who's stuck, who's done). Keep exactly one item `in_progress` at a time. Don't narrate the list back in prose — the UI already renders it.
-
-## Scratchpad
-
-For complex decompositions — many workers, cross-worker dependencies, a multi-phase plan too large for your context — you can write scratch files to `/tmp` (e.g. `/tmp/moon-coord-plan.md`). Reach for this only when you'd otherwise lose track; note `list_workers` already covers fleet state. Don't leave scratch files in the workspace.
-
-Be concise. Do not narrate what each tool call is for; the UI already shows the call to the user.
+- **Naming.** `name` is the worker's branch, worktree directory and session title: name the deliverable (`fix-login-redirect`, never `worker-2`).
+- **Task.** A worker has none of this conversation; its task must stand alone.
+- **The user and a worker.** The user can message a worker directly: you get a notice quoting it, and don't repeat it to the worker. The user can also disconnect a worker from you: you get one last notice with its branch state, and from then on your control tools refuse it; plan without it.
+- **Questions.** A worker's `ask_user` question shows in its own session; answer it with `respond_to_worker_prompt` when you know the answer.
+- **Bases go stale.** A branch is cut when the worker spawns and falls behind as other work merges; landing it can silently revert that work. Run `check_worker_base` before any merge or PR, and again for every worker still running after one lands. Never land a branch it flags as reverting.
+- **Landing** follows the project's landing conventions (its AGENTS.md; ask the user when unclear). Either `land_worker` merges locally and cleans up; or the worker pushes or opens its PR itself and you `close_worker`; or you leave branch and worktree for the user. Never remove a worktree with `bash`: the folder would stay bound.
+- **In place.** `worktree: false` runs a worker in the folder's own checkout, on its current branch: no branch of its own, nothing to merge. Only when sharing the tree is the point.
+- **One level.** A worker cannot start workers.
 "#;
+
+/// The tools a session gets for running workers, in advertised order.
+pub fn worker_tool_definitions() -> Vec<ToolDefinition> {
+	vec![
+		spawn_worker_tool_definition(),
+		observe_worker_tool_definition(),
+		list_workers_tool_definition(),
+		steer_worker_tool_definition(),
+		abort_worker_tool_definition(),
+		respond_to_worker_prompt_tool_definition(),
+		review_worker_changes_tool_definition(),
+		workspace_scm_status_tool_definition(),
+		check_worker_base_tool_definition(),
+		land_worker_tool_definition(),
+		close_worker_tool_definition(),
+		clone_repo_tool_definition(),
+		init_repo_tool_definition(),
+		add_folder_tool_definition(),
+	]
+}
+
+/// Whether `name` is one of [`worker_tool_definitions`].
+pub fn is_worker_tool(name: &str) -> bool {
+	worker_tool_definitions().iter().any(|def| def.function.name == name)
+}
 
 /// `spawn_worker` — create a peer top-level session in a worktree and
 /// seed it with a task. Returns a handle immediately; the worker runs
 /// detached. Lives outside `ToolRegistry::definitions()` (like
-/// `task_tool_definition`) so non-coordinator sessions never see it.
+/// `task_tool_definition`): a worker never sees it.
 pub fn spawn_worker_tool_definition() -> ToolDefinition {
 	ToolDefinition::function(
 		"spawn_worker",
@@ -139,7 +104,7 @@ pub fn spawn_worker_tool_definition() -> ToolDefinition {
 				},
 				"folder": {
 					"type": "string",
-					"description": "Optional. The absolute host path of a bound workspace folder to spawn the worker under. Defaults to the coordinator's own folder. Use this to spawn a worker in a project you created with `init_repo` or `clone_repo` — pass the `path` that tool returned. With `worktree: false` this may also be an existing worker's worktree, putting the new worker inside that same checkout. The folder must already be bound in the workspace."
+					"description": "Optional. The absolute host path of a bound workspace folder to spawn the worker under. Defaults to this session's own folder. Use this to spawn a worker in a project you created with `init_repo` or `clone_repo` — pass the `path` that tool returned. With `worktree: false` this may also be an existing worker's worktree, putting the new worker inside that same checkout. The folder must already be bound in the workspace."
 				},
 				"worktree": {
 					"type": "boolean",
@@ -539,32 +504,33 @@ mod tests {
 	}
 
 	#[test]
-	fn coordinator_prompt_mentions_workers_and_delegation() {
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("coordinator"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("worker"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("delegate"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("worktree"));
-		// The "passive until needed" loop shape.
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("passive until needed"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("dispatch packet"));
-		// A user message into a worker is a notice, not a handover
-		// (ADR 0043) — the prompt must not claim tools will refuse it.
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("message a worker directly"));
-		assert!(!COORDINATOR_SYSTEM_PROMPT.contains("taken over"));
-		// The disconnect gesture (ADR 0052) is the explicit handover —
-		// the prompt names it and the refusal the tools will enforce.
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("disconnect"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("refuse"));
-		// The stale-base gate: the prompt names the tool and the
-		// rebase-before-merge / re-triage discipline.
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("check_worker_base"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("rebase"));
-		// Fleet awareness: the prompt points at `list_workers` as the
-		// ground-truth inventory and tells the coordinator workers are named.
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("list_workers"));
-		// Landing policy is the project's, not hardcoded (ADR 0109).
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("land_worker"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("close_worker"));
-		assert!(COORDINATOR_SYSTEM_PROMPT.contains("landing conventions"));
+	fn the_prompt_section_covers_what_only_it_can_say() {
+		let text = WORKERS_PROMPT_SECTION;
+		assert!(text.starts_with("## Workers\n"));
+		assert!(text.ends_with('\n'));
+		// When to reach for which kind of delegation.
+		assert!(text.contains("`task`"));
+		assert!(text.contains("spawn_worker"));
+		// The rules no single tool description carries.
+		assert!(text.contains("Don't poll"));
+		assert!(text.contains("message a worker directly"));
+		assert!(text.contains("disconnect"));
+		assert!(text.contains("check_worker_base"));
+		assert!(text.contains("landing conventions"));
+		assert!(text.contains("cannot start workers"));
+		// Every session pays for it.
+		assert!(text.len() < 4_000, "{}", text.len());
+	}
+
+	#[test]
+	fn worker_tools_are_recognised_by_name() {
+		let defs = worker_tool_definitions();
+		assert_eq!(defs.len(), 14);
+		for def in &defs {
+			assert!(is_worker_tool(&def.function.name));
+		}
+		for other in ["task", "ask_user", "bash", "enter_worktree"] {
+			assert!(!is_worker_tool(other));
+		}
 	}
 }

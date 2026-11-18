@@ -551,7 +551,6 @@
 
 	/** Split a multi-file unified diff into per-file sections keyed
 	 * by the `b/<path>` of each `diff --git` header. */
-	const isCoordinator = $derived(app.sessions.find((s) => s.id === app.activeSession)?.mode === 'coordinator');
 
 	// Title rename: tap the title to edit inline. The rename
 	// propagates to the IDE via the broadcast `session_title_updated`
@@ -823,7 +822,6 @@
 <div class="session">
 	<div class="row session-head">
 		<button class="ghost back" onclick={() => app.closeSession()}>←</button>
-		{#if isCoordinator}<span class="badge" title="Coordinator — orchestrates worker agents">coord</span>{/if}
 		{#if editingTitle}
 			<input
 				bind:this={titleInputEl}
@@ -1263,21 +1261,7 @@
 			</div>
 		{/each}
 		{#if app.rows.length === 0}
-			{#if isCoordinator}
-				<div class="empty-hint">
-					<p><strong>Coordinator session</strong></p>
-					<p class="muted">
-						An orchestrator that spawns and manages worker agents. It can't edit files itself — it delegates each task
-						to a worker in its own git worktree.
-					</p>
-					<p class="muted">
-						Describe a goal (e.g. <em>look at the open GitHub issues and open a PR for each</em>) and it will decompose
-						it into worker tasks.
-					</p>
-				</div>
-			{:else}
-				<p class="muted">No messages yet. Send one below.</p>
-			{/if}
+			<p class="muted">No messages yet. Send one below.</p>
 		{/if}
 	</div>
 
@@ -1352,7 +1336,7 @@
 			bind:value={draft}
 			onkeydown={onKeydown}
 			onpaste={onPaste}
-			placeholder={isCoordinator ? 'Describe a goal for the coordinator' : 'Message the coder'}
+			placeholder="Message the coder"
 			rows="1"
 		></textarea>
 		<!-- Send stays available while a turn runs: the message queues
@@ -1570,9 +1554,8 @@
 		margin-left: 0.3rem;
 		color: var(--fg-muted);
 	}
-	/* Coordinator-sent message into a worker — same pill language
-	   as the `coord` session badge so the reader can tell the
-	   orchestrator's instructions from their own. */
+	/* Coordinator-sent message into a worker: a pill, so the reader
+	   can tell its instructions from their own. */
 	.coordinator-tag {
 		display: inline-block;
 		font-size: 0.65rem;
@@ -2230,19 +2213,6 @@
 	.review-nodiff {
 		margin: 0.4rem 0 0;
 		font-size: 0.75rem;
-	}
-	.empty-hint {
-		padding: 1rem 0.5rem;
-		display: flex;
-		flex-direction: column;
-		gap: 0.4rem;
-	}
-	.empty-hint p {
-		margin: 0;
-		line-height: 1.4;
-	}
-	.empty-hint .muted {
-		font-size: 0.85rem;
 	}
 	.composer textarea {
 		flex: 1;

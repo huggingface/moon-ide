@@ -78,9 +78,8 @@ use crate::inference::ToolCall;
 /// optional `committed_branch` — the branch a session's work was
 /// committed onto, so the panel can offer a one-click jump back to it
 /// (ADR 0028). Also elides when absent.
-/// Bumped to 6 for the top-level `mode` field (ADR 0030). The field
-/// elides when `None` (the `Agent` default), so pre-6 sessions load
-/// byte-compatible — `from_top_level_wire(None) == Agent`.
+/// `6` carried a top-level `mode` (ADR 0030), retired by ADR 0125:
+/// a header still holding one loads, the key ignored.
 pub const SESSION_SCHEMA_VERSION: u32 = 6;
 
 /// File extension on every session file.
@@ -141,13 +140,6 @@ pub struct SessionHeader {
 	/// sub-agent ran under. `None` for top-level sessions; mirrors
 	/// `CoderMode::as_wire()` so the frontend reads it verbatim.
 	pub subagent_mode: Option<String>,
-	/// Wire string of the top-level session's mode (ADR 0030).
-	/// `None` means the `Agent` default (byte-compatible with every
-	/// pre-6 session); `Some("coordinator")` marks an orchestrator
-	/// session. Sub-agents leave this `None` — their mode lives in
-	/// `subagent_mode`. Read on load via `CoderMode::from_top_level_wire`
-	/// and on each turn to pick the tool list + system prompt.
-	pub mode: Option<String>,
 	/// Absolute path of the folder the sub-agent's tools operated
 	/// against. May differ from the parent's bound folder (which
 	/// owns the JSONL on disk) when the parent passed an explicit
@@ -295,9 +287,6 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.subagent_mode {
 			map.serialize_entry("subagent_mode", v)?;
 		}
-		if let Some(v) = &self.mode {
-			map.serialize_entry("mode", v)?;
-		}
 		if let Some(v) = &self.subagent_target_folder {
 			map.serialize_entry("subagent_target_folder", v)?;
 		}
@@ -360,8 +349,6 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			#[serde(default)]
 			subagent_mode: Option<String>,
 			#[serde(default)]
-			mode: Option<String>,
-			#[serde(default)]
 			subagent_target_folder: Option<String>,
 			#[serde(default)]
 			orchestrator_session_id: Option<String>,
@@ -392,7 +379,6 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			parent_session_id: raw.parent_session_id,
 			parent_tool_call_id: raw.parent_tool_call_id,
 			subagent_mode: raw.subagent_mode,
-			mode: raw.mode,
 			subagent_target_folder: raw.subagent_target_folder,
 			orchestrator_session_id: raw.orchestrator_session_id,
 			in_place_worker: raw.in_place_worker,
@@ -1778,12 +1764,6 @@ pub struct SessionSummary {
 	/// chip. `None` until the session's work is committed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub committed_branch: Option<String>,
-	/// Top-level session mode (ADR 0030) — `None` for the `Agent`
-	/// default, `Some("coordinator")` for an orchestrator session.
-	/// Lets the sessions list badge a coordinator row. Mirrors the
-	/// header's `mode` field (which elides the same way).
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub mode: Option<String>,
 	/// The coordinator that spawned this session, for a worker
 	/// (header's `orchestrator_session_id`). Lets the folder bar mark
 	/// activity that a coordinator launched apart from the user's own.
@@ -2231,7 +2211,6 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 				worktree_root: header.worktree_root,
 				worktree_branch: header.worktree_branch,
 				committed_branch: header.committed_branch,
-				mode: header.mode,
 				orchestrator_session_id: header.orchestrator_session_id,
 				last_error: summary.1,
 				interrupted: summary.2,
@@ -2248,7 +2227,6 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 		worktree_root: header.worktree_root,
 		worktree_branch: header.worktree_branch,
 		committed_branch: header.committed_branch,
-		mode: header.mode,
 		orchestrator_session_id: header.orchestrator_session_id,
 		last_error,
 		interrupted,
@@ -3267,7 +3245,6 @@ mod tests {
 			parent_session_id: None,
 			parent_tool_call_id: None,
 			subagent_mode: None,
-			mode: None,
 			subagent_target_folder: None,
 			bash_target_override: None,
 			worktree_root: None,
@@ -5374,81 +5351,13 @@ mod tests {
 		assert_eq!(reloaded.records.len(), 4);
 	}
 
-	mod coordinator_mode_field {
-		use super::*;
-
-		#[test]
-		fn coordinator_mode_serializes_and_elides_for_agent() {
-			// A coordinator session's header carries `mode:
-			// "coordinator"`; an ordinary agent session's header
-			// elides the field entirely (byte-compatible with
-			// pre-schema-6 sessions).
-			let mut coord = make_test_header("sess-coord");
-			coord.mode = Some("coordinator".to_string());
-			let json = serde_json::to_string(&coord).unwrap();
-			assert!(json.contains("\"mode\":\"coordinator\""));
-
-			let agent = make_test_header("sess-agent");
-			let json = serde_json::to_string(&agent).unwrap();
-			// `mode` field absent for the default agent session.
-			assert!(!json.contains("\"mode\""));
-		}
-
-		#[test]
-		fn coordinator_mode_round_trips_through_serialize_deserialize() {
-			let mut coord = make_test_header("sess-coord-rt");
-			coord.mode = Some("coordinator".to_string());
-			let json = serde_json::to_string(&coord).unwrap();
-			let back: SessionHeader = serde_json::from_str(&json).unwrap();
-			assert_eq!(back.mode.as_deref(), Some("coordinator"));
-		}
-
-		#[test]
-		fn absent_mode_deserializes_to_none() {
-			// A pre-schema-6 header has no `mode` field; loading it
-			// must produce `None`, which `from_top_level_wire` maps
-			// to `Agent`.
-			let agent = make_test_header("sess-old");
-			let json = serde_json::to_string(&agent).unwrap();
-			let back: SessionHeader = serde_json::from_str(&json).unwrap();
-			assert!(back.mode.is_none());
-		}
-
-		#[test]
-		fn session_summary_carries_mode() {
-			let mut coord = make_test_header("sess-coord-summary");
-			coord.mode = Some("coordinator".to_string());
-			let summary = SessionSummary {
-				id: coord.id.clone(),
-				title: coord.title.clone(),
-				created_at_ms: coord.created_at_ms,
-				updated_at_ms: coord.updated_at_ms,
-				worktree_root: None,
-				worktree_branch: None,
-				committed_branch: None,
-				mode: coord.mode.clone(),
-				orchestrator_session_id: None,
-				last_error: false,
-				interrupted: false,
-			};
-			let json = serde_json::to_string(&summary).unwrap();
-			assert!(json.contains("\"mode\":\"coordinator\""));
-			// An agent summary elides it.
-			let agent_summary = SessionSummary {
-				id: "sess-agent".into(),
-				title: "t".into(),
-				created_at_ms: 1,
-				updated_at_ms: 1,
-				worktree_root: None,
-				worktree_branch: None,
-				committed_branch: None,
-				mode: None,
-				orchestrator_session_id: None,
-				last_error: false,
-				interrupted: false,
-			};
-			let json = serde_json::to_string(&agent_summary).unwrap();
-			assert!(!json.contains("\"mode\""));
-		}
+	#[test]
+	fn a_header_from_the_coordinator_mode_days_still_loads() {
+		let header = make_test_header("sess-old-coord");
+		let mut json: serde_json::Value = serde_json::to_value(&header).unwrap();
+		json["mode"] = serde_json::json!("coordinator");
+		let back: SessionHeader = serde_json::from_value(json).unwrap();
+		assert_eq!(back.id, "sess-old-coord");
+		assert!(!serde_json::to_string(&back).unwrap().contains("\"mode\""));
 	}
 }

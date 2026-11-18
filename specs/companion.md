@@ -191,13 +191,8 @@ nothing on the bridge changes.
 Per [scope discipline](../AGENTS.md#scope-discipline), the thinnest
 requested surface:
 
-- **Coordinator sessions (ADR 0030).** The phone can create
-  coordinator sessions (the `✦` button in the workspace view, via
-  `coder_new_coordinator_session`), and both the session list row and
-  the session view render a `coord` badge — left of the title, so the
-  truncating title can't ellipsise it away — plus a
-  coordinator-specific empty-state hint describing the delegation
-  model. Workers are ordinary sessions in the per-
+- **Workers (ADR 0030 / 0125).** Any session can run workers; nothing
+  marks it on the phone. Workers are ordinary sessions in the per-
   project list — opening one and sending a message parks a notice
   quoting what you said in the coordinator's steer queue (delivered
   with its next turn, [ADR 0043](decisions/0043-user-message-notifies-coordinator.md)
