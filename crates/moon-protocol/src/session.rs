@@ -251,11 +251,14 @@ pub struct InboxState {
 	/// Items hidden until a time. Expired entries are dropped by the
 	/// frontend on its next save.
 	pub snoozed: Vec<InboxSnooze>,
+	/// The inbox tab is open: it is the first tab of every folder
+	/// until closed.
+	pub tab_open: bool,
 }
 
 impl InboxState {
 	pub fn is_empty(&self) -> bool {
-		self.watched_authors.is_empty() && self.snoozed.is_empty()
+		self.watched_authors.is_empty() && self.snoozed.is_empty() && !self.tab_open
 	}
 }
 

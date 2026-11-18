@@ -30,6 +30,11 @@ When the folder's branch has an open GitHub PR, the review tab shows it:
   flags when the branch has moved). A checkout that isn't at that
   commit shows them a few lines off. The user's own drafts keep their
   content-based anchoring.
+- **GitHub's markdown dialect** for descriptions, notes and thread
+  comments: raw HTML is rendered (sanitised, with no `style`, ids,
+  author classes or form controls), comments are dropped, bare URLs
+  link, a newline breaks the line, and `> [!NOTE]`-style alerts are
+  callouts. File previews keep raw HTML escaped.
 - **Notes are parsed here**, from the last
   `<!-- moonbot:minor-notes:start -->` … `end` block; the block is
   removed from the description shown.

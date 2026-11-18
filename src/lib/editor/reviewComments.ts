@@ -51,6 +51,8 @@ import {
 	type DecorationSet,
 } from '@codemirror/view';
 import { getCachedMarkdown, renderMarkdown } from '../markdown';
+import { blockCards, blockShell } from './blockCards';
+import { diffCollapsePins } from './diffCollapse';
 import type { ReviewComment, ReviewSide } from '../protocol';
 
 /** How far from the hint line to scan for a drifted fingerprint. */
@@ -284,7 +286,7 @@ class CommentCardWidget extends WidgetType {
 		// Stop CodeMirror from treating clicks inside the card as
 		// text-selection gestures.
 		root.addEventListener('mousedown', (e) => e.stopPropagation());
-		return root;
+		return blockShell(root);
 	}
 
 	private iconButton(label: string, title: string, handler: () => void): HTMLButtonElement {
@@ -352,7 +354,7 @@ class ComposerWidget extends WidgetType {
 		});
 		// Focus after the widget is attached to the DOM.
 		queueMicrotask(() => form.textarea.focus());
-		return form.root;
+		return blockShell(form.root);
 	}
 
 	override ignoreEvent(): boolean {
@@ -506,6 +508,20 @@ const reviewCommentsField = StateField.define<DecorationSet>({
 	provide: (f) => EditorView.decorations.from(f),
 });
 
+// A commented line stays out of a diff's collapsed runs: a draft
+// nobody can see is a draft nobody remembers to publish.
+const commentPins = diffCollapsePins.compute(['doc', reviewCommentsFacet], (state) => {
+	const lines: number[] = [];
+	for (const comment of state.facet(reviewCommentsFacet)) {
+		const resolved = resolveAnchor(state, comment);
+		const end = resolved !== null ? resolved[1] : comment.anchor.endLine;
+		if (end >= 1 && end <= state.doc.lines) {
+			lines.push(end);
+		}
+	}
+	return lines;
+});
+
 // --- Hover gutter "+" -------------------------------------------------
 // A dedicated gutter column that shows a clickable "+" only on the
 // line the pointer is currently over, so a reviewer can start a
@@ -603,7 +619,9 @@ const hoverTracker = ViewPlugin.define((view) => {
 	};
 });
 
-// Styling for the cards, composer, and hover gutter. Lives on the
+// Styling for the cards, composer, and hover gutter. The shell (width,
+// inset, border, surface) is the shared one in `blockCards.ts`; what
+// is here is the inside of a draft card. Lives on the
 // extension (not in any host component's CSS) so every surface that
 // wires review comments — review sections, the regular editor, the
 // diff view — renders them identically. Colors ride the app's
@@ -646,15 +664,6 @@ const reviewBaseTheme = EditorView.baseTheme({
 		fontWeight: '700',
 		lineHeight: '1',
 		cursor: 'pointer',
-	},
-	'.cm-review-card, .cm-review-composer': {
-		margin: '4px 8px 4px 28px',
-		border: '1px solid var(--m-border)',
-		borderRadius: '6px',
-		background: 'var(--m-bg-1)',
-		fontFamily: 'var(--m-font-sans, system-ui, sans-serif)',
-		fontSize: '12px',
-		overflow: 'hidden',
 	},
 	'.cm-review-card-stale': {
 		opacity: '0.7',
@@ -776,8 +785,8 @@ const reviewBaseTheme = EditorView.baseTheme({
 		border: '1px solid var(--m-border)',
 		borderRadius: '4px',
 		color: 'var(--m-fg)',
-		fontFamily: 'var(--m-font-sans, system-ui, sans-serif)',
-		fontSize: '12px',
+		fontFamily: 'var(--m-font-ui)',
+		fontSize: 'var(--m-text-sm)',
 		lineHeight: '1.4',
 	},
 	'.cm-review-composer-input:focus': {
@@ -815,7 +824,15 @@ const reviewBaseTheme = EditorView.baseTheme({
  * [`ReviewWiring`] rather than assembling the facets by hand.
  */
 export function reviewCommentsExtension(): Extension {
-	return [reviewCommentsField, hoverLineField, addCommentGutter, hoverTracker, reviewBaseTheme];
+	return [
+		reviewCommentsField,
+		commentPins,
+		hoverLineField,
+		addCommentGutter,
+		hoverTracker,
+		reviewBaseTheme,
+		blockCards,
+	];
 }
 
 /** Operations a host wires into a [`ReviewWiring`]. */

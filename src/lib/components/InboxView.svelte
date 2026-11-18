@@ -31,7 +31,6 @@
 	import IssueIcon from './icons/IssueIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
-	import ReviewIcon from './icons/ReviewIcon.svelte';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -93,7 +92,10 @@
 		return inbox.folderFor(item.repo);
 	}
 
-	async function open(item: InboxItem) {
+	/** Open `item`. `background` (Ctrl / Cmd / middle click) adds a
+	 *  pull request's tab without leaving the inbox, so several can be
+	 *  queued up. */
+	async function open(item: InboxItem, background = false) {
 		if (openingId !== null) {
 			return;
 		}
@@ -102,12 +104,22 @@
 			openOnGitHub(item);
 			return;
 		}
+		// The tab reads the pull request from its folder's repository,
+		// so any checkout of the project will do; only another project
+		// means another folder.
+		const here = workspace.activeProjectPath === project;
+		if (background) {
+			const folder = here ? workspace.activeFolderPath : project;
+			if (folder !== null && workspace.openPrTabInBackground(folder, item.number, item.title)) {
+				if (!here) {
+					workspace.flash(`Opened #${item.number} in ${shortRepo(item.repo)}`);
+				}
+				void inbox.markRead(item);
+			}
+			return;
+		}
 		openingId = item.id;
 		try {
-			// The tab reads the pull request from the active folder's
-			// repository, so any checkout of the project will do; only
-			// another project means moving.
-			const here = workspace.activeProjectPath === project;
 			if (!here) {
 				await workspace.setActiveFolder(project);
 			}
@@ -120,6 +132,15 @@
 		} finally {
 			openingId = null;
 		}
+	}
+
+	function onRowClick(event: MouseEvent, item: InboxItem) {
+		selectedKey = item.id;
+		// The row's own buttons act for themselves.
+		if (event.target instanceof Element && event.target.closest('button') !== null) {
+			return;
+		}
+		void open(item, event.ctrlKey || event.metaKey || event.button === 1);
 	}
 
 	function openOnGitHub(item: InboxItem) {
@@ -159,10 +180,17 @@
 
 	function onKeydown(event: KeyboardEvent) {
 		// A focused row button handles its own Enter / Space.
-		if (event.ctrlKey || event.metaKey || event.altKey || event.target instanceof HTMLButtonElement) {
+		if (event.altKey || event.target instanceof HTMLButtonElement) {
 			return;
 		}
 		const selected = selectedIndex === -1 ? null : (rows[selectedIndex]?.item ?? null);
+		if (event.ctrlKey || event.metaKey) {
+			if (event.key === 'Enter' && selected !== null) {
+				event.preventDefault();
+				void open(selected, true);
+			}
+			return;
+		}
 		switch (event.key) {
 			case 'j':
 			case 'ArrowDown':
@@ -364,7 +392,6 @@
 	<div class="scroll" bind:this={list} tabindex="0" role="listbox" aria-label="GitHub inbox" onkeydown={onKeydown}>
 		{#each rows as row (row.item.id)}
 			{@const item = row.item}
-			{@const hasTab = projectFolder(item) !== null}
 			<!-- svelte-ignore a11y_click_events_have_key_events (keys are handled on the listbox) -->
 			<div
 				class="row"
@@ -374,8 +401,12 @@
 				role="option"
 				tabindex="-1"
 				aria-selected={item.id === selectedKey}
-				onclick={() => (selectedKey = item.id)}
-				ondblclick={() => void open(item)}
+				onclick={(event) => onRowClick(event, item)}
+				onauxclick={(event) => {
+					if (event.button === 1) {
+						onRowClick(event, item);
+					}
+				}}
 			>
 				<span class="unread-dot" title={item.notification !== null ? 'Unread' : undefined}></span>
 				<span class="state {item.kind === 'pull_request' ? (item.state ?? 'open') : 'plain'}" title={stateTitle(item)}>
@@ -410,11 +441,6 @@
 					<span class="opening">Opening…</span>
 				{:else}
 					<span class="actions">
-						{#if hasTab}
-							<button class="icon-btn" title="Open the pull request (Enter)" onclick={() => void open(item)}>
-								<ReviewIcon size={14} />
-							</button>
-						{/if}
 						<button class="icon-btn" title="Open on GitHub (o)" onclick={() => openOnGitHub(item)}>
 							<ExternalLinkIcon size={14} />
 						</button>
@@ -482,7 +508,7 @@
 
 	<footer class="hints">
 		<span><kbd>j</kbd><kbd>k</kbd> move</span>
-		<span><kbd>Enter</kbd> open</span>
+		<span><kbd>Enter</kbd> or click: open; with <kbd>Ctrl</kbd>, in the background</span>
 		<span><kbd>o</kbd> GitHub</span>
 		<span><kbd>e</kbd> mark read</span>
 		<span><kbd>s</kbd><kbd>w</kbd> snooze a day / a week</span>

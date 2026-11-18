@@ -17,7 +17,10 @@
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffConfigIgnoringWhitespace } from '../editor/diffWhitespace';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
-	import { diffCollapseContextExtension } from '../editor/diffCollapseContext';
+	import { diffBlockAlign } from '../editor/diffBlockAlign';
+	import { diffCollapse } from '../editor/diffCollapse';
+	import { gutterDigits } from '../editor/diffLayout';
+	import { wireHorizontalScrollSync } from '../editor/hScrollSync';
 	import { filePathFacet } from '../editor/lsp';
 	import { hasGotoModifier, lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
 	import { lspLanguageFor } from '../editor/lspLanguage';
@@ -354,7 +357,11 @@
 		}
 		currentWorking = text;
 		const m = merge;
-		if (!m) {
+		// An edit made in this pane comes back here through
+		// `updateText`; the pane already shows it, and replacing the
+		// whole document with itself would reset everything that is
+		// mapped through changes (collapsed runs, the selection).
+		if (!m || m.b.state.doc.toString() === text) {
 			return;
 		}
 		m.b.dispatch({ changes: { from: 0, to: m.b.state.doc.length, insert: text } });
@@ -455,7 +462,8 @@
 		const sideA: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('a'),
-			diffCollapseContextExtension,
+			diffCollapse(),
+			diffBlockAlign,
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightSelectionMatches(),
@@ -582,7 +590,8 @@
 		const sideB: Extension[] = [
 			lineNumbers(),
 			diffGutterTintExtension('b'),
-			diffCollapseContextExtension,
+			diffCollapse(),
+			diffBlockAlign,
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightActiveLine(),
@@ -658,21 +667,14 @@
 			// No revert controls — the review tab is read-only;
 			// the user can't apply A→B or vice versa from here.
 			//
-			// Aggregated review view collapses long unchanged
-			// regions behind `… N unchanged lines` placeholders.
-			// In `DiffView` (single-file, one-tab-at-a-time) we
-			// expanded everything because the change-bar gutter +
-			// overview ruler already tell you "where the diffs
-			// are" and the placeholders get in the way of Ctrl+F /
-			// scroll. Here it's the opposite trade-off: on a
-			// 30-file PR with a 2000-line file that only changed
-			// 20 lines, an uncollapsed mount stalls the scroll
-			// and forces the user to skim past acres of unchanged
-			// code to reach the next file. `margin: 3` keeps
-			// hunks readable (same as `git diff -U3`); `minSize:
-			// 5` only folds runs of ≥5 unchanged lines so tiny
-			// gaps between adjacent hunks stay expanded.
-			collapseUnchanged: { margin: 3, minSize: 5 },
+			// Long unchanged runs collapse (`diffCollapse()` in each
+			// pane's extensions, not the package's `collapseUnchanged`).
+			// `DiffView` shows the whole file because its change gutter
+			// and overview ruler already say where the changes are;
+			// here it's the opposite trade-off: on a 30-file PR with a
+			// 2000-line file that changed 20 lines, an uncollapsed
+			// mount makes the reader skim acres of unchanged code to
+			// reach the next file.
 			// See DiffView.svelte for the rationale: raw diff keeps
 			// highlights aligned to single change spans rather than
 			// fusing across short matched substrings. The whitespace
@@ -681,6 +683,7 @@
 		});
 
 		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
+		syncGutterDigits();
 		wiringA.attach(merge.a);
 		wiringB.attach(merge.b);
 		prWiringA.attach(merge.a);
@@ -723,50 +726,16 @@
 		persistReanchors();
 	}
 
-	/**
-	 * Bidirectional `scrollLeft` mirror between the two `.cm-scroller`
-	 * elements of the section's MergeView. Same pattern as
-	 * `DiffView.svelte`'s `wireHorizontalScrollSync`: when long
-	 * lines force one side into horizontal overflow, dragging
-	 * either side's bar (or wheel-scrolling horizontally) drags
-	 * the other in lockstep so the aligned chunks line up
-	 * visually.
-	 *
-	 * Echoes from our own programmatic writes are identified by
-	 * value (not by a time-windowed flag) so unequal `scrollWidth`s
-	 * — the wider side scrolling past the narrower's max — don't
-	 * race the rAF-release and snap the wider side back to the
-	 * clamped value. See `DiffView.svelte` for the long-form
-	 * rationale.
-	 *
-	 * Returns a cleanup that the section's onMount teardown
-	 * invokes on unmount.
-	 */
-	function wireHorizontalScrollSync(a: HTMLElement, b: HTMLElement): () => void {
-		const expected = new WeakMap<HTMLElement, number>();
-		const handle = (from: HTMLElement, to: HTMLElement) => {
-			const pending = expected.get(from);
-			if (pending !== undefined && from.scrollLeft === pending) {
-				expected.delete(from);
-				return;
-			}
-			expected.delete(from);
-			const toMax = Math.max(0, to.scrollWidth - to.clientWidth);
-			const target = Math.min(from.scrollLeft, toMax);
-			if (to.scrollLeft === target) {
-				return;
-			}
-			expected.set(to, target);
-			to.scrollLeft = target;
-		};
-		const onA = () => handle(a, b);
-		const onB = () => handle(b, a);
-		a.addEventListener('scroll', onA, { passive: true });
-		b.addEventListener('scroll', onB, { passive: true });
-		return () => {
-			a.removeEventListener('scroll', onA);
-			b.removeEventListener('scroll', onB);
-		};
+	// Both panes number their lines in a gutter of the same width,
+	// wide enough for the longer of the two documents.
+	function syncGutterDigits() {
+		if (!merge || !host) {
+			return;
+		}
+		host.style.setProperty(
+			'--m-diff-gutter-digits',
+			String(gutterDigits(merge.a.state.doc.lines, merge.b.state.doc.lines)),
+		);
 	}
 
 	async function loadBase(): Promise<string> {
@@ -1134,40 +1103,5 @@
 	}
 	.review-section :global(.cm-scroller) {
 		overflow-x: auto;
-	}
-	/* Character-level change marker: see the matching rules in
-	 * `DiffView.svelte` for the full rationale. Short version:
-	 * the library default is a 2px bottom-edge gradient that
-	 * reads as a loud underline doubled with LSP lint
-	 * squigglies. Swap for a soft same-hue background
-	 * (GitHub-style inline diff highlight) using our palette
-	 * tokens so theme flips track. `!important` beats the
-	 * package's themed rules without a fragile selector-
-	 * specificity arms race. */
-	.review-section :global(.cm-merge-b .cm-changedText) {
-		background: color-mix(in srgb, var(--m-success) 22%, transparent) !important;
-		border-radius: 2px;
-	}
-	.review-section :global(.cm-merge-a .cm-changedText),
-	.review-section :global(.cm-deletedChunk .cm-deletedText) {
-		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
-		border-radius: 2px;
-	}
-	.review-section :global(.cm-merge-b .cm-deletedText) {
-		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
-	}
-	/* Pure-added / pure-deleted lines: the line-level change is
-	 * already conveyed by the gutter bar plus the line tint, so
-	 * layering the per-character marker on top doubles up the
-	 * same hue across the entire line. `diffPureChange.ts`
-	 * adds the `.cm-moon-pure-change` line decoration on any
-	 * line whose content is wholly inside `Change` spans —
-	 * whole-chunk pure adds / deletes plus all-new / all-removed
-	 * lines living inside an otherwise-modified chunk. Lines
-	 * with surviving common substrings keep their per-character
-	 * markers so the substring-vs-surrounding-text distinction
-	 * stays visible. */
-	.review-section :global(.cm-moon-pure-change .cm-changedText) {
-		background: transparent !important;
 	}
 </style>

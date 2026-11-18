@@ -49,6 +49,10 @@ use crate::web::WebClient;
 /// tool calls if it really wants to wait longer.
 const BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const BASH_MAX_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a finished command's output pipes get to reach EOF. A
+/// process the command left running in the background inherits them
+/// and keeps them open for as long as it lives.
+const BASH_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// `read_file` returns at most this many bytes. Beyond it we
 /// truncate + tell the model so it can iterate (e.g. follow up with
@@ -919,6 +923,38 @@ const LIVE_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// flush while the command is silent) and on EOF, split on UTF-8
 /// boundaries so a multi-byte char straddling two reads is never
 /// mangled. EOF or a read error ends the drain.
+/// Wait up to `grace` for the pipe drains to reach EOF, then stop
+/// them. Returns whether they finished on their own.
+///
+/// EOF needs every holder of the pipe's write end to be gone, not
+/// just the command: `server &` leaves a process holding it, and
+/// waiting for that would hang the call until the server dies.
+async fn finish_drains(
+	stdout_task: Option<tokio::task::JoinHandle<()>>,
+	stderr_task: Option<tokio::task::JoinHandle<()>>,
+	grace: Duration,
+) -> bool {
+	let aborts: Vec<_> = [&stdout_task, &stderr_task]
+		.into_iter()
+		.flatten()
+		.map(tokio::task::JoinHandle::abort_handle)
+		.collect();
+	let finished = tokio::time::timeout(grace, async {
+		if let Some(task) = stdout_task {
+			let _ = task.await;
+		}
+		if let Some(task) = stderr_task {
+			let _ = task.await;
+		}
+	})
+	.await
+	.is_ok();
+	for abort in aborts {
+		abort.abort();
+	}
+	finished
+}
+
 async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(
 	mut pipe: R,
 	buf: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -2998,16 +3034,6 @@ impl ToolRegistry {
 			.stderr
 			.take()
 			.map(|pipe| tokio::spawn(drain_pipe(pipe, stderr_buf.clone(), Some(live_for("stderr")))));
-		let join_drains = |stdout_task: Option<tokio::task::JoinHandle<()>>,
-		                   stderr_task: Option<tokio::task::JoinHandle<()>>| async move {
-			if let Some(task) = stdout_task {
-				let _ = task.await;
-			}
-			if let Some(task) = stderr_task {
-				let _ = task.await;
-			}
-		};
-
 		// `None` = interrupted by the turn's cancel token.
 		let waited = tokio::select! {
 			biased;
@@ -3015,10 +3041,10 @@ impl ToolRegistry {
 			result = tokio::time::timeout(timeout, child.wait()) => Some(result),
 		};
 
-		let (exit_code, interrupted, timed_out) = match waited {
+		let (exit_code, interrupted, timed_out, output_held) = match waited {
 			Some(Ok(Ok(status))) => {
-				join_drains(stdout_task, stderr_task).await;
-				(status.code(), false, false)
+				let drained = finish_drains(stdout_task, stderr_task, BASH_DRAIN_GRACE).await;
+				(status.code(), false, false, !drained)
 			}
 			Some(Ok(Err(err))) => return Err(CoderError::tool_failed("bash", err.to_string())),
 			// Timeout / interrupt: kill, reap briefly, give the
@@ -3026,8 +3052,8 @@ impl ToolRegistry {
 			cut_short => {
 				let _ = child.start_kill();
 				let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-				let _ = tokio::time::timeout(Duration::from_millis(250), join_drains(stdout_task, stderr_task)).await;
-				(None, cut_short.is_none(), cut_short.is_some())
+				finish_drains(stdout_task, stderr_task, Duration::from_millis(250)).await;
+				(None, cut_short.is_none(), cut_short.is_some(), false)
 			}
 		};
 
@@ -3056,6 +3082,12 @@ impl ToolRegistry {
 			obj.insert(
 				"note".into(),
 				json!("the user interrupted the turn; the command was killed after producing this partial output"),
+			);
+		}
+		if output_held {
+			obj.insert(
+				"note".into(),
+				json!("the command exited, but a process it started in the background still holds its output; anything that process prints later is not captured. Start long-lived processes with detach: true instead"),
 			);
 		}
 		if timed_out {
@@ -4843,6 +4875,38 @@ mod tests {
 		assert_eq!(streamed, "café ok\n");
 		assert!(!streamed.contains('\u{FFFD}'));
 		assert_eq!(buf.lock().unwrap().as_slice(), bytes);
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn finish_drains_does_not_wait_for_a_background_child_holding_the_pipe() {
+		// The shell exits at once; the `sleep` it backgrounded keeps
+		// stdout open. The output so far must come back promptly.
+		let mut child = tokio::process::Command::new("sh")
+			.args(["-c", "sleep 3 & echo started"])
+			.stdin(std::process::Stdio::null())
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::null())
+			.kill_on_drop(true)
+			.spawn()
+			.unwrap();
+		let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let drain = tokio::spawn(super::drain_pipe(child.stdout.take().unwrap(), buf.clone(), None));
+		child.wait().await.unwrap();
+		let started = std::time::Instant::now();
+		let finished = super::finish_drains(Some(drain), None, std::time::Duration::from_millis(300)).await;
+		assert!(!finished);
+		assert!(started.elapsed() < std::time::Duration::from_secs(2));
+		assert_eq!(buf.lock().unwrap().as_slice(), b"started\n");
+	}
+
+	#[tokio::test]
+	async fn finish_drains_reports_a_clean_eof() {
+		let (writer, reader) = tokio::io::duplex(64);
+		let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+		let drain = tokio::spawn(super::drain_pipe(reader, buf, None));
+		drop(writer);
+		assert!(super::finish_drains(Some(drain), None, std::time::Duration::from_secs(2)).await);
 	}
 
 	#[test]

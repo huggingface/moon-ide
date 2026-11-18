@@ -9,12 +9,15 @@
 // PR head shows them a few lines off, the same way GitHub marks a
 // thread outdated.
 
+import { getChunks, getOriginalDoc } from '@codemirror/merge';
 import { Compartment, Facet, StateField, type EditorState, type Extension, type Range } from '@codemirror/state';
 import { Decoration, EditorView, WidgetType, type DecorationSet } from '@codemirror/view';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { relativeTime } from '../inboxSections';
 import { getCachedMarkdown, renderMarkdown } from '../markdown';
 import type { PrThreadComment, PullRequestDetail, ReviewSide } from '../protocol';
+import { blockCards, blockShell } from './blockCards';
+import { diffCollapsePins } from './diffCollapse';
 
 export type PrAnnotation =
 	| { kind: 'note'; line: number; text: string }
@@ -46,14 +49,20 @@ const prAnnotationsFacet = Facet.define<readonly PrAnnotation[], readonly PrAnno
 	combine: (values) => values[0] ?? [],
 });
 
+/** Base-side annotations for a unified diff, where the base document
+ * has no pane of its own: their `line` counts in the original text. */
+const prBaseAnnotationsFacet = Facet.define<readonly PrAnnotation[], readonly PrAnnotation[]>({
+	combine: (values) => values[0] ?? [],
+});
+
 function renderMarkdownInto(target: HTMLElement, source: string): void {
-	const cached = getCachedMarkdown(source);
+	const cached = getCachedMarkdown(source, { github: true });
 	if (cached !== undefined) {
 		target.innerHTML = cached;
 		return;
 	}
 	target.textContent = source;
-	void renderMarkdown(source).then((html) => {
+	void renderMarkdown(source, { github: true }).then((html) => {
 		if (target.isConnected) {
 			target.innerHTML = html;
 		}
@@ -84,12 +93,17 @@ function el(tag: string, className: string, text?: string): HTMLElement {
 }
 
 class AnnotationWidget extends WidgetType {
-	constructor(private readonly annotation: PrAnnotation) {
+	/** `oldLine`: the annotation is about a line of the base text that
+	 * this editor does not number, so the card says which. */
+	constructor(
+		private readonly annotation: PrAnnotation,
+		private readonly oldLine: number | null = null,
+	) {
 		super();
 	}
 
 	override eq(other: AnnotationWidget): boolean {
-		return other.annotation === this.annotation;
+		return other.annotation === this.annotation && other.oldLine === this.oldLine;
 	}
 
 	override toDOM(): HTMLElement {
@@ -101,13 +115,18 @@ class AnnotationWidget extends WidgetType {
 			const body = el('div', 'cm-pr-body markdown-body');
 			renderMarkdownInto(body, annotation.text);
 			card.append(body);
-			return card;
+			return blockShell(card);
 		}
 		const card = el('div', 'cm-pr-card cm-pr-thread');
 		card.addEventListener('click', openLinks);
 		const head = el('div', 'cm-pr-head');
 		const first = annotation.comments[0];
 		head.append(el('span', 'cm-pr-tag', annotation.resolved ? 'resolved thread' : 'review thread'));
+		if (this.oldLine !== null) {
+			const old = el('span', 'cm-pr-oldline', `old line ${this.oldLine}`);
+			old.title = 'This thread is on a line of the base version';
+			head.append(old);
+		}
 		const count = annotation.comments.length;
 		head.append(el('span', 'cm-pr-meta', `${first?.author ?? 'someone'}${count > 1 ? ` + ${count - 1} more` : ''}`));
 		head.append(el('span', 'cm-pr-spacer'));
@@ -142,12 +161,43 @@ class AnnotationWidget extends WidgetType {
 				}
 			});
 		}
-		return card;
+		return blockShell(card);
 	}
 
 	override ignoreEvent(): boolean {
 		return true;
 	}
+}
+
+/** Where a base-side annotation goes in a unified diff. A removed
+ * line has no line of its own there: the card sits right under the
+ * removed chunk it belongs to (`removedAt`). An unchanged one still
+ * exists in the working text, at `line`. */
+type BasePlacement = { removedAt: number } | { line: number };
+
+function placeBaseAnnotation(state: EditorState, oldLine: number): BasePlacement | null {
+	const chunks = getChunks(state)?.chunks;
+	if (chunks === undefined) {
+		return null;
+	}
+	const original = getOriginalDoc(state);
+	if (oldLine < 1 || oldLine > original.lines) {
+		return null;
+	}
+	const pos = original.line(oldLine).from;
+	// Offset between the two texts in the unchanged run `pos` is in.
+	let shift = 0;
+	for (const chunk of chunks) {
+		if (pos < chunk.fromA) {
+			break;
+		}
+		if (pos < chunk.toA) {
+			return { removedAt: Math.min(chunk.fromB, state.doc.length) };
+		}
+		shift = chunk.toB - chunk.toA;
+	}
+	const mapped = pos + shift;
+	return mapped > state.doc.length ? null : { line: state.doc.lineAt(mapped).number };
 }
 
 function buildDecorations(state: EditorState): DecorationSet {
@@ -162,13 +212,35 @@ function buildDecorations(state: EditorState): DecorationSet {
 			),
 		);
 	}
+	for (const annotation of state.facet(prBaseAnnotationsFacet)) {
+		const place = placeBaseAnnotation(state, annotation.line);
+		if (place === null) {
+			continue;
+		}
+		const widget = new AnnotationWidget(annotation, annotation.line);
+		if ('line' in place) {
+			ranges.push(Decoration.widget({ widget, side: 2, block: true }).range(state.doc.line(place.line).to));
+			continue;
+		}
+		// Side 0 of a block widget still means "before the line", but
+		// after the removed chunk's own widget (side -1) at that spot.
+		ranges.push(Decoration.widget({ widget, side: 0, block: true }).range(place.removedAt));
+	}
 	return Decoration.set(ranges, true);
+}
+
+function inputsChanged(before: EditorState, after: EditorState): boolean {
+	return (
+		before.facet(prAnnotationsFacet) !== after.facet(prAnnotationsFacet) ||
+		before.facet(prBaseAnnotationsFacet) !== after.facet(prBaseAnnotationsFacet) ||
+		(after.facet(prBaseAnnotationsFacet).length > 0 && getChunks(before)?.chunks !== getChunks(after)?.chunks)
+	);
 }
 
 const prAnnotationsField = StateField.define<DecorationSet>({
 	create: (state) => buildDecorations(state),
 	update: (value, tr) => {
-		if (!tr.docChanged && tr.startState.facet(prAnnotationsFacet) === tr.state.facet(prAnnotationsFacet)) {
+		if (!tr.docChanged && !inputsChanged(tr.startState, tr.state)) {
 			return value;
 		}
 		return buildDecorations(tr.state);
@@ -176,37 +248,35 @@ const prAnnotationsField = StateField.define<DecorationSet>({
 	provide: (field) => EditorView.decorations.from(field),
 });
 
+// An annotated line stays out of the diff's collapsed runs. A thread
+// on a removed line needs no pin: changes are never collapsed.
+const annotationPins = diffCollapsePins.compute([prAnnotationsFacet, prBaseAnnotationsFacet, 'doc'], (state) => {
+	const lines = state.facet(prAnnotationsFacet).map((annotation) => annotation.line);
+	for (const annotation of state.facet(prBaseAnnotationsFacet)) {
+		const place = placeBaseAnnotation(state, annotation.line);
+		if (place !== null && 'line' in place) {
+			lines.push(place.line);
+		}
+	}
+	return lines.filter((line) => line >= 1 && line <= state.doc.lines);
+});
+
+// The shell (width, inset, border, surface) is the shared one in
+// `blockCards.ts`; this is the inside of a pull-request card and the
+// accent that tells its kind apart.
 const prAnnotationsTheme = EditorView.baseTheme({
-	// Block widgets are as wide as the longest line, not as the pane.
-	// Size the card against the scroller instead and pin it, so a
-	// narrow pane wraps it rather than cutting it off.
-	'& .cm-scroller': {
-		containerType: 'inline-size',
-	},
 	'.cm-pr-card': {
-		position: 'sticky',
-		left: '28px',
-		margin: '4px 8px 6px 28px',
 		padding: '6px 10px',
-		maxWidth: 'min(760px, calc(100cqw - 110px))',
-		boxSizing: 'border-box',
-		border: '1px solid var(--m-border)',
-		borderLeft: '2px solid var(--m-warning)',
-		borderRadius: 'var(--m-radius-md)',
-		background: 'var(--m-bg-1)',
-		fontFamily: 'var(--m-font-ui)',
-		fontSize: 'var(--m-text-sm)',
-		color: 'var(--m-fg)',
-		whiteSpace: 'normal',
+		'--m-card-accent': 'var(--m-warning)',
 	},
 	'.cm-pr-note': {
 		display: 'flex',
 		alignItems: 'baseline',
 		gap: '8px',
-		borderLeftColor: 'var(--m-merged)',
+		'--m-card-accent': 'var(--m-merged)',
 	},
 	'.cm-pr-thread.cm-pr-folded': {
-		borderLeftColor: 'var(--m-border-strong)',
+		'--m-card-accent': 'var(--m-border-strong)',
 	},
 	'.cm-pr-folded .cm-pr-comments': {
 		display: 'none',
@@ -227,9 +297,13 @@ const prAnnotationsTheme = EditorView.baseTheme({
 		textTransform: 'uppercase',
 		color: 'var(--m-fg-muted)',
 	},
-	'.cm-pr-meta': {
+	'.cm-pr-meta, .cm-pr-oldline': {
 		color: 'var(--m-fg-subtle)',
 		fontSize: 'var(--m-text-xs)',
+	},
+	'.cm-pr-oldline': {
+		flexShrink: '0',
+		fontVariantNumeric: 'tabular-nums',
 	},
 	'.cm-pr-author': {
 		fontWeight: '600',
@@ -269,14 +343,23 @@ const prAnnotationsTheme = EditorView.baseTheme({
 	},
 });
 
+const NO_ANNOTATIONS: readonly PrAnnotation[] = [];
+
 /** One editor's annotation plumbing: the extension to install and a
- * way to push a new list in when the PR is re-read. */
+ * way to push a new list in when the PR is re-read. `unifiedBase` is
+ * for a unified diff, which shows the base side's annotations too. */
 export class PrAnnotationWiring {
 	private readonly compartment = new Compartment();
 	private view: EditorView | null = null;
 
-	extension(initial: readonly PrAnnotation[]): Extension {
-		return [this.compartment.of(prAnnotationsFacet.of(initial)), prAnnotationsField, prAnnotationsTheme];
+	extension(initial: readonly PrAnnotation[], unifiedBase = NO_ANNOTATIONS): Extension {
+		return [
+			this.compartment.of(this.facets(initial, unifiedBase)),
+			prAnnotationsField,
+			annotationPins,
+			prAnnotationsTheme,
+			blockCards,
+		];
 	}
 
 	attach(view: EditorView): void {
@@ -287,7 +370,11 @@ export class PrAnnotationWiring {
 		this.view = null;
 	}
 
-	sync(annotations: readonly PrAnnotation[]): void {
-		this.view?.dispatch({ effects: this.compartment.reconfigure(prAnnotationsFacet.of(annotations)) });
+	sync(annotations: readonly PrAnnotation[], unifiedBase = NO_ANNOTATIONS): void {
+		this.view?.dispatch({ effects: this.compartment.reconfigure(this.facets(annotations, unifiedBase)) });
+	}
+
+	private facets(annotations: readonly PrAnnotation[], unifiedBase: readonly PrAnnotation[]): Extension {
+		return [prAnnotationsFacet.of(annotations), prBaseAnnotationsFacet.of(unifiedBase)];
 	}
 }

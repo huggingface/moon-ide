@@ -221,6 +221,56 @@ function browserBuffer(path: string, url: string): OpenFile {
 	};
 }
 
+/** The synthetic buffer behind a `pr://<number>` tab. */
+function prBuffer(number: number, title: string): OpenFile {
+	return {
+		path: prPath(number),
+		name: prTabName(number, title),
+		kind: 'text',
+		isUntitled: false,
+		text: '',
+		previewUrl: '',
+		loadedFingerprint: fingerprint(''),
+		loadedMtimeMs: null,
+		isDirty: false,
+		isDeleted: false,
+		isExternal: false,
+		pendingEdit: null,
+		previewToken: 0,
+	};
+}
+
+/** Put the inbox tab first in `state`'s left strip (ADR 0112). A
+ *  folder with nothing else showing lands on it. */
+function pinInbox(state: FolderState): void {
+	if (!state.openFiles.some((f) => f.path === INBOX_PATH)) {
+		state.openFiles = [
+			...state.openFiles,
+			{
+				path: INBOX_PATH,
+				name: 'Inbox',
+				kind: 'text',
+				isUntitled: false,
+				text: '',
+				previewUrl: '',
+				loadedFingerprint: fingerprint(''),
+				loadedMtimeMs: null,
+				isDirty: false,
+				isDeleted: false,
+				isExternal: false,
+				pendingEdit: null,
+				previewToken: 0,
+			},
+		];
+	}
+	if (state.leftTabs[0] !== INBOX_PATH) {
+		state.leftTabs = [INBOX_PATH, ...state.leftTabs.filter((p) => p !== INBOX_PATH)];
+	}
+	if (state.leftActive === null) {
+		state.leftActive = INBOX_PATH;
+	}
+}
+
 class FolderState {
 	paths = $state<string[]>([]);
 
@@ -1334,6 +1384,13 @@ class WorkspaceState {
 		// rather than just the first cwd-match. No-op when the user
 		// is on a non-terminal tab or when there's no prior folder.
 		const previousFolderPath = this.activeFolderPath;
+		// Looking at the inbox while switching folders keeps it in
+		// view: it is the one tab that isn't about a folder.
+		const target = this.folderStates.get(path);
+		if (this.activePath === INBOX_PATH && target?.leftTabs.includes(INBOX_PATH)) {
+			target.leftActive = INBOX_PATH;
+			target.focusedSide = 'left';
+		}
 		// Profiling: a marker the user can wrap a DevTools >
 		// Performance > Record around to scope the flame chart to a
 		// single folder-switch gesture. The `performance.measure`
@@ -1713,7 +1770,11 @@ class WorkspaceState {
 		// Allocate FolderStates for any new folders.
 		for (const folder of snapshot.folders) {
 			if (!this.folderStates.has(folder.path)) {
-				this.folderStates.set(folder.path, new FolderState(folder.path));
+				const state = new FolderState(folder.path);
+				if (inbox.tabOpen) {
+					pinInbox(state);
+				}
+				this.folderStates.set(folder.path, state);
 			}
 		}
 		const tAdoptFolderStates = performance.now();
@@ -1797,7 +1858,8 @@ class WorkspaceState {
 
 	private setTabsFor(side: SplitSide, tabs: string[]) {
 		if (side === 'left') {
-			this.leftTabs = tabs;
+			// The pinned inbox stays first whatever was dropped before it.
+			this.leftTabs = tabs.includes(INBOX_PATH) ? [INBOX_PATH, ...tabs.filter((p) => p !== INBOX_PATH)] : tabs;
 		} else {
 			this.rightTabs = tabs;
 		}
@@ -1879,7 +1941,7 @@ class WorkspaceState {
 		this.filesPanelVisible = state.files_panel_visible;
 		// Per-workspace, like the terminals below: both come from
 		// `session.json`.
-		inbox.hydrate(session?.inbox ?? { watched_authors: [], snoozed: [] });
+		inbox.hydrate(session?.inbox ?? { watched_authors: [], snoozed: [], tab_open: false });
 		inbox.bindOnChange(() => this.persistAppState());
 		sessionDismissals.hydrate(session?.dismissed_coder_sessions ?? []);
 		sessionDismissals.bindOnChange(() => this.persistAppState());
@@ -2078,6 +2140,13 @@ class WorkspaceState {
 							// left as active rather than crash startup.
 						}
 					}
+				}
+			}
+			// The replay rebuilt each folder's tab lists from real
+			// paths only; put the pinned inbox back in front.
+			if (inbox.tabOpen) {
+				for (const folderState of this.folderStates.values()) {
+					pinInbox(folderState);
 				}
 			}
 			// Restore the active-folder pointer last so the UI lands on
@@ -4713,40 +4782,45 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Open (or focus) the GitHub inbox pseudo-tab (ADR 0112) in the
-	 * active folder's tab strip. Same synthetic-`OpenFile` shape as
-	 * the review tab; `InboxView` reads everything from the `inbox`
-	 * store, so the tab shows the same list in every folder.
+	 * Open (or focus) the GitHub inbox pseudo-tab (ADR 0112). The tab
+	 * is pinned: once open it is the first tab of every folder's left
+	 * strip until closed, so a folder switch never loses it.
+	 * `InboxView` reads everything from the `inbox` store, so every
+	 * folder's copy shows the same list.
 	 */
-	openInboxTab(side: SplitSide = this.focusedSide) {
+	openInboxTab() {
 		if (!this.workspace) {
 			this.flash('Open a folder before opening the inbox.');
 			return;
 		}
-		const path = INBOX_PATH;
-		if (!this.openFiles.some((f) => f.path === path)) {
-			const file: OpenFile = {
-				path,
-				name: 'Inbox',
-				kind: 'text',
-				isUntitled: false,
-				text: '',
-				previewUrl: '',
-				loadedFingerprint: fingerprint(''),
-				loadedMtimeMs: null,
-				isDirty: false,
-				isDeleted: false,
-				isExternal: false,
-				pendingEdit: null,
-				previewToken: 0,
-			};
-			this.openFiles = [...this.openFiles, file];
+		if (!inbox.tabOpen) {
+			inbox.tabOpen = true;
+			this.persistAppState();
 		}
-		const tabs = this.tabsFor(side);
-		if (!tabs.includes(path)) {
-			this.setTabsFor(side, [...tabs, path]);
+		for (const state of this.folderStates.values()) {
+			pinInbox(state);
 		}
-		this.setActive(path, side);
+		this.editorViewTick++;
+		this.setActive(INBOX_PATH, 'left');
+	}
+
+	/** Close the pinned inbox tab: it leaves every folder at once. */
+	#closeInboxTab() {
+		inbox.tabOpen = false;
+		for (const state of this.folderStates.values()) {
+			const index = state.leftTabs.indexOf(INBOX_PATH);
+			if (index >= 0) {
+				state.leftTabs = state.leftTabs.filter((p) => p !== INBOX_PATH);
+				if (state.leftActive === INBOX_PATH) {
+					state.leftActive = state.leftTabs[0] ?? null;
+				}
+			}
+			if (!state.rightTabs.includes(INBOX_PATH)) {
+				state.openFiles = state.openFiles.filter((f) => f.path !== INBOX_PATH);
+			}
+		}
+		this.editorViewTick++;
+		this.persistAppState();
 	}
 
 	/**
@@ -4857,30 +4931,36 @@ class WorkspaceState {
 	 */
 	openPrTab(number: number, title: string, side: SplitSide = this.focusedSide) {
 		const path = prPath(number);
-		const existing = this.openFiles.find((f) => f.path === path);
-		if (!existing) {
-			const file: OpenFile = {
-				path,
-				name: prTabName(number, title),
-				kind: 'text',
-				isUntitled: false,
-				text: '',
-				previewUrl: '',
-				loadedFingerprint: fingerprint(''),
-				loadedMtimeMs: null,
-				isDirty: false,
-				isDeleted: false,
-				isExternal: false,
-				pendingEdit: null,
-				previewToken: 0,
-			};
-			this.openFiles = [...this.openFiles, file];
+		if (!this.openFiles.some((f) => f.path === path)) {
+			this.openFiles = [...this.openFiles, prBuffer(number, title)];
 		}
 		const tabs = this.tabsFor(side);
 		if (!tabs.includes(path)) {
 			this.setTabsFor(side, [...tabs, path]);
 		}
 		this.setActive(path, side);
+	}
+
+	/**
+	 * Add a pull request's tab to `folderPath`'s left strip without
+	 * showing it: the way to queue several from the inbox. The folder
+	 * need not be the active one; the tab is there when the user gets
+	 * to it. Returns `false` when the folder isn't bound.
+	 */
+	openPrTabInBackground(folderPath: string, number: number, title: string): boolean {
+		const state = this.folderStates.get(folderPath);
+		if (state === undefined) {
+			return false;
+		}
+		const path = prPath(number);
+		if (!state.openFiles.some((f) => f.path === path)) {
+			state.openFiles = [...state.openFiles, prBuffer(number, title)];
+		}
+		if (!state.leftTabs.includes(path) && !state.rightTabs.includes(path)) {
+			state.leftTabs = [...state.leftTabs, path];
+		}
+		this.editorViewTick++;
+		return true;
 	}
 
 	/** Reconcile the tab strips with the backend registry: attach
@@ -5136,7 +5216,7 @@ class WorkspaceState {
 			return;
 		}
 		if (isInboxPath(path)) {
-			this.openInboxTab(side);
+			this.openInboxTab();
 			return;
 		}
 		if (isBrowserPath(path)) {
@@ -6091,6 +6171,10 @@ class WorkspaceState {
 	}
 
 	async closeFile(path: string, side: SplitSide = this.focusedSide) {
+		if (isInboxPath(path) && side === 'left' && inbox.tabOpen) {
+			this.#closeInboxTab();
+			return;
+		}
 		const file = this.openFiles.find((f) => f.path === path);
 		if (!file) {
 			return;
@@ -6246,6 +6330,10 @@ class WorkspaceState {
 	 * (or untouched if dropping on itself).
 	 */
 	moveTab(fromPath: string, fromSide: SplitSide, toSide: SplitSide, beforePath: string | null) {
+		// The pinned inbox doesn't leave the left strip.
+		if (isInboxPath(fromPath) && fromSide === 'left' && toSide === 'right') {
+			return;
+		}
 		if (fromSide === toSide) {
 			this.moveFile(fromPath, beforePath, toSide);
 			return;

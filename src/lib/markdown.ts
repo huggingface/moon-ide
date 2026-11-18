@@ -128,9 +128,9 @@ function applyIssueRefRule(md: MarkdownIt): void {
 	});
 }
 
-function buildMarkdownIt(linkify: boolean, breaks = false): MarkdownIt {
+function buildMarkdownIt(linkify: boolean, breaks = false, html = false): MarkdownIt {
 	const md = new MarkdownIt({
-		html: false,
+		html,
 		linkify,
 		breaks,
 		typographer: false,
@@ -145,10 +145,55 @@ function buildMarkdownIt(linkify: boolean, breaks = false): MarkdownIt {
 	applyFenceCopyRule(md);
 	applyHeadingAnchorRule(md);
 	applyInlineAnchorRule(md);
+	applyAlertRule(md);
 	if (linkify) {
 		applyIssueRefRule(md);
 	}
 	return md;
+}
+
+const ALERT_RE = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\][ \t]*$/i;
+const ALERT_TITLES: Record<string, string> = {
+	note: 'Note',
+	tip: 'Tip',
+	important: 'Important',
+	warning: 'Warning',
+	caution: 'Caution',
+};
+
+/**
+ * GitHub alerts: a blockquote whose first line is `[!NOTE]` (or TIP,
+ * IMPORTANT, WARNING, CAUTION) alone becomes a titled callout instead
+ * of a quote that starts with the literal marker.
+ */
+function applyAlertRule(parser: MarkdownIt): void {
+	parser.core.ruler.push('github_alerts', (state) => {
+		const tokens = state.tokens;
+		for (let i = 0; i + 3 < tokens.length; i++) {
+			const quote = tokens[i];
+			const inline = tokens[i + 2];
+			if (quote?.type !== 'blockquote_open' || tokens[i + 1]?.type !== 'paragraph_open' || inline?.type !== 'inline') {
+				continue;
+			}
+			const children = inline.children ?? [];
+			const first = children[0];
+			const match = first?.type === 'text' ? ALERT_RE.exec(first.content) : null;
+			const next = children[1];
+			if (!match || (next !== undefined && next.type !== 'softbreak' && next.type !== 'hardbreak')) {
+				continue;
+			}
+			const kind = (match[1] ?? '').toLowerCase();
+			quote.attrJoin('class', `md-alert md-alert-${kind}`);
+			const title = new state.Token('html_block', '', 0);
+			title.block = true;
+			title.level = quote.level + 1;
+			title.content = `<p class="md-alert-title">${ALERT_TITLES[kind] ?? ''}</p>\n`;
+			inline.children = children.slice(next === undefined ? 1 : 2);
+			// A marker on a line of its own leaves an empty paragraph.
+			const emptied = inline.children.length === 0;
+			tokens.splice(i + 1, emptied ? 3 : 0, title);
+		}
+	});
 }
 
 /**
@@ -284,6 +329,45 @@ const md = buildMarkdownIt(false);
 const mdLinkified = buildMarkdownIt(true);
 // User-typed chat text: a single newline is a line break, as typed.
 const mdLinkifiedBreaks = buildMarkdownIt(true, true);
+// Text written on GitHub (PR descriptions, review comments): raw HTML
+// is part of the dialect there (`<details>`, `<sup>`, `<img>`, and
+// comments used as markers), bare URLs link, and a newline breaks the
+// line. DOMPurify is the XSS layer for this parser; see
+// `GITHUB_SANITISE`.
+const mdGithub = buildMarkdownIt(true, true, true);
+
+/** Which dialect to render. `github` is for text authored on GitHub. */
+export type MarkdownOptions = { linkify?: boolean; github?: boolean };
+
+function parserFor(options: MarkdownOptions): { parser: MarkdownIt; tag: string } {
+	if (options.github) {
+		return { parser: mdGithub, tag: 'G' };
+	}
+	return options.linkify ? { parser: mdLinkified, tag: 'L' } : { parser: md, tag: '_' };
+}
+
+/** Extra restrictions for the raw-HTML parser, on top of DOMPurify's
+ *  defaults (which already drop scripts, event handlers and comments):
+ *  nothing that can restyle or overlay the app, and no form controls. */
+const GITHUB_SANITISE = {
+	FORBID_TAGS: ['style', 'form', 'input', 'textarea', 'select', 'option', 'video', 'audio', 'svg', 'math'],
+	FORBID_ATTR: ['style', 'id', 'name'],
+};
+
+/** Classes this renderer emits itself. Anything else on a `class`
+ *  attribute came from the author's HTML and could pick up app styles. */
+const RENDERER_CLASS_RE = /^(?:md-|tok-|language-|cm-code$)/;
+
+function keepRendererClasses(_node: unknown, data: { attrName: string; attrValue: string; keepAttr: boolean }): void {
+	if (data.attrName !== 'class') {
+		return;
+	}
+	data.attrValue = data.attrValue
+		.split(/\s+/)
+		.filter((name) => RENDERER_CLASS_RE.test(name))
+		.join(' ');
+	data.keepAttr = data.attrValue !== '';
+}
 
 export type BlockRenderOptions = { linkify?: boolean; breaks?: boolean };
 
@@ -347,16 +431,16 @@ function applyLinkRules(parser: MarkdownIt): void {
 const markdownCache = new Map<string, string>();
 const MARKDOWN_CACHE_MAX = 500;
 
-function markdownCacheKey(source: string, linkify: boolean): string {
-	return (linkify ? 'L\x00' : '_\x00') + (activeRepoUrl ?? '') + '\x00' + source;
+function markdownCacheKey(source: string, tag: string): string {
+	return tag + '\x00' + (activeRepoUrl ?? '') + '\x00' + source;
 }
 
 /**
  * Sync lookup against the render cache. Returns `undefined` for a
  * miss — caller falls back to `renderMarkdown` (async).
  */
-export function getCachedMarkdown(source: string, options: { linkify?: boolean } = {}): string | undefined {
-	return markdownCache.get(markdownCacheKey(source, options.linkify ?? false));
+export function getCachedMarkdown(source: string, options: MarkdownOptions = {}): string | undefined {
+	return markdownCache.get(markdownCacheKey(source, parserFor(options).tag));
 }
 
 /**
@@ -527,21 +611,27 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
  * for the same `(source, linkify)` short-circuit on the synchronous
  * `getCachedMarkdown` path used by `CoderMarkdown.svelte`.
  */
-export async function renderMarkdown(source: string, options: { linkify?: boolean } = {}): Promise<string> {
-	const linkify = options.linkify ?? false;
-	const key = markdownCacheKey(source, linkify);
+export async function renderMarkdown(source: string, options: MarkdownOptions = {}): Promise<string> {
+	const { parser, tag } = parserFor(options);
+	const github = options.github === true;
+	const key = markdownCacheKey(source, tag);
 	const cached = markdownCache.get(key);
 	if (cached !== undefined) {
 		return cached;
 	}
-	const { frontmatter, body } = splitFrontmatter(source);
+	// A PR description is not a file: a leading `---` there is a rule.
+	const { frontmatter, body } = github ? { frontmatter: null, body: source } : splitFrontmatter(source);
 	const langs = extractFenceLanguages(body);
 	if (frontmatter !== null) {
 		langs.push('yaml');
 	}
 	await loadHighlighters(langs);
-	const parser = linkify ? mdLinkified : md;
 	const html = (frontmatter !== null ? frontmatterToHtml(frontmatter) : '') + parser.render(body);
+	// Hooks are global to DOMPurify; this one is scoped to the call,
+	// which is synchronous.
+	if (github) {
+		DOMPurify.addHook('uponSanitizeAttribute', keepRendererClasses);
+	}
 	const sanitised = DOMPurify.sanitize(html, {
 		// Block any URI scheme that isn't on the known-safe list.
 		// DOMPurify defaults already cover the common cases; this is
@@ -556,7 +646,11 @@ export async function renderMarkdown(source: string, options: { linkify?: boolea
 		// our fenced-code "Copy" buttons are non-submitting buttons
 		// regardless of the surrounding form context.
 		ADD_ATTR: ['type'],
+		...(github ? GITHUB_SANITISE : {}),
 	});
+	if (github) {
+		DOMPurify.removeHook('uponSanitizeAttribute');
+	}
 	markdownCache.set(key, sanitised);
 	if (markdownCache.size > MARKDOWN_CACHE_MAX) {
 		const oldest = markdownCache.keys().next().value;
@@ -848,7 +942,14 @@ export const EXTERNAL_MARKDOWN_SCHEMES = new Set(['http:', 'https:', 'mailto:', 
  * `MarkdownIt` to skip the highlighter (grammar imports break in
  * the vitest environment) and apply just the rules under test.
  */
-export const __test = { applyHeadingAnchorRule, applyInlineAnchorRule, frontmatterToHtml, splitTopLevelBlocks };
+export const __test = {
+	applyAlertRule,
+	applyHeadingAnchorRule,
+	applyInlineAnchorRule,
+	frontmatterToHtml,
+	keepRendererClasses,
+	splitTopLevelBlocks,
+};
 
 /**
  * If `href` parses as an absolute URL with an allow-listed scheme,

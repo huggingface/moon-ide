@@ -2,10 +2,14 @@
 	import { mount as mountComponent, unmount } from 'svelte';
 	import { isSyntheticBufferPath, workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
 	import { ipc } from '../ipc';
+	import { isCommitPath } from '../util/commitPath';
+	import { isInboxPath } from '../util/inboxPath';
 	import { isMarkdownPath } from '../util/markdown';
+	import { isPrPath } from '../util/prPath';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import CloseIcon from './icons/CloseIcon.svelte';
+	import InboxIcon from './icons/InboxIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
 	import { formatError } from '../protocol';
 
@@ -102,7 +106,10 @@
 		const status = workspace.gitStatusEntries.find((e) => e.path === activePath)?.status;
 		return status === 'modified' || status === 'deleted';
 	});
-	const showToolbar = $derived(showViewToggle || canRevert);
+	// A commit or pull-request tab is a stack of diffs and nothing
+	// else, so the only control it gets is the split / unified one.
+	const activeIsStackedDiff = $derived(activePath !== null && (isCommitPath(activePath) || isPrPath(activePath)));
+	const showToolbar = $derived(showViewToggle || canRevert || activeIsStackedDiff);
 
 	function setView(mode: ViewMode) {
 		if (activePath === null) {
@@ -172,6 +179,12 @@
 		});
 		return () => cancelAnimationFrame(handle);
 	});
+
+	/** The inbox tab on the left strip is pinned (ADR 0112): first,
+	 *  not draggable, and spared by "Close others" / "Close all". */
+	function isPinned(path: string): boolean {
+		return side === 'left' && isInboxPath(path);
+	}
 
 	function close(event: Event, path: string) {
 		event.stopPropagation();
@@ -494,7 +507,7 @@
 		}
 
 		const paneTabs = workspace.tabsFor(side);
-		const hasOthers = paneTabs.some((p) => p !== file.path);
+		const hasOthers = paneTabs.some((p) => p !== file.path && !isPinned(p));
 		items.push({
 			id: 'close',
 			label: 'Close',
@@ -507,7 +520,7 @@
 			label: 'Close others',
 			disabled: !hasOthers,
 			onSelect: () => {
-				const others = workspace.tabsFor(side).filter((p) => p !== file.path);
+				const others = workspace.tabsFor(side).filter((p) => p !== file.path && !isPinned(p));
 				for (const p of others) {
 					void workspace.closeFile(p, side);
 				}
@@ -516,9 +529,9 @@
 		items.push({
 			id: 'close-all',
 			label: 'Close all',
-			disabled: paneTabs.length === 0,
+			disabled: paneTabs.every(isPinned),
 			onSelect: () => {
-				const all = workspace.tabsFor(side).slice();
+				const all = workspace.tabsFor(side).filter((p) => !isPinned(p));
 				for (const p of all) {
 					void workspace.closeFile(p, side);
 				}
@@ -584,13 +597,14 @@
 				role="tab"
 				class="tab"
 				class:active={activePath === file.path}
+				class:pinned={isPinned(file.path)}
 				class:active-blurred={activePath === file.path && !paneFocused}
 				class:dragging={draggingPath === file.path}
 				class:drop-before={dropBeforePath === file.path}
 				aria-selected={activePath === file.path}
 				title={file.isUntitled || isSyntheticBufferPath(file.path) ? file.name : file.path}
 				tabindex="0"
-				draggable="true"
+				draggable={!isPinned(file.path)}
 				onclick={() => workspace.setActive(file.path, side)}
 				onkeydown={(e) => onTabKey(e, file.path)}
 				oncontextmenu={(e) => openTabMenu(e, file)}
@@ -610,6 +624,7 @@
 						ondblclick={(e) => e.stopPropagation()}
 					/>
 				{:else}
+					{#if isPinned(file.path)}<InboxIcon size={13} />{/if}
 					<span class="name">{file.name}</span>
 				{/if}
 				{#if file.pendingEdit}
@@ -673,18 +688,18 @@
 						Diff
 					</button>
 				{/if}
-				{#if currentView === 'diff'}
-					<button
-						type="button"
-						class="view-btn"
-						class:selected={workspace.diffLayout === 'unified'}
-						aria-pressed={workspace.diffLayout === 'unified'}
-						onclick={() => workspace.toggleDiffLayout()}
-						title="Show deletions inline in one column (narrow panes always do)"
-					>
-						Unified
-					</button>
-				{/if}
+			{/if}
+			{#if currentView === 'diff' || activeIsStackedDiff}
+				<button
+					type="button"
+					class="view-btn"
+					class:selected={workspace.diffLayout === 'unified'}
+					aria-pressed={workspace.diffLayout === 'unified'}
+					onclick={() => workspace.toggleDiffLayout()}
+					title="Show deletions inline in one column (narrow panes always do)"
+				>
+					Unified
+				</button>
 			{/if}
 			{#if canRevert}
 				<button
@@ -753,6 +768,20 @@
 	.tab:hover {
 		color: var(--m-fg);
 		background: var(--m-bg-1);
+	}
+	/* The pinned tab stays put while the others scroll under it. */
+	.tab.pinned {
+		position: sticky;
+		left: 0;
+		z-index: 1;
+		background: var(--m-bg);
+		box-shadow: 6px 0 6px -2px var(--m-bg);
+	}
+	.tab.pinned:hover {
+		background: var(--m-bg-1);
+	}
+	.tab.pinned.active {
+		background: var(--m-bg-2);
 	}
 	.tab.active {
 		background: var(--m-bg-2);

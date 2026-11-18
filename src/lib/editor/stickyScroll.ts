@@ -5,7 +5,7 @@
 // both panes of the diff view.
 //
 // Scope detection reuses `enclosingStack` from
-// `diffCollapseContext.ts` — the same deliberately-heuristic
+// `enclosingScope.ts` — the same deliberately-heuristic
 // indent-walk the Review tab uses to annotate collapse placeholders
 // (see that module's header for why we don't ask the LSP). Never
 // wrong, occasionally absent; an empty stack simply hides the
@@ -36,7 +36,7 @@
 import { EditorView, ViewPlugin, type ViewUpdate } from '@codemirror/view';
 import { highlightingFor, syntaxTree } from '@codemirror/language';
 import { highlightTree, type Highlighter } from '@lezer/highlight';
-import { enclosingStack, type EnclosingDef } from './diffCollapseContext';
+import { enclosingStack, type EnclosingDef } from './enclosingScope';
 
 // Deeper nesting than this is clipped to the innermost scopes —
 // matching VS Code's default cap, and keeping the header from

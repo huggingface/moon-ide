@@ -36,6 +36,9 @@
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffConfigIgnoringWhitespace } from '../editor/diffWhitespace';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
+	import { diffBlockAlign } from '../editor/diffBlockAlign';
+	import { effectiveDiffLayout, gutterDigits } from '../editor/diffLayout';
+	import { wireHorizontalScrollSync } from '../editor/hScrollSync';
 	import { commentsForSide, reanchorComments, ReviewWiring } from '../editor/reviewComments';
 	import { blameExtension, blameFacet } from '../editor/blame';
 	import { lspGotoDefinitionExtension } from '../editor/lspGotoDefinition';
@@ -84,13 +87,8 @@
 	let unified: EditorView | undefined = $state(undefined);
 	const paneB = $derived.by<EditorView | undefined>(() => merge?.b ?? unified);
 	const unifiedCompartment = new Compartment();
-	// Below this width two columns are too cramped to read, so the
-	// view goes unified whatever the preference says.
-	const NARROW_DIFF_PX = 720;
 	let hostWidth = $state(0);
-	const layout = $derived<'split' | 'unified'>(
-		workspace.diffLayout === 'unified' || (hostWidth > 0 && hostWidth < NARROW_DIFF_PX) ? 'unified' : 'split',
-	);
+	const layout = $derived(effectiveDiffLayout(workspace.diffLayout, hostWidth));
 	let builtLayout: 'split' | 'unified' | null = null;
 	// Cleanup for the horizontal-scroll sync wired up at the tail
 	// of `buildMerge`. Cleared on teardown so we don't leak DOM
@@ -604,6 +602,10 @@
 			...(file.isDeleted ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
 		];
 
+		host.style.setProperty(
+			'--m-diff-gutter-digits',
+			String(gutterDigits(head.split('\n').length, rightText.split('\n').length)),
+		);
 		builtLayout = layout;
 		if (builtLayout === 'unified') {
 			unified = new EditorView({
@@ -721,9 +723,11 @@
 	}
 
 	function buildSplit(head: string, sharedLeft: Extension[], rightText: string, rightExtensions: Extension[]): void {
+		// A review-comment card lives in the right pane only; the left
+		// one makes room for it so the lines after it stay level.
 		const view = new MergeView({
-			a: { doc: head, extensions: sharedLeft },
-			b: { doc: rightText, extensions: rightExtensions },
+			a: { doc: head, extensions: [...sharedLeft, diffBlockAlign] },
+			b: { doc: rightText, extensions: [...rightExtensions, diffBlockAlign] },
 			parent: host,
 			// The package's built-in `cm-changeGutter` (a 3px
 			// coloured bar) is replaced by tinting the line-number
@@ -1031,62 +1035,6 @@
 	}
 
 	/**
-	 * Keep the two side `.cm-scroller` elements horizontally
-	 * aligned. `@codemirror/merge` already syncs vertical scroll
-	 * (the outer `.cm-mergeView` drives both editors' Y axis) but
-	 * each side's scroller owns its own X axis — so a long line
-	 * on the left can scroll right while the right side stays
-	 * pinned, which makes line-by-line comparison painful.
-	 *
-	 * We mirror `scrollLeft` either way: a scroll on `a` writes to
-	 * `b` and vice-versa. Naively guarding with a time-windowed
-	 * `syncing` flag (microtask / rAF) is racy when the two sides
-	 * have different `scrollWidth`s: the wider side scrolls past
-	 * the narrower side's max, the narrower side clamps, and the
-	 * deferred `scroll` echo on the narrower side then yanks the
-	 * wider side back to the clamped value. That's the "snaps
-	 * back sometimes" behaviour reported on long-line diffs.
-	 *
-	 * Instead we identify echoes by *value*: when we mirror
-	 * `from → to`, we record the value `to` will settle at (after
-	 * the browser clamps it to `to`'s max scroll) as `expected[to]`.
-	 * The next `scroll` event on `to` that matches `expected[to]`
-	 * is consumed as the echo and cleared; anything else is a
-	 * real user scroll and propagates. This is correct regardless
-	 * of frame timing.
-	 *
-	 * Returns a cleanup that removes both listeners. Caller (the
-	 * `onMount` teardown above) drops it on diff-view unmount.
-	 */
-	function wireHorizontalScrollSync(a: HTMLElement, b: HTMLElement): () => void {
-		const expected = new WeakMap<HTMLElement, number>();
-		const handle = (from: HTMLElement, to: HTMLElement) => {
-			const pending = expected.get(from);
-			if (pending !== undefined && from.scrollLeft === pending) {
-				// Echo from our own programmatic write to `from`.
-				expected.delete(from);
-				return;
-			}
-			expected.delete(from);
-			const toMax = Math.max(0, to.scrollWidth - to.clientWidth);
-			const target = Math.min(from.scrollLeft, toMax);
-			if (to.scrollLeft === target) {
-				return;
-			}
-			expected.set(to, target);
-			to.scrollLeft = target;
-		};
-		const onA = () => handle(a, b);
-		const onB = () => handle(b, a);
-		a.addEventListener('scroll', onA, { passive: true });
-		b.addEventListener('scroll', onB, { passive: true });
-		return () => {
-			a.removeEventListener('scroll', onA);
-			b.removeEventListener('scroll', onB);
-		};
-	}
-
-	/**
 	 * Per-side sticky synthetic horizontal scrollbar.
 	 *
 	 * `@codemirror/merge` lays the inner `.cm-scroller`s out at
@@ -1332,43 +1280,5 @@
 	}
 	.diff-host :global(.diff-hscrollbar-fill) {
 		height: 1px;
-	}
-	/* Character-level change marker: the library default is a 2px
-	 * bottom-edge gradient, which (a) reads as a loud underline on
-	 * top of the already-tinted line and (b) collides visually with
-	 * LSP lint underlines that use the same bottom-edge gesture.
-	 * Swap for a soft same-hue background (GitHub-style inline diff
-	 * highlight). Uses our palette via `color-mix` so theme flips
-	 * track. `!important` is needed to beat the package's themed
-	 * rules without a fragile selector-specificity arms race. */
-	.diff-host :global(.cm-merge-b .cm-changedText) {
-		background: color-mix(in srgb, var(--m-success) 22%, transparent) !important;
-		border-radius: 2px;
-	}
-	.diff-host :global(.cm-merge-a .cm-changedText),
-	.diff-host :global(.cm-deletedChunk .cm-deletedText) {
-		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
-		border-radius: 2px;
-	}
-	.diff-host :global(.cm-merge-b .cm-deletedText) {
-		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
-	}
-	/* Pure-added / pure-deleted lines: the line-level change is
-	 * already conveyed by the gutter bar (`.cm-changedLineGutter`
-	 * — green on B for additions, red on A for deletions) and the
-	 * subtle line-background tint. Layering the per-character
-	 * highlight (`.cm-changedText`) on top doubles up the same hue
-	 * across the entire line and reads as saturated noise without
-	 * adding information. The line decoration `.cm-moon-pure-change`
-	 * is added by `diffPureChange.ts` on any line whose entire
-	 * content is part of a `Change` span — covering whole-chunk
-	 * pure adds/deletes *and* the all-new / all-removed lines
-	 * sitting inside an otherwise-modified chunk (e.g. a block of
-	 * inserted comment lines between two unchanged anchors). Lines
-	 * with surviving common substrings keep their per-character
-	 * markers since the substring-vs-surrounding-text distinction
-	 * is useful there. */
-	.diff-host :global(.cm-moon-pure-change .cm-changedText) {
-		background: transparent !important;
 	}
 </style>

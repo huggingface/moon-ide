@@ -25,6 +25,9 @@ A PR opens as a `pr://<number>` tab of the folder the user is in:
 - **No folder switch** when the active folder is the PR's project or
   one of its worktrees. A PR of another bound project makes that
   project active first, since a tab belongs to a folder.
+- **Background open** (Ctrl-click, middle click, `Ctrl+Enter`) adds
+  the tab without showing it, in the PR's project when that isn't the
+  active one, so several PRs can be queued from the inbox.
 - **Review** posts a verdict (comment / approve / request changes)
   with a summary, by PR number.
 - A worktree is made only on request: **Check out in a worktree**

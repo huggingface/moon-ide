@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { Compartment, EditorState, type Extension } from '@codemirror/state';
 	import { EditorView, lineNumbers } from '@codemirror/view';
 	import { foldGutter, indentUnit } from '@codemirror/language';
 	import { highlightSelectionMatches } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
-	import { MergeView, diff as rawDiff } from '@codemirror/merge';
+	import { MergeView, diff as rawDiff, unifiedMergeView } from '@codemirror/merge';
 	import { ipc } from '../ipc';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
@@ -13,16 +13,19 @@
 	import { moonEditorTheme } from '../editor/theme';
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
-	import { diffCollapseContextExtension } from '../editor/diffCollapseContext';
+	import { diffBlockAlign } from '../editor/diffBlockAlign';
+	import { collapsedLines, diffCollapse, restoreCollapsed } from '../editor/diffCollapse';
+	import { effectiveDiffLayout, gutterDigits } from '../editor/diffLayout';
+	import { wireHorizontalScrollSync } from '../editor/hScrollSync';
 	import { annotationsFor, PrAnnotationWiring } from '../editor/prAnnotations';
-	import type { EditorConfig, GitFileStatus, PullRequestDetail } from '../protocol';
+	import type { DiffLayout, EditorConfig, GitFileStatus, PullRequestDetail } from '../protocol';
 
 	type Props = {
 		path: string;
 		status: GitFileStatus;
 		// Full SHAs: the commit and its first parent. Both sides of
-		// the MergeView read from `git_ref_content` — the base side
-		// from `parentSha`, the after side from `commitSha`. An empty
+		// the diff read from `git_ref_content` — the base side from
+		// `parentSha`, the after side from `commitSha`. An empty
 		// `parentSha` (root commit) renders the base side empty.
 		commitSha: string;
 		parentSha: string;
@@ -39,11 +42,23 @@
 
 	let sectionEl: HTMLElement | undefined = $state();
 	let host: HTMLDivElement | undefined = $state();
+	// Exactly one of `merge` / `unified` is set once built; `paneB` is
+	// the after-side editor either way.
 	let merge: MergeView | undefined = $state();
-	let mounted = $state(false);
+	let unified: EditorView | undefined = $state();
+	const paneB = $derived.by<EditorView | undefined>(() => merge?.b ?? unified);
 	let loading = $state(false);
 	let buildToken = 0;
 	let detachHScrollSync: (() => void) | null = null;
+
+	// Both blobs are immutable, so they are fetched once and a layout
+	// switch rebuilds the editors from them without another round trip.
+	type Loaded = { base: string; after: string; lang: Extension };
+	let loaded: Loaded | null = null;
+
+	let hostWidth = $state(0);
+	const layout = $derived(effectiveDiffLayout(workspace.diffLayout, hostWidth));
+	let builtLayout = $state<DiffLayout | null>(null);
 
 	const langA = new Compartment();
 	const langB = new Compartment();
@@ -61,11 +76,13 @@
 	const prWiringB = new PrAnnotationWiring();
 	const baseAnnotations = $derived(annotationsFor(pullRequest ?? null, path, 'base'));
 	const workingAnnotations = $derived(annotationsFor(pullRequest ?? null, path, 'working'));
+	// The unified editor has no base pane, so it carries that side's
+	// threads too, under the removed lines they are about.
 	$effect(() => {
 		prWiringA.sync(baseAnnotations);
 	});
 	$effect(() => {
-		prWiringB.sync(workingAnnotations);
+		prWiringB.sync(workingAnnotations, builtLayout === 'unified' ? baseAnnotations : undefined);
 	});
 
 	function editorConfigExtensions(ec: EditorConfig): Extension {
@@ -115,7 +132,7 @@
 	}
 
 	async function build() {
-		if (mounted || loading || !host) {
+		if (loaded !== null || loading || !host) {
 			return;
 		}
 		loading = true;
@@ -132,10 +149,13 @@
 		if (token !== buildToken || !host) {
 			return;
 		}
-		const ec = editorConfigExtensions(workspace.editorConfigFor(path));
+		loaded = { base, after, lang };
+		mountViews(loaded);
+		loading = false;
+	}
 
-		const readOnly: Extension[] = [EditorState.readOnly.of(true), EditorView.editable.of(false)];
-
+	function paneExtensions(pane: 'a' | 'b', lang: Extension): Extension[] {
+		const isA = pane === 'a';
 		// Selection-publish hook so `Ctrl+L` can attach a highlighted
 		// range from the commit diff to the coder — same gesture as
 		// the regular editor / DiffView / ReviewSection. Unlike those
@@ -149,95 +169,168 @@
 				publishCommitSelection(update.state);
 			}
 		});
-
-		const commonExts: Extension[] = [
+		return [
 			lineNumbers(),
-			diffGutterTintExtension('a'),
-			diffCollapseContextExtension,
+			diffGutterTintExtension(pane),
+			diffCollapse(),
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightSelectionMatches(),
 			searchAsYouType(),
 			highlightTabs(),
-		];
-
-		const sideA: Extension[] = [
-			...commonExts,
-			themeA.of(moonEditorTheme(workspace.effectiveTheme)),
-			langA.of(lang),
-			ecA.of(ec),
-			wrapA.of(workspace.lineWrap ? EditorView.lineWrapping : []),
+			(isA ? themeA : themeB).of(moonEditorTheme(workspace.effectiveTheme)),
+			(isA ? langA : langB).of(lang),
+			(isA ? ecA : ecB).of(editorConfigExtensions(workspace.editorConfigFor(path))),
+			(isA ? wrapA : wrapB).of(workspace.lineWrap ? EditorView.lineWrapping : []),
 			selectionPublish,
-			...(pullRequest === undefined ? [] : [prWiringA.extension(baseAnnotations)]),
-			...readOnly,
+			EditorState.readOnly.of(true),
+			EditorView.editable.of(false),
 		];
+	}
 
-		const sideB: Extension[] = [
-			lineNumbers(),
-			diffGutterTintExtension('b'),
-			diffCollapseContextExtension,
-			foldGutter(),
-			diffPureChangeExtension,
-			highlightSelectionMatches(),
-			searchAsYouType(),
-			highlightTabs(),
-			themeB.of(moonEditorTheme(workspace.effectiveTheme)),
-			langB.of(lang),
-			ecB.of(ec),
-			wrapB.of(workspace.lineWrap ? EditorView.lineWrapping : []),
-			selectionPublish,
-			...(pullRequest === undefined ? [] : [prWiringB.extension(workingAnnotations)]),
-			...readOnly,
-		];
+	function mountViews({ base, after, lang }: Loaded) {
+		if (!host) {
+			return;
+		}
+		const next = layout;
+		const annotated = pullRequest !== undefined;
+		host.style.setProperty(
+			'--m-diff-gutter-digits',
+			String(gutterDigits(base.split('\n').length, after.split('\n').length)),
+		);
+		if (next === 'unified') {
+			const view = new EditorView({
+				parent: host,
+				state: EditorState.create({
+					doc: after,
+					extensions: [
+						...paneExtensions('b', lang),
+						annotated ? prWiringB.extension(workingAnnotations, baseAnnotations) : [],
+						unifiedMergeView({
+							original: base,
+							gutter: false,
+							highlightChanges: true,
+							syntaxHighlightDeletions: true,
+							mergeControls: false,
+							diffConfig: { override: rawDiff },
+						}),
+					],
+				}),
+			});
+			if (annotated) {
+				prWiringB.attach(view);
+			}
+			unified = view;
+		} else {
+			const view = new MergeView({
+				a: {
+					doc: base,
+					extensions: [
+						...paneExtensions('a', lang),
+						diffBlockAlign,
+						annotated ? prWiringA.extension(baseAnnotations) : [],
+					],
+				},
+				b: {
+					doc: after,
+					extensions: [
+						...paneExtensions('b', lang),
+						diffBlockAlign,
+						annotated ? prWiringB.extension(workingAnnotations) : [],
+					],
+				},
+				parent: host,
+				gutter: false,
+				highlightChanges: true,
+				diffConfig: { override: rawDiff },
+			});
+			detachHScrollSync = wireHorizontalScrollSync(view.a.scrollDOM, view.b.scrollDOM);
+			if (annotated) {
+				prWiringA.attach(view.a);
+				prWiringB.attach(view.b);
+			}
+			merge = view;
+		}
+		builtLayout = next;
+	}
 
+	function destroyViews() {
 		detachHScrollSync?.();
 		detachHScrollSync = null;
+		prWiringA.detach();
+		prWiringB.detach();
+		merge?.destroy();
+		merge = undefined;
+		unified?.destroy();
+		unified = undefined;
+		builtLayout = null;
+	}
 
-		merge = new MergeView({
-			a: { doc: base, extensions: sideA },
-			b: { doc: after, extensions: sideB },
-			parent: host,
-			gutter: false,
-			highlightChanges: true,
-			collapseUnchanged: { margin: 3, minSize: 5 },
-			diffConfig: { override: rawDiff },
-		});
+	// Where the layout switch reads "the line the reader is on": just
+	// below the view's sticky banner and this section's sticky header.
+	const ANCHOR_OFFSET_PX = 80;
 
-		detachHScrollSync = wireHorizontalScrollSync(merge.a.scrollDOM, merge.b.scrollDOM);
-		if (pullRequest !== undefined) {
-			prWiringA.attach(merge.a);
-			prWiringB.attach(merge.b);
+	// The element whose scrollbar moves the stacked sections.
+	function scrollParent(): HTMLElement | null {
+		for (let el = sectionEl?.parentElement ?? null; el !== null; el = el.parentElement) {
+			const overflow = getComputedStyle(el).overflowY;
+			if (overflow === 'auto' || overflow === 'scroll') {
+				return el;
+			}
 		}
-		mounted = true;
-		loading = false;
+		return null;
 	}
 
-	function wireHorizontalScrollSync(a: HTMLElement, b: HTMLElement): () => void {
-		const expected = new WeakMap<HTMLElement, number>();
-		const handle = (from: HTMLElement, to: HTMLElement) => {
-			const pending = expected.get(from);
-			if (pending !== undefined && from.scrollLeft === pending) {
-				expected.delete(from);
+	// Switching layout (preference flip, or the pane crossing the
+	// narrow threshold) rebuilds the editors from the loaded blobs.
+	// The two layouts differ in height, so the section the reader is
+	// in keeps the line under the top of the viewport where it was;
+	// the others just rebuild.
+	$effect(() => {
+		const next = layout;
+		untrack(() => {
+			if (builtLayout === null || builtLayout === next || loaded === null) {
 				return;
 			}
-			expected.delete(from);
-			const toMax = Math.max(0, to.scrollWidth - to.clientWidth);
-			const target = Math.min(from.scrollLeft, toMax);
-			if (to.scrollLeft === target) {
+			const scroller = scrollParent();
+			const before = paneB;
+			let anchor: { line: number; top: number } | null = null;
+			if (scroller !== null && before !== undefined) {
+				const rect = before.dom.getBoundingClientRect();
+				const top = scroller.getBoundingClientRect().top + ANCHOR_OFFSET_PX;
+				if (rect.top <= top && rect.bottom > top) {
+					const block = before.lineBlockAtHeight(top - before.documentTop);
+					anchor = { line: before.state.doc.lineAt(block.from).number, top: before.documentTop + block.top };
+				}
+			}
+			// Both layouts collapse the same lines of the after-side
+			// text, so what the reader had expanded stays expanded.
+			const collapsed = before === undefined ? null : collapsedLines(before.state);
+			destroyViews();
+			mountViews(loaded);
+			const rebuilt = merge?.b ?? unified;
+			if (collapsed !== null && rebuilt !== undefined) {
+				restoreCollapsed(rebuilt, collapsed);
+			}
+			const token = buildToken;
+			const held = anchor;
+			if (held === null || scroller === null) {
 				return;
 			}
-			expected.set(to, target);
-			to.scrollLeft = target;
-		};
-		const onA = () => handle(a, b);
-		const onB = () => handle(b, a);
-		a.addEventListener('scroll', onA, { passive: true });
-		b.addEventListener('scroll', onB, { passive: true });
-		return () => {
-			a.removeEventListener('scroll', onA);
-			b.removeEventListener('scroll', onB);
-		};
-	}
+			// Two frames: the first lets the new editors measure and
+			// the merge view place its spacers.
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					const after = merge?.b ?? unified;
+					if (token !== buildToken || after === undefined) {
+						return;
+					}
+					const line = after.state.doc.line(Math.min(held.line, after.state.doc.lines));
+					scroller.scrollTop += after.lineBlockAt(line.from).top + after.documentTop - held.top;
+				});
+			});
+		});
+	});
 
 	function openInEditor() {
 		void workspace.openFile(path, side);
@@ -282,53 +375,74 @@
 
 	$effect(() => {
 		const ec = editorConfigExtensions(workspace.editorConfigFor(path));
-		if (!merge) {
+		const b = paneB;
+		if (!b) {
 			return;
 		}
-		merge.a.dispatch({ effects: ecA.reconfigure(ec) });
-		merge.b.dispatch({ effects: ecB.reconfigure(ec) });
+		merge?.a.dispatch({ effects: ecA.reconfigure(ec) });
+		b.dispatch({ effects: ecB.reconfigure(ec) });
+	});
+
+	// Theme and soft-wrap follow the workspace toggles without a
+	// rebuild; both panes flip together so the alignment holds.
+	$effect(() => {
+		const theme = workspace.effectiveTheme;
+		const b = paneB;
+		if (!b) {
+			return;
+		}
+		merge?.a.dispatch({ effects: themeA.reconfigure(moonEditorTheme(theme)) });
+		b.dispatch({ effects: themeB.reconfigure(moonEditorTheme(theme)) });
+	});
+	$effect(() => {
+		const ext = workspace.lineWrap ? EditorView.lineWrapping : [];
+		const b = paneB;
+		if (!b) {
+			return;
+		}
+		merge?.a.dispatch({ effects: wrapA.reconfigure(ext) });
+		b.dispatch({ effects: wrapB.reconfigure(ext) });
 	});
 
 	onMount(() => {
 		registerSection(path, sectionEl ?? null);
+		// A frame later, not inside the callback: crossing the narrow
+		// threshold rebuilds the editors, and resizing observed
+		// elements from their own callback is a "ResizeObserver loop"
+		// error.
+		let frame = -1;
+		const resize = new ResizeObserver(() => {
+			cancelAnimationFrame(frame);
+			frame = requestAnimationFrame(() => {
+				hostWidth = host?.clientWidth ?? 0;
+			});
+		});
+		if (host) {
+			hostWidth = host.clientWidth;
+			resize.observe(host);
+		}
+		let io: IntersectionObserver | null = null;
 		if (eager) {
 			void build();
 		} else if (sectionEl) {
-			const io = new IntersectionObserver(
+			io = new IntersectionObserver(
 				(entries) => {
-					for (const entry of entries) {
-						if (entry.isIntersecting) {
-							io.disconnect();
-							void build();
-							return;
-						}
+					if (entries.some((entry) => entry.isIntersecting)) {
+						io?.disconnect();
+						void build();
 					}
 				},
 				{ rootMargin: '50% 0px' },
 			);
 			io.observe(sectionEl);
-			return () => {
-				io.disconnect();
-				registerSection(path, null);
-				buildToken++;
-				detachHScrollSync?.();
-				detachHScrollSync = null;
-				prWiringA.detach();
-				prWiringB.detach();
-				merge?.destroy();
-				merge = undefined;
-				clearOurSelection();
-			};
 		}
 		return () => {
+			io?.disconnect();
+			resize.disconnect();
+			cancelAnimationFrame(frame);
 			registerSection(path, null);
 			buildToken++;
-			detachHScrollSync?.();
-			detachHScrollSync = null;
-			prWiringA.detach();
-			prWiringB.detach();
-			merge?.destroy();
-			merge = undefined;
+			destroyViews();
 			clearOurSelection();
 		};
 	});
@@ -344,9 +458,9 @@
 		</button>
 	</header>
 	<div class="body" bind:this={host}></div>
-	{#if !mounted && loading}
+	{#if builtLayout === null && loading}
 		<div class="placeholder">Loading diff…</div>
-	{:else if !mounted}
+	{:else if builtLayout === null}
 		<div class="placeholder">Scroll to load diff</div>
 	{/if}
 </section>
@@ -445,28 +559,13 @@
 		font-size: 11px;
 		color: var(--m-fg-subtle);
 	}
-	/* Character-level change marker — same rules as
-	 * `ReviewSection.svelte` and `DiffView.svelte`: the library
-	 * default is a 2px bottom-edge gradient that reads as a loud
-	 * underline. Swap for a soft same-hue background (GitHub-style
-	 * inline diff highlight) using our palette tokens so theme flips
-	 * track. `!important` beats the package's themed rules. */
-	.commit-section :global(.cm-merge-b .cm-changedText) {
-		background: color-mix(in srgb, var(--m-success) 22%, transparent) !important;
-		border-radius: 2px;
+	/* Unified layout: one editor, grown to its content like the two
+	 * panes of the split layout, so the stacked view keeps a single
+	 * scrollbar. The theme asks for `height: 100%`. */
+	.body > :global(.cm-editor) {
+		height: auto;
 	}
-	.commit-section :global(.cm-merge-a .cm-changedText),
-	.commit-section :global(.cm-deletedChunk .cm-deletedText) {
-		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
-		border-radius: 2px;
-	}
-	.commit-section :global(.cm-merge-b .cm-deletedText) {
-		background: color-mix(in srgb, var(--m-danger) 22%, transparent) !important;
-	}
-	/* Pure-added / pure-deleted lines: the gutter tint already
-	 * conveys the line-level change, so clear the per-character
-	 * marker to avoid doubling up the same hue. */
-	.commit-section :global(.cm-moon-pure-change .cm-changedText) {
-		background: transparent !important;
+	.commit-section :global(.cm-editor.cm-focused) {
+		outline: none;
 	}
 </style>

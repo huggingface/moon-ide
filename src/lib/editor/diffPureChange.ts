@@ -134,6 +134,29 @@ export function lineFullyCovered(
 }
 
 /**
+ * The unified layout's counterpart. There a removed chunk is not
+ * document text but a widget the merge package builds, one
+ * `.cm-deletedLine` per old line, and it marks the removed characters
+ * itself (`.cm-deletedText`). A line removed as a whole has nothing
+ * but such marks in it; tag it with the same class so the same CSS
+ * rule drops the per-character tint. The package keeps one DOM node
+ * per chunk for as long as the chunk lives, so a tagged line stays
+ * tagged.
+ */
+function tagRemovedLines(view: EditorView): void {
+	for (const line of view.contentDOM.querySelectorAll(
+		'.cm-deletedChunk .cm-deletedLine:not(.cm-moon-pure-change) > del',
+	)) {
+		const whole = Array.from(line.childNodes).every(
+			(node) => node instanceof HTMLElement && (node.tagName === 'BR' || node.classList.contains('cm-deletedText')),
+		);
+		if (whole) {
+			line.parentElement?.classList.add('cm-moon-pure-change');
+		}
+	}
+}
+
+/**
  * Per-pane extension. Recomputes when the merge view's chunk set
  * changes (which happens whenever either pane's document is edited
  * — both panes get a state update when chunks rebuild, so this
@@ -142,8 +165,9 @@ export function lineFullyCovered(
 export const diffPureChangeExtension = ViewPlugin.fromClass(
 	class {
 		decorations: DecorationSet;
-		constructor(view: EditorView) {
+		constructor(private readonly view: EditorView) {
 			this.decorations = compute(view);
+			this.scheduleTagging();
 		}
 		update(u: ViewUpdate) {
 			const prev = getChunks(u.startState)?.chunks;
@@ -151,6 +175,17 @@ export const diffPureChangeExtension = ViewPlugin.fromClass(
 			if (prev !== next) {
 				this.decorations = compute(u.view);
 			}
+			if (prev !== next || u.viewportChanged) {
+				this.scheduleTagging();
+			}
+		}
+		// Removed chunks only exist in the DOM once the view has drawn
+		// this update, and only the unified layout has any.
+		private scheduleTagging() {
+			if (getChunks(this.view.state)?.side !== 'b') {
+				return;
+			}
+			this.view.requestMeasure({ key: this, read: () => null, write: () => tagRemovedLines(this.view) });
 		}
 	},
 	{ decorations: (v) => v.decorations },

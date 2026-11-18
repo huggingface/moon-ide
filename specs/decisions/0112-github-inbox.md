@@ -36,6 +36,10 @@ its reasons as tags.
 - **Opening a pull request** (Enter) opens it in a tab, without a
   checkout ([ADR 0115](0115-pr-tab-without-a-checkout.md)), and marks
   its thread read. Issues and other subjects open on GitHub.
+- **The tab is pinned.** Once open it is the first tab of every
+  folder until closed, and switching folders while looking at it keeps
+  it in view: it is the one tab that is about the workspace, not a
+  folder. Its open state is saved with the rest of the inbox's state.
 - **Mark read** (`e`) marks the notification thread read on GitHub.
 - **Snooze** (`s` / `w`) hides an item until 08:00 the next day or the
   next Monday; a **Snoozed** chip shows what is hidden. GitHub has no

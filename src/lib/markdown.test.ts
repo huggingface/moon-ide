@@ -3,7 +3,8 @@ import { describe, expect, it } from 'vitest';
 
 import { __test, slugifyHeading, splitFrontmatter } from './markdown';
 
-const { applyHeadingAnchorRule, applyInlineAnchorRule, frontmatterToHtml } = __test;
+const { applyAlertRule, applyHeadingAnchorRule, applyInlineAnchorRule, frontmatterToHtml, keepRendererClasses } =
+	__test;
 
 // Build a bare markdown-it with just our two anchor rules. We skip
 // the highlighter (grammar imports require the editor's bundle
@@ -329,5 +330,67 @@ describe('frontmatterToHtml', () => {
 	it('falls back to a raw YAML block when the YAML is invalid', () => {
 		const html = frontmatterToHtml('title: [unterminated');
 		expect(html).toContain('md-frontmatter-raw');
+	});
+});
+
+describe('GitHub alerts', () => {
+	function render(source: string, html = false): string {
+		const md = new MarkdownIt({ html, breaks: html });
+		applyAlertRule(md);
+		return md.render(source);
+	}
+
+	it('turns a marked blockquote into a titled callout', () => {
+		const html = render('> [!NOTE]\n> **Medium Risk** changes auth.\n');
+		expect(html).toContain('<blockquote class="md-alert md-alert-note">');
+		expect(html).toContain('<p class="md-alert-title">Note</p>');
+		expect(html).toContain('<p><strong>Medium Risk</strong> changes auth.</p>');
+		expect(html).not.toContain('[!NOTE]');
+	});
+
+	it('handles a marker followed by a blank quoted line, and hard breaks', () => {
+		const html = render('> [!WARNING]\n>\n> Careful.\n', true);
+		expect(html).toContain('md-alert-warning');
+		expect(html).toContain('<p>Careful.</p>');
+		expect(html).not.toContain('<p></p>');
+		expect(render('> [!TIP]\n> Short.\n', true)).toContain('<p>Short.</p>');
+	});
+
+	it('leaves ordinary quotes and inline markers alone', () => {
+		expect(render('> [!NOTE] same line\n')).not.toContain('md-alert');
+		expect(render('> just a quote\n')).not.toContain('md-alert');
+		expect(render('> [!SHOUT]\n> x\n')).not.toContain('md-alert');
+	});
+
+	it('lets a comment marker before a rule stay a comment with raw HTML on', () => {
+		const html = render('<!-- CURSOR_SUMMARY -->\n---\n\ntext <sup>small</sup>\n', true);
+		expect(html).toContain('<!-- CURSOR_SUMMARY -->');
+		expect(html).toContain('<hr>');
+		expect(html).not.toContain('<h2>');
+		expect(html).toContain('<sup>small</sup>');
+	});
+});
+
+describe('keepRendererClasses', () => {
+	function filter(value: string) {
+		const data = { attrName: 'class', attrValue: value, keepAttr: true };
+		keepRendererClasses(null, data);
+		return data;
+	}
+
+	it('keeps the classes this renderer emits and drops the rest', () => {
+		expect(filter('md-alert md-alert-note toast')).toMatchObject({
+			attrValue: 'md-alert md-alert-note',
+			keepAttr: true,
+		});
+		expect(filter('tok-keyword')).toMatchObject({ keepAttr: true });
+		expect(filter('cm-code language-ts')).toMatchObject({ attrValue: 'cm-code language-ts' });
+		expect(filter('app cm-editor')).toMatchObject({ attrValue: '', keepAttr: false });
+	});
+
+	it('ignores other attributes', () => {
+		const data = { attrName: 'href', attrValue: 'https://example.test', keepAttr: true };
+		keepRendererClasses(null, data);
+		expect(data.attrValue).toBe('https://example.test');
 	});
 });

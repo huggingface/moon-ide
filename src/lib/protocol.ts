@@ -1071,6 +1071,8 @@ export type InboxState = {
 	 * `name[bot]`. */
 	watched_authors: string[];
 	snoozed: InboxSnooze[];
+	/** The inbox tab is open: first tab of every folder until closed. */
+	tab_open: boolean;
 };
 
 /** An inbox item hidden until `until` (RFC 3339). */

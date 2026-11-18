@@ -15,4 +15,9 @@ watched_authors: Array<string>,
  * Items hidden until a time. Expired entries are dropped by the
  * frontend on its next save.
  */
-snoozed: Array<InboxSnooze>, };
+snoozed: Array<InboxSnooze>, 
+/**
+ * The inbox tab is open: it is the first tab of every folder
+ * until closed.
+ */
+tab_open: boolean, };

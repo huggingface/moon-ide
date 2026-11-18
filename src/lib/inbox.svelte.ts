@@ -32,6 +32,10 @@ class InboxStore {
 	 * no such state, and a snoozed thread stays unread there. */
 	snoozed = $state<InboxSnooze[]>([]);
 	filter = $state('');
+	/** The inbox tab is open. Owned by the workspace store, which
+	 * keeps the tab pinned in every folder; kept here to be saved
+	 * with the rest of the inbox's state. */
+	tabOpen = $state(false);
 
 	/** Filter chips switched on in the tab. None means every item
 	 * that isn't snoozed. Not persisted: a fresh window starts with
@@ -54,10 +58,11 @@ class InboxStore {
 	hydrate(state: InboxState): void {
 		this.watchedAuthors = [...state.watched_authors];
 		this.snoozed = activeSnoozes(state.snoozed, Date.now());
+		this.tabOpen = state.tab_open;
 	}
 
 	serialise(): InboxState {
-		return { watched_authors: this.watchedAuthors, snoozed: this.snoozed };
+		return { watched_authors: this.watchedAuthors, snoozed: this.snoozed, tab_open: this.tabOpen };
 	}
 
 	/** Called whenever the persisted part (authors, snoozes) changes. */

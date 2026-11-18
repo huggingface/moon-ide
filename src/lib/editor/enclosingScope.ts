@@ -1,37 +1,20 @@
-// Annotates `@codemirror/merge`'s `… N unchanged lines` collapse
-// placeholders with the enclosing definition (function / class /
-// method / etc.) the way GitHub shows the symbol after the `@@`
-// hunk header. Lets a reviewer tell "which function is this hunk
-// in?" without expanding the fold.
+// Which definition (function / class / method / impl ...) encloses a
+// piece of code. One home for the two ways we answer that, so the
+// sticky-scroll header, the diff collapse bars and their "expand to
+// the enclosing block" action agree on what counts as a definition:
 //
-// Deliberately heuristic, not LSP-backed: the review tab keeps the
-// LSP broker silent for files the user only scrolls past (see
-// `ReviewSection.svelte`'s lazy goto-def attach), so resolving the
-// enclosing symbol through `documentSymbol` would defeat that and
-// add async churn. Instead we walk the document text upward from
-// the first line after the fold, looking for the nearest
-// definition-looking line at a strictly smaller indent. That's
-// accurate on properly-indented code (every language we ship) and
-// silently produces no label when it can't find one — never wrong,
-// occasionally absent.
-//
-// Implementation: a `ViewPlugin` that, after each layout, finds the
-// package's own `.cm-collapsedLines` widgets (left intact so its
-// click-to-expand + sibling-pane sync keep working) and appends a
-// muted context span. We don't rebuild the collapse decorations
-// ourselves — owning the expand interaction would mean reaching
-// into the package's internal `mergeConfig` facet for the sibling
-// sync, which is fragile. Post-decorating the existing DOM is the
-// lower-risk seam.
+//   - `enclosingStack`: a text heuristic. Walk upward looking for the
+//     nearest definition-looking line at a strictly smaller indent.
+//     Works without a parser (StreamLanguage modes, plain text) and
+//     without the LSP, which the review surfaces keep silent for
+//     files the user only scrolls past. Never wrong on properly
+//     indented code, occasionally absent.
+//   - `enclosingBlocks`: the Lezer tree. Walk up from a range through
+//     the nodes that contain it and keep the definition-like ones.
+//     Knows where a block ends, which the indent walk can only guess.
 
-import { EditorView, ViewPlugin, type ViewUpdate } from '@codemirror/view';
 import type { Text } from '@codemirror/state';
-
-const CONTEXT_CLASS = 'cm-collapseContext';
-// Marks a widget we've already annotated this layout pass so a
-// no-op `ViewUpdate` (selection move, focus) doesn't re-walk every
-// fold.
-const STAMP = 'data-moon-collapse-ctx';
+import type { SyntaxNode, Tree } from '@lezer/common';
 
 // Definition-looking lines, language-agnostic across our stack
 // (TS / JS / Rust / Go / Python / Svelte script / CSS-ish blocks).
@@ -140,17 +123,6 @@ export function enclosingStack(doc: Text, fromLine: number): EnclosingDef[] {
 	return found.toReversed();
 }
 
-/**
- * Innermost enclosing definition for `fromLine` (1-based, the first
- * visible line *after* a collapsed region). Returns the trimmed
- * signature, or `null` when nothing convincing is found.
- */
-export function enclosingSymbol(doc: Text, fromLine: number): string | null {
-	const stack = enclosingStack(doc, fromLine);
-	const innermost = stack[stack.length - 1];
-	return innermost === undefined ? null : innermost.label;
-}
-
 // Trim a signature to a compact label: drop a trailing opening
 // brace / colon, collapse interior whitespace, and clamp length.
 function summarise(trimmed: string): string {
@@ -165,65 +137,94 @@ function summarise(trimmed: string): string {
 	return s;
 }
 
-function annotate(view: EditorView): void {
-	const widgets = view.dom.querySelectorAll<HTMLElement>('.cm-collapsedLines');
-	for (const widget of widgets) {
-		if (widget.hasAttribute(STAMP)) {
-			continue;
-		}
-		const pos = view.posAtDOM(widget);
-		// The widget replaces the collapsed block; `posAtDOM` lands at
-		// its start. The first line after the fold is one past the
-		// block's end line — find it via the line at the widget's end.
-		const startLine = view.state.doc.lineAt(pos);
-		// The fold spans N lines starting at `startLine`; the first
-		// visible line after it is `startLine + N`.
-		const afterFoldLine = startLine.number + countCollapsedLines(widget);
-		const symbol = enclosingSymbol(view.state.doc, afterFoldLine);
-		widget.setAttribute(STAMP, '1');
-		if (symbol === null) {
-			continue;
-		}
-		const span = document.createElement('span');
-		span.className = CONTEXT_CLASS;
-		span.textContent = symbol;
-		widget.appendChild(span);
-	}
+/** An enclosing definition as a 1-based inclusive line range, plus
+ *  the compact label of its first line. */
+export interface EnclosingBlock {
+	from: number;
+	to: number;
+	label: string;
 }
 
-// The widget's text is `… N unchanged lines`; pull N back out so we
-// know how far the fold reaches. Falls back to 0 (so we look at the
-// line right after the widget's start) if the phrase changes.
-function countCollapsedLines(widget: HTMLElement): number {
-	// childNodes[0] is the package's own text node; reading it
-	// avoids counting our appended span.
-	const first = widget.childNodes[0];
-	const text = first?.textContent ?? widget.textContent ?? '';
-	const m = text.match(/(\d+)/);
-	if (m === null || m[1] === undefined) {
-		return 0;
-	}
-	return Number.parseInt(m[1], 10);
-}
+// Lezer node names that are a definition whatever their first line
+// looks like (a typed TS method, `const f = async () => {`, a Rust
+// `impl`). Same vocabulary as `DEFINITION` above, spelled the way the
+// grammars we ship name their nodes.
+const DEFINITION_NODE = new RegExp(
+	[
+		'^(?:',
+		'(?:Function|Method|Constructor|Class|Interface|Enum|Namespace)(?:Declaration|Definition|Decl)',
+		'|(?:Function|Class|Closure|Lambda)Expression',
+		'|ArrowFunction|FunctionLiteral',
+		'|(?:Function|Impl|Struct|Enum|Trait|Mod)Item',
+		')$',
+	].join(''),
+);
+
+// Node kinds that can stand for a definition when their first line
+// reads like one (`describe('x', () => {`, a K&R function body). A
+// parameter or argument list starting on that same line must not: it
+// ends long before the block does.
+const BLOCK_LIKE_NODE = /(?:Block|Body|Declaration|Definition|Decl|Statement|Item|Expression)$/;
 
 /**
- * View plugin that decorates the merge package's unchanged-region
- * collapse placeholders with their enclosing definition. Install on
- * either or both panes of a `MergeView`.
+ * Definition-like syntax nodes containing `from..to`, innermost
+ * first. Single-line nodes and the document node are skipped: neither
+ * is a block worth expanding to.
  */
-export const diffCollapseContextExtension = ViewPlugin.fromClass(
-	class {
-		constructor(view: EditorView) {
-			// Defer to next frame: the package's collapse widgets are
-			// block decorations rendered during this same layout, so
-			// their DOM may not be queryable synchronously on
-			// construction.
-			requestAnimationFrame(() => annotate(view));
+export function enclosingBlocks(doc: Text, tree: Tree, from: number, to: number): EnclosingBlock[] {
+	const out: EnclosingBlock[] = [];
+	let node: SyntaxNode | null = tree.resolveInner(Math.min(from, doc.length), 1);
+	while (node !== null && (node.from > from || node.to < to)) {
+		node = node.parent;
+	}
+	for (; node !== null && node.parent !== null; node = node.parent) {
+		const first = doc.lineAt(node.from);
+		const last = doc.lineAt(node.to);
+		if (last.number === first.number) {
+			continue;
 		}
-		update(update: ViewUpdate) {
-			if (update.docChanged || update.viewportChanged || update.geometryChanged) {
-				requestAnimationFrame(() => annotate(update.view));
-			}
+		const previous = out[out.length - 1];
+		if (previous !== undefined && previous.from === first.number && previous.to === last.number) {
+			continue;
 		}
-	},
-);
+		const trimmed = first.text.trim();
+		if (DEFINITION_NODE.test(node.name) || (BLOCK_LIKE_NODE.test(node.name) && looksLikeDefinition(trimmed))) {
+			out.push({ from: first.number, to: last.number, label: summarise(trimmed) });
+		}
+	}
+	return out;
+}
+
+// A line that only closes the block opened above it.
+const CLOSER = /^(?:[}\])]|end\b)/;
+
+/**
+ * The same answer from indentation alone, for documents without a
+ * syntax tree: `enclosingStack`'s definitions, innermost first, each
+ * running to the last line before the indent drops back to the
+ * definition's own (a closing brace at that indent is included).
+ */
+export function enclosingBlocksByIndent(doc: Text, line: number): EnclosingBlock[] {
+	return enclosingStack(doc, line)
+		.toReversed()
+		.map((def) => ({ from: def.line, to: indentBlockEnd(doc, def.line), label: def.label }));
+}
+
+function indentBlockEnd(doc: Text, defLine: number): number {
+	const base = indentOf(doc.line(defLine).text);
+	let end = defLine;
+	for (let n = defLine + 1; n <= doc.lines; n++) {
+		const text = doc.line(n).text;
+		const trimmed = text.trim();
+		if (trimmed.length === 0) {
+			continue;
+		}
+		const indent = indentOf(text);
+		if (indent > base) {
+			end = n;
+			continue;
+		}
+		return indent === base && CLOSER.test(trimmed) ? n : end;
+	}
+	return end;
+}

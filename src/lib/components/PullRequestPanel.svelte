@@ -50,13 +50,13 @@
 
 	function markdown(el: HTMLElement, source: string) {
 		const render = (text: string) => {
-			const cached = getCachedMarkdown(text);
+			const cached = getCachedMarkdown(text, { github: true });
 			if (cached !== undefined) {
 				el.innerHTML = cached;
 				return;
 			}
 			el.textContent = text;
-			void renderMarkdown(text).then((html) => {
+			void renderMarkdown(text, { github: true }).then((html) => {
 				if (el.isConnected) {
 					el.innerHTML = html;
 				}
@@ -314,6 +314,11 @@
 	.body {
 		margin-top: var(--m-space-2);
 		max-width: 860px;
+	}
+	/* A description that opens with a rule (bots put one under their
+	   marker comment) would double the panel's own divider. */
+	.body :global(> hr:first-child) {
+		display: none;
 	}
 	ul {
 		margin: var(--m-space-2) 0 0;

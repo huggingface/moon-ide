@@ -100,6 +100,21 @@
 	/* A merged pull request: the one forge state with no twin above. */
 	--m-merged: #b392f0;
 
+	/* Diff surfaces, one vocabulary for every view that shows a
+	   change: the tint of an inserted / deleted line, the stronger
+	   highlight of the characters that changed inside it, the
+	   line-number cell beside it, and the filler row that keeps the
+	   other pane level. Mixed from the accents above, so the light
+	   theme and a workspace colour scheme follow without a second
+	   set. */
+	--m-diff-added-line: color-mix(in srgb, var(--m-success) 9%, transparent);
+	--m-diff-added-text: color-mix(in srgb, var(--m-success) 24%, transparent);
+	--m-diff-added-gutter: color-mix(in srgb, var(--m-success) 28%, transparent);
+	--m-diff-deleted-line: color-mix(in srgb, var(--m-danger) 9%, transparent);
+	--m-diff-deleted-text: color-mix(in srgb, var(--m-danger) 24%, transparent);
+	--m-diff-deleted-gutter: color-mix(in srgb, var(--m-danger) 28%, transparent);
+	--m-diff-filler: color-mix(in srgb, var(--m-fg) 4%, transparent);
+
 	/* Shape, spacing and type scale. New components take these
 	   instead of literal px; older ones move over as they are
 	   touched. */
@@ -486,6 +501,42 @@ button:focus-visible {
 	padding: 0.2em 0.8em;
 	margin-left: 0;
 }
+/* GitHub alerts (`> [!NOTE]`), see `applyAlertRule` in markdown.ts. */
+.markdown-body blockquote.md-alert {
+	--md-alert: var(--m-accent);
+	border-left-color: var(--md-alert);
+	color: var(--m-fg);
+}
+.markdown-body .md-alert-title {
+	margin: 0 0 0.3em;
+	color: var(--md-alert);
+	font-size: 0.92em;
+	font-weight: 600;
+}
+.markdown-body blockquote.md-alert-tip {
+	--md-alert: var(--m-success);
+}
+.markdown-body blockquote.md-alert-important {
+	--md-alert: var(--m-merged);
+}
+.markdown-body blockquote.md-alert-warning {
+	--md-alert: var(--m-warning);
+}
+.markdown-body blockquote.md-alert-caution {
+	--md-alert: var(--m-danger);
+}
+.markdown-body details {
+	margin: 0.6em 0;
+}
+.markdown-body summary {
+	cursor: pointer;
+	color: var(--m-fg-muted);
+}
+.markdown-body sup,
+.markdown-body sub {
+	line-height: 0;
+	color: var(--m-fg-muted);
+}
 .markdown-body hr {
 	border: none;
 	border-top: 1px solid var(--m-border);
@@ -725,13 +776,13 @@ button:focus-visible {
    the line-number column only to avoid colouring the lint /
    foldGutter columns. */
 .cm-gutter.cm-lineNumbers .cm-gutterElement.cm-gitline-added {
-	background: color-mix(in srgb, var(--m-success) 28%, transparent);
+	background: var(--m-diff-added-gutter);
 }
 .cm-gutter.cm-lineNumbers .cm-gutterElement.cm-gitline-modified {
 	background: color-mix(in srgb, var(--m-accent) 28%, transparent);
 }
 .cm-gutter.cm-lineNumbers .cm-gutterElement.cm-gitline-deleted {
-	background: color-mix(in srgb, var(--m-danger) 28%, transparent);
+	background: var(--m-diff-deleted-gutter);
 }
 /* Pure-deletion wedges in the editor (`deleted-above` /
    `deleted-below`): the line itself isn't gone — its neighbours
@@ -790,25 +841,71 @@ button:focus-visible {
 	font-weight: 600;
 }
 
-/* Enclosing-symbol label appended to `@codemirror/merge`'s
-   `… N unchanged lines` collapse placeholders in the Review changes
-   tab (editor/diffCollapseContext.ts). GitHub-style "which function
-   is this hunk in?" hint, derived from a text heuristic. Reads as a
-   quiet monospace aside separated from the line count. */
-.cm-collapsedLines .cm-collapseContext {
-	margin-inline-start: 12px;
-	padding-inline-start: 12px;
-	border-inline-start: 1px solid var(--m-border);
-	color: var(--m-fg-muted);
-	font-family: var(--m-font-mono, monospace);
-	opacity: 0.85;
+/* Diff surfaces (`DiffView`, review / commit / pull-request sections,
+   split or unified). `@codemirror/merge` ships its own hardcoded
+   tints, a 2px underline for changed characters, and nothing at all
+   for the filler rows; all of it is replaced here with the
+   `--m-diff-*` tokens so every diff reads the same in both themes.
+   `!important` because the package's rules are scoped per theme
+   (`&light.cm-merge-a ...`) and would otherwise win on specificity.
+
+   The base pane (`.cm-merge-a`) and a unified view's removed chunk
+   are the "deleted" side; the working pane and a unified view
+   (`.cm-merge-b`) the "inserted" one. */
+.cm-editor.cm-merge-a .cm-changedLine,
+.cm-editor .cm-deletedChunk {
+	background-color: var(--m-diff-deleted-line) !important;
 }
-/* The package decorates the placeholder with a trailing `⦚`
-   pseudo-element; suppress it when we've appended a context label
-   so the row reads `⦚ … N unchanged lines │ symbol` instead of
-   trailing a stray glyph after the symbol. */
-.cm-collapsedLines:has(.cm-collapseContext)::after {
-	content: none;
+.cm-editor.cm-merge-b .cm-changedLine,
+.cm-editor .cm-inlineChangedLine {
+	background-color: var(--m-diff-added-line) !important;
+}
+.cm-editor.cm-merge-a .cm-changedText,
+.cm-editor.cm-merge-b .cm-deletedText,
+.cm-editor .cm-deletedChunk .cm-deletedText {
+	background: var(--m-diff-deleted-text) !important;
+	border-radius: 2px;
+}
+.cm-editor.cm-merge-b .cm-changedText {
+	background: var(--m-diff-added-text) !important;
+	border-radius: 2px;
+}
+/* A line that is new or gone as a whole (`editor/diffPureChange.ts`)
+   already says so with its tint and its gutter cell; highlighting
+   every character on top is the same hue twice. */
+.cm-editor .cm-line.cm-moon-pure-change .cm-changedText,
+.cm-editor .cm-deletedChunk .cm-deletedLine.cm-moon-pure-change .cm-deletedText {
+	background: transparent !important;
+}
+/* In a diff pane a changed line's number cell takes the pane's hue,
+   whether the line is new or rewritten: red on the base side, green
+   on the working side. (The regular editor keeps blue for
+   "modified".) */
+.cm-merge-a .cm-gutter.cm-lineNumbers .cm-gutterElement.cm-gitline-modified {
+	background: var(--m-diff-deleted-gutter);
+}
+.cm-merge-b .cm-gutter.cm-lineNumbers .cm-gutterElement.cm-gitline-modified {
+	background: var(--m-diff-added-gutter);
+}
+/* Filler: the rows a pane leaves empty opposite the other pane's
+   insertions, deletions and cards. */
+.cm-editor .cm-mergeSpacer {
+	background: var(--m-diff-filler);
+}
+/* Line-number gutters of a diff are sized for a fixed digit count
+   instead of each document's own, so the two panes of a section and
+   the sections of a stacked view put their code at the same column.
+   A section with a longer file raises `--m-diff-gutter-digits`. */
+.cm-merge-a .cm-gutter.cm-lineNumbers .cm-gutterElement,
+.cm-merge-b .cm-gutter.cm-lineNumbers .cm-gutterElement {
+	box-sizing: border-box;
+	min-width: calc(var(--m-diff-gutter-digits, 4) * 1ch + 8px);
+}
+/* Same reason: the fold column is as wide as its marker, and a file
+   whose language has nothing to fold would get a narrower one. */
+.cm-merge-a .cm-gutter.cm-foldGutter,
+.cm-merge-b .cm-gutter.cm-foldGutter {
+	width: 17px;
 }
 /* Sticky enclosing-scope header (editor/stickyScroll.ts) — VS Code's
    "sticky scroll". A zero-height sticky wrapper prepended to

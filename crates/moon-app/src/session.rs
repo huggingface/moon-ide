@@ -203,6 +203,7 @@ mod tests {
 				id: "acme/app#1".into(),
 				until: "2026-11-19T07:00:00Z".into(),
 			}],
+			tab_open: true,
 		};
 		payload.dismissed_coder_sessions = vec![DismissedCoderSession {
 			id: "s1".into(),
