@@ -117,9 +117,9 @@ fn is_lifecycle_event(line: &str) -> bool {
 /// A lifecycle event fired: re-snapshot the truth and broadcast.
 /// We don't trust the event's own payload for the new state —
 /// `die`/`stop` race each other and the final `compose ps`
-/// reading is the only honest answer. Goes through the ADR 0020
-/// cache, which at this point has aged past its 1 s TTL for any
-/// reading taken before the stop landed.
+/// reading is the only honest answer. Read past the ADR 0020
+/// cache: a probe taken just before the event is still inside its
+/// TTL and would report the state the event just ended.
 async fn on_lifecycle_event(app: &AppCore) {
 	let container = match workspace_handle(app).await {
 		Ok(c) => c,
@@ -128,7 +128,7 @@ async fn on_lifecycle_event(app: &AppCore) {
 			return;
 		}
 	};
-	match container.status().await {
+	match container.status_fresh().await {
 		Ok(status) => emit_container_state(app.events.as_ref(), &status),
 		Err(err) => tracing::warn!(error = %err, "container events watcher: status query failed"),
 	}

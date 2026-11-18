@@ -190,24 +190,39 @@ pub struct PullRequestDetail {
 	/// refer to that commit.
 	pub minor_notes_sha: Option<String>,
 	/// Review threads, oldest first. Empty when they could not be
-	/// fetched.
+	/// fetched, and in the answer of `pr_detail`, which leaves them
+	/// to `pr_threads`.
 	pub threads: Vec<PrThread>,
+	/// Top-level comments and review summaries, oldest first: what
+	/// GitHub's Conversation tab shows besides the threads.
+	pub conversation: Vec<crate::inbox::ConversationComment>,
 }
 
-/// A pull request opened in its own tab, without a checkout: the
-/// detail plus the diff GitHub shows under "Files changed". Both
-/// ends of that diff are in the folder's object store once this is
-/// returned, so the file contents read like any other revision.
+/// The diff of a pull request opened without a checkout: what GitHub
+/// shows under "Files changed". Both ends are in the folder's object
+/// store once this is returned, so the file contents read like any
+/// other revision.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
-pub struct PrOpened {
-	pub detail: PullRequestDetail,
+pub struct PrDiff {
 	/// Full SHA of the commit the head branched from the base at: the
 	/// "before" side of every file.
 	pub merge_base: String,
 	/// Files changed from `merge_base` to the PR head.
-	pub files: Vec<crate::git::GitStatusEntry>,
+	pub files: Vec<PrDiffFile>,
+}
+
+/// One file of a [`PrDiff`], with the size of its change.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct PrDiffFile {
+	pub path: String,
+	pub status: crate::git::GitFileStatus,
+	/// Lines added and removed. `None` for a binary file.
+	pub additions: Option<u32>,
+	pub deletions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

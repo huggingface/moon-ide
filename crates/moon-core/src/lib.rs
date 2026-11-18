@@ -13,6 +13,7 @@ pub mod forge;
 pub mod format;
 pub mod host;
 pub mod inbox;
+pub mod issue;
 pub mod lint_staged;
 pub mod logs;
 pub mod lsp;

@@ -153,8 +153,12 @@ The split matters because Pierre Diffs is display-only — forcing it to also ed
 
 - **One list**, newest first, each item once. Toggle chips above it (Unread, Review requested, Watched, Mentioned, Mine, each with a count, and Snoozed when anything is) filter it: none selected shows every item that isn't snoozed, several show their union. The selection is not persisted.
 - **Row**: unread dot, state icon (open / draft / merged / closed PR, issue, other), title, number, repository and author, tags for why it is listed (the notification reason for an unread item), then `+added −removed`, comment count, review decision, check rollup, author avatar, age.
-- **Keys** (focus in the list): `j` / `k` or arrows move, `Enter` or a click opens the PR in a PR tab (other subjects open on GitHub); `Ctrl+Enter`, `Ctrl`-click or a middle click adds the PR's tab without leaving the inbox, so several can be queued, `o` opens it on GitHub, `e` marks its thread read, `s` / `w` snooze it until 08:00 tomorrow / next Monday (or wake it), `r` refreshes, `/` focuses the filter, `1`–`5` toggle the chips and `0` clears them.
+- **Keys** (focus in the list): `j` / `k` or arrows move, `Enter` or a click opens a pull request or an issue of a bound repository in its own tab (anything else opens on GitHub); `Ctrl+Enter`, `Ctrl`-click or a middle click adds the tab without leaving the inbox, so several can be queued, `o` opens it on GitHub, `e` marks its thread read, `s` / `w` snooze it until 08:00 tomorrow / next Monday (or wake it), `r` refreshes, `/` focuses the filter, `1`–`5` toggle the chips and `0` clears them.
 - **Snoozed** items leave the list and the button's counts until their time; the Snoozed chip shows them. Snoozes are local to the workspace; GitHub is not told, so the thread stays unread there. New activity does not wake an item early.
+- **Signals**: a row of an open pull request also shows how many review threads are unresolved and how many minor notes moonbot left, read when the row is new or GitHub says it changed ([ADR 0119](decisions/0119-inbox-signals-and-groups.md)).
+- **Group by topic** (`g`, or the button right of the chips): the open pull requests are sorted into named groups by one model call, and the list is shown under group headings (name, count, what the group has in common), newest group first; a heading folds its rows. Everything else (issues, notifications, closed pull requests, anything the model left out) comes last under "Not grouped". The chips and the filter apply as before.
+  - A pull request stays in its group until it leaves the inbox. New ones are placed as they arrive, into the existing groups where they fit. **Regroup** sorts everything again.
+  - Groups are kept per workspace. If the call fails (the coder isn't signed in, say) the list says so and stays as it was; nothing is retried until asked.
 - **Filter** matches every typed word against title, repository, author, branch and `#number`.
 - **Watching** lists the watched authors; add a login or `name[bot]`, remove with the chip's ×. The list is per workspace.
 - The sidebar's Inbox button carries three counts: unread, waiting for review, and open from watched authors (snoozed items excluded).
@@ -163,6 +167,18 @@ The split matters because Pierre Diffs is display-only — forcing it to also ed
 ### Pull request tab
 
 `pr://<number>` (`PrView.svelte`), opened from the inbox, shows a pull request of the active folder's repository without checking it out ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)): the PR panel, then a read-only diff per changed file from the merge base to the PR head, with review threads and moonbot's notes under their lines. The header carries **Review** (verdict and summary), **Check out in a worktree** and **Start an agent on it**; the last two are disabled for a fork PR. Not restored at launch.
+
+- **Loads in stages**: the title from the tab at once, then description, conversation and checks, then review threads and the diff as each arrives. Coming back to the tab paints the last answer while it re-reads.
+- **Review threads** in the PR panel list the open ones; "Show N resolved" adds the rest.
+- **Conversation**: top-level comments and review summaries in the PR panel, after the description, oldest first. A long one is cut to a few lines with "Show all". Read-only; each links to GitHub.
+- **Files** ([ADR 0118](decisions/0118-pr-files-one-at-a-time.md)): a list of the changed files beside the diffs (over them, from the banner's **Files** button, in a pane too narrow for both) with status, `+added −removed`, the count of unresolved threads and notes, and a tick once viewed; the file under the top of the pane is highlighted. Each file header has the same numbers, a collapse toggle and a **Viewed** box.
+  - Marking a file viewed folds it and opens the next unviewed one. Marks last until the IDE closes or the PR's head moves.
+  - With more than 8 files nothing starts open and going to a file closes the others. Deleted, binary, generated (lockfiles, snapshots, minified) and very large files start collapsed in any PR.
+  - `j` / `k` go to the next / previous file, `v` toggles viewed on the current one.
+
+### Issue tab
+
+`issue://<number>` (`IssueView.svelte`), opened from the inbox, shows an issue of the active folder's repository ([ADR 0117](decisions/0117-issue-tab.md)): title, state, labels, author, assignees, description and comments in GitHub's markdown. Read-only, with refresh and "Open on GitHub". Not restored at launch.
 
 ### Editor context menu
 

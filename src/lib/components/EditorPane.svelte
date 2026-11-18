@@ -9,6 +9,7 @@
 	import MarkdownView from './MarkdownView.svelte';
 	import ReviewView from './ReviewView.svelte';
 	import CommitView from './CommitView.svelte';
+	import IssueView from './IssueView.svelte';
 	import PrView from './PrView.svelte';
 	import BrowserView from './BrowserView.svelte';
 	import InboxView from './InboxView.svelte';
@@ -18,6 +19,7 @@
 	import { isReviewPath } from '../util/reviewPath';
 	import { isInboxPath } from '../util/inboxPath';
 	import { isCommitPath } from '../util/commitPath';
+	import { isIssuePath } from '../util/issuePath';
 	import { isPrPath } from '../util/prPath';
 	import { isBrowserPath } from '../util/browserPath';
 	import { frontendLog } from '../logs.svelte';
@@ -87,6 +89,9 @@
 		}
 		if (isPrPath(file.path)) {
 			return { path, file, kind: 'pr' as const };
+		}
+		if (isIssuePath(file.path)) {
+			return { path, file, kind: 'issue' as const };
 		}
 		// Review view: synthetic `review://…` buffer. Wins over
 		// everything else for that path.
@@ -254,6 +259,10 @@
 			{:else if view.file && view.kind === 'pr'}
 				{#key view.file.path}
 					<PrView {side} />
+				{/key}
+			{:else if view.file && view.kind === 'issue'}
+				{#key view.file.path}
+					<IssueView {side} />
 				{/key}
 			{:else if view.file && view.kind === 'review'}
 				{#key view.file.path}

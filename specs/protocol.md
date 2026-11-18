@@ -39,7 +39,12 @@ STATUS: partial — Phase 0 ships fs operations via Tauri commands. Streams (`fs
 
 - `pr_current() -> PullRequestDetail | null` — the open GitHub PR for the active folder's branch: description (minus moonbot's notes block), state, review decision, checks, the parsed notes and the review threads. `null` when there is no PR, the remote isn't GitHub, or `gh` can't answer.
 
-- `pr_open({ number }) -> PrOpened` — pull request `number` of the active folder's repository, without a checkout ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)): fetches its head into `refs/moon/pr/<number>` and returns the detail, the merge base with the base branch, and the files changed between the two. Both revisions can then be read with `fs_git_ref_content`. Errors when the fetch fails or `gh` cannot describe the PR.
+- A pull request tab reads in three calls, so the description is on screen before the slow part ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)):
+  - `pr_detail({ number }) -> PullRequestDetail` — pull request `number` of the active folder's repository, with `threads` empty. One `gh` call.
+  - `pr_threads({ url }) -> PrThread[]` — the review threads of the pull request at `url`.
+  - `pr_diff({ number, baseRef, headSha }) -> PrDiff` — fetches the head into `refs/moon/pr/<number>` and returns the merge base with the base branch and the files changed between the two, each with its added / removed line counts (`null` for a binary file). Both revisions can then be read with `fs_git_ref_content`. Errors when the fetch fails.
+- `PullRequestDetail.conversation` — top-level comments and review summaries, oldest first. Comments GitHub hides are left out, as are reviews that carry nothing but inline threads.
+- `issue_open({ number }) -> IssueDetail` — issue `number` of the active folder's repository: title, state, author, labels, assignees, body and comments ([ADR 0117](decisions/0117-issue-tab.md)).
 - `fs_publish_pr_review`'s request takes an optional `prNumber`: the review goes to that PR instead of the current branch's.
 
 Shapes: [`crates/moon-protocol/src/review.rs`](../crates/moon-protocol/src/review.rs).
@@ -48,6 +53,8 @@ Shapes: [`crates/moon-protocol/src/review.rs`](../crates/moon-protocol/src/revie
 
 - `inbox_fetch({ watchedAuthors }) -> InboxSnapshot` — one poll of GitHub through the host's `gh`, limited to the bound folders' GitHub repositories (echoed in `repos`; empty means nothing was asked). Never errors for GitHub's sake: `status` reports a missing or logged-out `gh`, and `failures` lists the sources whose rows are absent from this snapshot.
 - `inbox_mark_read({ threadId })` — marks a notification thread read.
+- `inbox_digests({ subjects: [{ repo, number }] }) -> InboxPrDigest[]` — per pull request: count of moonbot's minor notes, open and resolved review threads, the first changed paths and the start of the description ([ADR 0119](decisions/0119-inbox-signals-and-groups.md)). Apart from `inbox_fetch` so a poll stays cheap; one that can't be read is missing from the answer.
+- `inbox_group({ request: { items, existing } }) -> InboxGrouping` — one model call sorting `items` into named groups, reusing `existing` ones by name. An item the model leaves out has no assignment. Errors when the coder isn't signed in or the answer can't be read.
 - `inbox_open_pr({ folderPath, branch }) -> { workspace, folderPath }` — makes `branch` available for review without moving the project's checkout: returns the bound worktree already on it, the project itself when it is on it, or a new worktree under `<project>/.worktrees/`. `folderPath` must be a project folder, not a worktree.
 
 Shapes: [`crates/moon-protocol/src/inbox.rs`](../crates/moon-protocol/src/inbox.rs).

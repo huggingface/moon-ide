@@ -2053,6 +2053,33 @@ impl CoderHandle {
 		Ok(cleaned)
 	}
 
+	/// Sort the inbox's pull requests into groups to review together
+	/// (ADR 0119). One call to the standard model: which pull requests
+	/// belong together is a judgement call, and a wrong group is worse
+	/// than none. Nothing is asked when there is nothing to place.
+	pub async fn group_pull_requests(
+		&self,
+		request: &moon_protocol::inbox::InboxGroupRequest,
+	) -> Result<moon_protocol::inbox::InboxGrouping, CoderError> {
+		if request.items.is_empty() {
+			return Ok(Default::default());
+		}
+		let messages = vec![
+			ChatMessage::System {
+				content: crate::pr_groups::SYSTEM_PROMPT.to_string(),
+			},
+			ChatMessage::user(crate::pr_groups::build_prompt(request)),
+		];
+		let model = self.state.models.read().await.standard().to_owned();
+		let cancel = CancellationToken::new();
+		let response = self
+			.state
+			.inference
+			.chat_completion(&model, &messages, &[], &cancel)
+			.await?;
+		crate::pr_groups::parse_response(&response.content.unwrap_or_default(), request).map_err(CoderError::Internal)
+	}
+
 	/// Suggest a commit message from the working-tree diff. Same
 	/// shape as [`Self::suggest_branch_name`] — fast model,
 	/// tightly-scoped system prompt, output run through

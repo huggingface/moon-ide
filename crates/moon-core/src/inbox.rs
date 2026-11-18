@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use moon_protocol::inbox::{
-	InboxCi, InboxFailure, InboxItem, InboxItemKind, InboxItemState, InboxNotification, InboxRepo, InboxReview,
-	InboxSnapshot, InboxSource, InboxStatus,
+	InboxCi, InboxFailure, InboxItem, InboxItemKind, InboxItemState, InboxNotification, InboxPrDigest, InboxPrRef,
+	InboxRepo, InboxReview, InboxSnapshot, InboxSource, InboxStatus,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -471,10 +471,10 @@ fn is_bound(repos: &[InboxRepo], full_name: &str) -> bool {
 	repos.iter().any(|repo| repo.repo.eq_ignore_ascii_case(full_name))
 }
 
-/// Query resolving `(repo, number)` pairs to pull requests, aliased
-/// `n0`, `n1`, … in input order. Pairs whose repo isn't a plain
-/// `owner/name` are left out (their alias is simply absent).
-fn hydrate_query(subjects: &[(String, u32)]) -> String {
+/// Query reading `fields` of the pull requests at `(repo, number)`,
+/// aliased `n0`, `n1`, … in input order. Pairs whose repo isn't a
+/// plain `owner/name` are left out (their alias is simply absent).
+fn subjects_query(subjects: &[(String, u32)], fields: &str) -> String {
 	let fields: Vec<String> = subjects
 		.iter()
 		.enumerate()
@@ -482,7 +482,7 @@ fn hydrate_query(subjects: &[(String, u32)]) -> String {
 		.filter_map(|(index, (repo, number))| {
 			let (owner, name) = repo.split_once('/')?;
 			Some(format!(
-				"n{index}: repository(owner: \"{owner}\", name: \"{name}\") {{ pullRequest(number: {number}) {{ {PR_FIELDS} }} }}"
+				"n{index}: repository(owner: \"{owner}\", name: \"{name}\") {{ pullRequest(number: {number}) {{ {fields} }} }}"
 			))
 		})
 		.collect();
@@ -495,7 +495,7 @@ fn hydrate_query(subjects: &[(String, u32)]) -> String {
 async fn hydrate_prs(subjects: &[(String, u32)]) -> HashMap<String, InboxItem> {
 	let mut hydrated = HashMap::new();
 	for chunk in subjects.chunks(HYDRATE_CHUNK) {
-		let mut data = match gh_graphql(&hydrate_query(chunk), &[]).await {
+		let mut data = match gh_graphql(&subjects_query(chunk, PR_FIELDS), &[]).await {
 			Ok(data) => data,
 			Err(err) => {
 				tracing::debug!(error = %err.detail(), "inbox: hydrating notification subjects failed");
@@ -510,6 +510,98 @@ async fn hydrate_prs(subjects: &[(String, u32)]) -> HashMap<String, InboxItem> {
 		}
 	}
 	hydrated
+}
+
+const DIGEST_FIELDS: &str =
+	"body reviewThreads(first: 100) { nodes { isResolved } } files(first: 30) { nodes { path } }";
+
+/// How much of a description [`InboxPrDigest::summary`] keeps.
+const SUMMARY_CHARS: usize = 400;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDigest {
+	#[serde(default)]
+	body: String,
+	review_threads: RawNodes<RawDigestThread>,
+	files: Option<RawNodes<RawDigestFile>>,
+}
+
+#[derive(Deserialize)]
+struct RawNodes<T> {
+	nodes: Vec<T>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDigestThread {
+	is_resolved: bool,
+}
+
+#[derive(Deserialize)]
+struct RawDigestFile {
+	path: String,
+}
+
+/// A description as one line of plain-ish text: HTML comments (bot
+/// markers, templates) dropped, whitespace collapsed, cut short.
+fn summarise(prose: &str) -> String {
+	let mut text = String::new();
+	let mut rest = prose;
+	while let Some(start) = rest.find("<!--") {
+		text.push_str(&rest[..start]);
+		rest = rest[start..].find("-->").map_or("", |end| &rest[start + end + 3..]);
+	}
+	text.push_str(rest);
+	let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+	match collapsed.char_indices().nth(SUMMARY_CHARS) {
+		Some((cut, _)) => format!("{}…", &collapsed[..cut]),
+		None => collapsed,
+	}
+}
+
+fn digest_from_node(id: String, node: Value) -> Option<InboxPrDigest> {
+	let raw: RawDigest = serde_json::from_value(node).ok()?;
+	let (prose, notes, _) = crate::pull_request::split_minor_notes(&raw.body);
+	let open = raw
+		.review_threads
+		.nodes
+		.iter()
+		.filter(|thread| !thread.is_resolved)
+		.count();
+	Some(InboxPrDigest {
+		id,
+		minor_notes: notes.len() as u32,
+		open_threads: open as u32,
+		resolved_threads: (raw.review_threads.nodes.len() - open) as u32,
+		paths: raw
+			.files
+			.map(|files| files.nodes.into_iter().map(|file| file.path).collect())
+			.unwrap_or_default(),
+		summary: summarise(&prose),
+	})
+}
+
+/// Notes, review threads, changed paths and the start of the
+/// description for each of `subjects`. Best-effort: a pull request
+/// that can't be read is missing from the answer.
+pub async fn digests(subjects: &[InboxPrRef]) -> Vec<InboxPrDigest> {
+	let pairs: Vec<(String, u32)> = subjects.iter().map(|s| (s.repo.clone(), s.number)).collect();
+	let mut out = Vec::new();
+	for chunk in pairs.chunks(HYDRATE_CHUNK) {
+		let mut data = match gh_graphql(&subjects_query(chunk, DIGEST_FIELDS), &[]).await {
+			Ok(data) => data,
+			Err(err) => {
+				tracing::debug!(error = %err.detail(), "inbox: reading pull request digests failed");
+				continue;
+			}
+		};
+		for (index, (repo, number)) in chunk.iter().enumerate() {
+			let node = data.pointer_mut(&format!("/n{index}/pullRequest")).map(Value::take);
+			out.extend(node.and_then(|node| digest_from_node(pr_item_id(repo, *number), node)));
+		}
+	}
+	out
 }
 
 /// Fold search results and unread threads into one list, newest first.
@@ -821,15 +913,59 @@ mod tests {
 	}
 
 	#[test]
-	fn hydrate_query_aliases_by_position_and_skips_odd_repos() {
-		let query = hydrate_query(&[
-			("acme/app".to_owned(), 42),
-			("bad\"repo/x".to_owned(), 1),
-			("acme/lib".to_owned(), 7),
-		]);
-		assert!(query.contains("n0: repository(owner: \"acme\", name: \"app\") { pullRequest(number: 42)"));
+	fn subjects_query_aliases_by_position_and_skips_odd_repos() {
+		let query = subjects_query(
+			&[
+				("acme/app".to_owned(), 42),
+				("bad\"repo/x".to_owned(), 1),
+				("acme/lib".to_owned(), 7),
+			],
+			"title",
+		);
+		assert!(query.contains("n0: repository(owner: \"acme\", name: \"app\") { pullRequest(number: 42) { title } }"));
 		assert!(!query.contains("n1:"));
 		assert!(query.contains("n2: repository(owner: \"acme\", name: \"lib\") { pullRequest(number: 7)"));
+	}
+
+	#[test]
+	fn digest_counts_notes_and_threads_and_trims_the_description() {
+		let body = format!(
+			"<!-- template -->\nFixes the   cursor.\n\n{}\n\n<!-- moonbot:minor-notes:start -->\n\
+			 > **Minor notes** <sub>last reviewed `abc1234`</sub>\n>\n> - `a.rs:1` — x\n> - `b.rs` — y\n\
+			 <!-- moonbot:minor-notes:end -->\n",
+			"word ".repeat(200)
+		);
+		let digest = digest_from_node(
+			"acme/app#7".to_owned(),
+			json!({
+				"body": body,
+				"reviewThreads": { "nodes": [{ "isResolved": false }, { "isResolved": true }, { "isResolved": false }] },
+				"files": { "nodes": [{ "path": "src/a.rs" }, { "path": "src/b.rs" }] },
+			}),
+		)
+		.expect("a digest");
+		assert_eq!(
+			(digest.minor_notes, digest.open_threads, digest.resolved_threads),
+			(2, 2, 1)
+		);
+		assert_eq!(digest.paths, ["src/a.rs", "src/b.rs"]);
+		assert!(
+			digest.summary.starts_with("Fixes the cursor. word word"),
+			"{}",
+			digest.summary
+		);
+		assert!(digest.summary.ends_with('…') && digest.summary.chars().count() == SUMMARY_CHARS + 1);
+		assert!(!digest.summary.contains("template") && !digest.summary.contains("Minor notes"));
+	}
+
+	#[test]
+	fn summarise_survives_an_unclosed_comment_and_wide_characters() {
+		assert_eq!(summarise("Before <!-- never closed"), "Before");
+		assert_eq!(
+			summarise(&"é".repeat(SUMMARY_CHARS + 5)).chars().count(),
+			SUMMARY_CHARS + 1
+		);
+		assert_eq!(summarise("  "), "");
 	}
 
 	#[test]

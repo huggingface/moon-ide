@@ -4,8 +4,9 @@
 	// and the review threads as a jump list. Sits at the top of the
 	// review scroll, above the file sections.
 	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { getCachedMarkdown, renderMarkdown } from '../markdown';
+	import { githubMarkdown, openMarkdownLinks } from '../githubMarkdown';
 	import type { PrCheckState, PrThread, PullRequestDetail } from '../protocol';
+	import Conversation from './Conversation.svelte';
 	import Pill from './Pill.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
@@ -45,38 +46,11 @@
 	);
 	const openThreads = $derived(pr.threads.filter((thread) => !thread.resolved));
 	const resolvedThreads = $derived(pr.threads.length - openThreads.length);
+	// Resolved threads are history; they are listed when asked for.
+	let showResolved = $state(false);
+	const listedThreads = $derived(showResolved ? pr.threads : openThreads);
 	// The notes' line numbers are for the commit moonbot reviewed.
 	const notesStale = $derived(pr.minorNotesSha !== null && !pr.headSha.startsWith(pr.minorNotesSha));
-
-	function markdown(el: HTMLElement, source: string) {
-		const render = (text: string) => {
-			const cached = getCachedMarkdown(text, { github: true });
-			if (cached !== undefined) {
-				el.innerHTML = cached;
-				return;
-			}
-			el.textContent = text;
-			void renderMarkdown(text, { github: true }).then((html) => {
-				if (el.isConnected) {
-					el.innerHTML = html;
-				}
-			});
-		};
-		render(source);
-		return { update: render };
-	}
-
-	function openLinks(event: MouseEvent) {
-		const anchor = event.target instanceof Element ? event.target.closest('a') : null;
-		const href = anchor?.getAttribute('href') ?? '';
-		if (anchor === null) {
-			return;
-		}
-		event.preventDefault();
-		if (/^https?:\/\//.test(href)) {
-			void openUrl(href);
-		}
-	}
 
 	function firstLine(thread: PrThread): string {
 		const body = thread.comments[0]?.body ?? '';
@@ -130,7 +104,14 @@
 		<details class="block" open>
 			<summary>Description</summary>
 			<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions (delegated link clicks; the links themselves are focusable) -->
-			<div class="markdown-body body" use:markdown={pr.body} onclick={openLinks}></div>
+			<div class="markdown-body body" use:githubMarkdown={pr.body} onclick={openMarkdownLinks}></div>
+		</details>
+	{/if}
+
+	{#if pr.conversation.length > 0}
+		<details class="block" open>
+			<summary>Conversation <span class="count">{pr.conversation.length}</span></summary>
+			<Conversation comments={pr.conversation} />
 		</details>
 	{/if}
 
@@ -159,7 +140,7 @@
 							{location(note.path, note.line)}
 						</button>
 						<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions (delegated link clicks) -->
-						<div class="markdown-body note" use:markdown={note.text} onclick={openLinks}></div>
+						<div class="markdown-body note" use:githubMarkdown={note.text} onclick={openMarkdownLinks}></div>
 					</li>
 				{/each}
 			</ul>
@@ -173,7 +154,7 @@
 				{#if resolvedThreads > 0}<span class="hint">{resolvedThreads} resolved</span>{/if}
 			</summary>
 			<ul>
-				{#each openThreads as thread, index (index)}
+				{#each listedThreads as thread, index (index)}
 					<li>
 						<button
 							class="loc"
@@ -188,6 +169,7 @@
 						<span class="thread-line">
 							<strong>{thread.comments[0]?.author ?? 'someone'}</strong>
 							{firstLine(thread)}
+							{#if thread.resolved}<span class="hint">resolved</span>{/if}
 							{#if thread.outdated}<span class="hint">outdated</span>{/if}
 						</span>
 						<button
@@ -200,6 +182,12 @@
 					</li>
 				{/each}
 			</ul>
+			{#if resolvedThreads > 0}
+				<button class="toggle" onclick={() => (showResolved = !showResolved)}>
+					{showResolved ? 'Hide' : 'Show'}
+					{resolvedThreads} resolved
+				</button>
+			{/if}
 		</details>
 	{/if}
 
@@ -414,6 +402,20 @@
 		text-decoration: underline;
 	}
 
+	.toggle {
+		margin-top: var(--m-space-1);
+		padding: 2px var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-accent);
+		font: inherit;
+		font-size: var(--m-text-sm);
+		cursor: pointer;
+	}
+	.toggle:hover {
+		background: var(--m-bg-2);
+	}
 	.icon-btn {
 		display: inline-flex;
 		align-items: center;

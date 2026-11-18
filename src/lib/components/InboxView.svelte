@@ -11,6 +11,7 @@
 		CHIP_LABELS,
 		INBOX_CATEGORIES,
 		TAG_LABELS,
+		groupRows,
 		quietTags,
 		reasonLabel,
 		relativeTime,
@@ -18,12 +19,16 @@
 		snoozeLabel,
 		snoozeUntil,
 		type InboxChip,
+		type InboxRow,
+		type InboxSection,
 	} from '../inboxSections';
 	import type { InboxItem, InboxSource } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import Pill from './Pill.svelte';
 	import BellIcon from './icons/BellIcon.svelte';
 	import CheckIcon from './icons/CheckIcon.svelte';
+	import ChevronDownIcon from './icons/ChevronDownIcon.svelte';
+	import ChevronRightIcon from './icons/ChevronRightIcon.svelte';
 	import ClockIcon from './icons/ClockIcon.svelte';
 	import CloseIcon from './icons/CloseIcon.svelte';
 	import CommentIcon from './icons/CommentIcon.svelte';
@@ -50,7 +55,18 @@
 	let authorDraft = $state('');
 	let now = $state(Date.now());
 
-	const rows = $derived(inbox.list.items);
+	const listed = $derived(inbox.list.items);
+	// By group (ADR 0119) the list is the same rows under headings;
+	// flat, it is one run with none.
+	const sections = $derived<InboxSection[]>(
+		inbox.groupByTopic ? groupRows(listed, inbox.groups, inbox.groupOf) : [{ name: null, reason: '', rows: listed }],
+	);
+	// Folded groups, by name ('' is the ungrouped rest). Not kept:
+	// what is worth hiding changes with what is in the list.
+	let folded = $state<Record<string, boolean>>({});
+	const isFolded = (section: InboxSection) => inbox.groupByTopic && folded[section.name ?? ''] === true;
+	// What the keys walk: the rows on screen, in screen order.
+	const rows = $derived(sections.flatMap((section) => (isFolded(section) ? [] : section.rows)));
 	const counts = $derived(inbox.list.counts);
 	// The snoozed chip appears with the first snoozed item, and stays
 	// while it is on so it can be switched off again.
@@ -83,34 +99,27 @@
 		list.querySelector<HTMLElement>(`[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: 'nearest' });
 	});
 
-	/** Project folder whose repository `item` is a pull request of,
-	 * when the workspace has it bound. Anything else has no tab here. */
-	function projectFolder(item: InboxItem): string | null {
-		if (item.kind !== 'pull_request' || item.number === null) {
-			return null;
-		}
-		return inbox.folderFor(item.repo);
-	}
-
-	/** Open `item`. `background` (Ctrl / Cmd / middle click) adds a
-	 *  pull request's tab without leaving the inbox, so several can be
-	 *  queued up. */
+	/** Open `item` in its own tab: a pull request or an issue of a
+	 *  bound repository. Anything else opens on GitHub. `background`
+	 *  (Ctrl / Cmd / middle click) adds the tab without leaving the
+	 *  inbox, so several can be queued up. */
 	async function open(item: InboxItem, background = false) {
 		if (openingId !== null) {
 			return;
 		}
-		const project = projectFolder(item);
-		if (project === null || item.number === null) {
+		const project = inbox.folderFor(item.repo);
+		const kind = item.kind === 'pull_request' ? 'pr' : item.kind === 'issue' ? 'issue' : null;
+		if (project === null || item.number === null || kind === null) {
 			openOnGitHub(item);
 			return;
 		}
-		// The tab reads the pull request from its folder's repository,
-		// so any checkout of the project will do; only another project
-		// means another folder.
+		// The tab reads from its folder's repository, so any checkout
+		// of the project will do; only another project means another
+		// folder.
 		const here = workspace.activeProjectPath === project;
 		if (background) {
 			const folder = here ? workspace.activeFolderPath : project;
-			if (folder !== null && workspace.openPrTabInBackground(folder, item.number, item.title)) {
+			if (folder !== null && workspace.openGithubTabInBackground(folder, kind, item.number, item.title)) {
 				if (!here) {
 					workspace.flash(`Opened #${item.number} in ${shortRepo(item.repo)}`);
 				}
@@ -127,7 +136,12 @@
 				return;
 			}
 			// This pane's side means nothing in another folder's layout.
-			workspace.openPrTab(item.number, item.title, here ? side : undefined);
+			const target = here ? side : undefined;
+			if (kind === 'pr') {
+				workspace.openPrTab(item.number, item.title, target);
+			} else {
+				workspace.openIssueTab(item.number, item.title, target);
+			}
 			void inbox.markRead(item);
 		} finally {
 			openingId = null;
@@ -224,6 +238,9 @@
 			case 'r':
 				void inbox.refresh();
 				break;
+			case 'g':
+				inbox.setGroupByTopic(!inbox.groupByTopic);
+				break;
 			case '/':
 				filterInput?.focus();
 				filterInput?.select();
@@ -291,6 +308,120 @@
 		}
 	}
 </script>
+
+{#snippet rowView(row: InboxRow)}
+	{@const item = row.item}
+	{@const digest = inbox.digests[item.id]?.digest}
+	<!-- svelte-ignore a11y_click_events_have_key_events (keys are handled on the listbox) -->
+	<div
+		class="row"
+		class:selected={item.id === selectedKey}
+		class:unread={item.notification !== null}
+		data-key={item.id}
+		role="option"
+		tabindex="-1"
+		aria-selected={item.id === selectedKey}
+		onclick={(event) => onRowClick(event, item)}
+		onauxclick={(event) => {
+			if (event.button === 1) {
+				onRowClick(event, item);
+			}
+		}}
+	>
+		<span class="unread-dot" title={item.notification !== null ? 'Unread' : undefined}></span>
+		<span class="state {item.kind === 'pull_request' ? (item.state ?? 'open') : 'plain'}" title={stateTitle(item)}>
+			{#if item.kind === 'pull_request'}
+				<PullRequestIcon size={14} />
+			{:else if item.kind === 'issue'}
+				<IssueIcon size={14} />
+			{:else}
+				<BellIcon size={14} />
+			{/if}
+		</span>
+		<span class="title">{item.title}</span>
+		{#if item.number !== null}
+			<span class="number">#{item.number}</span>
+		{/if}
+		<span class="meta" title={item.repo}>
+			{shortRepo(item.repo)}{#if item.author !== null}<span class="sep">·</span>{item.author}{/if}
+		</span>
+		<span class="tags">
+			{#if row.snoozed}
+				<Pill>until {snoozeLabel(inbox.snoozedUntil(item.id) ?? '', new Date(now))}</Pill>
+			{/if}
+			{#if item.notification !== null}
+				<Pill tone="accent">{reasonLabel(item.notification.reason)}</Pill>
+			{/if}
+			{#each quietTags(row) as tag (tag)}
+				<Pill title={CHIP_LABELS[tag]}>{TAG_LABELS[tag]}</Pill>
+			{/each}
+			{#if digest !== undefined && digest.openThreads > 0}
+				<Pill tone="warning" title="Review threads nobody has resolved">
+					{digest.openThreads} open thread{digest.openThreads === 1 ? '' : 's'}
+				</Pill>
+			{/if}
+			{#if digest !== undefined && digest.minorNotes > 0}
+				<Pill title="Moonbot's minor notes in the description">
+					{digest.minorNotes} note{digest.minorNotes === 1 ? '' : 's'}
+				</Pill>
+			{/if}
+		</span>
+		<span class="spacer"></span>
+		{#if openingId === item.id}
+			<span class="opening">Opening…</span>
+		{:else}
+			<span class="actions">
+				<button class="icon-btn" title="Open on GitHub (o)" onclick={() => openOnGitHub(item)}>
+					<ExternalLinkIcon size={14} />
+				</button>
+				{#if item.notification !== null}
+					<button class="icon-btn" title="Mark read (e)" onclick={() => void inbox.markRead(item)}>
+						<CheckIcon size={14} />
+					</button>
+				{/if}
+				<button
+					class="icon-btn"
+					title={row.snoozed ? 'Wake (s)' : 'Snooze until tomorrow (s); next week is w'}
+					onclick={() => toggleSnooze(item, 'tomorrow')}
+				>
+					<ClockIcon size={14} />
+				</button>
+			</span>
+		{/if}
+		<!-- The trailing columns keep their width when empty so
+			 they line up down the list. -->
+		<span class="diffstat">
+			{#if item.additions !== null && item.deletions !== null}
+				<span class="add">+{item.additions}</span>
+				<span class="del">−{item.deletions}</span>
+			{/if}
+		</span>
+		<span class="comments" title={item.commentCount ? `${item.commentCount} comments` : undefined}>
+			{#if item.commentCount}
+				<CommentIcon size={12} />{item.commentCount}
+			{/if}
+		</span>
+		<span class="review {item.review ?? 'none'}">
+			{#if item.review === 'approved'}
+				<span title="Approved"><CheckIcon size={13} /></span>
+			{:else if item.review === 'changes_requested'}
+				<span title="Changes requested"><CloseIcon size={13} /></span>
+			{/if}
+		</span>
+		<span
+			class="ci {item.ci ?? 'none'}"
+			title={item.ci === null
+				? undefined
+				: `Checks: ${item.ci === 'success' ? 'passing' : item.ci === 'failure' ? 'failing' : 'running'}`}
+		></span>
+		{#if item.authorAvatarUrl !== null}
+			<img class="avatar" src={avatar(item.authorAvatarUrl)} alt="" title={item.author ?? undefined} />
+		{:else}
+			<span class="avatar"></span>
+		{/if}
+		<span class="time">{relativeTime(item.notification?.updatedAt ?? item.updatedAt, now)}</span>
+	</div>
+{/snippet}
 
 <div class="inbox">
 	<header class="head">
@@ -386,112 +517,63 @@
 					Clear
 				</button>
 			{/if}
+			<span class="spacer"></span>
+			{#if inbox.grouping}
+				<span class="grouping">Grouping…</span>
+			{:else if inbox.groupByTopic}
+				<button
+					class="chip-clear"
+					title="Throw the groups away and sort every pull request again"
+					onmousedown={(event) => event.preventDefault()}
+					onclick={() => inbox.regroup()}
+				>
+					Regroup
+				</button>
+			{/if}
+			<button
+				class="chip plain"
+				class:active={inbox.groupByTopic}
+				aria-pressed={inbox.groupByTopic}
+				title="Sort the open pull requests into groups to review together (g)"
+				onmousedown={(event) => event.preventDefault()}
+				onclick={() => inbox.setGroupByTopic(!inbox.groupByTopic)}
+			>
+				Group by topic
+			</button>
 		</div>
 	{/if}
 
+	{#if inbox.groupByTopic && inbox.groupError !== null}
+		<p class="notice">
+			Could not group the pull requests: {inbox.groupError}
+			<button class="chip-clear" onclick={() => inbox.retryGrouping()}>Try again</button>
+		</p>
+	{/if}
+
 	<div class="scroll" bind:this={list} tabindex="0" role="listbox" aria-label="GitHub inbox" onkeydown={onKeydown}>
-		{#each rows as row (row.item.id)}
-			{@const item = row.item}
-			<!-- svelte-ignore a11y_click_events_have_key_events (keys are handled on the listbox) -->
-			<div
-				class="row"
-				class:selected={item.id === selectedKey}
-				class:unread={item.notification !== null}
-				data-key={item.id}
-				role="option"
-				tabindex="-1"
-				aria-selected={item.id === selectedKey}
-				onclick={(event) => onRowClick(event, item)}
-				onauxclick={(event) => {
-					if (event.button === 1) {
-						onRowClick(event, item);
-					}
-				}}
-			>
-				<span class="unread-dot" title={item.notification !== null ? 'Unread' : undefined}></span>
-				<span class="state {item.kind === 'pull_request' ? (item.state ?? 'open') : 'plain'}" title={stateTitle(item)}>
-					{#if item.kind === 'pull_request'}
-						<PullRequestIcon size={14} />
-					{:else if item.kind === 'issue'}
-						<IssueIcon size={14} />
-					{:else}
-						<BellIcon size={14} />
-					{/if}
-				</span>
-				<span class="title">{item.title}</span>
-				{#if item.number !== null}
-					<span class="number">#{item.number}</span>
-				{/if}
-				<span class="meta" title={item.repo}>
-					{shortRepo(item.repo)}{#if item.author !== null}<span class="sep">·</span>{item.author}{/if}
-				</span>
-				<span class="tags">
-					{#if row.snoozed}
-						<Pill>until {snoozeLabel(inbox.snoozedUntil(item.id) ?? '', new Date(now))}</Pill>
-					{/if}
-					{#if item.notification !== null}
-						<Pill tone="accent">{reasonLabel(item.notification.reason)}</Pill>
-					{/if}
-					{#each quietTags(row) as tag (tag)}
-						<Pill title={CHIP_LABELS[tag]}>{TAG_LABELS[tag]}</Pill>
-					{/each}
-				</span>
-				<span class="spacer"></span>
-				{#if openingId === item.id}
-					<span class="opening">Opening…</span>
-				{:else}
-					<span class="actions">
-						<button class="icon-btn" title="Open on GitHub (o)" onclick={() => openOnGitHub(item)}>
-							<ExternalLinkIcon size={14} />
-						</button>
-						{#if item.notification !== null}
-							<button class="icon-btn" title="Mark read (e)" onclick={() => void inbox.markRead(item)}>
-								<CheckIcon size={14} />
-							</button>
-						{/if}
-						<button
-							class="icon-btn"
-							title={row.snoozed ? 'Wake (s)' : 'Snooze until tomorrow (s); next week is w'}
-							onclick={() => toggleSnooze(item, 'tomorrow')}
-						>
-							<ClockIcon size={14} />
-						</button>
-					</span>
-				{/if}
-				<!-- The trailing columns keep their width when empty so
-					 they line up down the list. -->
-				<span class="diffstat">
-					{#if item.additions !== null && item.deletions !== null}
-						<span class="add">+{item.additions}</span>
-						<span class="del">−{item.deletions}</span>
-					{/if}
-				</span>
-				<span class="comments" title={item.commentCount ? `${item.commentCount} comments` : undefined}>
-					{#if item.commentCount}
-						<CommentIcon size={12} />{item.commentCount}
-					{/if}
-				</span>
-				<span class="review {item.review ?? 'none'}">
-					{#if item.review === 'approved'}
-						<span title="Approved"><CheckIcon size={13} /></span>
-					{:else if item.review === 'changes_requested'}
-						<span title="Changes requested"><CloseIcon size={13} /></span>
-					{/if}
-				</span>
-				<span
-					class="ci {item.ci ?? 'none'}"
-					title={item.ci === null
-						? undefined
-						: `Checks: ${item.ci === 'success' ? 'passing' : item.ci === 'failure' ? 'failing' : 'running'}`}
-				></span>
-				{#if item.authorAvatarUrl !== null}
-					<img class="avatar" src={avatar(item.authorAvatarUrl)} alt="" title={item.author ?? undefined} />
-				{:else}
-					<span class="avatar"></span>
-				{/if}
-				<span class="time">{relativeTime(item.notification?.updatedAt ?? item.updatedAt, now)}</span>
-			</div>
-		{:else}
+		{#each sections as section (section.name ?? '')}
+			{#if inbox.groupByTopic}
+				<!-- A click must not take focus from the list: the keys keep working. -->
+				<button
+					class="group"
+					aria-expanded={!isFolded(section)}
+					title={isFolded(section) ? 'Show these' : 'Hide these'}
+					onmousedown={(event) => event.preventDefault()}
+					onclick={() => (folded[section.name ?? ''] = !isFolded(section))}
+				>
+					{#if isFolded(section)}<ChevronRightIcon size={14} />{:else}<ChevronDownIcon size={14} />{/if}
+					<span class="group-name" class:rest={section.name === null}>{section.name ?? 'Not grouped'}</span>
+					<span class="count">{section.rows.length}</span>
+					<span class="group-reason">{section.reason}</span>
+				</button>
+			{/if}
+			{#if !isFolded(section)}
+				{#each section.rows as row (row.item.id)}
+					{@render rowView(row)}
+				{/each}
+			{/if}
+		{/each}
+		{#if listed.length === 0}
 			{#if inbox.snapshot === null}
 				<p class="empty">{inbox.loading ? 'Loading…' : ''}</p>
 			{:else if status === 'ok' && inbox.snapshot.repos.length === 0}
@@ -503,7 +585,7 @@
 			{:else if status === 'ok'}
 				<p class="empty">Nothing is waiting on you.</p>
 			{/if}
-		{/each}
+		{/if}
 	</div>
 
 	<footer class="hints">
@@ -514,6 +596,7 @@
 		<span><kbd>s</kbd><kbd>w</kbd> snooze a day / a week</span>
 		<span><kbd>r</kbd> refresh</span>
 		<span><kbd>/</kbd> filter</span>
+		<span><kbd>g</kbd> group by topic</span>
 		<span><kbd>1</kbd>–<kbd>5</kbd> toggle a chip, <kbd>0</kbd> clears</span>
 	</footer>
 </div>
@@ -690,6 +773,54 @@
 	.chip.active .count {
 		background: color-mix(in srgb, var(--m-accent) 22%, transparent);
 		color: var(--m-fg);
+	}
+	.chip.plain {
+		padding: 0 var(--m-space-2);
+	}
+	.chips .spacer {
+		flex: 1;
+	}
+	.grouping {
+		color: var(--m-fg-subtle);
+		font-size: var(--m-text-sm);
+	}
+	.group {
+		display: flex;
+		align-items: center;
+		gap: var(--m-space-2);
+		width: 100%;
+		height: 30px;
+		padding: 0 var(--m-space-4);
+		border: none;
+		border-bottom: 1px solid var(--m-border);
+		background: var(--m-bg-1);
+		color: var(--m-fg-muted);
+		font: inherit;
+		font-size: var(--m-text-sm);
+		text-align: left;
+		cursor: pointer;
+		position: sticky;
+		top: 0;
+		z-index: 1;
+	}
+	.group:hover {
+		color: var(--m-fg);
+	}
+	.group-name {
+		flex-shrink: 0;
+		color: var(--m-fg);
+		font-weight: 600;
+	}
+	.group-name.rest {
+		color: var(--m-fg-muted);
+		font-weight: 400;
+	}
+	.group-reason {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--m-fg-subtle);
 	}
 	.chip-clear {
 		padding: 2px var(--m-space-2);

@@ -402,6 +402,14 @@ logs a warning; a SIGKILLed IDE leaves containers running and the
 next launch skips the `up` for anything already `Running`; a failed
 auto-resume logs and surfaces in the popover.
 
+The resume decision reads container state past the status cache
+([ADR 0020](decisions/0020-container-status-cache.md)). On a quick
+relaunch it runs within moments of the previous instance stopping the
+shell, and a probe the new process took just before that is still
+inside its TTL: trusting it reads `Running`, skips the resume and
+leaves the shell down. The docker-events watcher reads fresh for the
+same reason.
+
 The launch-time bottom-panel auto-spawn checks the container
 status after the startup `container.refresh()` settles; if the
 shell isn't up yet (the backend is still `docker compose up`-ing

@@ -58,7 +58,12 @@ import type {
 	WorkerLinkState,
 	PromptResponse,
 	InboxOpenedPr,
+	InboxGroupRequest,
+	InboxGrouping,
+	InboxPrDigest,
+	InboxPrRef,
 	InboxSnapshot,
+	IssueDetail,
 	LogEntry,
 	LogLevel,
 	LspCodeAction,
@@ -77,7 +82,8 @@ import type {
 	ForwardedPort,
 	ForwardedPortStatus,
 	PortsApplyResult,
-	PrOpened,
+	PrDiff,
+	PrThread,
 	PublishReviewRequest,
 	PullRequestDetail,
 	PublishReviewResult,
@@ -226,11 +232,20 @@ export const ipc = {
 	},
 	pullRequest: {
 		current: () => call<PullRequestDetail | null>('pr_current'),
-		open: (number: number) => call<PrOpened>('pr_open', { number }),
+		/** Description, checks and conversation: one fast call. */
+		detail: (number: number) => call<PullRequestDetail>('pr_detail', { number }),
+		threads: (url: string) => call<PrThread[]>('pr_threads', { url }),
+		diff: (number: number, baseRef: string, headSha: string) => call<PrDiff>('pr_diff', { number, baseRef, headSha }),
+	},
+	issue: {
+		open: (number: number) => call<IssueDetail>('issue_open', { number }),
 	},
 	inbox: {
 		fetch: (watchedAuthors: string[]) => call<InboxSnapshot>('inbox_fetch', { watchedAuthors }),
 		markRead: (threadId: string) => call<void>('inbox_mark_read', { threadId }),
+		digests: (subjects: InboxPrRef[]) => call<InboxPrDigest[]>('inbox_digests', { subjects }),
+		/** One model call; fails when the coder isn't signed in. */
+		group: (request: InboxGroupRequest) => call<InboxGrouping>('inbox_group', { request }),
 		openPr: (folderPath: string, branch: string) => call<InboxOpenedPr>('inbox_open_pr', { folderPath, branch }),
 	},
 	search: {

@@ -20,6 +20,7 @@ mod commands;
 mod events;
 mod file_protocol;
 mod focus_socket;
+mod logging;
 mod remote_bridge;
 mod remote_workspace;
 mod state;
@@ -62,19 +63,23 @@ pub fn run() {
 	// reqwest is unaffected either way (it picks its own provider).
 	let _ = rustls::crypto::ring::default_provider().install_default();
 
-	tracing_subscriber::fmt()
-		.with_env_filter(
-			tracing_subscriber::EnvFilter::try_from_default_env()
-				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,moon=debug")),
-		)
-		.init();
+	let cli_workspace = parse_workspace_arg();
+	let workspaces_dir = resolve_workspaces_dir();
+	logging::init(
+		workspaces_dir
+			.as_ref()
+			.ok()
+			.and_then(|dir| dir.parent())
+			.map(|data| data.join("logs"))
+			.as_deref(),
+		cli_workspace.as_deref().unwrap_or("launcher"),
+	);
 
 	// Resolve mode + (optional) listener before touching Tauri.
 	// The launcher / focus-relay paths return `None` here and the
 	// process exits with no window ever appearing.
-	let cli_workspace = parse_workspace_arg();
 	let config_dir = resolve_config_dir().expect("could not resolve app config dir");
-	let workspaces_dir = resolve_workspaces_dir().expect("could not resolve workspaces dir");
+	let workspaces_dir = workspaces_dir.expect("could not resolve workspaces dir");
 	let Some(boot) = bootstrap(&cli_workspace, &config_dir, &workspaces_dir) else {
 		return;
 	};

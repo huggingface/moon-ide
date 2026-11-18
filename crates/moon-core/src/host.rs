@@ -13,7 +13,7 @@ use moon_protocol::git::{
 	GitBaseCheckFile, GitBranchInfo, GitCommitResult, GitFileBlame, GitFileStatus, GitLineBlame, GitMergeState,
 	GitPermalink, GitStatusEntry, GitWorktree, PrListScope, PrListStatus,
 };
-use moon_protocol::review::{PublishReviewRequest, PublishReviewResult, ReviewEvent, ReviewSide};
+use moon_protocol::review::{PrDiffFile, PublishReviewRequest, PublishReviewResult, ReviewEvent, ReviewSide};
 use moon_protocol::{MoonError, MoonResult};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -34,7 +34,7 @@ pub struct PullRequestDiff {
 	/// Full SHA the PR head branched from its base at.
 	pub merge_base: String,
 	/// Files changed from `merge_base` to the PR head.
-	pub files: Vec<GitStatusEntry>,
+	pub files: Vec<PrDiffFile>,
 }
 
 /// What branch a freshly-created worktree should be on (ADR 0028).
@@ -2407,7 +2407,19 @@ impl WorkspaceHost for LocalHost {
 		let head = head_sha.to_owned();
 		tokio::task::spawn_blocking(move || {
 			let merge_base = run_git_merge_base(&root, &base, &head)?;
-			let files = run_git_diff_entries(&root, &merge_base, &head)?;
+			let mut sizes = run_git_diff_numstat(&root, &merge_base, &head)?;
+			let files = run_git_diff_entries(&root, &merge_base, &head)?
+				.into_iter()
+				.map(|entry| {
+					let (additions, deletions) = sizes.remove(&entry.path).flatten().unzip();
+					PrDiffFile {
+						path: entry.path,
+						status: entry.status,
+						additions,
+						deletions,
+					}
+				})
+				.collect();
 			Ok(PullRequestDiff { merge_base, files })
 		})
 		.await
@@ -4473,6 +4485,48 @@ fn run_git_diff_entries(root: &Utf8Path, base: &str, head: &str) -> MoonResult<V
 		)));
 	}
 	Ok(parse_diff_name_status_z(&diff.stdout))
+}
+
+/// Lines added and removed per path from `base` to `head`; `None` for
+/// a binary file. Same revision range and rename handling as
+/// [`run_git_diff_entries`], so the paths line up.
+fn run_git_diff_numstat(
+	root: &Utf8Path,
+	base: &str,
+	head: &str,
+) -> MoonResult<std::collections::HashMap<String, Option<(u32, u32)>>> {
+	let diff = std::process::Command::new("git")
+		.arg("-C")
+		.arg(root.as_std_path())
+		.arg(NO_OPTIONAL_LOCKS)
+		.args(["diff", "--numstat", "-z", "--no-renames", &format!("{base}..{head}")])
+		.env("LC_ALL", "C")
+		.output()
+		.map_err(|e| MoonError::IoError(format!("git diff failed to launch: {e}")))?;
+	if !diff.status.success() {
+		return Err(MoonError::IoError(format!(
+			"git diff: {}",
+			String::from_utf8_lossy(&diff.stderr).trim()
+		)));
+	}
+	Ok(parse_diff_numstat_z(&diff.stdout))
+}
+
+/// `git diff --numstat -z --no-renames`: `<added>\t<removed>\t<path>\0`
+/// records, with `-` for both counts of a binary file.
+fn parse_diff_numstat_z(buf: &[u8]) -> std::collections::HashMap<String, Option<(u32, u32)>> {
+	let mut out = std::collections::HashMap::new();
+	for record in buf.split(|&b| b == 0) {
+		let Ok(record) = std::str::from_utf8(record) else {
+			continue;
+		};
+		let mut fields = record.splitn(3, '\t');
+		let (Some(added), Some(removed), Some(path)) = (fields.next(), fields.next(), fields.next()) else {
+			continue;
+		};
+		out.insert(path.to_owned(), added.parse().ok().zip(removed.parse().ok()));
+	}
+	out
 }
 
 /// `git merge-base <a> <b>` as a full SHA. Unrelated histories and
@@ -10549,6 +10603,15 @@ mod tests {
 		assert!(!is_full_sha("HEAD"));
 		assert!(!is_full_sha("0123456"));
 		assert!(!is_full_sha("--upload-pack=evil"));
+	}
+
+	#[test]
+	fn parse_diff_numstat_z_reads_counts_and_binary_files() {
+		let sizes = parse_diff_numstat_z(b"12\t3\tsrc/a b.rs\0-\t-\tlogo.png\x000\t7\tgone.txt\0junk\0");
+		assert_eq!(sizes.get("src/a b.rs"), Some(&Some((12, 3))));
+		assert_eq!(sizes.get("logo.png"), Some(&None));
+		assert_eq!(sizes.get("gone.txt"), Some(&Some((0, 7))));
+		assert_eq!(sizes.len(), 3);
 	}
 
 	#[test]

@@ -204,6 +204,7 @@ mod tests {
 				until: "2026-11-19T07:00:00Z".into(),
 			}],
 			tab_open: true,
+			..InboxState::default()
 		};
 		payload.dismissed_coder_sessions = vec![DismissedCoderSession {
 			id: "s1".into(),

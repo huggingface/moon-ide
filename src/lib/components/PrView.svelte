@@ -1,25 +1,48 @@
 <script lang="ts" module>
-	import type { PrOpened } from '../protocol';
+	import type { PrDiff, PrDiffFile, PullRequestDetail } from '../protocol';
 
 	// The last answer per pull request. The tab is unmounted whenever
-	// another one is shown, and re-reading takes a round trip to
-	// GitHub: coming back paints this at once while the re-read runs.
-	const lastOpened = new Map<string, PrOpened>();
+	// another one is shown, and re-reading takes round trips to GitHub
+	// and to the remote: coming back paints this at once while the
+	// re-read runs.
+	type Loaded = { detail: PullRequestDetail; diff: PrDiff | null };
+	const lastLoaded = new Map<string, Loaded>();
+
+	// Viewed marks per pull request, for as long as the IDE runs. They
+	// belong to one head commit: a push may have changed any file, so
+	// it clears them all.
+	const viewedMarks = new Map<string, { headSha: string; paths: Record<string, boolean> }>();
+
+	// The file each pull request's tab was last on, to come back to.
+	const lastPlace = new Map<string, string>();
 </script>
 
 <script lang="ts">
-	// A pull request in its own tab (ADR 0113): GitHub's description,
-	// checks and threads above the diff from where the branch left its
-	// base. Everything is read from the repository's object store, so
-	// no checkout exists and the folder the user is working in is left
-	// as it is. Checking the branch out is an explicit button.
-	import { onMount } from 'svelte';
+	// A pull request in its own tab (ADR 0115): GitHub's description,
+	// conversation, checks and threads above the diff from where the
+	// branch left its base. Everything is read from the repository's
+	// object store, so no checkout exists and the folder the user is
+	// working in is left as it is. Checking the branch out is an
+	// explicit button.
+	//
+	// It loads in stages so there is something to read early: the
+	// description from one `gh` call, then the review threads and the
+	// diff (a fetch from the remote, the slow part) side by side.
+	//
+	// Files are reviewed one at a time rather than scrolled through
+	// (ADR 0118): a list of them beside the diffs, a viewed mark that
+	// folds a file away and opens the next, and nothing open to begin
+	// with when there are many.
+	import { onMount, tick } from 'svelte';
+	import { attentionCounts, LARGE_PR_FILES, nextUnviewed, startsCollapsed, type FileOutline } from '../prFiles';
 	import { ipc } from '../ipc';
 	import { formatError, type ReviewEvent } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { numberFromPrPath } from '../util/prPath';
 	import CommitSection from './CommitSection.svelte';
+	import DiffStat from './DiffStat.svelte';
 	import PullRequestPanel from './PullRequestPanel.svelte';
+	import CheckIcon from './icons/CheckIcon.svelte';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -35,20 +58,196 @@
 	let scroller: HTMLDivElement | undefined = $state();
 	const sectionEls = new Map<string, HTMLElement>();
 
-	const number = $derived.by(() => {
-		const path = side === 'left' ? workspace.leftActive : workspace.rightActive;
-		return path === null ? null : numberFromPrPath(path);
-	});
+	const tabPath = $derived(side === 'left' ? workspace.leftActive : workspace.rightActive);
+	const number = $derived(tabPath === null ? null : numberFromPrPath(tabPath));
+	// What the tab strip already knows, to head the page before
+	// GitHub answers.
+	const tabName = $derived(workspace.openFiles.find((file) => file.path === tabPath)?.name ?? '');
 	const cacheKey = $derived(`${workspace.activeProjectPath ?? ''}\n${number ?? ''}`);
 
-	let opened = $state<PrOpened | null>(null);
+	let detail = $state<PullRequestDetail | null>(null);
+	let diff = $state<PrDiff | null>(null);
 	let loadError = $state('');
+	let diffError = $state('');
 	let loading = $state(false);
 	let loadToken = 0;
 
-	const detail = $derived(opened?.detail ?? null);
-	const files = $derived(opened?.files ?? []);
+	const files = $derived(diff?.files ?? []);
 	const paths = $derived(new Set(files.map((file) => file.path)));
+
+	let viewed = $state<Record<string, boolean>>({});
+	let viewedSha = '';
+	// The reader's own open / closed choices, over `startsCollapsed`.
+	let folded = $state<Record<string, boolean>>({});
+	const attention = $derived(detail === null ? new Map<string, number>() : attentionCounts(detail));
+	const viewedCount = $derived(files.filter((file) => viewed[file.path]).length);
+	const totals = $derived({
+		additions: files.reduce((sum, file) => sum + (file.additions ?? 0), 0),
+		deletions: files.reduce((sum, file) => sum + (file.deletions ?? 0), 0),
+	});
+
+	function isCollapsed(file: PrDiffFile): boolean {
+		return folded[file.path] ?? (viewed[file.path] === true || startsCollapsed(file, files.length));
+	}
+
+	/** Take up the marks made for `headSha` earlier, or start clean. */
+	function adoptViewed(headSha: string) {
+		if (headSha === viewedSha) {
+			return;
+		}
+		viewedSha = headSha;
+		const marks = viewedMarks.get(cacheKey);
+		viewed = marks?.headSha === headSha ? { ...marks.paths } : {};
+		folded = {};
+	}
+
+	function setViewed(path: string, value: boolean) {
+		viewed[path] = value;
+		folded[path] = value;
+		viewedMarks.set(cacheKey, { headSha: viewedSha, paths: $state.snapshot(viewed) });
+		if (!value) {
+			return;
+		}
+		const next = nextUnviewed(files, viewed, path);
+		if (next !== null) {
+			void jumpTo(next);
+		}
+	}
+
+	function toggleFold(file: PrDiffFile) {
+		folded[file.path] = !isCollapsed(file);
+	}
+
+	function outlineFor(file: PrDiffFile): FileOutline {
+		return {
+			additions: file.additions,
+			deletions: file.deletions,
+			attention: attention.get(file.path) ?? 0,
+			collapsed: isCollapsed(file),
+			viewed: viewed[file.path] === true,
+			onToggle: () => toggleFold(file),
+			onViewed: (value) => setViewed(file.path, value),
+		};
+	}
+
+	// The file under the top of the viewport; `null` above the first
+	// one, where the description is.
+	let activePath = $state<string | null>(null);
+	let spyFrame = -1;
+
+	function setActive(path: string | null) {
+		activePath = path;
+		if (path === null) {
+			lastPlace.delete(cacheKey);
+		} else {
+			lastPlace.set(cacheKey, path);
+		}
+	}
+
+	function spy() {
+		cancelAnimationFrame(spyFrame);
+		spyFrame = requestAnimationFrame(() => {
+			if (scroller === undefined) {
+				return;
+			}
+			const line = scroller.getBoundingClientRect().top + BANNER_PX + 12;
+			let found: string | null = null;
+			for (const file of files) {
+				const el = sectionEls.get(file.path);
+				if (el === undefined || el.getBoundingClientRect().top > line) {
+					break;
+				}
+				found = file.path;
+			}
+			setActive(found);
+		});
+	}
+
+	// Wide enough for the list to sit beside two diff columns; below
+	// that it opens over the page, from the banner.
+	const DOCK_PX = 1000;
+	const BANNER_PX = 37;
+	let width = $state(0);
+	let railWanted = $state<boolean | null>(null);
+	const docked = $derived(width >= DOCK_PX);
+	const railShown = $derived(files.length > 1 && (railWanted ?? docked));
+
+	let railList: HTMLDivElement | undefined = $state();
+	// Keeps the current file in sight in a list longer than the pane.
+	$effect(() => {
+		void activePath;
+		void tick().then(() => railList?.querySelector('.rail-item.active')?.scrollIntoView({ block: 'nearest' }));
+	});
+
+	function leaveRail() {
+		if (!docked) {
+			railWanted = null;
+		}
+	}
+
+	function toOverview() {
+		leaveRail();
+		scroller?.scrollTo({ top: 0 });
+	}
+
+	/** Open `path`'s diff and bring it under the banner. In a large
+	 *  pull request the other files close, so moving through them
+	 *  leaves one diff on the page rather than a growing pile. */
+	async function jumpTo(path: string) {
+		leaveRail();
+		if (files.length > LARGE_PR_FILES) {
+			for (const file of files) {
+				folded[file.path] = file.path !== path;
+			}
+		} else {
+			folded[path] = false;
+		}
+		await tick();
+		sectionEls.get(path)?.scrollIntoView({ block: 'start' });
+		setActive(path);
+	}
+
+	function step(delta: 1 | -1) {
+		const at = files.findIndex((file) => file.path === activePath);
+		const next = files[at === -1 ? (delta === 1 ? 0 : -1) : at + delta];
+		if (next !== undefined) {
+			void jumpTo(next.path);
+		}
+	}
+
+	function onKeydown(event: KeyboardEvent) {
+		if (event.ctrlKey || event.metaKey || event.altKey || files.length === 0) {
+			return;
+		}
+		const target = event.target;
+		const typing =
+			target instanceof HTMLTextAreaElement ||
+			target instanceof HTMLSelectElement ||
+			(target instanceof HTMLInputElement && target.type !== 'checkbox');
+		if (typing) {
+			return;
+		}
+		if (event.key === 'j' || event.key === 'k') {
+			event.preventDefault();
+			step(event.key === 'j' ? 1 : -1);
+			return;
+		}
+		if (event.key === 'v' && activePath !== null) {
+			event.preventDefault();
+			setViewed(activePath, viewed[activePath] !== true);
+		}
+	}
+
+	const STATUS_LETTER: Record<string, string> = { added: 'A', modified: 'M', deleted: 'D', renamed: 'R' };
+
+	function baseName(path: string): string {
+		return path.slice(path.lastIndexOf('/') + 1);
+	}
+
+	function dirName(path: string): string {
+		const cut = path.lastIndexOf('/');
+		return cut === -1 ? '' : path.slice(0, cut);
+	}
 
 	async function load() {
 		const wanted = number;
@@ -58,27 +257,60 @@
 		}
 		const key = cacheKey;
 		const token = ++loadToken;
+		const current = () => token === loadToken;
 		loading = true;
 		try {
-			const result = await ipc.pullRequest.open(wanted);
-			if (token !== loadToken) {
+			let fresh: PullRequestDetail;
+			try {
+				fresh = await ipc.pullRequest.detail(wanted);
+			} catch (err) {
+				if (!current()) {
+					return;
+				}
+				// A failed re-read keeps what is on screen.
+				if (detail === null) {
+					loadError = formatError(err);
+				} else {
+					workspace.flash(`Could not re-read the pull request: ${formatError(err)}`);
+				}
 				return;
 			}
-			lastOpened.set(key, result);
-			opened = result;
+			if (!current()) {
+				return;
+			}
+			// The threads arrive separately; until they do, keep the
+			// ones on screen instead of blinking them away.
+			detail = { ...fresh, threads: detail?.threads ?? [] };
+			adoptViewed(fresh.headSha);
 			loadError = '';
-		} catch (err) {
-			if (token !== loadToken) {
-				return;
-			}
-			// A failed re-read keeps what is on screen.
-			if (opened === null) {
-				loadError = formatError(err);
-			} else {
-				workspace.flash(`Could not re-read the pull request: ${formatError(err)}`);
+
+			const threads = ipc.pullRequest.threads(fresh.url).then(
+				(result) => {
+					if (current() && detail !== null) {
+						detail = { ...detail, threads: result };
+					}
+				},
+				() => {},
+			);
+			const diffed = ipc.pullRequest.diff(fresh.number, fresh.baseRef, fresh.headSha).then(
+				(result) => {
+					if (current()) {
+						diff = result;
+						diffError = '';
+					}
+				},
+				(err: unknown) => {
+					if (current()) {
+						diffError = formatError(err);
+					}
+				},
+			);
+			await Promise.all([threads, diffed]);
+			if (current() && detail !== null) {
+				lastLoaded.set(key, { detail, diff });
 			}
 		} finally {
-			if (token === loadToken) {
+			if (current()) {
 				loading = false;
 			}
 		}
@@ -86,10 +318,20 @@
 
 	onMount(() => {
 		scroller?.focus({ preventScroll: true });
-		opened = lastOpened.get(cacheKey) ?? null;
+		const last = lastLoaded.get(cacheKey);
+		if (last !== undefined) {
+			detail = last.detail;
+			diff = last.diff;
+			adoptViewed(last.detail.headSha);
+			const place = lastPlace.get(cacheKey);
+			if (place !== undefined && last.diff?.files.some((file) => file.path === place)) {
+				void jumpTo(place);
+			}
+		}
 		void load();
 		return () => {
 			loadToken++;
+			cancelAnimationFrame(spyFrame);
 		};
 	});
 
@@ -99,10 +341,6 @@
 			return;
 		}
 		sectionEls.set(path, el);
-	}
-
-	function scrollTo(path: string) {
-		sectionEls.get(path)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 	}
 
 	// Review dialog: closed → form → busy (the GitHub round trip) →
@@ -195,67 +433,139 @@
 	}
 </script>
 
-<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-<div class="pr-view" bind:this={scroller} tabindex="0" role="region" aria-label="Pull request">
-	{#if opened === null || detail === null}
-		<div class="empty" class:error={loadError !== ''}>
-			{#if loadError !== ''}
-				Could not open the pull request: {loadError}
-				<button type="button" class="btn" onclick={() => void load()} disabled={loading}>Try again</button>
-			{:else}
-				Loading pull request…
-			{/if}
-		</div>
-	{:else}
-		<div class="banner">
-			<span class="title">#{detail.number} {detail.title}</span>
-			<span class="counts">{files.length} file{files.length === 1 ? '' : 's'}</span>
-			<button
-				type="button"
-				class="btn"
-				disabled={detail.isCrossRepository || checkingOut}
-				title={detail.isCrossRepository
-					? FORK_TITLE
-					: `Check ${detail.headRef} out in a worktree and review it there, with drafts and a terminal`}
-				onclick={() => void checkOut()}
-			>
-				{checkingOut ? 'Checking out…' : 'Check out in a worktree'}
-			</button>
-			<button
-				type="button"
-				class="btn"
-				disabled={detail.isCrossRepository || startingAgent}
-				title={detail.isCrossRepository
-					? FORK_TITLE
-					: `Start a coder session on ${detail.headRef}, in its own worktree`}
-				onclick={() => void startAgent()}
-			>
-				{startingAgent ? 'Starting…' : 'Start an agent on it'}
-			</button>
-			<button type="button" class="btn primary" title="Comment on, approve or request changes" onclick={openReview}>
-				Review
-			</button>
-		</div>
-		<PullRequestPanel pr={detail} {paths} refreshing={loading} onJump={scrollTo} onRefresh={() => void load()} />
-		{#if files.length === 0}
-			<div class="empty">No files differ between {detail.headRef} and where it left {detail.baseRef}.</div>
-		{:else}
-			<div class="stack">
-				{#each files as entry, i (`${entry.path}|${opened.mergeBase}|${detail.headSha}`)}
-					<CommitSection
-						path={entry.path}
-						status={entry.status}
-						commitSha={detail.headSha}
-						parentSha={opened.mergeBase}
-						eager={i < 2}
-						pullRequest={detail}
-						{registerSection}
-						{side}
-					/>
+<!-- svelte-ignore a11y_no_static_element_interactions (j / k / v move through the files; every control they reach is also a button) -->
+<div class="pr-view" bind:clientWidth={width} onkeydown={onKeydown}>
+	{#if railShown && detail !== null}
+		<nav class="rail" class:floating={!docked} aria-label="Files changed">
+			<div class="rail-head">
+				<span>{viewedCount} / {files.length} viewed</span>
+				<DiffStat additions={totals.additions} deletions={totals.deletions} />
+			</div>
+			<div class="rail-list" bind:this={railList}>
+				<button type="button" class="rail-item" class:active={activePath === null} onclick={toOverview}>
+					<span class="rail-name">Overview</span>
+				</button>
+				{#each files as file (file.path)}
+					<button
+						type="button"
+						class="rail-item"
+						class:active={activePath === file.path}
+						class:viewed={viewed[file.path]}
+						title={file.path}
+						onclick={() => void jumpTo(file.path)}
+					>
+						<span class="rail-status status-{file.status}">{STATUS_LETTER[file.status] ?? '?'}</span>
+						<span class="rail-name">{baseName(file.path)}</span>
+						<span class="rail-dir">{dirName(file.path)}</span>
+						{#if (attention.get(file.path) ?? 0) > 0}
+							<span class="rail-attention">{attention.get(file.path)}</span>
+						{/if}
+						{#if viewed[file.path]}
+							<span class="rail-check"><CheckIcon size={12} /></span>
+						{:else}
+							<DiffStat additions={file.additions} deletions={file.deletions} />
+						{/if}
+					</button>
 				{/each}
 			</div>
-		{/if}
+		</nav>
 	{/if}
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+	<div class="main" bind:this={scroller} tabindex="0" role="region" aria-label="Pull request" onscroll={spy}>
+		{#if detail === null}
+			<div class="banner">
+				<span class="title">{tabName || (number === null ? 'Pull request' : `#${number}`)}</span>
+			</div>
+			<div class="empty" class:error={loadError !== ''}>
+				{#if loadError !== ''}
+					Could not open the pull request: {loadError}
+					<button type="button" class="btn" onclick={() => void load()} disabled={loading}>Try again</button>
+				{:else}
+					Loading pull request…
+				{/if}
+			</div>
+		{:else}
+			<div class="banner">
+				<span class="title">#{detail.number} {detail.title}</span>
+				{#if files.length > 1}
+					<button
+						type="button"
+						class="btn"
+						aria-pressed={railShown}
+						title="List of changed files (j / k next and previous, v viewed)"
+						onclick={() => (railWanted = !railShown)}
+					>
+						Files {viewedCount}/{files.length}
+					</button>
+				{:else if diff !== null}
+					<span class="counts">{files.length} file{files.length === 1 ? '' : 's'}</span>
+				{/if}
+				<button
+					type="button"
+					class="btn"
+					disabled={detail.isCrossRepository || checkingOut}
+					title={detail.isCrossRepository
+						? FORK_TITLE
+						: `Check ${detail.headRef} out in a worktree and review it there, with drafts and a terminal`}
+					onclick={() => void checkOut()}
+				>
+					{checkingOut ? 'Checking out…' : 'Check out in a worktree'}
+				</button>
+				<button
+					type="button"
+					class="btn"
+					disabled={detail.isCrossRepository || startingAgent}
+					title={detail.isCrossRepository
+						? FORK_TITLE
+						: `Start a coder session on ${detail.headRef}, in its own worktree`}
+					onclick={() => void startAgent()}
+				>
+					{startingAgent ? 'Starting…' : 'Start an agent on it'}
+				</button>
+				<button type="button" class="btn primary" title="Comment on, approve or request changes" onclick={openReview}>
+					Review
+				</button>
+			</div>
+			<PullRequestPanel
+				pr={detail}
+				{paths}
+				refreshing={loading}
+				onJump={(path) => void jumpTo(path)}
+				onRefresh={() => void load()}
+			/>
+			{#if diff === null}
+				<div class="empty" class:error={diffError !== ''}>
+					{#if diffError !== ''}
+						Could not load the diff: {diffError}
+						<button type="button" class="btn" onclick={() => void load()} disabled={loading}>Try again</button>
+					{:else}
+						Fetching the diff…
+					{/if}
+				</div>
+			{:else if files.length === 0}
+				<div class="empty">No files differ between {detail.headRef} and where it left {detail.baseRef}.</div>
+			{:else}
+				<div class="stack">
+					{#each files as entry, i (`${entry.path}|${diff.mergeBase}|${detail.headSha}`)}
+						<CommitSection
+							path={entry.path}
+							status={entry.status}
+							commitSha={detail.headSha}
+							parentSha={diff.mergeBase}
+							eager={i < 2}
+							pullRequest={detail}
+							outline={outlineFor(entry)}
+							{registerSection}
+							{side}
+						/>
+					{/each}
+				</div>
+				{#if files.length > 1}
+					<div class="tail"></div>
+				{/if}
+			{/if}
+		{/if}
+	</div>
 </div>
 
 {#if reviewPhase !== 'closed' && detail !== null}
@@ -332,6 +642,127 @@
 
 <style>
 	.pr-view {
+		position: relative;
+		flex: 1;
+		min-width: 0;
+		min-height: 0;
+		display: flex;
+		background: var(--m-bg);
+		color: var(--m-fg);
+	}
+	.rail {
+		display: flex;
+		flex-direction: column;
+		flex-shrink: 0;
+		width: 232px;
+		min-height: 0;
+		border-right: 1px solid var(--m-border);
+		background: var(--m-bg-1);
+		font-size: var(--m-text-sm);
+	}
+	.rail.floating {
+		position: absolute;
+		top: 37px;
+		bottom: 0;
+		left: 0;
+		z-index: 4;
+		width: min(320px, 90%);
+		box-shadow: var(--m-shadow-pop);
+	}
+	.rail-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--m-space-2);
+		box-sizing: border-box;
+		height: 37px;
+		flex-shrink: 0;
+		padding: 0 var(--m-space-3);
+		border-bottom: 1px solid var(--m-border);
+		color: var(--m-fg-muted);
+		font-variant-numeric: tabular-nums;
+	}
+	.rail-list {
+		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
+		padding: var(--m-space-1);
+	}
+	.rail-item {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		width: 100%;
+		height: 26px;
+		padding: 0 var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-fg);
+		font: inherit;
+		text-align: left;
+		cursor: pointer;
+	}
+	.rail-item:hover {
+		background: var(--m-bg-2);
+	}
+	.rail-item.active {
+		background: var(--m-bg-3);
+	}
+	.rail-item.viewed .rail-name,
+	.rail-item.viewed .rail-dir {
+		color: var(--m-fg-subtle);
+	}
+	.rail-status {
+		flex-shrink: 0;
+		width: 12px;
+		font-family: var(--m-font-mono, monospace);
+		font-size: 10px;
+		font-weight: 600;
+		text-align: center;
+	}
+	.status-added {
+		color: var(--m-green);
+	}
+	.status-modified {
+		color: var(--m-blue);
+	}
+	.status-deleted {
+		color: var(--m-red);
+	}
+	.rail-name {
+		flex-shrink: 0;
+		max-width: 60%;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.rail-dir {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--m-fg-subtle);
+		font-size: var(--m-text-xs);
+	}
+	.rail-attention {
+		flex-shrink: 0;
+		min-width: 16px;
+		padding: 0 5px;
+		border-radius: var(--m-radius-pill);
+		background: color-mix(in srgb, var(--m-accent) 16%, transparent);
+		color: var(--m-accent);
+		font-size: var(--m-text-xs);
+		line-height: 16px;
+		text-align: center;
+	}
+	.rail-check {
+		display: inline-flex;
+		flex-shrink: 0;
+		color: var(--m-success);
+	}
+	.main {
 		/* Read by each section's sticky header so it parks under the
 		 * banner instead of sliding beneath it. */
 		--m-review-banner-h: 37px;
@@ -379,8 +810,14 @@
 	}
 	/* The panel brings its own side margins for the review tab's
 	 * narrower gutter; here the scroller already has them. */
-	.pr-view :global(section.pr) {
+	.main :global(section.pr) {
 		margin: var(--m-space-3) 0;
+	}
+	/* Room below the last file, so any of them can be brought up
+	 * under the banner. */
+	.tail {
+		flex-shrink: 0;
+		height: 100vh;
 	}
 	.stack {
 		display: flex;

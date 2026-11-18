@@ -254,11 +254,17 @@ pub struct InboxState {
 	/// The inbox tab is open: it is the first tab of every folder
 	/// until closed.
 	pub tab_open: bool,
+	/// The list is shown by group rather than flat.
+	pub group_by_topic: bool,
+	/// Groups the model made (ADR 0119), and which pull request is in
+	/// which. Kept so a pull request stays where it was put.
+	pub groups: Vec<crate::inbox::InboxGroup>,
+	pub grouped: Vec<crate::inbox::InboxGroupAssignment>,
 }
 
 impl InboxState {
 	pub fn is_empty(&self) -> bool {
-		self.watched_authors.is_empty() && self.snoozed.is_empty() && !self.tab_open
+		*self == Self::default()
 	}
 }
 

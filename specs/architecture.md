@@ -88,6 +88,10 @@ Phase 0 ships only `LocalHost` and exposes it through Tauri commands directly. T
 - The Svelte UI is single-threaded JS; long ops happen on the Rust side.
 - Streams (file watchers, PTY output, LSP notifications) are pushed to the UI via Tauri events keyed by stable subscription IDs.
 
+## Logs
+
+The desktop process logs to stdout and to `<data_local_dir>/moon-ide/logs/<workspace-id>.<date>.log` (`launcher.<date>.log` for the workspace picker): one file per day, seven kept. A launched desktop app has no terminal, and the problems worth reading logs for (container shutdown and resume across a quit and relaunch) span two processes; both append to the same file and every line carries its process id. `RUST_LOG` filters both outputs; the default is `info,moon=debug`.
+
 ## Failure model
 
 Any host operation can fail because the host is gone (container stopped, network blip). The UI must treat workspace I/O as fallible and surface a degraded state without crashing. The core auto-reconnects to the agent in remote mode.

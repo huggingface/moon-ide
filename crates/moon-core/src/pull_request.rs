@@ -4,9 +4,9 @@
 //! tab) or by number, with its diff and no checkout (the PR tab).
 
 use camino::Utf8Path;
-use moon_protocol::inbox::{InboxItemState, InboxReview};
+use moon_protocol::inbox::{ConversationComment, ConversationReview, InboxItemState, InboxReview};
 use moon_protocol::review::{
-	PrCheck, PrCheckState, PrMinorNote, PrOpened, PrThread, PrThreadComment, PullRequestDetail, ReviewSide,
+	PrCheck, PrCheckState, PrDiff, PrMinorNote, PrThread, PrThreadComment, PullRequestDetail, ReviewSide,
 };
 use moon_protocol::{MoonError, MoonResult};
 use serde::Deserialize;
@@ -41,14 +41,88 @@ struct RawPr {
 	is_cross_repository: bool,
 	#[serde(default)]
 	status_check_rollup: Vec<RawCheck>,
+	#[serde(default)]
+	comments: Vec<RawComment>,
+	#[serde(default)]
+	reviews: Vec<RawReview>,
 }
 
 const PR_VIEW_FIELDS: &str = "number,title,url,body,state,isDraft,author,reviewDecision,baseRefName,headRefName,\
-	headRefOid,isCrossRepository,statusCheckRollup";
+	headRefOid,isCrossRepository,statusCheckRollup,comments,reviews";
+
+/// A top-level comment, as `gh pr view` and `gh issue view` list them.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RawComment {
+	author: Option<RawAuthor>,
+	#[serde(default)]
+	body: String,
+	created_at: String,
+	#[serde(default)]
+	url: String,
+	/// Hidden on GitHub (outdated, resolved, spam, ...).
+	#[serde(default)]
+	is_minimized: bool,
+}
+
+impl RawComment {
+	/// `None` for a comment GitHub hides.
+	pub(crate) fn into_comment(self) -> Option<ConversationComment> {
+		if self.is_minimized {
+			return None;
+		}
+		Some(ConversationComment {
+			author: self.author.map(|author| author.login),
+			body: self.body,
+			created_at: self.created_at,
+			url: self.url,
+			review: None,
+		})
+	}
+}
 
 #[derive(Deserialize)]
-struct RawAuthor {
-	login: String,
+#[serde(rename_all = "camelCase")]
+struct RawReview {
+	author: Option<RawAuthor>,
+	#[serde(default)]
+	body: String,
+	submitted_at: Option<String>,
+	state: String,
+}
+
+/// The conversation of a pull request: its comments, plus each review
+/// that says something. A `COMMENTED` review with no summary only
+/// carries inline threads, which are shown on their lines; a pending
+/// one isn't submitted yet.
+fn conversation_from_raw(comments: Vec<RawComment>, reviews: Vec<RawReview>, pr_url: &str) -> Vec<ConversationComment> {
+	let mut out: Vec<ConversationComment> = comments.into_iter().filter_map(RawComment::into_comment).collect();
+	for review in reviews {
+		let verdict = match review.state.as_str() {
+			"APPROVED" => ConversationReview::Approved,
+			"CHANGES_REQUESTED" => ConversationReview::ChangesRequested,
+			"DISMISSED" => ConversationReview::Dismissed,
+			"COMMENTED" if !review.body.trim().is_empty() => ConversationReview::Commented,
+			_ => continue,
+		};
+		let Some(created_at) = review.submitted_at else {
+			continue;
+		};
+		out.push(ConversationComment {
+			author: review.author.map(|author| author.login),
+			body: review.body,
+			created_at,
+			url: pr_url.to_owned(),
+			review: Some(verdict),
+		});
+	}
+	out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+	out
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RawAuthor {
+	pub(crate) login: String,
 }
 
 /// One entry of `gh pr view --json statusCheckRollup`: a check run
@@ -138,6 +212,13 @@ fn parse_note_line(line: &str) -> Option<PrMinorNote> {
 	})
 }
 
+/// `https://github.com/<owner>/<name>/pull/<n>` → `(owner, name, n)`.
+fn pr_from_url(url: &str) -> Option<(&str, &str, u32)> {
+	let (owner, name) = repo_from_pr_url(url)?;
+	let number = url.rsplit('/').next()?.parse().ok()?;
+	Some((owner, name, number))
+}
+
 /// `https://github.com/<owner>/<name>/pull/<n>` → `(owner, name)`.
 fn repo_from_pr_url(url: &str) -> Option<(&str, &str)> {
 	let path = url.strip_prefix("https://")?.split_once('/')?.1;
@@ -211,6 +292,7 @@ async fn fetch_threads(owner: &str, name: &str, number: u32) -> Vec<PrThread> {
 /// aside: those are a second request.
 fn detail_from_raw(raw: RawPr) -> PullRequestDetail {
 	let (body, minor_notes, minor_notes_sha) = split_minor_notes(&raw.body);
+	let conversation = conversation_from_raw(raw.comments, raw.reviews, &raw.url);
 	PullRequestDetail {
 		number: raw.number,
 		title: raw.title,
@@ -237,13 +319,16 @@ fn detail_from_raw(raw: RawPr) -> PullRequestDetail {
 		minor_notes,
 		minor_notes_sha,
 		threads: Vec::new(),
+		conversation,
 	}
 }
 
-/// Read a pull request of `root`'s GitHub repository: `number`, or
-/// the one open for the current branch when `None`. Errors when the
-/// remote isn't GitHub, `gh` can't answer, or there is no such PR.
-pub async fn fetch(root: &Utf8Path, number: Option<u32>) -> MoonResult<PullRequestDetail> {
+/// Read a pull request of `root`'s GitHub repository, without its
+/// review threads: `number`, or the one open for the current branch
+/// when `None`. One `gh` call, so a tab can paint the description
+/// while the threads and the diff are still on their way. Errors when
+/// the remote isn't GitHub, `gh` can't answer, or there is no such PR.
+pub async fn fetch_detail(root: &Utf8Path, number: Option<u32>) -> MoonResult<PullRequestDetail> {
 	let owned = root.to_owned();
 	let remote = tokio::task::spawn_blocking(move || detect_forge_remote(&owned))
 		.await
@@ -263,7 +348,22 @@ pub async fn fetch(root: &Utf8Path, number: Option<u32>) -> MoonResult<PullReque
 	}
 	let raw: RawPr =
 		serde_json::from_slice(&output.stdout).map_err(|e| MoonError::Internal(format!("gh pr view JSON: {e}")))?;
-	let mut detail = detail_from_raw(raw);
+	Ok(detail_from_raw(raw))
+}
+
+/// The review threads of the pull request at `url` (its GitHub page,
+/// as [`PullRequestDetail::url`] has it). Empty when they can't be
+/// read: the tab is still useful without them.
+pub async fn fetch_threads_at(url: &str) -> MoonResult<Vec<PrThread>> {
+	let Some((owner, name, number)) = pr_from_url(url) else {
+		return Err(MoonError::invalid(format!("not a pull request URL: {url}")));
+	};
+	Ok(fetch_threads(owner, name, number).await)
+}
+
+/// [`fetch_detail`] with the review threads filled in.
+pub async fn fetch(root: &Utf8Path, number: Option<u32>) -> MoonResult<PullRequestDetail> {
+	let mut detail = fetch_detail(root, number).await?;
 	if let Some((owner, name)) = repo_from_pr_url(&detail.url) {
 		detail.threads = fetch_threads(owner, name, detail.number).await;
 	}
@@ -284,22 +384,12 @@ pub async fn fetch_current(root: &Utf8Path) -> Option<PullRequestDetail> {
 	}
 }
 
-/// Pull request `number` with its diff, for a tab that needs no
-/// checkout of the branch. `host` is any checkout of the repository,
-/// rooted at `root`.
-pub async fn open(host: &dyn WorkspaceHost, root: &Utf8Path, number: u32) -> MoonResult<PrOpened> {
-	let detail = fetch(root, Some(number)).await?;
-	open_fetched(host, detail).await
-}
-
-/// The git half of [`open`]: bring the commits behind `detail` into
-/// the repository and diff the head against where it left the base.
-pub async fn open_fetched(host: &dyn WorkspaceHost, detail: PullRequestDetail) -> MoonResult<PrOpened> {
-	let diff = host
-		.git_pull_request_diff(detail.number, &detail.base_ref, &detail.head_sha)
-		.await?;
-	Ok(PrOpened {
-		detail,
+/// The diff of pull request `number` for a tab that needs no checkout
+/// of the branch: bring its commits into the repository behind `host`
+/// and diff `head_sha` against where it left `base_ref`.
+pub async fn diff(host: &dyn WorkspaceHost, number: u32, base_ref: &str, head_sha: &str) -> MoonResult<PrDiff> {
+	let diff = host.git_pull_request_diff(number, base_ref, head_sha).await?;
+	Ok(PrDiff {
 		merge_base: diff.merge_base,
 		files: diff.files,
 	})
@@ -452,7 +542,8 @@ mod tests {
 	#[tokio::test]
 	async fn open_fetches_the_head_and_diffs_it_against_the_merge_base() {
 		use crate::test_util::{run_git, which_git};
-		use moon_protocol::git::{GitFileStatus, GitStatusEntry};
+		use moon_protocol::git::GitFileStatus;
+		use moon_protocol::review::PrDiffFile;
 
 		let Some(git) = which_git() else {
 			eprintln!("git not on PATH — skipping pull request open test");
@@ -521,20 +612,23 @@ mod tests {
 		};
 		let head_before = rev(&local, "HEAD");
 
-		let opened = open_fetched(&host, detail.clone()).await.unwrap();
+		let opened = diff(&host, detail.number, &detail.base_ref, &detail.head_sha)
+			.await
+			.unwrap();
 
-		assert_eq!(opened.detail, detail);
 		assert_eq!(opened.merge_base, fork_point);
-		let entry = |path: &str, status| GitStatusEntry {
+		let entry = |path: &str, status, additions, deletions| PrDiffFile {
 			path: path.to_owned(),
 			status,
+			additions: Some(additions),
+			deletions: Some(deletions),
 		};
 		assert_eq!(
 			opened.files,
 			[
-				entry("README.md", GitFileStatus::Modified),
-				entry("gone.txt", GitFileStatus::Deleted),
-				entry("new.txt", GitFileStatus::Added),
+				entry("README.md", GitFileStatus::Modified, 1, 0),
+				entry("gone.txt", GitFileStatus::Deleted, 0, 1),
+				entry("new.txt", GitFileStatus::Added, 1, 0),
 			]
 		);
 		assert_eq!(rev(&local, "refs/moon/pr/1"), head_sha);
@@ -554,9 +648,52 @@ mod tests {
 		);
 
 		// A PR whose ref `origin` doesn't have is an error, with git's words.
-		let missing = PullRequestDetail { number: 2, ..detail };
-		let err = open_fetched(&host, missing).await.unwrap_err();
+		let err = diff(&host, 2, &detail.base_ref, &detail.head_sha).await.unwrap_err();
 		assert!(err.to_string().contains("git fetch"), "{err}");
+	}
+
+	#[test]
+	fn conversation_merges_comments_and_reviews_that_say_something() {
+		let raw: RawPr = serde_json::from_value(json!({
+			"number": 7, "title": "T", "url": "https://github.com/acme/app/pull/7", "state": "OPEN",
+			"baseRefName": "main", "headRefName": "f", "headRefOid": "",
+			"comments": [
+				{ "author": { "login": "sam" }, "body": "Second", "createdAt": "2026-11-17T12:00:00Z", "url": "https://example.test/c2" },
+				{ "author": null, "body": "First", "createdAt": "2026-11-17T10:00:00Z", "url": "https://example.test/c1" },
+			],
+			"reviews": [
+				{ "author": { "login": "bot" }, "body": "", "submittedAt": "2026-11-17T11:00:00Z", "state": "COMMENTED" },
+				{ "author": { "login": "bot" }, "body": "Summary", "submittedAt": "2026-11-17T11:30:00Z", "state": "COMMENTED" },
+				{ "author": { "login": "li" }, "body": "", "submittedAt": "2026-11-17T13:00:00Z", "state": "APPROVED" },
+				{ "author": { "login": "li" }, "body": "draft", "submittedAt": null, "state": "PENDING" },
+			],
+		}))
+		.unwrap();
+		let conversation = detail_from_raw(raw).conversation;
+		let seen: Vec<_> = conversation
+			.iter()
+			.map(|c| (c.author.as_deref(), c.body.as_str(), c.review))
+			.collect();
+		assert_eq!(
+			seen,
+			[
+				(None, "First", None),
+				(Some("bot"), "Summary", Some(ConversationReview::Commented)),
+				(Some("sam"), "Second", None),
+				(Some("li"), "", Some(ConversationReview::Approved)),
+			]
+		);
+		assert_eq!(conversation[3].url, "https://github.com/acme/app/pull/7");
+	}
+
+	#[test]
+	fn repo_and_number_are_read_from_the_pr_url() {
+		assert_eq!(
+			pr_from_url("https://github.com/acme/app/pull/42"),
+			Some(("acme", "app", 42))
+		);
+		assert_eq!(pr_from_url("https://github.com/acme/app/pull/x"), None);
+		assert_eq!(pr_from_url("https://github.com/acme/app/issues/42"), None);
 	}
 
 	#[test]

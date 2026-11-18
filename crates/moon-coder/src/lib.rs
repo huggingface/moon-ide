@@ -31,6 +31,7 @@ mod images;
 pub mod inference;
 pub mod mcp;
 pub mod models;
+pub mod pr_groups;
 pub mod prompts;
 pub mod providers;
 mod request_compression;

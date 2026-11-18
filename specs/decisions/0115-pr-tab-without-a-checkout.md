@@ -36,6 +36,10 @@ A PR opens as a `pr://<number>` tab of the folder the user is in:
   branch). Neither is offered for a fork PR, whose branch isn't on
   `origin`.
 - The tab is not restored at launch.
+- **It loads in stages**: the description from one `gh` call, then
+  the review threads and the diff side by side. The diff waits on a
+  fetch from the remote, which is the slow part and no reason to hold
+  back the text.
 
 Discarding a worktree no longer asks first: the branch is kept, so
 nothing is lost. It still asks before forcing the removal of one with

@@ -164,7 +164,11 @@ impl AppCore {
 			}
 		};
 
-		let status = match shell.status().await {
+		// Fresh, not cached: on a relaunch this runs within moments of
+		// the previous instance stopping the shell, and a probe this
+		// process took just before that still says `Running`. Trusting
+		// it skips the resume and leaves the shell down.
+		let status = match shell.status_fresh().await {
 			Ok(s) => s,
 			Err(err) => {
 				tracing::warn!(error = %err, "auto_resume_shell: status query failed");
@@ -285,7 +289,7 @@ impl AppCore {
 			// keep startup snappy. Still emit so the folder bar's
 			// indicator paints `Running` on first frame instead of
 			// waiting for the user to open the popover.
-			match project.status().await {
+			match project.status_fresh().await {
 				Ok(status) if status.state == ContainerState::Running => {
 					tracing::info!(folder = %folder_path, "auto_resume_project_composes: already running, skipping");
 					emit_project_compose_state(self.events.as_ref(), &folder_path, Some(&project), status);

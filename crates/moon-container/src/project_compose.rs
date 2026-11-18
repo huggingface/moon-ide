@@ -217,6 +217,17 @@ impl ProjectCompose {
 		.await
 	}
 
+	/// [`Self::status`] past the cache: drop the cached reading and
+	/// probe the daemon. For decisions taken right after something
+	/// *outside this process* changed the containers (a previous IDE
+	/// instance finishing its shutdown, a `docker` event): nothing
+	/// here invalidated the cache for those, so a reading up to
+	/// [`status_cache::STATUS_TTL`] old can still say `Running`.
+	pub async fn status_fresh(&self) -> Result<ContainerStatus, LifecycleError> {
+		self.invalidate_status_cache().await;
+		self.status().await
+	}
+
 	/// Drop the cached `status()` reading so the next call
 	/// re-probes `docker compose ps`. Called by every mutating
 	/// method after `docker compose` succeeds.

@@ -67,6 +67,7 @@ import { INBOX_PATH, isInboxPath } from './util/inboxPath';
 import { inbox } from './inbox.svelte';
 import { sessionDismissals } from './sessionDismissals.svelte';
 import { commitPath, isCommitPath, shaFromCommitPath } from './util/commitPath';
+import { isIssuePath, issuePath, issueTabName, numberFromIssuePath } from './util/issuePath';
 import { isPrPath, numberFromPrPath, prPath, prTabName } from './util/prPath';
 import { browserIdFromPath, browserPath, browserTabName, isBrowserPath } from './util/browserPath';
 import { wireBrowserBridge } from './browserBridge';
@@ -225,11 +226,12 @@ function browserBuffer(path: string, url: string): OpenFile {
 	};
 }
 
-/** The synthetic buffer behind a `pr://<number>` tab. */
-function prBuffer(number: number, title: string): OpenFile {
+/** The synthetic buffer behind a pseudo-tab that reads everything
+ *  from its path (`pr://<number>`, `issue://<number>`). */
+function pseudoBuffer(path: string, name: string): OpenFile {
 	return {
-		path: prPath(number),
-		name: prTabName(number, title),
+		path,
+		name,
 		kind: 'text',
 		isUntitled: false,
 		text: '',
@@ -1956,7 +1958,16 @@ class WorkspaceState {
 		this.filesPanelVisible = state.files_panel_visible;
 		// Per-workspace, like the terminals below: both come from
 		// `session.json`.
-		inbox.hydrate(session?.inbox ?? { watched_authors: [], snoozed: [], tab_open: false });
+		inbox.hydrate(
+			session?.inbox ?? {
+				watched_authors: [],
+				snoozed: [],
+				tab_open: false,
+				group_by_topic: false,
+				groups: [],
+				grouped: [],
+			},
+		);
 		inbox.bindOnChange(() => this.persistAppState());
 		sessionDismissals.hydrate(session?.dismissed_coder_sessions ?? []);
 		sessionDismissals.bindOnChange(() => this.persistAppState());
@@ -4941,13 +4952,21 @@ class WorkspaceState {
 	 * Open (or focus) a pull request's pseudo-tab in the active
 	 * folder's tab strip. Needs no checkout of the branch: `PrView`
 	 * reads the pull request and its diff from the number in the
-	 * path, against the active folder's repository. Same
-	 * synthetic-`OpenFile` shape as `openCommitTab`.
+	 * path, against the active folder's repository.
 	 */
 	openPrTab(number: number, title: string, side: SplitSide = this.focusedSide) {
-		const path = prPath(number);
+		this.#showPseudoTab(prPath(number), prTabName(number, title), side);
+	}
+
+	/** Open (or focus) an issue's pseudo-tab (ADR 0117), an issue of
+	 *  the active folder's repository. */
+	openIssueTab(number: number, title: string, side: SplitSide = this.focusedSide) {
+		this.#showPseudoTab(issuePath(number), issueTabName(number, title), side);
+	}
+
+	#showPseudoTab(path: string, name: string, side: SplitSide) {
 		if (!this.openFiles.some((f) => f.path === path)) {
-			this.openFiles = [...this.openFiles, prBuffer(number, title)];
+			this.openFiles = [...this.openFiles, pseudoBuffer(path, name)];
 		}
 		const tabs = this.tabsFor(side);
 		if (!tabs.includes(path)) {
@@ -4957,19 +4976,20 @@ class WorkspaceState {
 	}
 
 	/**
-	 * Add a pull request's tab to `folderPath`'s left strip without
-	 * showing it: the way to queue several from the inbox. The folder
-	 * need not be the active one; the tab is there when the user gets
-	 * to it. Returns `false` when the folder isn't bound.
+	 * Add a pull request's or an issue's tab to `folderPath`'s left
+	 * strip without showing it: the way to queue several from the
+	 * inbox. The folder need not be the active one; the tab is there
+	 * when the user gets to it. Returns `false` when the folder isn't
+	 * bound.
 	 */
-	openPrTabInBackground(folderPath: string, number: number, title: string): boolean {
+	openGithubTabInBackground(folderPath: string, kind: 'pr' | 'issue', number: number, title: string): boolean {
 		const state = this.folderStates.get(folderPath);
 		if (state === undefined) {
 			return false;
 		}
-		const path = prPath(number);
+		const path = kind === 'pr' ? prPath(number) : issuePath(number);
 		if (!state.openFiles.some((f) => f.path === path)) {
-			state.openFiles = [...state.openFiles, prBuffer(number, title)];
+			state.openFiles = [...state.openFiles, pseudoBuffer(path, prTabName(number, title))];
 		}
 		if (!state.leftTabs.includes(path) && !state.rightTabs.includes(path)) {
 			state.leftTabs = [...state.leftTabs, path];
@@ -5258,6 +5278,13 @@ class WorkspaceState {
 			const number = numberFromPrPath(path);
 			if (number !== null) {
 				this.openPrTab(number, '', side);
+			}
+			return;
+		}
+		if (isIssuePath(path)) {
+			const number = numberFromIssuePath(path);
+			if (number !== null) {
+				this.openIssueTab(number, '', side);
 			}
 			return;
 		}
@@ -7617,6 +7644,7 @@ export function isSyntheticBufferPath(path: string): boolean {
 		isReviewPath(path) ||
 		isCommitPath(path) ||
 		isPrPath(path) ||
+		isIssuePath(path) ||
 		isBrowserPath(path) ||
 		isInboxPath(path)
 	);

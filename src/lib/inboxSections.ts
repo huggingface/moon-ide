@@ -3,7 +3,15 @@
 // previous one, and the text filter. Kept apart from the store so it
 // can be tested without runes.
 
-import type { InboxItem, InboxSnapshot, InboxSnooze, InboxSource } from './protocol';
+import type {
+	InboxGroup,
+	InboxGroupAssignment,
+	InboxGrouping,
+	InboxItem,
+	InboxSnapshot,
+	InboxSnooze,
+	InboxSource,
+} from './protocol';
 
 /** A reason an item is in the inbox. An item can have several. */
 export type InboxCategory = 'unread' | 'review' | 'watched' | 'mentioned' | 'mine';
@@ -38,7 +46,8 @@ export type InboxList = {
 	counts: Record<InboxChip, number>;
 };
 
-function isOpenPr(item: InboxItem): boolean {
+/** A pull request that is still up for review. */
+export function isOpenPr(item: InboxItem): boolean {
 	return item.kind === 'pull_request' && (item.state === 'open' || item.state === 'draft');
 }
 
@@ -286,4 +295,68 @@ export function relativeTime(iso: string, now: number): string {
 		return `${days}d`;
 	}
 	return `${Math.round(days / 30)}mo`;
+}
+
+/** A run of rows under one heading. `name` is `null` for the rows no
+ * group holds: issues, notifications, pull requests not placed yet. */
+export type InboxSection = { name: string | null; reason: string; rows: InboxRow[] };
+
+/**
+ * `rows` under their groups. Rows keep their order within a section,
+ * and sections are ordered by their first row, so a list that came
+ * newest first leads with the group holding the newest item. Rows
+ * without a known group come last, together.
+ */
+export function groupRows(
+	rows: readonly InboxRow[],
+	groups: readonly InboxGroup[],
+	groupOf: ReadonlyMap<string, string>,
+): InboxSection[] {
+	const known = new Map(groups.map((group) => [group.name, group]));
+	const sections = new Map<string, InboxSection>();
+	const rest: InboxRow[] = [];
+	for (const row of rows) {
+		const group = known.get(groupOf.get(row.item.id) ?? '');
+		if (group === undefined) {
+			rest.push(row);
+			continue;
+		}
+		let section = sections.get(group.name);
+		if (section === undefined) {
+			section = { name: group.name, reason: group.reason, rows: [] };
+			sections.set(group.name, section);
+		}
+		section.rows.push(row);
+	}
+	const out = [...sections.values()];
+	if (rest.length > 0) {
+		out.push({ name: null, reason: '', rows: rest });
+	}
+	return out;
+}
+
+/** Fold a grouping answer into what is already known: new groups are
+ * appended, and each named item moves to its group. */
+export function applyGrouping(
+	groups: readonly InboxGroup[],
+	grouped: readonly InboxGroupAssignment[],
+	answer: InboxGrouping,
+): { groups: InboxGroup[]; grouped: InboxGroupAssignment[] } {
+	const names = new Set(groups.map((group) => group.name));
+	const placed = new Set(answer.assignments.map((assignment) => assignment.id));
+	return {
+		groups: [...groups, ...answer.groups.filter((group) => !names.has(group.name))],
+		grouped: [...grouped.filter((assignment) => !placed.has(assignment.id)), ...answer.assignments],
+	};
+}
+
+/** Drop assignments of items that are gone, and groups left empty. */
+export function pruneGrouping(
+	groups: readonly InboxGroup[],
+	grouped: readonly InboxGroupAssignment[],
+	liveIds: ReadonlySet<string>,
+): { groups: InboxGroup[]; grouped: InboxGroupAssignment[] } {
+	const kept = grouped.filter((assignment) => liveIds.has(assignment.id));
+	const used = new Set(kept.map((assignment) => assignment.group));
+	return { groups: groups.filter((group) => used.has(group.name)), grouped: kept };
 }

@@ -7,8 +7,26 @@
 
 import { ipc } from './ipc';
 import { SvelteSet } from 'svelte/reactivity';
-import { activeSnoozes, buildList, mergeSnapshot, withoutNotification, type InboxChip } from './inboxSections';
-import { formatError, type InboxState, type InboxItem, type InboxSnapshot, type InboxSnooze } from './protocol';
+import {
+	activeSnoozes,
+	applyGrouping,
+	buildList,
+	isOpenPr,
+	mergeSnapshot,
+	pruneGrouping,
+	withoutNotification,
+	type InboxChip,
+} from './inboxSections';
+import {
+	formatError,
+	type InboxGroup,
+	type InboxGroupAssignment,
+	type InboxItem,
+	type InboxPrDigest,
+	type InboxSnapshot,
+	type InboxSnooze,
+	type InboxState,
+} from './protocol';
 
 /** Poll period while an inbox tab is on screen in a focused window. */
 const VISIBLE_POLL_MS = 75_000;
@@ -37,6 +55,23 @@ class InboxStore {
 	 * with the rest of the inbox's state. */
 	tabOpen = $state(false);
 
+	/** Notes, review threads and changed paths per pull request
+	 * (ADR 0119), with the `updatedAt` each was read at: a row is
+	 * read again only once GitHub says it changed. */
+	digests = $state<Record<string, { updatedAt: string; digest: InboxPrDigest }>>({});
+
+	/** The list is shown by group. */
+	groupByTopic = $state(false);
+	/** Groups the model made, and where it put each pull request. A
+	 * pull request stays in its group until it leaves the inbox or
+	 * the user asks for a regroup. */
+	groups = $state<InboxGroup[]>([]);
+	grouped = $state<InboxGroupAssignment[]>([]);
+	/** A grouping call is running. */
+	grouping = $state(false);
+	groupError = $state<string | null>(null);
+	readonly groupOf = $derived(new Map(this.grouped.map((assignment) => [assignment.id, assignment.group])));
+
 	/** Filter chips switched on in the tab. None means every item
 	 * that isn't snoozed. Not persisted: a fresh window starts with
 	 * the whole list. */
@@ -54,15 +89,30 @@ class InboxStore {
 	#timer: number | null = null;
 	#lastAttempt = 0;
 	#onChange: (() => void) | null = null;
+	#readingDigests = false;
+	/** Pull requests a grouping call was asked about and didn't place.
+	 * They aren't offered again by themselves, or a model that keeps
+	 * leaving one out would be asked at every poll. */
+	readonly #unplaced = new Set<string>();
 
 	hydrate(state: InboxState): void {
 		this.watchedAuthors = [...state.watched_authors];
 		this.snoozed = activeSnoozes(state.snoozed, Date.now());
 		this.tabOpen = state.tab_open;
+		this.groupByTopic = state.group_by_topic;
+		this.groups = [...state.groups];
+		this.grouped = [...state.grouped];
 	}
 
 	serialise(): InboxState {
-		return { watched_authors: this.watchedAuthors, snoozed: this.snoozed, tab_open: this.tabOpen };
+		return {
+			watched_authors: this.watchedAuthors,
+			snoozed: this.snoozed,
+			tab_open: this.tabOpen,
+			group_by_topic: this.groupByTopic,
+			groups: this.groups,
+			grouped: this.grouped,
+		};
 	}
 
 	/** Called whenever the persisted part (authors, snoozes) changes. */
@@ -167,6 +217,127 @@ class InboxStore {
 			this.error = formatError(err);
 		} finally {
 			this.loading = false;
+		}
+		await this.#readDigests();
+		this.#forgetGone();
+		void this.#placeNew();
+	}
+
+	/** Read the digest of every open pull request that is new or has
+	 * changed since its last one. Best-effort: a row without one just
+	 * shows no counts, and is asked for again at the next poll. */
+	async #readDigests(): Promise<void> {
+		const items = this.snapshot?.items ?? [];
+		const stale = items.filter(
+			(item) => isOpenPr(item) && item.number !== null && this.digests[item.id]?.updatedAt !== item.updatedAt,
+		);
+		if (stale.length === 0 || this.#readingDigests) {
+			return;
+		}
+		this.#readingDigests = true;
+		try {
+			const read = await ipc.inbox.digests(stale.map((item) => ({ repo: item.repo, number: item.number ?? 0 })));
+			const updatedAt = new Map(stale.map((item) => [item.id, item.updatedAt]));
+			const live = new Set((this.snapshot?.items ?? items).map((item) => item.id));
+			const next = Object.fromEntries(Object.entries(this.digests).filter(([id]) => live.has(id)));
+			for (const digest of read) {
+				next[digest.id] = { updatedAt: updatedAt.get(digest.id) ?? '', digest };
+			}
+			this.digests = next;
+		} catch {
+			// The rows stay as they were.
+		} finally {
+			this.#readingDigests = false;
+		}
+	}
+
+	/** Drop what is kept about pull requests that left the inbox. Only
+	 * after a complete poll: a source that failed says nothing about
+	 * whether its items are gone. */
+	#forgetGone(): void {
+		const snapshot = this.snapshot;
+		if (snapshot === null || snapshot.status.kind !== 'ok' || snapshot.failures.length > 0) {
+			return;
+		}
+		const pruned = pruneGrouping(this.groups, this.grouped, new Set(snapshot.items.map((item) => item.id)));
+		if (pruned.grouped.length === this.grouped.length && pruned.groups.length === this.groups.length) {
+			return;
+		}
+		this.groups = pruned.groups;
+		this.grouped = pruned.grouped;
+		this.#onChange?.();
+	}
+
+	setGroupByTopic(on: boolean): void {
+		if (this.groupByTopic === on) {
+			return;
+		}
+		this.groupByTopic = on;
+		this.#onChange?.();
+		void this.#placeNew(true);
+	}
+
+	/** Sort every pull request afresh. The groups on screen stay until
+	 * the new ones arrive, so a failed call loses nothing. */
+	regroup(): void {
+		void this.#placeNew(true, true);
+	}
+
+	/** Try the grouping call again after a failure. */
+	retryGrouping(): void {
+		void this.#placeNew(true);
+	}
+
+	/** Ask the model where the pull requests without a group go
+	 * (ADR 0119). Runs only while the list is shown by group, and
+	 * only for pull requests it hasn't been asked about. After a
+	 * failure nothing is asked again until the user says so
+	 * (`retry`): a poll every minute is no reason to repeat a call
+	 * that isn't working. `afresh` places every pull request again
+	 * and replaces the groups with the answer. */
+	async #placeNew(retry = false, afresh = false): Promise<void> {
+		if (!this.groupByTopic || this.grouping || (this.groupError !== null && !retry)) {
+			return;
+		}
+		const pending = (this.snapshot?.items ?? []).filter(
+			(item) => isOpenPr(item) && (afresh || (!this.groupOf.has(item.id) && !this.#unplaced.has(item.id))),
+		);
+		if (pending.length === 0) {
+			return;
+		}
+		this.grouping = true;
+		try {
+			const answer = await ipc.inbox.group({
+				items: pending.map((item) => ({
+					id: item.id,
+					repo: item.repo,
+					title: item.title,
+					author: item.author,
+					headRef: item.headRef,
+					additions: item.additions,
+					deletions: item.deletions,
+					paths: this.digests[item.id]?.digest.paths ?? [],
+					summary: this.digests[item.id]?.digest.summary ?? '',
+				})),
+				existing: afresh ? [] : this.groups,
+			});
+			const merged = afresh ? applyGrouping([], [], answer) : applyGrouping(this.groups, this.grouped, answer);
+			this.groups = merged.groups;
+			this.grouped = merged.grouped;
+			if (afresh) {
+				this.#unplaced.clear();
+			}
+			for (const item of pending) {
+				if (!this.groupOf.has(item.id)) {
+					this.#unplaced.add(item.id);
+				}
+			}
+			this.groupError = null;
+			this.#onChange?.();
+		} catch (err) {
+			this.groupError = formatError(err);
+		} finally {
+			this.grouping = false;
 		}
 	}
 

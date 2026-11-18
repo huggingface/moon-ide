@@ -21,6 +21,11 @@ When the folder's branch has an open GitHub PR, the review tab shows it:
   check counts, description, moonbot's notes, open review threads, and
   the checks list (failing first). Notes and threads are a jump list
   into the diff.
+- **The conversation in the panel**, after the description: top-level
+  comments and review summaries, oldest first, long ones cut short
+  until asked for. They are where a bot's whole review often lives,
+  and nothing else in the tab showed them. Comments GitHub hides are
+  left out, as are reviews that are only a carrier for inline threads.
 - **Under their lines in the diff**: review threads, and moonbot notes
   that name a line. Resolved threads are folded to one row.
 - **Read-only.** Replying to or resolving a thread still happens on

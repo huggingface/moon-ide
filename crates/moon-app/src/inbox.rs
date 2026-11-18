@@ -4,8 +4,10 @@ use camino::Utf8Path;
 use moon_core::forge::{detect_forge_remote, ForgeKind};
 use moon_core::host::WorktreeBranch;
 use moon_core::inbox;
-use moon_protocol::inbox::{InboxOpenedPr, InboxRepo, InboxSnapshot};
-use moon_protocol::review::{PrOpened, PullRequestDetail};
+use moon_protocol::inbox::{
+	InboxGroupRequest, InboxGrouping, InboxOpenedPr, InboxPrDigest, InboxPrRef, InboxRepo, InboxSnapshot, IssueDetail,
+};
+use moon_protocol::review::{PrDiff, PrThread, PullRequestDetail};
 use moon_protocol::workspace::FolderOrigin;
 use moon_protocol::MoonError;
 
@@ -45,6 +47,20 @@ async fn bound_repos(app: &AppCore) -> Vec<InboxRepo> {
 pub async fn inbox_fetch(app: &AppCore, watched_authors: Vec<String>) -> Result<InboxSnapshot, MoonError> {
 	let repos = bound_repos(app).await;
 	Ok(inbox::fetch(&watched_authors, repos).await)
+}
+
+/// Notes, review threads, changed paths and the start of the
+/// description of each pull request in `subjects`. One that can't be
+/// read is missing from the answer.
+pub async fn inbox_digests(subjects: Vec<InboxPrRef>) -> Result<Vec<InboxPrDigest>, MoonError> {
+	Ok(inbox::digests(&subjects).await)
+}
+
+/// Sort `request.items` into groups to review together (ADR 0119):
+/// one model call, through the coder's inference. Errors when the
+/// coder isn't signed in or the model's answer can't be read.
+pub async fn inbox_group(app: &AppCore, request: InboxGroupRequest) -> Result<InboxGrouping, MoonError> {
+	app.coder.group_pull_requests(&request).await.map_err(MoonError::from)
 }
 
 pub async fn inbox_mark_read(thread_id: String) -> Result<(), MoonError> {
@@ -113,18 +129,42 @@ pub async fn pr_current(app: &AppCore) -> Result<Option<PullRequestDetail>, Moon
 	Ok(moon_core::pull_request::fetch_current(Utf8Path::new(&entry.folder.path)).await)
 }
 
-/// Pull request `number` of the active folder's repository, with its
-/// diff and without a checkout: any folder of the repository will do,
-/// since worktrees share one object store.
-pub async fn pr_open(app: &AppCore, number: u32) -> Result<PrOpened, MoonError> {
+/// Pull request `number` of the active folder's repository, without
+/// its review threads or diff: the one fast call a PR tab paints
+/// from. Any folder of the repository will do.
+pub async fn pr_detail(app: &AppCore, number: u32) -> Result<PullRequestDetail, MoonError> {
 	let entry = app.workspaces.require_active_folder().await?;
-	moon_core::pull_request::open(entry.host.as_ref(), Utf8Path::new(&entry.folder.path), number).await
+	moon_core::pull_request::fetch_detail(Utf8Path::new(&entry.folder.path), Some(number)).await
+}
+
+/// Review threads of the pull request at `url`.
+pub async fn pr_threads(url: String) -> Result<Vec<PrThread>, MoonError> {
+	moon_core::pull_request::fetch_threads_at(&url).await
+}
+
+/// The diff of pull request `number` of the active folder's
+/// repository, without a checkout: worktrees share one object store,
+/// so any folder of the repository will do.
+pub async fn pr_diff(app: &AppCore, number: u32, base_ref: String, head_sha: String) -> Result<PrDiff, MoonError> {
+	let entry = app.workspaces.require_active_folder().await?;
+	moon_core::pull_request::diff(entry.host.as_ref(), number, &base_ref, &head_sha).await
+}
+
+/// Issue `number` of the active folder's repository.
+pub async fn issue_open(app: &AppCore, number: u32) -> Result<IssueDetail, MoonError> {
+	let entry = app.workspaces.require_active_folder().await?;
+	moon_core::issue::fetch(Utf8Path::new(&entry.folder.path), number).await
 }
 
 crate::commands! {
 	pr_current([app]),
-	pr_open([app] number: u32),
+	pr_detail([app] number: u32),
+	pr_threads(url: String),
+	pr_diff([app] number: u32, base_ref: String, head_sha: String),
+	issue_open([app] number: u32),
 	inbox_fetch([app] watched_authors: Vec<String>),
+	inbox_digests(subjects: Vec<InboxPrRef>),
+	inbox_group([app] request: InboxGroupRequest),
 	inbox_mark_read(thread_id: String),
 	inbox_open_pr([app] folder_path: String, branch: String),
 }

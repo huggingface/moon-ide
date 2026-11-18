@@ -168,3 +168,137 @@ pub struct InboxOpenedPr {
 	/// when it already has the branch checked out.
 	pub folder_path: String,
 }
+
+/// An issue as its tab shows it (ADR 0117).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueDetail {
+	pub number: u32,
+	pub title: String,
+	pub url: String,
+	/// Markdown.
+	pub body: String,
+	pub open: bool,
+	pub author: Option<String>,
+	/// RFC 3339.
+	pub created_at: String,
+	pub labels: Vec<IssueLabel>,
+	pub assignees: Vec<String>,
+	/// Oldest first.
+	pub comments: Vec<ConversationComment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct IssueLabel {
+	pub name: String,
+	/// Six hex digits, no `#`.
+	pub color: String,
+}
+
+/// One entry of an issue's or pull request's conversation: a
+/// top-level comment, or a review's summary.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationComment {
+	pub author: Option<String>,
+	/// Markdown. Empty for a review submitted without a summary.
+	pub body: String,
+	/// RFC 3339.
+	pub created_at: String,
+	pub url: String,
+	/// Set when this is a review's summary rather than a comment.
+	pub review: Option<ConversationReview>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationReview {
+	Approved,
+	ChangesRequested,
+	Commented,
+	Dismissed,
+}
+
+/// A pull request the inbox asks more about.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct InboxPrRef {
+	/// `owner/name`.
+	pub repo: String,
+	pub number: u32,
+}
+
+/// What a pull request's row shows beyond the listing, and what
+/// grouping reads of it (ADR 0119). Fetched apart from the snapshot,
+/// and only for rows that changed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxPrDigest {
+	/// [`InboxItem::id`].
+	pub id: String,
+	/// Moonbot's minor notes in the description.
+	pub minor_notes: u32,
+	pub open_threads: u32,
+	pub resolved_threads: u32,
+	/// The first changed paths.
+	pub paths: Vec<String>,
+	/// The start of the description, as plain text.
+	pub summary: String,
+}
+
+/// A named set of pull requests to review together.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct InboxGroup {
+	pub name: String,
+	/// What its pull requests have in common, in a few words.
+	pub reason: String,
+}
+
+/// Which [`InboxGroup`] (by name) an item belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct InboxGroupAssignment {
+	/// [`InboxItem::id`].
+	pub id: String,
+	pub group: String,
+}
+
+/// One pull request as `inbox_group` describes it to the model.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxGroupItem {
+	pub id: String,
+	pub repo: String,
+	pub title: String,
+	pub author: Option<String>,
+	pub head_ref: Option<String>,
+	pub additions: Option<u32>,
+	pub deletions: Option<u32>,
+	pub paths: Vec<String>,
+	pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct InboxGroupRequest {
+	/// Pull requests to place.
+	pub items: Vec<InboxGroupItem>,
+	/// Groups that already exist: reused by name when one fits.
+	pub existing: Vec<InboxGroup>,
+}
+
+/// Answer of `inbox_group`. `groups` are the ones `assignments` name;
+/// an item the model left out has no assignment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct InboxGrouping {
+	pub groups: Vec<InboxGroup>,
+	pub assignments: Vec<InboxGroupAssignment>,
+}

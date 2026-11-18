@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
 	activeSnoozes,
+	applyGrouping,
 	buildList,
 	categoriesOf,
+	groupRows,
+	type InboxChip,
+	type InboxRow,
 	matchesFilter,
 	mergeSnapshot,
+	pruneGrouping,
 	quietTags,
 	relativeTime,
 	snoozeLabel,
 	snoozeUntil,
 	withoutNotification,
-	type InboxChip,
 } from './inboxSections';
 import type { InboxItem, InboxSnapshot } from './protocol';
 
@@ -222,5 +226,68 @@ describe('snooze', () => {
 		expect(snoozeLabel(new Date(2026, 10, 19, 8, 0).toISOString(), now)).toBe('tomorrow 08:00');
 		expect(snoozeLabel(new Date(2026, 10, 23, 8, 0).toISOString(), now)).toBe('Mon 08:00');
 		expect(snoozeLabel(new Date(2026, 10, 18, 18, 5).toISOString(), now)).toBe('today 18:05');
+	});
+});
+
+describe('grouping', () => {
+	const row = (id: string): InboxRow => ({ item: item({ id }), categories: [], snoozed: false });
+	const groups = [
+		{ name: 'Docs', reason: 'readme only' },
+		{ name: 'Cursor fixes', reason: 'pagination bugs' },
+	];
+
+	it('puts rows under their groups, ordered by first row, with the rest last', () => {
+		const sections = groupRows(
+			[row('a'), row('b'), row('c'), row('d'), row('e')],
+			groups,
+			new Map([
+				['a', 'Cursor fixes'],
+				['c', 'Docs'],
+				['d', 'Cursor fixes'],
+				['e', 'A group that no longer exists'],
+			]),
+		);
+		expect(sections.map((section) => [section.name, section.rows.map((r) => r.item.id)])).toEqual([
+			['Cursor fixes', ['a', 'd']],
+			['Docs', ['c']],
+			[null, ['b', 'e']],
+		]);
+		expect(sections[0]?.reason).toBe('pagination bugs');
+	});
+
+	it('has no sections for no rows, and no rest when everything is placed', () => {
+		expect(groupRows([], groups, new Map())).toEqual([]);
+		expect(groupRows([row('a')], groups, new Map([['a', 'Docs']])).map((section) => section.name)).toEqual(['Docs']);
+	});
+
+	it('folds an answer in: new groups appended, named items moved', () => {
+		const merged = applyGrouping(groups, [{ id: 'a', group: 'Docs' }], {
+			groups: [
+				{ name: 'Docs', reason: 'ignored: the group exists' },
+				{ name: 'CI', reason: 'workflow changes' },
+			],
+			assignments: [
+				{ id: 'a', group: 'CI' },
+				{ id: 'b', group: 'Docs' },
+			],
+		});
+		expect(merged.groups.map((group) => group.name)).toEqual(['Docs', 'Cursor fixes', 'CI']);
+		expect(merged.groups[0]?.reason).toBe('readme only');
+		expect(merged.grouped).toEqual([
+			{ id: 'a', group: 'CI' },
+			{ id: 'b', group: 'Docs' },
+		]);
+	});
+
+	it('prunes items that are gone and groups left empty', () => {
+		const pruned = pruneGrouping(
+			groups,
+			[
+				{ id: 'a', group: 'Docs' },
+				{ id: 'b', group: 'Cursor fixes' },
+			],
+			new Set(['a']),
+		);
+		expect(pruned).toEqual({ groups: [groups[0]], grouped: [{ id: 'a', group: 'Docs' }] });
 	});
 });

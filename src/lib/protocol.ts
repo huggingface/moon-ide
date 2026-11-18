@@ -400,16 +400,55 @@ export type PullRequestDetail = {
 	minorNotes: PrMinorNote[];
 	/** Short SHA the notes' line numbers refer to. */
 	minorNotesSha: string | null;
+	/** Empty in `pr_detail`'s answer; `pr_threads` reads them. */
 	threads: PrThread[];
+	/** Top-level comments and review summaries, oldest first. */
+	conversation: ConversationComment[];
 };
 
-/** A pull request opened in its own tab, without a checkout: the
- * detail and the diff from `mergeBase` to its head. Mirrors
- * `moon_protocol::review::PrOpened`. */
-export type PrOpened = {
-	detail: PullRequestDetail;
+export type ConversationReview = 'approved' | 'changes_requested' | 'commented' | 'dismissed';
+
+/** A top-level comment of an issue or pull request, or a review's
+ * summary (`review` set). Mirrors
+ * `moon_protocol::inbox::ConversationComment`. */
+export type ConversationComment = {
+	author: string | null;
+	body: string;
+	createdAt: string;
+	url: string;
+	review: ConversationReview | null;
+};
+
+export type IssueLabel = { name: string; color: string };
+
+/** An issue as its tab shows it. Mirrors
+ * `moon_protocol::inbox::IssueDetail`. */
+export type IssueDetail = {
+	number: number;
+	title: string;
+	url: string;
+	body: string;
+	open: boolean;
+	author: string | null;
+	createdAt: string;
+	labels: IssueLabel[];
+	assignees: string[];
+	comments: ConversationComment[];
+};
+
+/** The diff of a pull request opened without a checkout, from
+ * `mergeBase` to its head. Mirrors `moon_protocol::review::PrDiff`. */
+export type PrDiff = {
 	mergeBase: string;
-	files: GitStatusEntry[];
+	files: PrDiffFile[];
+};
+
+/** One file of a `PrDiff`. The counts are `null` for a binary file. */
+export type PrDiffFile = {
+	path: string;
+	status: GitFileStatus;
+	additions: number | null;
+	deletions: number | null;
 };
 
 /**
@@ -1073,7 +1112,49 @@ export type InboxState = {
 	snoozed: InboxSnooze[];
 	/** The inbox tab is open: first tab of every folder until closed. */
 	tab_open: boolean;
+	/** The list is shown by group rather than flat. */
+	group_by_topic: boolean;
+	/** Groups the model made, and which pull request is in which. */
+	groups: InboxGroup[];
+	grouped: InboxGroupAssignment[];
 };
+
+export type InboxPrRef = { repo: string; number: number };
+
+/** What a pull request's row shows beyond the listing, and what
+ * grouping reads of it. Mirrors `moon_protocol::inbox::InboxPrDigest`. */
+export type InboxPrDigest = {
+	id: string;
+	minorNotes: number;
+	openThreads: number;
+	resolvedThreads: number;
+	paths: string[];
+	summary: string;
+};
+
+/** A named set of pull requests to review together. */
+export type InboxGroup = { name: string; reason: string };
+
+export type InboxGroupAssignment = { id: string; group: string };
+
+/** One pull request as `inbox_group` describes it to the model. */
+export type InboxGroupItem = {
+	id: string;
+	repo: string;
+	title: string;
+	author: string | null;
+	headRef: string | null;
+	additions: number | null;
+	deletions: number | null;
+	paths: string[];
+	summary: string;
+};
+
+export type InboxGroupRequest = { items: InboxGroupItem[]; existing: InboxGroup[] };
+
+/** Answer of `inbox_group`: an item the model left out has no
+ * assignment. */
+export type InboxGrouping = { groups: InboxGroup[]; assignments: InboxGroupAssignment[] };
 
 /** An inbox item hidden until `until` (RFC 3339). */
 export type InboxSnooze = { id: string; until: string };

@@ -18,7 +18,11 @@
 	import { effectiveDiffLayout, gutterDigits } from '../editor/diffLayout';
 	import { wireHorizontalScrollSync } from '../editor/hScrollSync';
 	import { annotationsFor, PrAnnotationWiring } from '../editor/prAnnotations';
+	import type { FileOutline } from '../prFiles';
 	import type { DiffLayout, EditorConfig, GitFileStatus, PullRequestDetail } from '../protocol';
+	import DiffStat from './DiffStat.svelte';
+	import ChevronDownIcon from './icons/ChevronDownIcon.svelte';
+	import ChevronRightIcon from './icons/ChevronRightIcon.svelte';
 
 	type Props = {
 		path: string;
@@ -36,9 +40,17 @@
 		// PR tab, ADR 0113): its review threads and line-bound moonbot
 		// notes render under their lines. Absent for a plain commit.
 		pullRequest?: PullRequestDetail;
+		// The PR tab's per-file review controls (ADR 0118): the size
+		// of the change, a collapse toggle and a viewed mark. A
+		// collapsed section is its header alone and loads nothing.
+		outline?: FileOutline;
 	};
 
-	let { path, status, commitSha, parentSha, eager, registerSection, side, pullRequest }: Props = $props();
+	let { path, status, commitSha, parentSha, eager, registerSection, side, pullRequest, outline }: Props = $props();
+
+	const collapsed = $derived(outline?.collapsed ?? false);
+	// Near enough to the viewport for its diff to be worth loading.
+	let inView = $state(false);
 
 	let sectionEl: HTMLElement | undefined = $state();
 	let host: HTMLDivElement | undefined = $state();
@@ -150,9 +162,33 @@
 			return;
 		}
 		loaded = { base, after, lang };
-		mountViews(loaded);
 		loading = false;
+		if (!collapsed) {
+			mountViews(loaded);
+		}
 	}
+
+	// Collapsing drops the editors (hidden ones would measure
+	// themselves at zero height) but keeps the blobs, so opening the
+	// file again is a rebuild without a round trip.
+	$effect(() => {
+		const hide = collapsed;
+		const wanted = inView;
+		untrack(() => {
+			if (hide) {
+				destroyViews();
+				return;
+			}
+			if (!wanted || builtLayout !== null) {
+				return;
+			}
+			if (loaded !== null) {
+				mountViews(loaded);
+				return;
+			}
+			void build();
+		});
+	});
 
 	function paneExtensions(pane: 'a' | 'b', lang: Extension): Extension[] {
 		const isA = pane === 'a';
@@ -305,12 +341,12 @@
 			}
 			// Both layouts collapse the same lines of the after-side
 			// text, so what the reader had expanded stays expanded.
-			const collapsed = before === undefined ? null : collapsedLines(before.state);
+			const hiddenLines = before === undefined ? null : collapsedLines(before.state);
 			destroyViews();
 			mountViews(loaded);
 			const rebuilt = merge?.b ?? unified;
-			if (collapsed !== null && rebuilt !== undefined) {
-				restoreCollapsed(rebuilt, collapsed);
+			if (hiddenLines !== null && rebuilt !== undefined) {
+				restoreCollapsed(rebuilt, hiddenLines);
 			}
 			const token = buildToken;
 			const held = anchor;
@@ -414,7 +450,12 @@
 		const resize = new ResizeObserver(() => {
 			cancelAnimationFrame(frame);
 			frame = requestAnimationFrame(() => {
-				hostWidth = host?.clientWidth ?? 0;
+				// A collapsed section's body has no box; its last real
+				// width still decides the layout it reopens in.
+				const width = host?.clientWidth ?? 0;
+				if (width > 0) {
+					hostWidth = width;
+				}
 			});
 		});
 		if (host) {
@@ -423,13 +464,13 @@
 		}
 		let io: IntersectionObserver | null = null;
 		if (eager) {
-			void build();
+			inView = true;
 		} else if (sectionEl) {
 			io = new IntersectionObserver(
 				(entries) => {
 					if (entries.some((entry) => entry.isIntersecting)) {
 						io?.disconnect();
-						void build();
+						inView = true;
 					}
 				},
 				{ rootMargin: '50% 0px' },
@@ -448,20 +489,43 @@
 	});
 </script>
 
-<section bind:this={sectionEl} class="commit-section" aria-label={`Diff of ${path}`}>
+<section bind:this={sectionEl} class="commit-section" class:collapsed aria-label={`Diff of ${path}`}>
 	<header class="hdr">
+		{#if outline !== undefined}
+			<button
+				type="button"
+				class="fold"
+				aria-expanded={!collapsed}
+				title={collapsed ? 'Show the diff' : 'Hide the diff'}
+				onclick={outline.onToggle}
+			>
+				{#if collapsed}<ChevronRightIcon size={14} />{:else}<ChevronDownIcon size={14} />{/if}
+			</button>
+		{/if}
 		<span class="status status-{status}" title={`Status: ${status}`} aria-label={`Status ${status}`}>
 			{statusLabel(status)}
 		</span>
 		<button type="button" class="path" title={`Open ${path}`} onclick={openInEditor}>
 			{#if dirName(path)}<span class="dir">{dirName(path)}/</span>{/if}<span class="name">{fileName(path)}</span>
 		</button>
+		{#if outline !== undefined}
+			{#if outline.attention > 0}
+				<span class="attention" title="Unresolved threads and notes on this file">{outline.attention}</span>
+			{/if}
+			<DiffStat additions={outline.additions} deletions={outline.deletions} />
+			<label class="viewed" title="Mark as viewed and move to the next file (v)">
+				<input
+					type="checkbox"
+					checked={outline.viewed}
+					onchange={(event) => outline.onViewed(event.currentTarget.checked)}
+				/>
+				Viewed
+			</label>
+		{/if}
 	</header>
 	<div class="body" bind:this={host}></div>
-	{#if builtLayout === null && loading}
-		<div class="placeholder">Loading diff…</div>
-	{:else if builtLayout === null}
-		<div class="placeholder">Scroll to load diff</div>
+	{#if !collapsed && builtLayout === null}
+		<div class="placeholder">{loading ? 'Loading diff…' : 'Scroll to load diff'}</div>
 	{/if}
 </section>
 
@@ -544,6 +608,56 @@
 	}
 	.dir {
 		color: var(--m-fg-subtle);
+	}
+	.commit-section.collapsed .hdr {
+		border-bottom: none;
+		border-radius: 5px;
+	}
+	.fold {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 20px;
+		height: 20px;
+		margin-left: -4px;
+		padding: 0;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-fg-muted);
+		cursor: pointer;
+	}
+	.fold:hover {
+		background: var(--m-bg-3);
+		color: var(--m-fg);
+	}
+	.attention {
+		flex-shrink: 0;
+		min-width: 16px;
+		padding: 0 5px;
+		border-radius: var(--m-radius-pill);
+		background: color-mix(in srgb, var(--m-accent) 16%, transparent);
+		color: var(--m-accent);
+		font-size: var(--m-text-xs);
+		font-variant-numeric: tabular-nums;
+		line-height: 16px;
+		text-align: center;
+	}
+	.viewed {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--m-space-1);
+		flex-shrink: 0;
+		margin-left: var(--m-space-2);
+		color: var(--m-fg-muted);
+		font-size: var(--m-text-xs);
+		cursor: pointer;
+	}
+	.viewed input {
+		margin: 0;
+		accent-color: var(--m-accent);
+		cursor: pointer;
 	}
 	.body {
 		min-height: 0;
