@@ -2145,6 +2145,9 @@
 			case 'slack_read': {
 				return typeof o.target === 'string' ? o.target : null;
 			}
+			case 'review_note': {
+				return typeof o.path === 'string' ? `${o.path}:${String(o.line ?? '?')}` : null;
+			}
 			case 'web_fetch':
 			case 'open_browser': {
 				return typeof o.url === 'string' ? o.url : null;

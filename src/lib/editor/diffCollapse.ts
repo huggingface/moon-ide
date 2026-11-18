@@ -377,7 +377,15 @@ function planFor(state: EditorState, range: LineRange, tree: Tree, changes: read
 	});
 }
 
-type BarInfo = { lines: number; plan: BarPlan };
+/** `tail`: nothing follows the collapsed run, so its bar has no block
+ *  to offer an explanation of. */
+type BarInfo = { lines: number; plan: BarPlan; tail: boolean };
+
+/** When an editor provides this, each bar offers to explain the code
+ *  that follows it; the callback is given that block's lines. */
+export const diffCollapseAsk = Facet.define<(block: LineRange) => void, ((block: LineRange) => void) | null>({
+	combine: (values) => values[0] ?? null,
+});
 
 function sameAction(a: BarAction | null, b: BarAction | null): boolean {
 	if (a === null || b === null) {
@@ -416,6 +424,7 @@ class CollapseBarWidget extends WidgetType {
 		const b = other.info;
 		return (
 			a.lines === b.lines &&
+			a.tail === b.tail &&
 			a.plan.symbol === b.plan.symbol &&
 			sameAction(a.plan.below, b.plan.below) &&
 			sameAction(a.plan.above, b.plan.above)
@@ -456,6 +465,22 @@ class CollapseBarWidget extends WidgetType {
 
 		const actions = row.appendChild(document.createElement('span'));
 		actions.className = 'cm-diffCollapse-actions';
+		const ask = view.state.facet(diffCollapseAsk);
+		if (ask !== null && !this.info.tail) {
+			const explain = document.createElement('button');
+			explain.type = 'button';
+			explain.className = 'cm-diffCollapse-btn cm-diffCollapse-ask';
+			explain.textContent = 'Explain';
+			explain.title = 'Ask the agent what the change below does';
+			explain.addEventListener('mousedown', (event) => event.preventDefault());
+			explain.addEventListener('click', () => {
+				const block = blockAfter(view, root);
+				if (block !== null) {
+					ask(block);
+				}
+			});
+			actions.append(explain);
+		}
 		if (plan.above !== null) {
 			const { text, title } = actionText(plan.above, 'above');
 			actions.append(button(text, title, 'above', 'cm-diffCollapse-btn'));
@@ -492,7 +517,11 @@ function withDeco(state: EditorState, ranges: readonly PosRange[], rebuild: bool
 	const changes = ownChanges(state);
 	const decorations: Range<Decoration>[] = ranges.map((range) => {
 		const lines = toLines(state.doc, range);
-		const info = { lines: lines.to - lines.from + 1, plan: planFor(state, lines, tree, changes) };
+		const info = {
+			lines: lines.to - lines.from + 1,
+			plan: planFor(state, lines, tree, changes),
+			tail: lines.to >= state.doc.lines,
+		};
 		return Decoration.replace({ widget: new CollapseBarWidget(info), block: true }).range(range.from, range.to);
 	});
 	return { ranges, deco: Decoration.set(decorations), rebuild };
@@ -644,6 +673,25 @@ function runCommand(view: EditorView, bar: HTMLElement, command: BarCommand): vo
 	commit(view, revealLines(collapsedLines(state), reveal));
 }
 
+/** The visible lines between `bar`'s collapsed run and the next one. */
+function blockAfter(view: EditorView, bar: HTMLElement): LineRange | null {
+	const state = view.state;
+	const pos = view.posAtDOM(bar);
+	const ranges = state.field(collapseField).ranges;
+	const index = ranges.findIndex((range) => range.from <= pos && pos <= range.to);
+	const hit = ranges[index];
+	if (hit === undefined) {
+		return null;
+	}
+	const from = toLines(state.doc, hit).to + 1;
+	if (from > state.doc.lines) {
+		return null;
+	}
+	const next = ranges[index + 1];
+	const to = next === undefined ? state.doc.lines : toLines(state.doc, next).from - 1;
+	return { from, to: Math.max(from, to) };
+}
+
 class CollapseSync {
 	// A pane whose ranges moved on their own (an edit, a rebuild)
 	// carries them to its sibling; one that was merely told its
@@ -779,6 +827,9 @@ const collapseTheme = EditorView.baseTheme({
 		color: 'var(--m-fg)',
 		borderColor: 'var(--m-border-strong)',
 		background: 'var(--m-wash-hover)',
+	},
+	'.cm-diffCollapse-ask': {
+		color: 'var(--m-accent)',
 	},
 	'.cm-gutterElement.cm-diffCollapse-gutter': {
 		boxSizing: 'border-box',

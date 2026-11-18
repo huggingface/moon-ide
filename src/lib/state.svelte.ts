@@ -4,11 +4,13 @@ import { confirm, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { SvelteMap } from 'svelte/reactivity';
 import { ipc } from './ipc';
 import { setMarkdownRepoUrl } from './markdown';
+import { reviewNotes } from './reviewNotes.svelte';
 import {
 	defaultEditorConfig,
 	formatError,
 	type AppState,
 	type BranchList,
+	type CoderSessionSummary,
 	type PrListScope,
 	type CompareBaseline,
 	type BranchSwitchTarget,
@@ -1601,6 +1603,26 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Start the agent a pull request is reviewed with (ADR 0124): a
+	 * session in the checkout of `branch`, which is made as a worktree
+	 * of the project at `folderPath` when there is none. The project
+	 * must be the active one, since the session opens in its panel.
+	 * Returns the session, or `null` when it could not be started.
+	 */
+	async newCoderReviewSession(folderPath: string, branch: string): Promise<CoderSessionSummary | null> {
+		try {
+			const result = await ipc.coder.newReviewSession(folderPath, branch);
+			await this.adoptWorkspaceSnapshot(result.workspace);
+			this.persistAppState();
+			coder.adoptCreatedSession(result.session);
+			return result.session;
+		} catch (err) {
+			this.flash(`Could not start an agent on ${branch}: ${formatError(err)}`);
+			return null;
+		}
+	}
+
+	/**
 	 * Spin up an isolated coder session in its own git worktree
 	 * (ADR 0028). The backend branches off the active folder's HEAD,
 	 * checks the branch out into a worktree, binds that worktree as
@@ -2046,6 +2068,7 @@ class WorkspaceState {
 		// that an in-flight turn (e.g. resumed across HMR reloads)
 		// keeps streaming into `coder.rows`.
 		void coder.wireRuntime();
+		void reviewNotes.wireRuntime();
 		// Same pattern for the container status pip — bind the
 		// `container:state` event subscription once, then pull the
 		// current snapshot for whatever workspace is open. Capture

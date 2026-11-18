@@ -497,6 +497,10 @@ export const ipc = {
 		readImage: (path: string) => call<string>('coder_read_image', { path }),
 		activeBackgroundProcesses: (sessionId: string) =>
 			call<ActiveBackgroundProcess[]>('coder_active_background_processes', { sessionId }),
+		/** The agent a pull request is reviewed with: a session in the
+		 * checkout of `branch`, made if there is none. */
+		newReviewSession: (folderPath: string, branch: string) =>
+			call<NewWorktreeSession>('coder_new_review_session', { folderPath, branch }),
 		newWorktreeSession: (baseBranch?: string) =>
 			call<NewWorktreeSession>('coder_new_worktree_session', { baseBranch: baseBranch ?? null }),
 		discardWorktree: (path: string, force: boolean) => call<Workspace>('coder_discard_worktree', { path, force }),

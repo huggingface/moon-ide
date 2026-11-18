@@ -362,6 +362,14 @@ class InboxStore {
 		const wanted = repo.toLowerCase();
 		return this.snapshot?.repos.find((bound) => bound.repo.toLowerCase() === wanted)?.folderPath ?? null;
 	}
+
+	/** GitHub page of pull request or issue `number` of the repository
+	 *  bound at `folderPath`. GitHub redirects between `/pull/` and
+	 *  `/issues/`, so one form serves both. */
+	urlFor(folderPath: string, number: number): string | null {
+		const repo = this.snapshot?.repos.find((bound) => bound.folderPath === folderPath)?.repo;
+		return repo === undefined ? null : `https://github.com/${repo}/issues/${number}`;
+	}
 }
 
 export const inbox = new InboxStore();

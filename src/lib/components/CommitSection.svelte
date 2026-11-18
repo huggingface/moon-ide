@@ -7,6 +7,7 @@
 	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { MergeView, diff as rawDiff, unifiedMergeView } from '@codemirror/merge';
 	import { statusColor } from '../fileIcon';
+	import { repoUrlOf } from '../githubMarkdown';
 	import { ipc } from '../ipc';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
@@ -15,12 +16,13 @@
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import { diffBlockAlign } from '../editor/diffBlockAlign';
-	import { collapsedLines, diffCollapse, restoreCollapsed } from '../editor/diffCollapse';
+	import { collapsedLines, diffCollapse, diffCollapseAsk, restoreCollapsed } from '../editor/diffCollapse';
 	import { effectiveDiffLayout, gutterDigits } from '../editor/diffLayout';
 	import { wireHorizontalScrollSync } from '../editor/hScrollSync';
-	import { annotationsFor, PrAnnotationWiring } from '../editor/prAnnotations';
+	import { annotationsFor, PrAnnotationWiring, type PrAnnotation } from '../editor/prAnnotations';
 	import type { FileOutline } from '../prFiles';
-	import type { DiffLayout, EditorConfig, GitFileStatus, PullRequestDetail } from '../protocol';
+	import type { DiffLayout, EditorConfig, GitFileStatus, PullRequestDetail, ReviewSide } from '../protocol';
+	import type { FileNotes, NoteThread } from '../reviewNotes';
 	import DiffStat from './DiffStat.svelte';
 	import FileIcon from './FileIcon.svelte';
 	import StatusWord from './StatusWord.svelte';
@@ -51,10 +53,24 @@
 		// that need not be the active one: a pull request tab shows a
 		// project's pull request wherever the user is (ADR 0121).
 		folderPath?: string | undefined;
+		// The agent's notes on this file and the ways to ask it more
+		// (ADR 0124). Absent where there is no agent to ask.
+		notes?: FileNotes | undefined;
 	};
 
-	let { path, status, commitSha, parentSha, eager, registerSection, side, pullRequest, outline, folderPath }: Props =
-		$props();
+	let {
+		path,
+		status,
+		commitSha,
+		parentSha,
+		eager,
+		registerSection,
+		side,
+		pullRequest,
+		outline,
+		folderPath,
+		notes,
+	}: Props = $props();
 
 	const collapsed = $derived(outline?.collapsed ?? false);
 	// Near enough to the viewport for its diff to be worth loading.
@@ -94,8 +110,40 @@
 
 	const prWiringA = new PrAnnotationWiring();
 	const prWiringB = new PrAnnotationWiring();
-	const baseAnnotations = $derived(annotationsFor(pullRequest ?? null, path, 'base'));
-	const workingAnnotations = $derived(annotationsFor(pullRequest ?? null, path, 'working'));
+	// One card per thread object: a thread that didn't change keeps
+	// its card, and whatever is half-typed in it.
+	const noteCards = new WeakMap<NoteThread, PrAnnotation>();
+	function noteAnnotations(threadSide: ReviewSide): PrAnnotation[] {
+		const handlers = notes;
+		if (handlers === undefined) {
+			return [];
+		}
+		return handlers.threads
+			.filter((thread) => thread.side === threadSide)
+			.map((thread) => {
+				let card = noteCards.get(thread);
+				if (card === undefined) {
+					card = {
+						kind: 'agent',
+						line: thread.line,
+						repoUrl: pullRequest === undefined ? null : repoUrlOf(pullRequest.url),
+						thread: {
+							entries: thread.entries,
+							pending: thread.pending,
+							onReply: (text) => notes?.onReply(thread, text),
+							onDismiss: () => notes?.onDismiss(thread),
+						},
+					};
+					noteCards.set(thread, card);
+				}
+				return card;
+			});
+	}
+	const baseAnnotations = $derived([...annotationsFor(pullRequest ?? null, path, 'base'), ...noteAnnotations('base')]);
+	const workingAnnotations = $derived([
+		...annotationsFor(pullRequest ?? null, path, 'working'),
+		...noteAnnotations('working'),
+	]);
 	// The unified editor has no base pane, so it carries that side's
 	// threads too, under the removed lines they are about.
 	$effect(() => {
@@ -202,6 +250,8 @@
 			lineNumbers(),
 			diffGutterTintExtension(pane),
 			diffCollapse(),
+			// The new side's bars offer to explain the block they lead to.
+			!isA && notes !== undefined ? diffCollapseAsk.of((block) => notes?.onExplain(block)) : [],
 			foldGutter(),
 			diffPureChangeExtension,
 			highlightSelectionMatches(),
@@ -513,6 +563,16 @@
 		</button>
 		<StatusWord {status} />
 		<span class="grow"></span>
+		{#if notes !== undefined}
+			<button
+				type="button"
+				class="explain"
+				title="Ask the agent what this file's changes do"
+				onclick={() => notes?.onExplain(null)}
+			>
+				Explain
+			</button>
+		{/if}
 		{#if outline !== undefined}
 			{#if outline.attention > 0}
 				<span class="attention" title="Unresolved threads and notes on this file">{outline.attention}</span>
@@ -571,6 +631,21 @@
 	}
 	.grow {
 		flex: 1;
+	}
+	.explain {
+		flex-shrink: 0;
+		padding: 1px 6px;
+		border: 1px solid transparent;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-accent);
+		font: inherit;
+		font-size: var(--m-text-xs);
+		cursor: pointer;
+	}
+	.explain:hover {
+		border-color: var(--m-border-strong);
+		background: var(--m-wash-hover);
 	}
 	.path {
 		flex: 0 1 auto;

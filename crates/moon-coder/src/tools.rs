@@ -1594,6 +1594,33 @@ impl ToolRegistry {
 				}),
 			),
 			ToolDefinition::function(
+				"review_note",
+				"Put a note on a line of the diff the user is reviewing: the changes of the branch you are on, as a pull request or as local changes. It shows as a card under that line in the IDE's review views. Only the user sees it: it is never posted to GitHub or anywhere else. Use it when asked to explain or summarise a change at a place in the diff, or to point the user at a line. Keep it to a few sentences of Markdown; a second call on the same `path` and `line` adds to that card's thread. `line` counts in the file as it is in your checkout; for a line the change removed, pass `side: \"base\"` and count in the old version.",
+				json!({
+					"type": "object",
+					"properties": {
+						"path": {
+							"type": "string",
+							"description": "File the note is about, relative to the repository root."
+						},
+						"line": {
+							"type": "integer",
+							"description": "1-based line the card goes under."
+						},
+						"text": {
+							"type": "string",
+							"description": "The note, in Markdown. A few sentences."
+						},
+						"side": {
+							"type": "string",
+							"enum": ["head", "base"],
+							"description": "`head` (default): the new version of the file. `base`: the old version, for a removed line."
+						}
+					},
+					"required": ["path", "line", "text"]
+				}),
+			),
+			ToolDefinition::function(
 				"list_browser_tabs",
 				"List the IDE's open browser tabs (opened by you, another session, or the user): `tab_id`, `url`, and `target` (`host` / `container`). `url` is the last URL requested for the tab — links the user clicked inside the page aren't tracked.",
 				json!({ "type": "object", "properties": {} }),
@@ -2541,6 +2568,8 @@ impl ToolRegistry {
 			"slack_read" => self.slack_read(args, cancel).await,
 			// Only shows a page to the user; not a mutation.
 			"open_browser" => self.open_browser(args, cx).await,
+			// Shows a card to the user; changes nothing.
+			"review_note" => self.review_note(args, cx),
 			"list_browser_tabs" => Ok(self.list_browser_tabs()),
 			"browser_tab" => self.browser_tab(args, cx).await,
 			// Reading the page is inspection; acting on it is gated like
@@ -2903,6 +2932,58 @@ impl ToolRegistry {
 			.read(&target, parsed.limit, parsed.cursor.as_deref(), cancel)
 			.await
 			.map_err(|err| err.into_tool(TOOL))
+	}
+
+	fn review_note(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
+		const TOOL: &str = "review_note";
+		#[derive(Deserialize)]
+		struct ReviewNoteArgs {
+			path: String,
+			line: u32,
+			text: String,
+			#[serde(default)]
+			side: Option<String>,
+		}
+		let parsed: ReviewNoteArgs =
+			serde_json::from_value(args.clone()).map_err(|err| CoderError::invalid_args(TOOL, err.to_string()))?;
+		let root = cx.folder.folder.path.as_str();
+		// The diff views name files relative to the repository root.
+		let path = parsed.path.trim();
+		let path = path
+			.strip_prefix(root)
+			.map_or(path, |rest| rest.trim_start_matches('/'))
+			.trim_start_matches("./");
+		let text = parsed.text.trim();
+		if path.is_empty() || path.starts_with('/') || path.split('/').any(|part| part == "..") {
+			return Err(CoderError::invalid_args(
+				TOOL,
+				"path must be a file inside the repository",
+			));
+		}
+		if parsed.line == 0 {
+			return Err(CoderError::invalid_args(TOOL, "line is 1-based"));
+		}
+		if text.is_empty() {
+			return Err(CoderError::invalid_args(TOOL, "text must not be empty"));
+		}
+		let side = match parsed.side.as_deref() {
+			None | Some("head") => "working",
+			Some("base") => "base",
+			Some(other) => {
+				return Err(CoderError::invalid_args(
+					TOOL,
+					format!("side must be `head` or `base`, got `{other}`"),
+				))
+			}
+		};
+		cx.background.emit_live(crate::event::CoderEvent::ReviewNote {
+			root: root.to_owned(),
+			path: path.to_owned(),
+			line: parsed.line,
+			side: side.to_owned(),
+			text: text.to_owned(),
+		});
+		Ok(json!({ "shown": true, "path": path, "line": parsed.line }))
 	}
 
 	async fn open_browser(&self, args: &Value, cx: &ToolContext) -> Result<Value, CoderError> {
@@ -5561,6 +5642,82 @@ mod tests {
 			terminals.register("sibling", registration(&paths[1])).await;
 			let cx = cx_for(&tools, 0).await;
 			assert!(tools.terminal_definitions(&cx).await.is_empty());
+		}
+
+		/// `review_note` (ADR 0124) is a card for the user and nothing
+		/// more: one live event, tagged with the checkout it is about.
+		#[tokio::test]
+		async fn review_note_becomes_one_event_for_the_ui() {
+			use crate::event::CoderEvent;
+			use serde_json::json;
+			let (paths, _dirs, _terminals, tools) = harness(1).await;
+			let cx = cx_for(&tools, 0).await;
+			let seen: Arc<std::sync::Mutex<Vec<CoderEvent>>> = Arc::default();
+			let sink = seen.clone();
+			cx.background
+				.set_event_sink(Arc::new(move |event| sink.lock().unwrap().push(event)));
+			let cancel = CancellationToken::new();
+
+			let absolute = format!("{}/src/a.rs", paths[0]);
+			let out = tools
+				.dispatch(
+					"review_note",
+					&json!({ "path": absolute, "line": 12, "text": " Takes the lock. " }),
+					&cx,
+					&cancel,
+				)
+				.await
+				.expect("a note");
+			assert_eq!(out, json!({ "shown": true, "path": "src/a.rs", "line": 12 }));
+			tools
+				.dispatch(
+					"review_note",
+					&json!({ "path": "./src/b.rs", "line": 3, "text": "Gone.", "side": "base" }),
+					&cx,
+					&cancel,
+				)
+				.await
+				.expect("a note on the old side");
+			let notes: Vec<(String, String, u32, String, String)> = seen
+				.lock()
+				.unwrap()
+				.iter()
+				.map(|event| match event {
+					CoderEvent::ReviewNote {
+						root,
+						path,
+						line,
+						side,
+						text,
+					} => (root.clone(), path.clone(), *line, side.clone(), text.clone()),
+					other => panic!("unexpected event {other:?}"),
+				})
+				.collect();
+			let root = paths[0].to_string();
+			let note = |path: &str, line, side: &str, text: &str| {
+				(root.clone(), path.to_owned(), line, side.to_owned(), text.to_owned())
+			};
+			assert_eq!(
+				notes,
+				[
+					note("src/a.rs", 12, "working", "Takes the lock."),
+					note("src/b.rs", 3, "base", "Gone.")
+				]
+			);
+
+			for bad in [
+				json!({ "path": "../other/a.rs", "line": 1, "text": "x" }),
+				json!({ "path": "/etc/passwd", "line": 1, "text": "x" }),
+				json!({ "path": "src/a.rs", "line": 0, "text": "x" }),
+				json!({ "path": "src/a.rs", "line": 1, "text": "  " }),
+				json!({ "path": "src/a.rs", "line": 1, "text": "x", "side": "left" }),
+			] {
+				assert!(
+					tools.dispatch("review_note", &bad, &cx, &cancel).await.is_err(),
+					"{bad}"
+				);
+			}
+			assert_eq!(seen.lock().unwrap().len(), 2);
 		}
 
 		/// The Slack tools exist for the model only while the workspace

@@ -1934,6 +1934,9 @@ export type CoderEvent =
 	/** Live-only chunk of a running foreground `bash` call's output
 	 *  (ADR 0085); the settled `tool_result` carries the full output. */
 	| { kind: 'tool_output_delta'; tool_call_id: string; stream: 'stdout' | 'stderr'; chunk: string }
+	/** `review_note`: a card on a line of the diff under review, for
+	 *  the checkout at `root`. Live-only. */
+	| { kind: 'review_note'; root: string; path: string; line: number; side: ReviewSide; text: string }
 	| { kind: 'turn_complete' }
 	| { kind: 'aborted' }
 	| { kind: 'error'; message: string }

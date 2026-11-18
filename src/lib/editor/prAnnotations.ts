@@ -19,9 +19,20 @@ import type { PrThreadComment, PullRequestDetail, ReviewSide } from '../protocol
 import { blockCards, blockShell } from './blockCards';
 import { diffCollapsePins } from './diffCollapse';
 
+/** What the agent said about a line, and what the user asked back
+ *  (ADR 0124). Local to the IDE: nothing here is on GitHub. */
+export type AgentThread = {
+	entries: readonly { from: 'agent' | 'you'; text: string }[];
+	/** The agent has been asked and hasn't answered yet. */
+	pending: boolean;
+	onReply: (text: string) => void;
+	onDismiss: () => void;
+};
+
 export type PrAnnotation = (
 	| { kind: 'note'; line: number; text: string }
 	| { kind: 'thread'; line: number; resolved: boolean; comments: PrThreadComment[] }
+	| { kind: 'agent'; line: number; thread: AgentThread }
 ) & {
 	/** The pull request's repository: where `#123` in the text points. */
 	repoUrl: string | null;
@@ -83,6 +94,53 @@ function el(tag: string, className: string, text?: string): HTMLElement {
 	return node;
 }
 
+function agentCard(thread: AgentThread, repoUrl: string | null): HTMLElement {
+	const card = el('div', 'cm-pr-card cm-pr-agent');
+	card.addEventListener('click', openLinks);
+	const head = el('div', 'cm-pr-head');
+	head.append(el('span', 'cm-pr-tag', 'agent'));
+	head.append(el('span', 'cm-pr-meta', 'only you see this'));
+	head.append(el('span', 'cm-pr-spacer'));
+	const dismiss = el('button', 'cm-pr-link', 'Dismiss');
+	dismiss.setAttribute('type', 'button');
+	dismiss.addEventListener('click', () => thread.onDismiss());
+	head.append(dismiss);
+	card.append(head);
+	const list = el('div', 'cm-pr-comments');
+	for (const entry of thread.entries) {
+		const item = el('div', 'cm-pr-comment');
+		if (entry.from === 'you') {
+			item.append(el('span', 'cm-pr-author', 'you'), el('span', 'cm-pr-asked', entry.text));
+		} else {
+			const body = el('div', 'cm-pr-body markdown-body');
+			githubMarkdown(body, { text: entry.text, repoUrl });
+			item.append(body);
+		}
+		list.append(item);
+	}
+	if (thread.pending) {
+		list.append(el('div', 'cm-pr-comment cm-pr-pending', 'The agent is looking…'));
+	}
+	card.append(list);
+	const reply = document.createElement('input');
+	reply.className = 'cm-pr-reply';
+	reply.type = 'text';
+	reply.placeholder = 'Ask the agent about this…';
+	reply.spellcheck = false;
+	reply.addEventListener('keydown', (event) => {
+		event.stopPropagation();
+		const text = reply.value.trim();
+		if (event.key !== 'Enter' || text === '') {
+			return;
+		}
+		event.preventDefault();
+		reply.value = '';
+		thread.onReply(text);
+	});
+	card.append(reply);
+	return card;
+}
+
 class AnnotationWidget extends WidgetType {
 	/** `oldLine`: the annotation is about a line of the base text that
 	 * this editor does not number, so the card says which. */
@@ -107,6 +165,9 @@ class AnnotationWidget extends WidgetType {
 			githubMarkdown(body, { text: annotation.text, repoUrl: annotation.repoUrl });
 			card.append(body);
 			return blockShell(card);
+		}
+		if (annotation.kind === 'agent') {
+			return blockShell(agentCard(annotation.thread, annotation.repoUrl));
 		}
 		const card = el('div', 'cm-pr-card cm-pr-thread');
 		card.addEventListener('click', openLinks);
@@ -265,6 +326,32 @@ const prAnnotationsTheme = EditorView.baseTheme({
 		alignItems: 'baseline',
 		gap: '8px',
 		'--m-card-accent': 'var(--m-merged)',
+	},
+	'.cm-pr-agent': {
+		'--m-card-accent': 'var(--m-accent)',
+	},
+	'.cm-pr-asked': {
+		marginLeft: '8px',
+		color: 'var(--m-fg-muted)',
+		whiteSpace: 'pre-wrap',
+	},
+	'.cm-pr-pending': {
+		color: 'var(--m-fg-subtle)',
+	},
+	'.cm-pr-reply': {
+		boxSizing: 'border-box',
+		width: '100%',
+		marginTop: '6px',
+		padding: '3px 6px',
+		border: '1px solid var(--m-border)',
+		borderRadius: 'var(--m-radius-sm)',
+		background: 'var(--m-bg)',
+		color: 'var(--m-fg)',
+		font: 'inherit',
+	},
+	'.cm-pr-reply:focus': {
+		outline: 'none',
+		borderColor: 'var(--m-accent)',
 	},
 	'.cm-pr-thread.cm-pr-folded': {
 		'--m-card-accent': 'var(--m-border-strong)',

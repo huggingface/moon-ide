@@ -212,6 +212,19 @@ pub enum CoderEvent {
 		chunk: String,
 	},
 
+	/// The agent put a note on a line of the diff the user is
+	/// reviewing (`review_note`, ADR 0124). Live-only: the IDE keeps
+	/// the notes in memory and never sends them anywhere. `root` is
+	/// the checkout the agent works in, which is how the IDE knows
+	/// whose diff it is; `side` is `"working"` or `"base"`.
+	ReviewNote {
+		root: String,
+		path: String,
+		line: u32,
+		side: String,
+		text: String,
+	},
+
 	/// The whole turn ended cleanly.
 	TurnComplete,
 	/// Live-only heads-up that the provider returned a transient

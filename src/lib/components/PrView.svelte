@@ -46,6 +46,8 @@
 	import { formatError, type ReviewEvent } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { statusColor } from '../fileIcon';
+	import { explainPrompt, replyPrompt, type FileNotes, type NotePlace } from '../reviewNotes';
+	import { reviewNotes } from '../reviewNotes.svelte';
 	import { parsePrPath } from '../util/prPath';
 	import CommitSection from './CommitSection.svelte';
 	import DiffStat from './DiffStat.svelte';
@@ -106,6 +108,11 @@
 	function adoptViewed(headSha: string) {
 		if (headSha === viewedSha) {
 			return;
+		}
+		// A push while the tab is open: the agent's notes were about
+		// lines of the version before it.
+		if (viewedSha !== '' && notesRoot !== null) {
+			reviewNotes.clear(notesRoot);
 		}
 		viewedSha = headSha;
 		const marks = viewedMarks.get(cacheKey);
@@ -436,25 +443,95 @@
 		}
 	}
 
+	// The agent this pull request is reviewed with (ADR 0124): one
+	// session in the checkout of its branch, asked from the diff and
+	// answering on it. A fork's branch isn't ours to check out.
+	const agent = $derived(tabPath === null ? undefined : reviewNotes.agents[tabPath]);
+	const checkout = $derived.by(() => {
+		const branch = detail?.headRef;
+		const bound = workspace.workspace?.folders.find(
+			(candidate) =>
+				candidate.origin.kind === 'worktree' &&
+				candidate.origin.parentPath === folder &&
+				candidate.origin.branch === branch,
+		);
+		return bound?.path ?? null;
+	});
+	const notesRoot = $derived(agent?.root ?? checkout);
+	const threads = $derived(reviewNotes.threadsFor(notesRoot));
+
 	let startingAgent = $state(false);
-	async function startAgent() {
-		if (detail === null || folder === null || startingAgent) {
-			return;
+	/** The session to ask, started (with its checkout) when there is
+	 *  none. The pull request's project becomes the active one, since
+	 *  that is where the session shows; this tab comes along. */
+	async function ensureAgent(): Promise<{ sessionId: string; root: string } | null> {
+		if (agent !== undefined) {
+			return agent;
+		}
+		if (detail === null || folder === null || tabPath === null || startingAgent) {
+			return null;
 		}
 		startingAgent = true;
 		try {
-			// The session is made in the pull request's project, which
-			// becomes the active one; this tab comes along.
 			if (workspace.activeProjectPath !== folder) {
 				await workspace.setActiveFolder(folder);
 				if (workspace.activeProjectPath !== folder) {
-					return;
+					return null;
 				}
 			}
-			await workspace.newCoderWorktreeSession(detail.headRef);
+			const session = await workspace.newCoderReviewSession(folder, detail.headRef);
+			if (session === null) {
+				return null;
+			}
+			const started = { sessionId: session.id, root: session.worktree_root ?? folder };
+			reviewNotes.registerAgent(tabPath, started.sessionId, started.root);
+			return started;
 		} finally {
 			startingAgent = false;
 		}
+	}
+
+	/** Put `text` to the agent, with a waiting card at `place`. */
+	async function askAgent(text: string, place: NotePlace | null, question: string | null) {
+		const target = await ensureAgent();
+		if (target === null) {
+			return;
+		}
+		if (place !== null) {
+			reviewNotes.ask(target.root, place, question);
+		}
+		try {
+			await ipc.coder.send(text, [], target.sessionId);
+		} catch (err) {
+			reviewNotes.settle(target.root);
+			if (tabPath !== null) {
+				reviewNotes.forgetAgent(tabPath);
+			}
+			workspace.flash(`Could not reach the agent: ${formatError(err)}`);
+		}
+	}
+
+	function notesFor(path: string): FileNotes | undefined {
+		const current = detail;
+		if (current === null || current.isCrossRepository) {
+			return undefined;
+		}
+		return {
+			threads: threads.filter((thread) => thread.path === path),
+			onExplain: (lines) => {
+				const place = lines === null ? null : { path, side: 'working' as const, line: lines.from };
+				if (place === null) {
+					workspace.flash(`Asked the agent about ${path}.`);
+				}
+				void askAgent(explainPrompt(current, path, lines), place, null);
+			},
+			onReply: (thread, text) => void askAgent(replyPrompt(thread, text), thread, text),
+			onDismiss: (thread) => {
+				if (notesRoot !== null) {
+					reviewNotes.dismiss(notesRoot, thread);
+				}
+			},
+		};
 	}
 </script>
 
@@ -557,10 +634,10 @@
 					disabled={detail.isCrossRepository || startingAgent}
 					title={detail.isCrossRepository
 						? FORK_TITLE
-						: `Start a coder session on ${detail.headRef}, in its own worktree`}
-					onclick={() => void startAgent()}
+						: `Start a coder session on ${detail.headRef}, in a checkout of its own. "Explain" on the diff asks it.`}
+					onclick={() => void ensureAgent()}
 				>
-					{startingAgent ? 'Starting…' : 'Start an agent on it'}
+					{startingAgent ? 'Starting…' : agent === undefined ? 'Start an agent on it' : 'Agent started'}
 				</button>
 				<button type="button" class="btn primary" title="Comment on, approve or request changes" onclick={openReview}>
 					Review
@@ -596,6 +673,7 @@
 							pullRequest={detail}
 							outline={outlineFor(entry)}
 							folderPath={folder ?? undefined}
+							notes={notesFor(entry.path)}
 							{registerSection}
 							{side}
 						/>

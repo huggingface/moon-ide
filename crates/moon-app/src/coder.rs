@@ -533,6 +533,24 @@ pub struct NewWorktreeSession {
 	pub session: SessionSummary,
 }
 
+/// Start the agent a pull request is reviewed with (ADR 0124): a
+/// session in the checkout of `branch`, which is found or made the
+/// way "Check out in a worktree" does it, so the agent reads the pull
+/// request's own code. The session is filed under the project at
+/// `folder_path` and opens in its panel.
+pub async fn coder_new_review_session(
+	app: &AppCore,
+	folder_path: String,
+	branch: String,
+) -> Result<NewWorktreeSession, MoonError> {
+	let opened = crate::inbox::inbox_open_pr(app, folder_path, branch).await?;
+	let session = app.coder.create_session_in_folder(&opened.folder_path).await?;
+	Ok(NewWorktreeSession {
+		workspace: opened.workspace,
+		session,
+	})
+}
+
 /// Create an isolated coder session in its own git worktree
 /// (ADR 0028). Branches off the **active** folder's `HEAD`, checks
 /// the branch out into a worktree under the workspace state dir,
@@ -1710,6 +1728,7 @@ crate::commands! {
 	coder_read_background_process([app] session_id: String, id: String, tail_bytes: Option<usize>),
 	coder_stop_background_process([app] session_id: String, id: String),
 	coder_new_worktree_session([app] base_branch: Option<String>),
+	coder_new_review_session([app] folder_path: String, branch: String),
 	coder_discard_worktree([app] path: String, force: bool),
 	coder_merge_and_remove_worktree([app] path: String, base_branch: String),
 	coder_move_session_to_worktree([app]),

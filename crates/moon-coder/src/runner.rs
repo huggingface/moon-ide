@@ -2563,6 +2563,33 @@ impl CoderHandle {
 		Ok((summary, workspace))
 	}
 
+	/// Mint a session that works in the bound folder at `folder_path`
+	/// and make it the visible one (ADR 0124): the agent a pull
+	/// request is reviewed with, in the checkout of its branch. A
+	/// worktree folder gets the worktree routing; a project folder is
+	/// an ordinary session there.
+	pub async fn create_session_in_folder(&self, folder_path: &str) -> Result<SessionSummary, CoderError> {
+		let folder = self
+			.state
+			.workspaces
+			.folder_for_path(folder_path)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("no bound folder at `{folder_path}`")))?;
+		let root = self.state.coder_root_of(folder.clone()).await;
+		let fs = self.state.folder_session_for(Utf8Path::new(&root.folder.path)).await;
+		let mut blank = Session::new_blank_with_mode(CoderMode::Agent);
+		if let moon_protocol::workspace::FolderOrigin::Worktree { branch, .. } = &folder.folder.origin {
+			blank.header.worktree_root = Some(folder.folder.path.clone());
+			blank.header.worktree_branch = Some(branch.clone());
+		}
+		let summary = blank.summary();
+		let id = blank.header.id.clone();
+		fs.insert_runtime(id.clone(), Arc::new(SessionRuntime::new(blank)))
+			.await;
+		fs.set_visible(id).await;
+		Ok(summary)
+	}
+
 	/// Mint a worker session that runs **in place** — directly
 	/// against an existing bound folder, with no worktree and no
 	/// branch of its own (`spawn_worker` with `worktree: false`,

@@ -1,12 +1,14 @@
 <script lang="ts">
 	import { mount as mountComponent, unmount } from 'svelte';
 	import { isSyntheticBufferPath, workspace, type MarkdownView, type OpenFile, type SplitSide } from '../state.svelte';
+	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { inbox } from '../inbox.svelte';
 	import { ipc } from '../ipc';
 	import { isCommitPath } from '../util/commitPath';
 	import { isInboxPath } from '../util/inboxPath';
 	import { isMarkdownPath } from '../util/markdown';
-	import { isIssuePath } from '../util/issuePath';
-	import { isPrPath } from '../util/prPath';
+	import { isIssuePath, parseIssuePath } from '../util/issuePath';
+	import { isPrPath, parsePrPath } from '../util/prPath';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
 	import TabTitle from './TabTitle.svelte';
@@ -504,6 +506,18 @@
 				title: file.path,
 				onSelect: () => {
 					void copyToClipboard(file.path, 'relative path');
+				},
+			});
+		}
+
+		const github = parsePrPath(file.path) ?? parseIssuePath(file.path);
+		const githubUrl = github === null ? null : inbox.urlFor(github.folder, github.number);
+		if (githubUrl !== null) {
+			items.push({
+				id: 'open-on-github',
+				label: 'Open on GitHub',
+				onSelect: () => {
+					void openUrl(githubUrl);
 				},
 			});
 		}
