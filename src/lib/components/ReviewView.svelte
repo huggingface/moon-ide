@@ -889,7 +889,7 @@
 			paths={entryPaths}
 			refreshing={prRefreshing}
 			onJump={scrollTo}
-			onRefresh={() => void refreshPullRequest()}
+			onRefresh={refreshPullRequest}
 		/>
 	{/if}
 	{#if entries.length === 0}

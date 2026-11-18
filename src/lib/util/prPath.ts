@@ -1,32 +1,56 @@
-// Synthetic path scheme for a pull request opened without a checkout.
-// One tab per pull request, keyed on `pr://<number>`; the number is
-// all `PrView` needs, since it reads the pull request from the active
-// folder's repository. Same can't-collide-with-a-real-path trick as
-// `commit://`.
+// Synthetic path scheme for a pull request opened without a checkout:
+// `pr://<folder>#<number>`, where `<folder>` is the bound project
+// folder whose repository the pull request belongs to. The folder is
+// in the path because the tab is shown in every folder's strip
+// (ADR 0121), so "the active folder" says nothing about it. Same
+// can't-collide-with-a-real-path trick as `commit://`.
 
 const PREFIX = 'pr://';
 
 /** Tab titles are `#<number> <title>`; longer titles are cut here. */
 const MAX_TITLE = 48;
 
-export function prPath(number: number): string {
-	return `${PREFIX}${number}`;
+/** A pull request or issue tab's subject: the project folder to read
+ *  it through, and its number there. */
+export type GithubTabRef = { folder: string; number: number };
+
+/** `<prefix><folder>#<number>`. */
+export function githubTabPath(prefix: string, folder: string, number: number): string {
+	return `${prefix}${folder}#${number}`;
+}
+
+/** Inverse of `githubTabPath`; `null` for anything else. The number
+ *  follows the last `#`, so a folder with one in its name still
+ *  parses. */
+export function parseGithubTabPath(prefix: string, path: string): GithubTabRef | null {
+	if (!path.startsWith(prefix)) {
+		return null;
+	}
+	const cut = path.lastIndexOf('#');
+	if (cut <= prefix.length) {
+		return null;
+	}
+	const digits = path.slice(cut + 1);
+	if (!/^[1-9][0-9]*$/.test(digits)) {
+		return null;
+	}
+	return { folder: path.slice(prefix.length, cut), number: Number(digits) };
+}
+
+export function prPath(folder: string, number: number): string {
+	return githubTabPath(PREFIX, folder, number);
 }
 
 export function isPrPath(path: string): boolean {
 	return path.startsWith(PREFIX);
 }
 
-/** The pull request number of a `pr://<number>` path; `null` for
- * anything else, which callers treat as "not a pull request tab". */
-export function numberFromPrPath(path: string): number | null {
-	if (!path.startsWith(PREFIX)) {
-		return null;
-	}
-	const digits = path.slice(PREFIX.length);
-	return /^[1-9][0-9]*$/.test(digits) ? Number(digits) : null;
+export function parsePrPath(path: string): GithubTabRef | null {
+	return parseGithubTabPath(PREFIX, path);
 }
 
+/** `#<number> <title>`, or just the number when the title isn't known
+ *  (a tab reopened from navigation history). */
 export function prTabName(number: number, title: string): string {
 	const trimmed = title.trim();
 	if (trimmed === '') {

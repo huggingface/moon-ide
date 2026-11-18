@@ -7,7 +7,7 @@ use moon_core::inbox;
 use moon_protocol::inbox::{
 	InboxGroupRequest, InboxGrouping, InboxOpenedPr, InboxPrDigest, InboxPrRef, InboxRepo, InboxSnapshot, IssueDetail,
 };
-use moon_protocol::review::{PrDiff, PrThread, PullRequestDetail};
+use moon_protocol::review::{PrAction, PrDiff, PrThread, PullRequestDetail};
 use moon_protocol::workspace::FolderOrigin;
 use moon_protocol::MoonError;
 
@@ -129,11 +129,10 @@ pub async fn pr_current(app: &AppCore) -> Result<Option<PullRequestDetail>, Moon
 	Ok(moon_core::pull_request::fetch_current(Utf8Path::new(&entry.folder.path)).await)
 }
 
-/// Pull request `number` of the active folder's repository, without
-/// its review threads or diff: the one fast call a PR tab paints
-/// from. Any folder of the repository will do.
-pub async fn pr_detail(app: &AppCore, number: u32) -> Result<PullRequestDetail, MoonError> {
-	let entry = app.workspaces.require_active_folder().await?;
+/// Pull request `number` of `folder_path`'s repository, without its
+/// review threads or diff: the one fast call a PR tab paints from.
+pub async fn pr_detail(app: &AppCore, folder_path: String, number: u32) -> Result<PullRequestDetail, MoonError> {
+	let entry = crate::fs::folder_or_active(app, Some(folder_path)).await?;
 	moon_core::pull_request::fetch_detail(Utf8Path::new(&entry.folder.path), Some(number)).await
 }
 
@@ -142,26 +141,39 @@ pub async fn pr_threads(url: String) -> Result<Vec<PrThread>, MoonError> {
 	moon_core::pull_request::fetch_threads_at(&url).await
 }
 
-/// The diff of pull request `number` of the active folder's
-/// repository, without a checkout: worktrees share one object store,
-/// so any folder of the repository will do.
-pub async fn pr_diff(app: &AppCore, number: u32, base_ref: String, head_sha: String) -> Result<PrDiff, MoonError> {
-	let entry = app.workspaces.require_active_folder().await?;
+/// The diff of pull request `number` of `folder_path`'s repository,
+/// without a checkout: worktrees share one object store, so any
+/// folder of the repository will do.
+pub async fn pr_diff(
+	app: &AppCore,
+	folder_path: String,
+	number: u32,
+	base_ref: String,
+	head_sha: String,
+) -> Result<PrDiff, MoonError> {
+	let entry = crate::fs::folder_or_active(app, Some(folder_path)).await?;
 	moon_core::pull_request::diff(entry.host.as_ref(), number, &base_ref, &head_sha).await
 }
 
-/// Issue `number` of the active folder's repository.
-pub async fn issue_open(app: &AppCore, number: u32) -> Result<IssueDetail, MoonError> {
-	let entry = app.workspaces.require_active_folder().await?;
+/// Change the state of the pull request at `url`: ready, draft, merge,
+/// close or reopen (ADR 0120). Only ever called for a click.
+pub async fn pr_act(url: String, action: PrAction) -> Result<(), MoonError> {
+	moon_core::pull_request::act(&url, &action).await
+}
+
+/// Issue `number` of `folder_path`'s repository.
+pub async fn issue_open(app: &AppCore, folder_path: String, number: u32) -> Result<IssueDetail, MoonError> {
+	let entry = crate::fs::folder_or_active(app, Some(folder_path)).await?;
 	moon_core::issue::fetch(Utf8Path::new(&entry.folder.path), number).await
 }
 
 crate::commands! {
 	pr_current([app]),
-	pr_detail([app] number: u32),
+	pr_detail([app] folder_path: String, number: u32),
 	pr_threads(url: String),
-	pr_diff([app] number: u32, base_ref: String, head_sha: String),
-	issue_open([app] number: u32),
+	pr_diff([app] folder_path: String, number: u32, base_ref: String, head_sha: String),
+	pr_act(url: String, action: PrAction),
+	issue_open([app] folder_path: String, number: u32),
 	inbox_fetch([app] watched_authors: Vec<String>),
 	inbox_digests(subjects: Vec<InboxPrRef>),
 	inbox_group([app] request: InboxGroupRequest),

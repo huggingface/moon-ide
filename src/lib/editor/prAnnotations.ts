@@ -14,14 +14,18 @@ import { Compartment, Facet, StateField, type EditorState, type Extension, type 
 import { Decoration, EditorView, WidgetType, type DecorationSet } from '@codemirror/view';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { relativeTime } from '../inboxSections';
-import { getCachedMarkdown, renderMarkdown } from '../markdown';
+import { githubMarkdown, repoUrlOf } from '../githubMarkdown';
 import type { PrThreadComment, PullRequestDetail, ReviewSide } from '../protocol';
 import { blockCards, blockShell } from './blockCards';
 import { diffCollapsePins } from './diffCollapse';
 
-export type PrAnnotation =
+export type PrAnnotation = (
 	| { kind: 'note'; line: number; text: string }
-	| { kind: 'thread'; line: number; resolved: boolean; comments: PrThreadComment[] };
+	| { kind: 'thread'; line: number; resolved: boolean; comments: PrThreadComment[] }
+) & {
+	/** The pull request's repository: where `#123` in the text points. */
+	repoUrl: string | null;
+};
 
 /** Annotations that sit on a line of `path`'s `side`. File-level
  * notes and outdated threads have no line; the PR panel lists those. */
@@ -29,16 +33,17 @@ export function annotationsFor(pr: PullRequestDetail | null, path: string, side:
 	if (pr === null) {
 		return [];
 	}
+	const repoUrl = repoUrlOf(pr.url);
 	const out: PrAnnotation[] = [];
 	for (const thread of pr.threads) {
 		if (thread.path === path && thread.side === side && thread.line !== null) {
-			out.push({ kind: 'thread', line: thread.line, resolved: thread.resolved, comments: thread.comments });
+			out.push({ kind: 'thread', line: thread.line, resolved: thread.resolved, comments: thread.comments, repoUrl });
 		}
 	}
 	if (side === 'working') {
 		for (const note of pr.minorNotes) {
 			if (note.path === path && note.line !== null) {
-				out.push({ kind: 'note', line: note.line, text: note.text });
+				out.push({ kind: 'note', line: note.line, text: note.text, repoUrl });
 			}
 		}
 	}
@@ -54,20 +59,6 @@ const prAnnotationsFacet = Facet.define<readonly PrAnnotation[], readonly PrAnno
 const prBaseAnnotationsFacet = Facet.define<readonly PrAnnotation[], readonly PrAnnotation[]>({
 	combine: (values) => values[0] ?? [],
 });
-
-function renderMarkdownInto(target: HTMLElement, source: string): void {
-	const cached = getCachedMarkdown(source, { github: true });
-	if (cached !== undefined) {
-		target.innerHTML = cached;
-		return;
-	}
-	target.textContent = source;
-	void renderMarkdown(source, { github: true }).then((html) => {
-		if (target.isConnected) {
-			target.innerHTML = html;
-		}
-	});
-}
 
 /** Markdown links inside a card open in the system browser instead
  * of navigating the webview. */
@@ -113,7 +104,7 @@ class AnnotationWidget extends WidgetType {
 			card.addEventListener('click', openLinks);
 			card.append(el('span', 'cm-pr-tag', 'moonbot note'));
 			const body = el('div', 'cm-pr-body markdown-body');
-			renderMarkdownInto(body, annotation.text);
+			githubMarkdown(body, { text: annotation.text, repoUrl: annotation.repoUrl });
 			card.append(body);
 			return blockShell(card);
 		}
@@ -146,7 +137,7 @@ class AnnotationWidget extends WidgetType {
 			meta.append(el('span', 'cm-pr-author', comment.author ?? 'someone'));
 			meta.append(el('span', 'cm-pr-meta', relativeTime(comment.createdAt, now)));
 			const body = el('div', 'cm-pr-body markdown-body');
-			renderMarkdownInto(body, comment.body);
+			githubMarkdown(body, { text: comment.body, repoUrl: annotation.repoUrl });
 			item.append(meta, body);
 			list.append(item);
 		}

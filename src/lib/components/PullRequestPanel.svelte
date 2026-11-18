@@ -4,10 +4,11 @@
 	// and the review threads as a jump list. Sits at the top of the
 	// review scroll, above the file sections.
 	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { githubMarkdown, openMarkdownLinks } from '../githubMarkdown';
+	import { githubMarkdown, openMarkdownLinks, repoUrlOf } from '../githubMarkdown';
 	import type { PrCheckState, PrThread, PullRequestDetail } from '../protocol';
 	import Conversation from './Conversation.svelte';
 	import Pill from './Pill.svelte';
+	import PrActions from './PrActions.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
@@ -18,9 +19,11 @@
 		paths: ReadonlySet<string>;
 		refreshing: boolean;
 		onJump: (path: string) => void;
-		onRefresh: () => void;
+		onRefresh: () => void | Promise<void>;
 	};
 	let { pr, paths, refreshing, onJump, onRefresh }: Props = $props();
+
+	const repoUrl = $derived(repoUrlOf(pr.url));
 
 	const STATE_TONE = { open: 'success', draft: 'neutral', merged: 'merged', closed: 'danger' } as const;
 	const REVIEW_LABEL = {
@@ -68,7 +71,12 @@
 		<span class="state {pr.state}"><PullRequestIcon size={16} /></span>
 		<h2>{pr.title} <span class="number">#{pr.number}</span></h2>
 		<span class="spacer"></span>
-		<button class="icon-btn" class:spinning={refreshing} title="Re-read the pull request" onclick={onRefresh}>
+		<button
+			class="icon-btn"
+			class:spinning={refreshing}
+			title="Re-read the pull request"
+			onclick={() => void onRefresh()}
+		>
 			<RefreshIcon size={14} />
 		</button>
 		<button class="icon-btn" title="Open on GitHub" onclick={() => void openUrl(pr.url)}>
@@ -99,19 +107,20 @@
 			<code>{pr.headRef}</code> into <code>{pr.baseRef}</code>
 		</span>
 	</div>
+	<PrActions {pr} onChanged={onRefresh} />
 
 	{#if pr.body.trim() !== ''}
 		<details class="block" open>
 			<summary>Description</summary>
 			<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions (delegated link clicks; the links themselves are focusable) -->
-			<div class="markdown-body body" use:githubMarkdown={pr.body} onclick={openMarkdownLinks}></div>
+			<div class="markdown-body body" use:githubMarkdown={{ text: pr.body, repoUrl }} onclick={openMarkdownLinks}></div>
 		</details>
 	{/if}
 
 	{#if pr.conversation.length > 0}
 		<details class="block" open>
 			<summary>Conversation <span class="count">{pr.conversation.length}</span></summary>
-			<Conversation comments={pr.conversation} />
+			<Conversation comments={pr.conversation} {repoUrl} />
 		</details>
 	{/if}
 
@@ -140,7 +149,11 @@
 							{location(note.path, note.line)}
 						</button>
 						<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions (delegated link clicks) -->
-						<div class="markdown-body note" use:githubMarkdown={note.text} onclick={openMarkdownLinks}></div>
+						<div
+							class="markdown-body note"
+							use:githubMarkdown={{ text: note.text, repoUrl }}
+							onclick={openMarkdownLinks}
+						></div>
 					</li>
 				{/each}
 			</ul>

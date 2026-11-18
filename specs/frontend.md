@@ -166,8 +166,11 @@ The split matters because Pierre Diffs is display-only — forcing it to also ed
 
 ### Pull request tab
 
-`pr://<number>` (`PrView.svelte`), opened from the inbox, shows a pull request of the active folder's repository without checking it out ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)): the PR panel, then a read-only diff per changed file from the merge base to the PR head, with review threads and moonbot's notes under their lines. The header carries **Review** (verdict and summary), **Check out in a worktree** and **Start an agent on it**; the last two are disabled for a fork PR. Not restored at launch.
+`pr://<folder>#<number>` (`PrView.svelte`), opened from the inbox, shows a pull request of a bound project's repository without checking it out ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)): the PR panel, then a read-only diff per changed file from the merge base to the PR head, with review threads and moonbot's notes under their lines. The header carries **Review** (verdict and summary), **Check out in a worktree** and **Start an agent on it**; the last two are disabled for a fork PR. Not restored at launch.
 
+- **Belongs to the workspace, not to a folder** ([ADR 0121](decisions/0121-pr-tabs-belong-to-the-workspace.md)): it opens where the user is, whichever project the pull request is in, and is in every folder's tab strip from then on. Switching folders while looking at it keeps it in view; closing it closes it everywhere. A pull request of another project than the active one names that project in the banner. **Check out in a worktree**, **Start an agent on it** and a click on a file's name act in the pull request's project and make it the active one.
+- **State controls** under the title ([ADR 0120](decisions/0120-pr-state-controls.md)): **Ready for review** on a draft; on an open pull request the merge button (with a method picker when the repository allows several), **Convert to draft** and **Close**; **Reopen** on a closed one. The merge asks once more before going ahead. When GitHub would refuse the merge the button is disabled and says why (review, required check, conflicts, branch behind). The same controls are in the Review changes tab of a branch with a pull request.
+- **Mentions** (`@login`) in descriptions, comments and threads link to the user; the signed-in user's own are highlighted.
 - **Loads in stages**: the title from the tab at once, then description, conversation and checks, then review threads and the diff as each arrives. Coming back to the tab paints the last answer while it re-reads.
 - **Review threads** in the PR panel list the open ones; "Show N resolved" adds the rest.
 - **Conversation**: top-level comments and review summaries in the PR panel, after the description, oldest first. A long one is cut to a few lines with "Show all". Read-only; each links to GitHub.
@@ -178,7 +181,7 @@ The split matters because Pierre Diffs is display-only — forcing it to also ed
 
 ### Issue tab
 
-`issue://<number>` (`IssueView.svelte`), opened from the inbox, shows an issue of the active folder's repository ([ADR 0117](decisions/0117-issue-tab.md)): title, state, labels, author, assignees, description and comments in GitHub's markdown. Read-only, with refresh and "Open on GitHub". Not restored at launch.
+`issue://<folder>#<number>` (`IssueView.svelte`), opened from the inbox, shows an issue of a bound project's repository, in a tab that belongs to the workspace like a pull request's ([ADR 0117](decisions/0117-issue-tab.md)): title, state, labels, author, assignees, description and comments in GitHub's markdown. Read-only, with refresh and "Open on GitHub". Not restored at launch.
 
 ### Editor context menu
 

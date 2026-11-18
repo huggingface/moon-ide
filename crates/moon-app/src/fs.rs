@@ -414,9 +414,29 @@ pub async fn fs_git_blob_sha(app: &AppCore, path: String) -> Result<Option<Strin
 pub async fn fs_publish_pr_review(
 	app: &AppCore,
 	request: PublishReviewRequest,
+	folder_path: Option<String>,
 ) -> Result<PublishReviewResult, MoonError> {
-	let entry = app.workspaces.require_active_folder().await?;
+	let entry = folder_or_active(app, folder_path).await?;
 	entry.host.publish_pr_review(request).await
+}
+
+/// The bound folder at `folder_path`, or the active one when `None`.
+/// For the commands a pull request or issue tab calls: it stays open
+/// while the user moves between projects (ADR 0121), so "the active
+/// folder" is not its folder, and a review posted there would land on
+/// another repository's pull request of the same number.
+pub(crate) async fn folder_or_active(
+	app: &AppCore,
+	folder_path: Option<String>,
+) -> Result<std::sync::Arc<moon_core::WorkspaceFolderEntry>, MoonError> {
+	let Some(folder_path) = folder_path else {
+		return app.workspaces.require_active_folder().await;
+	};
+	app
+		.workspaces
+		.folder_for_path(&folder_path)
+		.await
+		.ok_or_else(|| MoonError::invalid(format!("unknown folder: {folder_path}")))
 }
 
 /// `HEAD` content for `path`. Feeds the "before" side of the editor's
@@ -437,8 +457,13 @@ pub async fn fs_git_head_content(app: &AppCore, path: String) -> Result<Option<S
 /// merge-base the frontend cached); the host validates and
 /// rejects anything else. `Ok(None)` on absent path / binary blob
 /// / no repo follows the same convention as `fs_git_head_content`.
-pub async fn fs_git_ref_content(app: &AppCore, rev: String, path: String) -> Result<Option<String>, MoonError> {
-	let entry = app.workspaces.require_active_folder().await?;
+pub async fn fs_git_ref_content(
+	app: &AppCore,
+	rev: String,
+	path: String,
+	folder_path: Option<String>,
+) -> Result<Option<String>, MoonError> {
+	let entry = folder_or_active(app, folder_path).await?;
 	let path = Utf8PathBuf::from(path);
 	entry.host.git_ref_content(&rev, &path).await
 }
@@ -737,9 +762,9 @@ crate::commands! {
 	fs_git_blame([app] path: String),
 	fs_git_permalink([app] path: String, start_line: u32, end_line: u32),
 	fs_git_blob_sha([app] path: String),
-	fs_publish_pr_review([app] request: PublishReviewRequest),
+	fs_publish_pr_review([app] request: PublishReviewRequest, folder_path: Option<String>),
 	fs_git_head_content([app] path: String),
-	fs_git_ref_content([app] rev: String, path: String),
+	fs_git_ref_content([app] rev: String, path: String, folder_path: Option<String>),
 	fs_git_default_branch_diff([app]),
 	fs_git_remote_web_url([app]),
 	fs_git_branch([app]),

@@ -38,7 +38,7 @@
 	import { ipc } from '../ipc';
 	import { formatError, type ReviewEvent } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
-	import { numberFromPrPath } from '../util/prPath';
+	import { parsePrPath } from '../util/prPath';
 	import CommitSection from './CommitSection.svelte';
 	import DiffStat from './DiffStat.svelte';
 	import PullRequestPanel from './PullRequestPanel.svelte';
@@ -59,11 +59,16 @@
 	const sectionEls = new Map<string, HTMLElement>();
 
 	const tabPath = $derived(side === 'left' ? workspace.leftActive : workspace.rightActive);
-	const number = $derived(tabPath === null ? null : numberFromPrPath(tabPath));
+	const ref = $derived(tabPath === null ? null : parsePrPath(tabPath));
+	const number = $derived(ref?.number ?? null);
+	// The project the pull request is in. The tab is shown wherever
+	// the user is (ADR 0121), so this is not the active folder.
+	const folder = $derived(ref?.folder ?? null);
+	const elsewhere = $derived(folder !== null && workspace.activeProjectPath !== folder);
 	// What the tab strip already knows, to head the page before
 	// GitHub answers.
 	const tabName = $derived(workspace.openFiles.find((file) => file.path === tabPath)?.name ?? '');
-	const cacheKey = $derived(`${workspace.activeProjectPath ?? ''}\n${number ?? ''}`);
+	const cacheKey = $derived(tabPath ?? '');
 
 	let detail = $state<PullRequestDetail | null>(null);
 	let diff = $state<PrDiff | null>(null);
@@ -249,8 +254,10 @@
 		return cut === -1 ? '' : path.slice(0, cut);
 	}
 
+	/** Re-read the pull request. Resolves once the detail is in (or
+	 *  has failed); the threads and the diff follow by themselves. */
 	async function load() {
-		const wanted = number;
+		const wanted = ref;
 		if (wanted === null) {
 			loadError = 'Not a pull request.';
 			return;
@@ -259,60 +266,62 @@
 		const token = ++loadToken;
 		const current = () => token === loadToken;
 		loading = true;
+		let fresh: PullRequestDetail;
 		try {
-			let fresh: PullRequestDetail;
-			try {
-				fresh = await ipc.pullRequest.detail(wanted);
-			} catch (err) {
-				if (!current()) {
-					return;
-				}
-				// A failed re-read keeps what is on screen.
-				if (detail === null) {
-					loadError = formatError(err);
-				} else {
-					workspace.flash(`Could not re-read the pull request: ${formatError(err)}`);
-				}
-				return;
-			}
+			fresh = await ipc.pullRequest.detail(wanted.folder, wanted.number);
+		} catch (err) {
 			if (!current()) {
 				return;
 			}
-			// The threads arrive separately; until they do, keep the
-			// ones on screen instead of blinking them away.
-			detail = { ...fresh, threads: detail?.threads ?? [] };
-			adoptViewed(fresh.headSha);
-			loadError = '';
+			loading = false;
+			// A failed re-read keeps what is on screen.
+			if (detail === null) {
+				loadError = formatError(err);
+			} else {
+				workspace.flash(`Could not re-read the pull request: ${formatError(err)}`);
+			}
+			return;
+		}
+		if (!current()) {
+			return;
+		}
+		// The threads arrive separately; until they do, keep the
+		// ones on screen instead of blinking them away.
+		detail = { ...fresh, threads: detail?.threads ?? [] };
+		adoptViewed(fresh.headSha);
+		loadError = '';
+		void loadRest(wanted.folder, fresh, key, current);
+	}
 
-			const threads = ipc.pullRequest.threads(fresh.url).then(
-				(result) => {
-					if (current() && detail !== null) {
-						detail = { ...detail, threads: result };
-					}
-				},
-				() => {},
-			);
-			const diffed = ipc.pullRequest.diff(fresh.number, fresh.baseRef, fresh.headSha).then(
-				(result) => {
-					if (current()) {
-						diff = result;
-						diffError = '';
-					}
-				},
-				(err: unknown) => {
-					if (current()) {
-						diffError = formatError(err);
-					}
-				},
-			);
-			await Promise.all([threads, diffed]);
-			if (current() && detail !== null) {
-				lastLoaded.set(key, { detail, diff });
-			}
-		} finally {
-			if (current()) {
-				loading = false;
-			}
+	async function loadRest(project: string, fresh: PullRequestDetail, key: string, current: () => boolean) {
+		const threads = ipc.pullRequest.threads(fresh.url).then(
+			(result) => {
+				if (current() && detail !== null) {
+					detail = { ...detail, threads: result };
+				}
+			},
+			() => {},
+		);
+		const diffed = ipc.pullRequest.diff(project, fresh.number, fresh.baseRef, fresh.headSha).then(
+			(result) => {
+				if (current()) {
+					diff = result;
+					diffError = '';
+				}
+			},
+			(err: unknown) => {
+				if (current()) {
+					diffError = formatError(err);
+				}
+			},
+		);
+		await Promise.all([threads, diffed]);
+		if (!current()) {
+			return;
+		}
+		loading = false;
+		if (detail !== null) {
+			lastLoaded.set(key, { detail, diff });
 		}
 	}
 
@@ -373,12 +382,15 @@
 		reviewPhase = 'busy';
 		const event = reviewEvent;
 		try {
-			const result = await ipc.fs.publishPrReview({
-				body: reviewSummary.trim() || null,
-				comments: [],
-				event,
-				prNumber: current.number,
-			});
+			const result = await ipc.fs.publishPrReview(
+				{
+					body: reviewSummary.trim() || null,
+					comments: [],
+					event,
+					prNumber: current.number,
+				},
+				folder ?? undefined,
+			);
 			if (result.kind === 'no_pr') {
 				reviewOutcome = `Pull request #${current.number} could not be found on the remote.`;
 			} else if (result.reviewUrl === '') {
@@ -407,13 +419,12 @@
 
 	let checkingOut = $state(false);
 	async function checkOut() {
-		const project = workspace.activeProjectPath;
-		if (detail === null || project === null || checkingOut) {
+		if (detail === null || folder === null || checkingOut) {
 			return;
 		}
 		checkingOut = true;
 		try {
-			await workspace.openPrForReview(project, detail.headRef);
+			await workspace.openPrForReview(folder, detail.headRef);
 		} finally {
 			checkingOut = false;
 		}
@@ -421,11 +432,19 @@
 
 	let startingAgent = $state(false);
 	async function startAgent() {
-		if (detail === null || startingAgent) {
+		if (detail === null || folder === null || startingAgent) {
 			return;
 		}
 		startingAgent = true;
 		try {
+			// The session is made in the pull request's project, which
+			// becomes the active one; this tab comes along.
+			if (workspace.activeProjectPath !== folder) {
+				await workspace.setActiveFolder(folder);
+				if (workspace.activeProjectPath !== folder) {
+					return;
+				}
+			}
 			await workspace.newCoderWorktreeSession(detail.headRef);
 		} finally {
 			startingAgent = false;
@@ -487,6 +506,11 @@
 		{:else}
 			<div class="banner">
 				<span class="title">#{detail.number} {detail.title}</span>
+				{#if elsewhere && folder !== null}
+					<span class="project" title={`A pull request of ${folder}, not of the folder you are in`}>
+						{baseName(folder)}
+					</span>
+				{/if}
 				{#if files.length > 1}
 					<button
 						type="button"
@@ -531,7 +555,7 @@
 				{paths}
 				refreshing={loading}
 				onJump={(path) => void jumpTo(path)}
-				onRefresh={() => void load()}
+				onRefresh={load}
 			/>
 			{#if diff === null}
 				<div class="empty" class:error={diffError !== ''}>
@@ -555,6 +579,7 @@
 							eager={i < 2}
 							pullRequest={detail}
 							outline={outlineFor(entry)}
+							folderPath={folder ?? undefined}
 							{registerSection}
 							{side}
 						/>
@@ -803,6 +828,15 @@
 		color: var(--m-fg);
 		font-size: var(--m-text-md);
 		font-weight: 600;
+	}
+	.project {
+		flex-shrink: 0;
+		padding: 0 var(--m-space-2);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-pill);
+		color: var(--m-fg-muted);
+		font-size: var(--m-text-xs);
+		line-height: 18px;
 	}
 	.counts {
 		flex-shrink: 0;

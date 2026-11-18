@@ -11,12 +11,12 @@
 	// read-only. Replying and triage happen on GitHub.
 	import { onMount } from 'svelte';
 	import { openUrl } from '@tauri-apps/plugin-opener';
-	import { githubMarkdown, openMarkdownLinks } from '../githubMarkdown';
+	import { githubMarkdown, openMarkdownLinks, repoUrlOf } from '../githubMarkdown';
 	import { relativeTime } from '../inboxSections';
 	import { ipc } from '../ipc';
 	import { formatError } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
-	import { numberFromIssuePath } from '../util/issuePath';
+	import { parseIssuePath } from '../util/issuePath';
 	import Conversation from './Conversation.svelte';
 	import Pill from './Pill.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
@@ -29,11 +29,12 @@
 	let scroller: HTMLDivElement | undefined = $state();
 
 	const tabPath = $derived(side === 'left' ? workspace.leftActive : workspace.rightActive);
-	const number = $derived(tabPath === null ? null : numberFromIssuePath(tabPath));
+	const ref = $derived(tabPath === null ? null : parseIssuePath(tabPath));
+	const number = $derived(ref?.number ?? null);
 	// What the tab strip already knows, to head the page before
 	// GitHub answers.
 	const tabName = $derived(workspace.openFiles.find((file) => file.path === tabPath)?.name ?? '');
-	const cacheKey = $derived(`${workspace.activeProjectPath ?? ''}\n${number ?? ''}`);
+	const cacheKey = $derived(tabPath ?? '');
 
 	let issue = $state<IssueDetail | null>(null);
 	let loadError = $state('');
@@ -41,7 +42,7 @@
 	let loadToken = 0;
 
 	async function load() {
-		const wanted = number;
+		const wanted = ref;
 		if (wanted === null) {
 			loadError = 'Not an issue.';
 			return;
@@ -50,7 +51,7 @@
 		const token = ++loadToken;
 		loading = true;
 		try {
-			const result = await ipc.issue.open(wanted);
+			const result = await ipc.issue.open(wanted.folder, wanted.number);
 			if (token !== loadToken) {
 				return;
 			}
@@ -131,7 +132,11 @@
 
 		{#if issue.body.trim() !== ''}
 			<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions (delegated link clicks; the links themselves are focusable) -->
-			<div class="markdown-body body" use:githubMarkdown={issue.body} onclick={openMarkdownLinks}></div>
+			<div
+				class="markdown-body body"
+				use:githubMarkdown={{ text: issue.body, repoUrl: repoUrlOf(issue.url) }}
+				onclick={openMarkdownLinks}
+			></div>
 		{:else}
 			<p class="none">No description.</p>
 		{/if}
@@ -140,7 +145,7 @@
 			<h3>
 				{issue.comments.length} comment{issue.comments.length === 1 ? '' : 's'}
 			</h3>
-			<Conversation comments={issue.comments} />
+			<Conversation comments={issue.comments} repoUrl={repoUrlOf(issue.url)} />
 		{/if}
 	{/if}
 </div>

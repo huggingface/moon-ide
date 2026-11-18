@@ -44,9 +44,14 @@
 		// of the change, a collapse toggle and a viewed mark. A
 		// collapsed section is its header alone and loads nothing.
 		outline?: FileOutline;
+		// The bound folder whose repository holds both revisions, when
+		// that need not be the active one: a pull request tab shows a
+		// project's pull request wherever the user is (ADR 0121).
+		folderPath?: string | undefined;
 	};
 
-	let { path, status, commitSha, parentSha, eager, registerSection, side, pullRequest, outline }: Props = $props();
+	let { path, status, commitSha, parentSha, eager, registerSection, side, pullRequest, outline, folderPath }: Props =
+		$props();
 
 	const collapsed = $derived(outline?.collapsed ?? false);
 	// Near enough to the viewport for its diff to be worth loading.
@@ -136,7 +141,7 @@
 			return '';
 		}
 		try {
-			const content = await ipc.fs.gitRefContent(rev, path);
+			const content = await ipc.fs.gitRefContent(rev, path, folderPath);
 			return content ?? '';
 		} catch {
 			return '';
@@ -368,8 +373,16 @@
 		});
 	});
 
-	function openInEditor() {
-		void workspace.openFile(path, side);
+	// The file as it is on disk. For another project's pull request
+	// that is a file of that project, so the click goes there.
+	async function openInEditor() {
+		if (folderPath !== undefined && workspace.activeProjectPath !== folderPath) {
+			await workspace.setActiveFolder(folderPath);
+			if (workspace.activeFolderPath !== folderPath) {
+				return;
+			}
+		}
+		await workspace.openFile(path, side);
 	}
 
 	/**
@@ -505,7 +518,7 @@
 		<span class="status status-{status}" title={`Status: ${status}`} aria-label={`Status ${status}`}>
 			{statusLabel(status)}
 		</span>
-		<button type="button" class="path" title={`Open ${path}`} onclick={openInEditor}>
+		<button type="button" class="path" title={`Open ${path}`} onclick={() => void openInEditor()}>
 			{#if dirName(path)}<span class="dir">{dirName(path)}/</span>{/if}<span class="name">{fileName(path)}</span>
 		</button>
 		{#if outline !== undefined}

@@ -6,7 +6,8 @@
 use camino::Utf8Path;
 use moon_protocol::inbox::{ConversationComment, ConversationReview, InboxItemState, InboxReview};
 use moon_protocol::review::{
-	PrCheck, PrCheckState, PrDiff, PrMinorNote, PrThread, PrThreadComment, PullRequestDetail, ReviewSide,
+	PrAction, PrCheck, PrCheckState, PrDiff, PrMergeMethod, PrMergeStatus, PrMinorNote, PrThread, PrThreadComment,
+	PullRequestDetail, ReviewSide,
 };
 use moon_protocol::{MoonError, MoonResult};
 use serde::Deserialize;
@@ -45,10 +46,129 @@ struct RawPr {
 	comments: Vec<RawComment>,
 	#[serde(default)]
 	reviews: Vec<RawReview>,
+	#[serde(default)]
+	mergeable: String,
+	#[serde(default)]
+	merge_state_status: String,
 }
 
 const PR_VIEW_FIELDS: &str = "number,title,url,body,state,isDraft,author,reviewDecision,baseRefName,headRefName,\
-	headRefOid,isCrossRepository,statusCheckRollup,comments,reviews";
+	headRefOid,isCrossRepository,statusCheckRollup,comments,reviews,mergeable,mergeStateStatus";
+
+/// `mergeStateStatus` and `mergeable` as one verdict. A conflict wins:
+/// GitHub can report it under either field.
+fn merge_status(merge_state: &str, mergeable: &str) -> PrMergeStatus {
+	if merge_state == "DIRTY" || mergeable == "CONFLICTING" {
+		return PrMergeStatus::Conflicting;
+	}
+	match merge_state {
+		"CLEAN" | "HAS_HOOKS" => PrMergeStatus::Clean,
+		"UNSTABLE" => PrMergeStatus::Unstable,
+		"BLOCKED" => PrMergeStatus::Blocked,
+		"BEHIND" => PrMergeStatus::Behind,
+		_ => PrMergeStatus::Unknown,
+	}
+}
+
+const ALL_MERGE_METHODS: [PrMergeMethod; 3] = [PrMergeMethod::Squash, PrMergeMethod::Merge, PrMergeMethod::Rebase];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMergeSettings {
+	squash_merge_allowed: bool,
+	merge_commit_allowed: bool,
+	rebase_merge_allowed: bool,
+	#[serde(default)]
+	viewer_default_merge_method: String,
+}
+
+/// The allowed methods, the viewer's default first.
+fn methods_from_settings(raw: &RawMergeSettings) -> Vec<PrMergeMethod> {
+	let default = match raw.viewer_default_merge_method.as_str() {
+		"SQUASH" => Some(PrMergeMethod::Squash),
+		"MERGE" => Some(PrMergeMethod::Merge),
+		"REBASE" => Some(PrMergeMethod::Rebase),
+		_ => None,
+	};
+	let mut methods: Vec<PrMergeMethod> = ALL_MERGE_METHODS
+		.into_iter()
+		.filter(|method| match method {
+			PrMergeMethod::Squash => raw.squash_merge_allowed,
+			PrMergeMethod::Merge => raw.merge_commit_allowed,
+			PrMergeMethod::Rebase => raw.rebase_merge_allowed,
+		})
+		.collect();
+	methods.sort_by_key(|method| Some(*method) != default);
+	methods
+}
+
+/// Merge methods `owner_repo` allows. Every method when the settings
+/// can't be read: GitHub still refuses one the repository doesn't
+/// allow, and says so.
+async fn merge_methods(owner_repo: &str) -> Vec<PrMergeMethod> {
+	let Some((owner, name)) = owner_repo.split_once('/') else {
+		return ALL_MERGE_METHODS.to_vec();
+	};
+	let query = "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { \
+		squashMergeAllowed mergeCommitAllowed rebaseMergeAllowed viewerDefaultMergeMethod } }";
+	let settings = match gh_graphql(query, &[("owner", owner), ("name", name)]).await {
+		Ok(mut data) => data.pointer_mut("/repository").map(Value::take),
+		Err(err) => {
+			tracing::debug!(error = %err.detail(), "pull_request: merge settings fetch failed");
+			None
+		}
+	};
+	match settings.and_then(|value| serde_json::from_value::<RawMergeSettings>(value).ok()) {
+		Some(raw) => methods_from_settings(&raw),
+		None => ALL_MERGE_METHODS.to_vec(),
+	}
+}
+
+/// `gh` arguments carrying out `action` on the pull request at `url`.
+/// `None` for a merge whose head isn't a full commit SHA.
+fn action_args(url: &str, action: &PrAction) -> Option<Vec<String>> {
+	let args: Vec<&str> = match action {
+		PrAction::Ready => vec!["pr", "ready", url],
+		PrAction::Draft => vec!["pr", "ready", url, "--undo"],
+		PrAction::Close => vec!["pr", "close", url],
+		PrAction::Reopen => vec!["pr", "reopen", url],
+		// No `--delete-branch`: that also deletes a local branch and
+		// can move the checkout. The repository's own setting decides
+		// what happens to the remote one.
+		PrAction::Merge { method, head_sha } => {
+			if head_sha.len() != 40 || !head_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+				return None;
+			}
+			let flag = match method {
+				PrMergeMethod::Squash => "--squash",
+				PrMergeMethod::Merge => "--merge",
+				PrMergeMethod::Rebase => "--rebase",
+			};
+			vec!["pr", "merge", url, flag, "--match-head-commit", head_sha]
+		}
+	};
+	Some(args.into_iter().map(str::to_owned).collect())
+}
+
+/// Carry out `action` on the pull request at `url` (its GitHub page).
+/// The repository comes from the URL, so no checkout is consulted or
+/// touched. Errors carry what `gh` said.
+pub async fn act(url: &str, action: &PrAction) -> MoonResult<()> {
+	if pr_from_url(url).is_none() {
+		return Err(MoonError::invalid(format!("not a pull request URL: {url}")));
+	}
+	let Some(args) = action_args(url, action) else {
+		return Err(MoonError::invalid("not a commit SHA".to_owned()));
+	};
+	let args: Vec<&str> = args.iter().map(String::as_str).collect();
+	let output = run_gh_in(None, &args)
+		.await
+		.map_err(|err| MoonError::IoError(err.detail()))?;
+	if !output.success {
+		return Err(MoonError::IoError(output.stderr.trim().to_owned()));
+	}
+	Ok(())
+}
 
 /// A top-level comment, as `gh pr view` and `gh issue view` list them.
 #[derive(Deserialize)]
@@ -320,6 +440,8 @@ fn detail_from_raw(raw: RawPr) -> PullRequestDetail {
 		minor_notes_sha,
 		threads: Vec::new(),
 		conversation,
+		merge_status: merge_status(&raw.merge_state_status, &raw.mergeable),
+		merge_methods: ALL_MERGE_METHODS.to_vec(),
 	}
 }
 
@@ -333,22 +455,26 @@ pub async fn fetch_detail(root: &Utf8Path, number: Option<u32>) -> MoonResult<Pu
 	let remote = tokio::task::spawn_blocking(move || detect_forge_remote(&owned))
 		.await
 		.map_err(|e| MoonError::Internal(format!("pull_request join error: {e}")))?;
-	if remote.map(|remote| remote.kind) != Some(ForgeKind::GitHub) {
+	let Some(remote) = remote.filter(|remote| remote.kind == ForgeKind::GitHub) else {
 		return Err(MoonError::invalid(format!("{root} is not a GitHub repository")));
-	}
+	};
 	let number_arg = number.map(|number| number.to_string());
 	let mut args = vec!["pr", "view"];
 	args.extend(number_arg.as_deref());
 	args.extend(["--json", PR_VIEW_FIELDS]);
-	let output = run_gh_in(Some(root), &args)
-		.await
-		.map_err(|err| MoonError::IoError(err.detail()))?;
+	// Side by side: the settings are a second request, and the tab's
+	// first paint waits on this function.
+	let (output, methods) = tokio::join!(run_gh_in(Some(root), &args), merge_methods(&remote.owner_repo));
+	let output = output.map_err(|err| MoonError::IoError(err.detail()))?;
 	if !output.success {
 		return Err(MoonError::IoError(format!("gh pr view: {}", output.stderr)));
 	}
 	let raw: RawPr =
 		serde_json::from_slice(&output.stdout).map_err(|e| MoonError::Internal(format!("gh pr view JSON: {e}")))?;
-	Ok(detail_from_raw(raw))
+	Ok(PullRequestDetail {
+		merge_methods: methods,
+		..detail_from_raw(raw)
+	})
 }
 
 /// The review threads of the pull request at `url` (its GitHub page,
@@ -684,6 +810,90 @@ mod tests {
 			]
 		);
 		assert_eq!(conversation[3].url, "https://github.com/acme/app/pull/7");
+	}
+
+	#[test]
+	fn merge_status_reads_both_fields() {
+		assert_eq!(merge_status("CLEAN", "MERGEABLE"), PrMergeStatus::Clean);
+		assert_eq!(merge_status("HAS_HOOKS", "MERGEABLE"), PrMergeStatus::Clean);
+		assert_eq!(merge_status("UNSTABLE", "MERGEABLE"), PrMergeStatus::Unstable);
+		assert_eq!(merge_status("BLOCKED", "MERGEABLE"), PrMergeStatus::Blocked);
+		assert_eq!(merge_status("BEHIND", "MERGEABLE"), PrMergeStatus::Behind);
+		assert_eq!(merge_status("DIRTY", "CONFLICTING"), PrMergeStatus::Conflicting);
+		assert_eq!(merge_status("BLOCKED", "CONFLICTING"), PrMergeStatus::Conflicting);
+		assert_eq!(merge_status("UNKNOWN", "UNKNOWN"), PrMergeStatus::Unknown);
+		assert_eq!(merge_status("", ""), PrMergeStatus::Unknown);
+	}
+
+	#[test]
+	fn merge_methods_are_the_allowed_ones_default_first() {
+		let settings = |squash, merge, rebase, default: &str| RawMergeSettings {
+			squash_merge_allowed: squash,
+			merge_commit_allowed: merge,
+			rebase_merge_allowed: rebase,
+			viewer_default_merge_method: default.to_owned(),
+		};
+		assert_eq!(
+			methods_from_settings(&settings(true, false, false, "SQUASH")),
+			[PrMergeMethod::Squash]
+		);
+		assert_eq!(
+			methods_from_settings(&settings(true, true, true, "REBASE")),
+			[PrMergeMethod::Rebase, PrMergeMethod::Squash, PrMergeMethod::Merge]
+		);
+		assert_eq!(
+			methods_from_settings(&settings(true, true, false, "")),
+			[PrMergeMethod::Squash, PrMergeMethod::Merge]
+		);
+	}
+
+	#[test]
+	fn actions_become_gh_arguments() {
+		let url = "https://github.com/acme/app/pull/7";
+		let args = |action| action_args(url, &action).map(|args| args.join(" "));
+		assert_eq!(
+			args(PrAction::Ready).as_deref(),
+			Some("pr ready https://github.com/acme/app/pull/7")
+		);
+		assert_eq!(
+			args(PrAction::Draft).as_deref(),
+			Some("pr ready https://github.com/acme/app/pull/7 --undo")
+		);
+		assert_eq!(
+			args(PrAction::Close).as_deref(),
+			Some("pr close https://github.com/acme/app/pull/7")
+		);
+		assert_eq!(
+			args(PrAction::Reopen).as_deref(),
+			Some("pr reopen https://github.com/acme/app/pull/7")
+		);
+		let sha = "b2293412bfa8143daf8e38b92063aa55b279e63e";
+		let merge = |method, head: &str| {
+			args(PrAction::Merge {
+				method,
+				head_sha: head.to_owned(),
+			})
+		};
+		assert_eq!(
+			merge(PrMergeMethod::Squash, sha),
+			Some(format!("pr merge {url} --squash --match-head-commit {sha}"))
+		);
+		assert!(merge(PrMergeMethod::Rebase, sha).unwrap().contains(" --rebase "));
+		// Never a flag gh would take for something else.
+		assert_eq!(merge(PrMergeMethod::Merge, "--admin"), None);
+		assert_eq!(merge(PrMergeMethod::Merge, "abc1234"), None);
+	}
+
+	#[tokio::test]
+	async fn an_action_on_something_that_is_no_pull_request_is_refused() {
+		for url in [
+			"--admin",
+			"https://github.com/acme/app/issues/7",
+			"https://github.com/acme/app/pull/x",
+		] {
+			let err = act(url, &PrAction::Close).await.unwrap_err();
+			assert!(err.to_string().contains("not a pull request URL"), "{err}");
+		}
 	}
 
 	#[test]

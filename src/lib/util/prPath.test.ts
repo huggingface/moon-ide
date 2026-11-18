@@ -1,19 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { isPrPath, numberFromPrPath, prPath, prTabName } from './prPath';
+import { isPrPath, parsePrPath, prPath, prTabName } from './prPath';
 
 describe('prPath', () => {
-	it('round-trips the number', () => {
-		expect(prPath(4099)).toBe('pr://4099');
-		expect(isPrPath('pr://4099')).toBe(true);
-		expect(numberFromPrPath('pr://4099')).toBe(4099);
+	it('round-trips the folder and the number', () => {
+		expect(prPath('/code/app', 4099)).toBe('pr:///code/app#4099');
+		expect(isPrPath('pr:///code/app#4099')).toBe(true);
+		expect(parsePrPath('pr:///code/app#4099')).toEqual({ folder: '/code/app', number: 4099 });
+	});
+
+	it('reads the number after the last #', () => {
+		expect(parsePrPath(prPath('/code/c#-app', 7))).toEqual({ folder: '/code/c#-app', number: 7 });
 	});
 
 	it('rejects other paths and malformed numbers', () => {
 		expect(isPrPath('src/pr.ts')).toBe(false);
-		expect(numberFromPrPath('commit://4099')).toBeNull();
-		expect(numberFromPrPath('pr://')).toBeNull();
-		expect(numberFromPrPath('pr://0')).toBeNull();
-		expect(numberFromPrPath('pr://12a')).toBeNull();
+		expect(parsePrPath('commit:///code/app#4099')).toBeNull();
+		expect(parsePrPath('pr://4099')).toBeNull();
+		expect(parsePrPath('pr://#4099')).toBeNull();
+		expect(parsePrPath('pr:///code/app#')).toBeNull();
+		expect(parsePrPath('pr:///code/app#0')).toBeNull();
+		expect(parsePrPath('pr:///code/app#12a')).toBeNull();
 	});
 
 	it('names the tab after the number and a bounded title', () => {

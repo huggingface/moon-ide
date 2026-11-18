@@ -1,25 +1,21 @@
-// Path of an issue's pseudo-tab (ADR 0117): `issue://<number>`, an
-// issue of the repository behind the folder whose tab strip holds it.
-// Same shape as `prPath.ts`.
+// Path of an issue's pseudo-tab (ADR 0117): `issue://<folder>#<number>`,
+// an issue of the repository behind the bound project folder
+// `<folder>`. Same shape as `prPath.ts`.
 
-import { prTabName } from './prPath';
+import { githubTabPath, parseGithubTabPath, prTabName, type GithubTabRef } from './prPath';
 
 const PREFIX = 'issue://';
 
-export function issuePath(number: number): string {
-	return `${PREFIX}${number}`;
+export function issuePath(folder: string, number: number): string {
+	return githubTabPath(PREFIX, folder, number);
 }
 
 export function isIssuePath(path: string): boolean {
 	return path.startsWith(PREFIX);
 }
 
-export function numberFromIssuePath(path: string): number | null {
-	if (!path.startsWith(PREFIX)) {
-		return null;
-	}
-	const digits = path.slice(PREFIX.length);
-	return /^[1-9][0-9]*$/.test(digits) ? Number(digits) : null;
+export function parseIssuePath(path: string): GithubTabRef | null {
+	return parseGithubTabPath(PREFIX, path);
 }
 
 /** `#<number> <title>`, bounded like a pull request's tab name. */

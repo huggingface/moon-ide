@@ -39,13 +39,14 @@ STATUS: partial — Phase 0 ships fs operations via Tauri commands. Streams (`fs
 
 - `pr_current() -> PullRequestDetail | null` — the open GitHub PR for the active folder's branch: description (minus moonbot's notes block), state, review decision, checks, the parsed notes and the review threads. `null` when there is no PR, the remote isn't GitHub, or `gh` can't answer.
 
-- A pull request tab reads in three calls, so the description is on screen before the slow part ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)):
-  - `pr_detail({ number }) -> PullRequestDetail` — pull request `number` of the active folder's repository, with `threads` empty. One `gh` call.
+- A pull request tab reads in three calls, so the description is on screen before the slow part ([ADR 0115](decisions/0115-pr-tab-without-a-checkout.md)). The tab names the bound project folder it reads through (`folderPath`) rather than relying on the active one, since it stays open across folder switches ([ADR 0121](decisions/0121-pr-tabs-belong-to-the-workspace.md)):
+  - `pr_detail({ folderPath, number }) -> PullRequestDetail` — pull request `number` of that folder's repository, with `threads` empty. Carries `mergeStatus` (GitHub's verdict on merging it now) and `mergeMethods` (what the repository allows, the viewer's default first).
   - `pr_threads({ url }) -> PrThread[]` — the review threads of the pull request at `url`.
-  - `pr_diff({ number, baseRef, headSha }) -> PrDiff` — fetches the head into `refs/moon/pr/<number>` and returns the merge base with the base branch and the files changed between the two, each with its added / removed line counts (`null` for a binary file). Both revisions can then be read with `fs_git_ref_content`. Errors when the fetch fails.
+  - `pr_diff({ folderPath, number, baseRef, headSha }) -> PrDiff` — fetches the head into `refs/moon/pr/<number>` and returns the merge base with the base branch and the files changed between the two, each with its added / removed line counts (`null` for a binary file). Both revisions can then be read with `fs_git_ref_content`. Errors when the fetch fails.
 - `PullRequestDetail.conversation` — top-level comments and review summaries, oldest first. Comments GitHub hides are left out, as are reviews that carry nothing but inline threads.
-- `issue_open({ number }) -> IssueDetail` — issue `number` of the active folder's repository: title, state, author, labels, assignees, body and comments ([ADR 0117](decisions/0117-issue-tab.md)).
-- `fs_publish_pr_review`'s request takes an optional `prNumber`: the review goes to that PR instead of the current branch's.
+- `pr_act({ url, action })` — changes the state of the pull request at `url` ([ADR 0120](decisions/0120-pr-state-controls.md)). `action` is `ready`, `draft`, `close`, `reopen`, or `merge` with a `method` and the `headSha` the user was shown; GitHub refuses the merge when the branch has moved since. Errors carry what `gh` said.
+- `issue_open({ folderPath, number }) -> IssueDetail` — issue `number` of that folder's repository: title, state, author, labels, assignees, body and comments ([ADR 0117](decisions/0117-issue-tab.md)).
+- `fs_publish_pr_review`'s request takes an optional `prNumber`: the review goes to that PR instead of the current branch's. The command, like `fs_git_ref_content`, takes an optional `folderPath` naming the bound folder to act in instead of the active one.
 
 Shapes: [`crates/moon-protocol/src/review.rs`](../crates/moon-protocol/src/review.rs).
 

@@ -9,8 +9,12 @@
 	import Pill from './Pill.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
 
-	type Props = { comments: readonly ConversationComment[] };
-	let { comments }: Props = $props();
+	type Props = {
+		comments: readonly ConversationComment[];
+		/** The repository the comments were written in. */
+		repoUrl: string | null;
+	};
+	let { comments, repoUrl }: Props = $props();
 
 	const REVIEW = {
 		approved: ['success', 'approved'],
@@ -59,7 +63,7 @@
 				<div
 					class="markdown-body body"
 					class:clamped={!expanded[id]}
-					use:githubMarkdown={comment.body}
+					use:githubMarkdown={{ text: comment.body, repoUrl }}
 					{@attach (el) => measure(el, id)}
 					onclick={openMarkdownLinks}
 				></div>

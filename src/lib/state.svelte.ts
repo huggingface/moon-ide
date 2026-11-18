@@ -67,8 +67,8 @@ import { INBOX_PATH, isInboxPath } from './util/inboxPath';
 import { inbox } from './inbox.svelte';
 import { sessionDismissals } from './sessionDismissals.svelte';
 import { commitPath, isCommitPath, shaFromCommitPath } from './util/commitPath';
-import { isIssuePath, issuePath, issueTabName, numberFromIssuePath } from './util/issuePath';
-import { isPrPath, numberFromPrPath, prPath, prTabName } from './util/prPath';
+import { isIssuePath, issuePath, parseIssuePath } from './util/issuePath';
+import { isPrPath, parsePrPath, prPath, prTabName } from './util/prPath';
 import { browserIdFromPath, browserPath, browserTabName, isBrowserPath } from './util/browserPath';
 import { wireBrowserBridge } from './browserBridge';
 
@@ -227,7 +227,7 @@ function browserBuffer(path: string, url: string): OpenFile {
 }
 
 /** The synthetic buffer behind a pseudo-tab that reads everything
- *  from its path (`pr://<number>`, `issue://<number>`). */
+ *  from its path (`pr://…`, `issue://…`). */
 function pseudoBuffer(path: string, name: string): OpenFile {
 	return {
 		path,
@@ -244,6 +244,46 @@ function pseudoBuffer(path: string, name: string): OpenFile {
 		pendingEdit: null,
 		previewToken: 0,
 	};
+}
+
+/** A pull request's or an issue's tab. These belong to the workspace,
+ *  not to a folder (ADR 0121): every folder's strip has them, so they
+ *  are still there after a folder switch. */
+type SharedTab = { path: string; name: string };
+
+function isSharedTabPath(path: string): boolean {
+	return isPrPath(path) || isIssuePath(path);
+}
+
+/** Give `state` the shared tab, at the end of its left strip unless
+ *  the folder already shows it somewhere. */
+function addSharedTab(state: FolderState, tab: SharedTab): void {
+	if (!state.openFiles.some((f) => f.path === tab.path)) {
+		state.openFiles = [...state.openFiles, pseudoBuffer(tab.path, tab.name)];
+	}
+	if (!state.leftTabs.includes(tab.path) && !state.rightTabs.includes(tab.path)) {
+		state.leftTabs = [...state.leftTabs, tab.path];
+	}
+}
+
+/** Take the shared tab at `path` out of `state`, landing each pane
+ *  that showed it on the tab before it. */
+function removeSharedTab(state: FolderState, path: string): void {
+	const leftIndex = state.leftTabs.indexOf(path);
+	if (leftIndex >= 0) {
+		state.leftTabs = state.leftTabs.filter((p) => p !== path);
+		if (state.leftActive === path) {
+			state.leftActive = state.leftTabs[Math.max(0, leftIndex - 1)] ?? null;
+		}
+	}
+	const rightIndex = state.rightTabs.indexOf(path);
+	if (rightIndex >= 0) {
+		state.rightTabs = state.rightTabs.filter((p) => p !== path);
+		if (state.rightActive === path) {
+			state.rightActive = state.rightTabs[Math.max(0, rightIndex - 1)] ?? null;
+		}
+	}
+	state.openFiles = state.openFiles.filter((f) => f.path !== path);
 }
 
 /** Put the inbox tab first in `state`'s left strip (ADR 0112). A
@@ -1398,11 +1438,13 @@ class WorkspaceState {
 		// rather than just the first cwd-match. No-op when the user
 		// is on a non-terminal tab or when there's no prior folder.
 		const previousFolderPath = this.activeFolderPath;
-		// Looking at the inbox while switching folders keeps it in
-		// view: it is the one tab that isn't about a folder.
+		// Looking at the inbox, a pull request or an issue while
+		// switching folders keeps it in view: those tabs aren't about
+		// the folder being left.
 		const target = this.folderStates.get(path);
-		if (this.activePath === INBOX_PATH && target?.leftTabs.includes(INBOX_PATH)) {
-			target.leftActive = INBOX_PATH;
+		const shown = this.activePath;
+		if (shown !== null && (shown === INBOX_PATH || isSharedTabPath(shown)) && target?.leftTabs.includes(shown)) {
+			target.leftActive = shown;
 			target.focusedSide = 'left';
 		}
 		// Profiling: a marker the user can wrap a DevTools >
@@ -1790,6 +1832,9 @@ class WorkspaceState {
 				const state = new FolderState(folder.path);
 				if (inbox.tabOpen) {
 					pinInbox(state);
+				}
+				for (const tab of this.#sharedTabs) {
+					addSharedTab(state, tab);
 				}
 				this.folderStates.set(folder.path, state);
 			}
@@ -4948,54 +4993,52 @@ class WorkspaceState {
 		this.setActive(path, side);
 	}
 
-	/**
-	 * Open (or focus) a pull request's pseudo-tab in the active
-	 * folder's tab strip. Needs no checkout of the branch: `PrView`
-	 * reads the pull request and its diff from the number in the
-	 * path, against the active folder's repository.
-	 */
-	openPrTab(number: number, title: string, side: SplitSide = this.focusedSide) {
-		this.#showPseudoTab(prPath(number), prTabName(number, title), side);
-	}
-
-	/** Open (or focus) an issue's pseudo-tab (ADR 0117), an issue of
-	 *  the active folder's repository. */
-	openIssueTab(number: number, title: string, side: SplitSide = this.focusedSide) {
-		this.#showPseudoTab(issuePath(number), issueTabName(number, title), side);
-	}
-
-	#showPseudoTab(path: string, name: string, side: SplitSide) {
-		if (!this.openFiles.some((f) => f.path === path)) {
-			this.openFiles = [...this.openFiles, pseudoBuffer(path, name)];
-		}
-		const tabs = this.tabsFor(side);
-		if (!tabs.includes(path)) {
-			this.setTabsFor(side, [...tabs, path]);
-		}
-		this.setActive(path, side);
-	}
+	/** Pull request and issue tabs open in the workspace, oldest
+	 *  first. Not persisted: they are not restored at launch. */
+	#sharedTabs: SharedTab[] = [];
 
 	/**
-	 * Add a pull request's or an issue's tab to `folderPath`'s left
-	 * strip without showing it: the way to queue several from the
-	 * inbox. The folder need not be the active one; the tab is there
-	 * when the user gets to it. Returns `false` when the folder isn't
-	 * bound.
+	 * Open (or focus) the tab of pull request `number` of the project
+	 * at `folderPath` (ADR 0115). The tab joins every folder's strip
+	 * and is shown in the active one, so nothing switches folder: it
+	 * reads the pull request through `folderPath` wherever the user
+	 * is. With `background`, it is added without being shown: the way
+	 * to queue several from the inbox.
 	 */
-	openGithubTabInBackground(folderPath: string, kind: 'pr' | 'issue', number: number, title: string): boolean {
-		const state = this.folderStates.get(folderPath);
-		if (state === undefined) {
-			return false;
+	openPrTab(folderPath: string, number: number, title: string, options: { background?: boolean } = {}) {
+		this.#openSharedTab(prPath(folderPath, number), prTabName(number, title), options.background === true);
+	}
+
+	/** Open (or focus) the tab of issue `number` of the project at
+	 *  `folderPath` (ADR 0117). Same rules as `openPrTab`. */
+	openIssueTab(folderPath: string, number: number, title: string, options: { background?: boolean } = {}) {
+		this.#openSharedTab(issuePath(folderPath, number), prTabName(number, title), options.background === true);
+	}
+
+	#openSharedTab(path: string, name: string, background: boolean) {
+		if (!this.#sharedTabs.some((tab) => tab.path === path)) {
+			this.#sharedTabs.push({ path, name });
 		}
-		const path = kind === 'pr' ? prPath(number) : issuePath(number);
-		if (!state.openFiles.some((f) => f.path === path)) {
-			state.openFiles = [...state.openFiles, pseudoBuffer(path, prTabName(number, title))];
-		}
-		if (!state.leftTabs.includes(path) && !state.rightTabs.includes(path)) {
-			state.leftTabs = [...state.leftTabs, path];
+		const tab = this.#sharedTabs.find((entry) => entry.path === path) ?? { path, name };
+		for (const state of this.folderStates.values()) {
+			addSharedTab(state, tab);
 		}
 		this.editorViewTick++;
-		return true;
+		if (background) {
+			return;
+		}
+		this.setActive(path, this.leftTabs.includes(path) ? 'left' : 'right');
+	}
+
+	/** Close a pull request's or an issue's tab: it leaves every
+	 *  folder at once. */
+	#closeSharedTab(path: string) {
+		this.#sharedTabs = this.#sharedTabs.filter((tab) => tab.path !== path);
+		for (const state of this.folderStates.values()) {
+			removeSharedTab(state, path);
+		}
+		this.editorViewTick++;
+		this.persistAppState();
 	}
 
 	/** Reconcile the tab strips with the backend registry: attach
@@ -5275,16 +5318,16 @@ class WorkspaceState {
 		if (isPrPath(path)) {
 			// Same rebuild-on-demand as the commit tab; the title is
 			// not known here, so a reopened tab is named by number.
-			const number = numberFromPrPath(path);
-			if (number !== null) {
-				this.openPrTab(number, '', side);
+			const ref = parsePrPath(path);
+			if (ref !== null) {
+				this.openPrTab(ref.folder, ref.number, '');
 			}
 			return;
 		}
 		if (isIssuePath(path)) {
-			const number = numberFromIssuePath(path);
-			if (number !== null) {
-				this.openIssueTab(number, '', side);
+			const ref = parseIssuePath(path);
+			if (ref !== null) {
+				this.openIssueTab(ref.folder, ref.number, '');
 			}
 			return;
 		}
@@ -6215,6 +6258,10 @@ class WorkspaceState {
 	async closeFile(path: string, side: SplitSide = this.focusedSide) {
 		if (isInboxPath(path) && side === 'left' && inbox.tabOpen) {
 			this.#closeInboxTab();
+			return;
+		}
+		if (isSharedTabPath(path)) {
+			this.#closeSharedTab(path);
 			return;
 		}
 		const file = this.openFiles.find((f) => f.path === path);

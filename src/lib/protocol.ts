@@ -404,7 +404,26 @@ export type PullRequestDetail = {
 	threads: PrThread[];
 	/** Top-level comments and review summaries, oldest first. */
 	conversation: ConversationComment[];
+	/** Whether GitHub would merge it now. Meaningless once merged or
+	 * closed. */
+	mergeStatus: PrMergeStatus;
+	/** Methods the repository allows, the viewer's default first. */
+	mergeMethods: PrMergeMethod[];
 };
+
+export type PrMergeStatus = 'clean' | 'unstable' | 'blocked' | 'behind' | 'conflicting' | 'unknown';
+
+export type PrMergeMethod = 'squash' | 'merge' | 'rebase';
+
+/** A change of state asked for on a pull request. `headSha` is the
+ * head the user was shown: GitHub refuses the merge when the branch
+ * has moved since. Mirrors `moon_protocol::review::PrAction`. */
+export type PrAction =
+	| { kind: 'ready' }
+	| { kind: 'draft' }
+	| { kind: 'merge'; method: PrMergeMethod; headSha: string }
+	| { kind: 'close' }
+	| { kind: 'reopen' };
 
 export type ConversationReview = 'approved' | 'changes_requested' | 'commented' | 'dismissed';
 

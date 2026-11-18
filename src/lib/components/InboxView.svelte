@@ -2,8 +2,8 @@
 	// The GitHub inbox tab (ADR 0112): pull requests and notification
 	// threads that want the user, in one list the chips above it
 	// narrow by why. Rows are a keyboard list; Enter opens a pull
-	// request in its own tab, with no checkout and, inside its
-	// project, no folder switch.
+	// request or an issue in its own tab, with no checkout and no
+	// folder switch.
 	import { onMount } from 'svelte';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { inbox } from '../inbox.svelte';
@@ -51,7 +51,6 @@
 	let list: HTMLDivElement | undefined = $state();
 	let filterInput: HTMLInputElement | undefined = $state();
 	let selectedKey = $state<string | null>(null);
-	let openingId = $state<string | null>(null);
 	let authorDraft = $state('');
 	let now = $state(Date.now());
 
@@ -100,52 +99,22 @@
 	});
 
 	/** Open `item` in its own tab: a pull request or an issue of a
-	 *  bound repository. Anything else opens on GitHub. `background`
-	 *  (Ctrl / Cmd / middle click) adds the tab without leaving the
-	 *  inbox, so several can be queued up. */
-	async function open(item: InboxItem, background = false) {
-		if (openingId !== null) {
-			return;
-		}
+	 *  bound repository. Anything else opens on GitHub. The tab opens
+	 *  where the user is, whichever project it is about (ADR 0121).
+	 *  `background` (Ctrl / Cmd / middle click) adds it without
+	 *  leaving the inbox, so several can be queued up. */
+	function open(item: InboxItem, background = false) {
 		const project = inbox.folderFor(item.repo);
-		const kind = item.kind === 'pull_request' ? 'pr' : item.kind === 'issue' ? 'issue' : null;
-		if (project === null || item.number === null || kind === null) {
+		if (project === null || item.number === null || (item.kind !== 'pull_request' && item.kind !== 'issue')) {
 			openOnGitHub(item);
 			return;
 		}
-		// The tab reads from its folder's repository, so any checkout
-		// of the project will do; only another project means another
-		// folder.
-		const here = workspace.activeProjectPath === project;
-		if (background) {
-			const folder = here ? workspace.activeFolderPath : project;
-			if (folder !== null && workspace.openGithubTabInBackground(folder, kind, item.number, item.title)) {
-				if (!here) {
-					workspace.flash(`Opened #${item.number} in ${shortRepo(item.repo)}`);
-				}
-				void inbox.markRead(item);
-			}
-			return;
+		if (item.kind === 'pull_request') {
+			workspace.openPrTab(project, item.number, item.title, { background });
+		} else {
+			workspace.openIssueTab(project, item.number, item.title, { background });
 		}
-		openingId = item.id;
-		try {
-			if (!here) {
-				await workspace.setActiveFolder(project, { recordNav: false });
-			}
-			if (workspace.activeProjectPath !== project) {
-				return;
-			}
-			// This pane's side means nothing in another folder's layout.
-			const target = here ? side : undefined;
-			if (kind === 'pr') {
-				workspace.openPrTab(item.number, item.title, target);
-			} else {
-				workspace.openIssueTab(item.number, item.title, target);
-			}
-			void inbox.markRead(item);
-		} finally {
-			openingId = null;
-		}
+		void inbox.markRead(item);
 	}
 
 	function onRowClick(event: MouseEvent, item: InboxItem) {
@@ -154,7 +123,7 @@
 		if (event.target instanceof Element && event.target.closest('button') !== null) {
 			return;
 		}
-		void open(item, event.ctrlKey || event.metaKey || event.button === 1);
+		open(item, event.ctrlKey || event.metaKey || event.button === 1);
 	}
 
 	function openOnGitHub(item: InboxItem) {
@@ -201,7 +170,7 @@
 		if (event.ctrlKey || event.metaKey) {
 			if (event.key === 'Enter' && selected !== null) {
 				event.preventDefault();
-				void open(selected, true);
+				open(selected, true);
 			}
 			return;
 		}
@@ -216,7 +185,7 @@
 				break;
 			case 'Enter':
 				if (selected !== null) {
-					void open(selected);
+					open(selected);
 				}
 				break;
 			case 'o':
@@ -367,27 +336,23 @@
 			{/if}
 		</span>
 		<span class="spacer"></span>
-		{#if openingId === item.id}
-			<span class="opening">Opening…</span>
-		{:else}
-			<span class="actions">
-				<button class="icon-btn" title="Open on GitHub (o)" onclick={() => openOnGitHub(item)}>
-					<ExternalLinkIcon size={14} />
+		<span class="actions">
+			<button class="icon-btn" title="Open on GitHub (o)" onclick={() => openOnGitHub(item)}>
+				<ExternalLinkIcon size={14} />
+			</button>
+			{#if item.notification !== null}
+				<button class="icon-btn" title="Mark read (e)" onclick={() => void inbox.markRead(item)}>
+					<CheckIcon size={14} />
 				</button>
-				{#if item.notification !== null}
-					<button class="icon-btn" title="Mark read (e)" onclick={() => void inbox.markRead(item)}>
-						<CheckIcon size={14} />
-					</button>
-				{/if}
-				<button
-					class="icon-btn"
-					title={row.snoozed ? 'Wake (s)' : 'Snooze until tomorrow (s); next week is w'}
-					onclick={() => toggleSnooze(item, 'tomorrow')}
-				>
-					<ClockIcon size={14} />
-				</button>
-			</span>
-		{/if}
+			{/if}
+			<button
+				class="icon-btn"
+				title={row.snoozed ? 'Wake (s)' : 'Snooze until tomorrow (s); next week is w'}
+				onclick={() => toggleSnooze(item, 'tomorrow')}
+			>
+				<ClockIcon size={14} />
+			</button>
+		</span>
 		<!-- The trailing columns keep their width when empty so
 			 they line up down the list. -->
 		<span class="diffstat">
@@ -915,12 +880,6 @@
 	.meta,
 	.time,
 	.comments,
-	.opening {
-		flex-shrink: 0;
-		color: var(--m-fg-subtle);
-		font-size: var(--m-text-sm);
-		white-space: nowrap;
-	}
 	.meta {
 		min-width: 0;
 		max-width: 30%;

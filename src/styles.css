@@ -495,6 +495,16 @@ button:focus-visible {
 .markdown-body a:hover {
 	text-decoration: underline;
 }
+.markdown-body a.md-mention {
+	color: var(--m-fg);
+	font-weight: 600;
+}
+/* A mention of the signed-in user (set by `githubMarkdown`). */
+.markdown-body a.md-mention-me {
+	padding: 0 3px;
+	border-radius: var(--m-radius-sm);
+	background: color-mix(in srgb, var(--m-warning) 22%, transparent);
+}
 .markdown-body blockquote {
 	border-left: 3px solid var(--m-border);
 	color: var(--m-fg-muted);

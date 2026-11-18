@@ -66,6 +66,15 @@ export function setMarkdownRepoUrl(url: string | null): void {
 	activeRepoUrl = url;
 }
 
+// Set for the length of one synchronous render whose text belongs to
+// a named repository rather than the active folder's: a pull request
+// tab shows another project's description (ADR 0121).
+let repoUrlOverride: string | null | undefined;
+
+function refRepoUrl(override: string | null | undefined = repoUrlOverride): string | null {
+	return override === undefined ? activeRepoUrl : override;
+}
+
 /**
  * Autolink standalone GitHub-style issue/PR references (`#123`) in
  * plain text to `<repo>/issues/123` (GitHub redirects to /pull for
@@ -76,7 +85,7 @@ export function setMarkdownRepoUrl(url: string | null): void {
  */
 function applyIssueRefRule(md: MarkdownIt): void {
 	md.core.ruler.push('issue_refs', (state) => {
-		const repoUrl = activeRepoUrl;
+		const repoUrl = refRepoUrl();
 		if (repoUrl === null || repoUrl.length === 0) {
 			return;
 		}
@@ -128,7 +137,67 @@ function applyIssueRefRule(md: MarkdownIt): void {
 	});
 }
 
-function buildMarkdownIt(linkify: boolean, breaks = false, html = false): MarkdownIt {
+/** A login, as GitHub allows them: no leading, trailing or doubled
+ *  hyphen is checked beyond the ends. Not followed by `/` (that is a
+ *  package scope far more often than a team) or `(` (a decorator). */
+const MENTION_RE = /(^|[^\w@/.`-])@([a-z\d](?:[a-z\d-]{0,37}[a-z\d])?)(?![\w/(@-])/i;
+
+/**
+ * Link `@login` in plain text to the user's GitHub page, as GitHub
+ * does in descriptions and comments. Same token-stream shape as the
+ * issue-ref rule: text inside links and code is left alone. Whether
+ * the login exists isn't known here, so any well-formed one links.
+ */
+function applyMentionRule(md: MarkdownIt): void {
+	md.core.ruler.push('github_mentions', (state) => {
+		for (const block of state.tokens) {
+			if (block.type !== 'inline' || !block.children) {
+				continue;
+			}
+			let linkDepth = 0;
+			const out: MdToken[] = [];
+			for (const tok of block.children) {
+				if (tok.type === 'link_open') {
+					linkDepth++;
+				} else if (tok.type === 'link_close') {
+					linkDepth--;
+				}
+				if (tok.type !== 'text' || linkDepth > 0 || !tok.content.includes('@')) {
+					out.push(tok);
+					continue;
+				}
+				let rest = tok.content;
+				let m = MENTION_RE.exec(rest);
+				while (m !== null) {
+					const before = rest.slice(0, m.index) + (m[1] ?? '');
+					if (before) {
+						const t = new state.Token('text', '', 0);
+						t.content = before;
+						out.push(t);
+					}
+					const open = new state.Token('link_open', 'a', 1);
+					open.attrSet('href', `https://github.com/${m[2]}`);
+					open.attrSet('class', 'md-mention');
+					out.push(open);
+					const label = new state.Token('text', '', 0);
+					label.content = `@${m[2]}`;
+					out.push(label);
+					out.push(new state.Token('link_close', 'a', -1));
+					rest = rest.slice(m.index + m[0].length);
+					m = MENTION_RE.exec(rest);
+				}
+				if (rest) {
+					const t = new state.Token('text', '', 0);
+					t.content = rest;
+					out.push(t);
+				}
+			}
+			block.children = out;
+		}
+	});
+}
+
+function buildMarkdownIt(linkify: boolean, breaks = false, html = false, mentions = false): MarkdownIt {
 	const md = new MarkdownIt({
 		html,
 		linkify,
@@ -148,6 +217,9 @@ function buildMarkdownIt(linkify: boolean, breaks = false, html = false): Markdo
 	applyAlertRule(md);
 	if (linkify) {
 		applyIssueRefRule(md);
+	}
+	if (mentions) {
+		applyMentionRule(md);
 	}
 	return md;
 }
@@ -334,10 +406,12 @@ const mdLinkifiedBreaks = buildMarkdownIt(true, true);
 // comments used as markers), bare URLs link, and a newline breaks the
 // line. DOMPurify is the XSS layer for this parser; see
 // `GITHUB_SANITISE`.
-const mdGithub = buildMarkdownIt(true, true, true);
+const mdGithub = buildMarkdownIt(true, true, true, true);
 
-/** Which dialect to render. `github` is for text authored on GitHub. */
-export type MarkdownOptions = { linkify?: boolean; github?: boolean };
+/** Which dialect to render. `github` is for text authored on GitHub;
+ *  `repoUrl` is then the repository its `#123` references point into
+ *  (`null` for none), when that isn't the active folder's. */
+export type MarkdownOptions = { linkify?: boolean; github?: boolean; repoUrl?: string | null };
 
 function parserFor(options: MarkdownOptions): { parser: MarkdownIt; tag: string } {
 	if (options.github) {
@@ -431,8 +505,8 @@ function applyLinkRules(parser: MarkdownIt): void {
 const markdownCache = new Map<string, string>();
 const MARKDOWN_CACHE_MAX = 500;
 
-function markdownCacheKey(source: string, tag: string): string {
-	return tag + '\x00' + (activeRepoUrl ?? '') + '\x00' + source;
+function markdownCacheKey(source: string, tag: string, repoUrl?: string | null): string {
+	return tag + '\x00' + (refRepoUrl(repoUrl) ?? '') + '\x00' + source;
 }
 
 /**
@@ -440,7 +514,7 @@ function markdownCacheKey(source: string, tag: string): string {
  * miss — caller falls back to `renderMarkdown` (async).
  */
 export function getCachedMarkdown(source: string, options: MarkdownOptions = {}): string | undefined {
-	return markdownCache.get(markdownCacheKey(source, parserFor(options).tag));
+	return markdownCache.get(markdownCacheKey(source, parserFor(options).tag, options.repoUrl));
 }
 
 /**
@@ -614,7 +688,7 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 export async function renderMarkdown(source: string, options: MarkdownOptions = {}): Promise<string> {
 	const { parser, tag } = parserFor(options);
 	const github = options.github === true;
-	const key = markdownCacheKey(source, tag);
+	const key = markdownCacheKey(source, tag, options.repoUrl);
 	const cached = markdownCache.get(key);
 	if (cached !== undefined) {
 		return cached;
@@ -626,7 +700,14 @@ export async function renderMarkdown(source: string, options: MarkdownOptions = 
 		langs.push('yaml');
 	}
 	await loadHighlighters(langs);
-	const html = (frontmatter !== null ? frontmatterToHtml(frontmatter) : '') + parser.render(body);
+	let rendered: string;
+	repoUrlOverride = options.repoUrl;
+	try {
+		rendered = parser.render(body);
+	} finally {
+		repoUrlOverride = undefined;
+	}
+	const html = (frontmatter !== null ? frontmatterToHtml(frontmatter) : '') + rendered;
 	// Hooks are global to DOMPurify; this one is scoped to the call,
 	// which is synchronous.
 	if (github) {
@@ -946,6 +1027,7 @@ export const __test = {
 	applyAlertRule,
 	applyHeadingAnchorRule,
 	applyInlineAnchorRule,
+	applyMentionRule,
 	frontmatterToHtml,
 	keepRendererClasses,
 	splitTopLevelBlocks,

@@ -196,6 +196,57 @@ pub struct PullRequestDetail {
 	/// Top-level comments and review summaries, oldest first: what
 	/// GitHub's Conversation tab shows besides the threads.
 	pub conversation: Vec<crate::inbox::ConversationComment>,
+	/// Whether GitHub would merge it now. Says nothing useful once
+	/// the pull request is merged or closed.
+	pub merge_status: PrMergeStatus,
+	/// Merge methods the repository allows, the viewer's default
+	/// first. All three when its settings could not be read.
+	pub merge_methods: Vec<PrMergeMethod>,
+}
+
+/// GitHub's verdict on merging an open pull request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum PrMergeStatus {
+	Clean,
+	/// Mergeable, with checks that aren't required failing or running.
+	Unstable,
+	/// A branch rule isn't met: a review, a required check.
+	Blocked,
+	/// The base branch has moved and the rules want the head up to date.
+	Behind,
+	Conflicting,
+	/// GitHub hasn't worked it out yet; a later read usually knows.
+	Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum PrMergeMethod {
+	Squash,
+	Merge,
+	Rebase,
+}
+
+/// A change of state the user asks for on a pull request (ADR 0120).
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+pub enum PrAction {
+	/// Draft → ready for review.
+	Ready,
+	/// Back to draft.
+	Draft,
+	/// Merge now. `head_sha` is the head the user was shown: GitHub
+	/// refuses when the branch has moved since.
+	Merge {
+		method: PrMergeMethod,
+		head_sha: String,
+	},
+	Close,
+	Reopen,
 }
 
 /// The diff of a pull request opened without a checkout: what GitHub

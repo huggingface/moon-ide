@@ -371,6 +371,36 @@ describe('GitHub alerts', () => {
 	});
 });
 
+describe('GitHub mentions', () => {
+	function render(source: string): string {
+		const md = new MarkdownIt({ linkify: true });
+		__test.applyMentionRule(md);
+		return md.render(source);
+	}
+	const link = (login: string) => `<a href="https://github.com/${login}" class="md-mention">@${login}</a>`;
+
+	it('links a login in prose, at the start, after punctuation and before it', () => {
+		expect(render('Requested by @coyotte508')).toContain(`Requested by ${link('coyotte508')}`);
+		expect(render('@alex can you look?')).toContain(`${link('alex')} can you look?`);
+		expect(render('(cc @moon-bot-app, @li.)')).toContain(`(cc ${link('moon-bot-app')}, ${link('li')}.)`);
+	});
+
+	it('leaves package scopes, decorators, emails and code alone', () => {
+		expect(render('bump @codemirror/merge and @types/node')).not.toContain('md-mention');
+		expect(render('the @Injectable() class')).not.toContain('md-mention');
+		expect(render('mail me@example.com or a@b')).not.toContain('md-mention');
+		expect(render('run `@alex` literally')).not.toContain('md-mention');
+		expect(render('a lone @ and @-x and x@y')).not.toContain('md-mention');
+	});
+
+	it('does not relink text that is already a link', () => {
+		const html = render('[@alex](https://example.test/a) and @sam');
+		expect(html).toContain('<a href="https://example.test/a">@alex</a>');
+		expect(html).toContain(link('sam'));
+		expect(html.match(/md-mention/g)).toHaveLength(1);
+	});
+});
+
 describe('keepRendererClasses', () => {
 	function filter(value: string) {
 		const data = { attrName: 'class', attrValue: value, keepAttr: true };

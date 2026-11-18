@@ -82,6 +82,7 @@ import type {
 	ForwardedPort,
 	ForwardedPortStatus,
 	PortsApplyResult,
+	PrAction,
 	PrDiff,
 	PrThread,
 	PublishReviewRequest,
@@ -203,9 +204,13 @@ export const ipc = {
 		gitPermalink: (path: string, startLine: number, endLine: number) =>
 			call<GitPermalink | null>('fs_git_permalink', { path, startLine, endLine }),
 		gitBlobSha: (path: string) => call<string | null>('fs_git_blob_sha', { path }),
-		publishPrReview: (request: PublishReviewRequest) => call<PublishReviewResult>('fs_publish_pr_review', { request }),
+		/** `folderPath` names the checkout whose repository the pull
+		 * request is in; the active folder when left out. */
+		publishPrReview: (request: PublishReviewRequest, folderPath?: string) =>
+			call<PublishReviewResult>('fs_publish_pr_review', { request, folderPath }),
 		gitHeadContent: (path: string) => call<string | null>('fs_git_head_content', { path }),
-		gitRefContent: (rev: string, path: string) => call<string | null>('fs_git_ref_content', { rev, path }),
+		gitRefContent: (rev: string, path: string, folderPath?: string) =>
+			call<string | null>('fs_git_ref_content', { rev, path, folderPath }),
 		gitDefaultBranchDiff: () => call<BranchDiffStatus | null>('fs_git_default_branch_diff'),
 		gitRemoteWebUrl: () => call<string | null>('fs_git_remote_web_url'),
 		gitBranch: () => call<GitBranchInfo>('fs_git_branch'),
@@ -232,13 +237,18 @@ export const ipc = {
 	},
 	pullRequest: {
 		current: () => call<PullRequestDetail | null>('pr_current'),
-		/** Description, checks and conversation: one fast call. */
-		detail: (number: number) => call<PullRequestDetail>('pr_detail', { number }),
+		/** Description, checks and conversation: one fast call. A
+		 * pull request tab names the project folder it reads through,
+		 * since it stays open across folder switches. */
+		detail: (folderPath: string, number: number) => call<PullRequestDetail>('pr_detail', { folderPath, number }),
 		threads: (url: string) => call<PrThread[]>('pr_threads', { url }),
-		diff: (number: number, baseRef: string, headSha: string) => call<PrDiff>('pr_diff', { number, baseRef, headSha }),
+		diff: (folderPath: string, number: number, baseRef: string, headSha: string) =>
+			call<PrDiff>('pr_diff', { folderPath, number, baseRef, headSha }),
+		/** Ready, draft, merge, close or reopen: only ever for a click. */
+		act: (url: string, action: PrAction) => call<void>('pr_act', { url, action }),
 	},
 	issue: {
-		open: (number: number) => call<IssueDetail>('issue_open', { number }),
+		open: (folderPath: string, number: number) => call<IssueDetail>('issue_open', { folderPath, number }),
 	},
 	inbox: {
 		fetch: (watchedAuthors: string[]) => call<InboxSnapshot>('inbox_fetch', { watchedAuthors }),

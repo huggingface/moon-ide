@@ -3,6 +3,8 @@ import type { ConversationComment } from "./ConversationComment";
 import type { InboxItemState } from "./InboxItemState";
 import type { InboxReview } from "./InboxReview";
 import type { PrCheck } from "./PrCheck";
+import type { PrMergeMethod } from "./PrMergeMethod";
+import type { PrMergeStatus } from "./PrMergeStatus";
 import type { PrMinorNote } from "./PrMinorNote";
 import type { PrThread } from "./PrThread";
 
@@ -41,4 +43,14 @@ threads: Array<PrThread>,
  * Top-level comments and review summaries, oldest first: what
  * GitHub's Conversation tab shows besides the threads.
  */
-conversation: Array<ConversationComment>, };
+conversation: Array<ConversationComment>, 
+/**
+ * Whether GitHub would merge it now. Says nothing useful once
+ * the pull request is merged or closed.
+ */
+mergeStatus: PrMergeStatus, 
+/**
+ * Merge methods the repository allows, the viewer's default
+ * first. All three when its settings could not be read.
+ */
+mergeMethods: Array<PrMergeMethod>, };
