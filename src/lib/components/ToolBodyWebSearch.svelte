@@ -110,6 +110,7 @@
 								type="button"
 								class="ws-title tool-link"
 								title={`Open ${hit.url} in browser`}
+								data-href={hit.url}
 								onclick={() => void openUrl(hit.url)}
 							>
 								{hit.title.length > 0 ? hit.title : hit.url}

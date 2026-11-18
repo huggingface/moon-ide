@@ -198,6 +198,8 @@ The menu lives in `editor/editorContextMenu.ts` (`EditorContextMenu` class) so t
 
 The tab strip's right-click menu (`EditorTabs.svelte`) carries **Rename…** (inline edit of the tab label — leaf name only, separators refused — routed through `WorkspaceState.renamePath`, which rebinds open buffers and now refuses while the affected buffer is dirty), **Reveal in file manager** (`fs_reveal_in_folder`), copy-path entries, and the close-family actions. The file tree's row menu (`FileTree.svelte`) has its own Pierre-driven inline **Rename**, the same **Reveal in file manager** entry, and the new-file / diff / discard / delete actions. Both mount the shared `ContextMenu.svelte` portaled onto `document.body`. See [ADR 0051](decisions/0051-tab-rename-reveal-live-previews.md).
 
+Right-clicking a web link anywhere in the app (transcript, tool rows, pull request and issue text, cards in a diff, Markdown previews) opens one menu (`LinkMenu.svelte`): **Open in IDE browser**, **Open in system browser**, **Copy link**. It takes precedence over a surrounding surface's own menu. A control that stands in for a link takes part by carrying the address in `data-href`.
+
 ### LSP hook
 
 Planned shape (not yet built): a per-file `ViewPlugin` subscribes to moon-core's LSP broker (one adapter per capability — hover, go-to-def, diagnostics, completions). The adapter translates LSP events into CM's `hoverTooltip`, `gotoDefinition` command, `setDiagnostics` effect, and `autocompletion` source respectively. Nothing goes to the UI that didn't come through moon-core — no direct LSP process ownership on the frontend.

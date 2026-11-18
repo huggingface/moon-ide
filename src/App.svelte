@@ -3,6 +3,7 @@
 	import Sidebar from './lib/components/Sidebar.svelte';
 	import BrowserFrames from './lib/components/BrowserFrames.svelte';
 	import ImageLightbox from './lib/components/ImageLightbox.svelte';
+	import LinkMenu from './lib/components/LinkMenu.svelte';
 	import EditorPane from './lib/components/EditorPane.svelte';
 	import StatusBar from './lib/components/StatusBar.svelte';
 	import Splash from './lib/components/Splash.svelte';
@@ -665,6 +666,7 @@
 	</div>
 	<BrowserFrames />
 	<ImageLightbox />
+	<LinkMenu />
 	<StatusBar />
 	<CommandPalette />
 	<BranchSwitcher />

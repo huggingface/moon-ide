@@ -3,8 +3,7 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import type { Attachment } from 'svelte/attachments';
 	import { confirm } from '@tauri-apps/plugin-dialog';
-	import { readImage, writeText as clipboardWriteText } from '@tauri-apps/plugin-clipboard-manager';
-	import { openUrl } from '@tauri-apps/plugin-opener';
+	import { readImage } from '@tauri-apps/plugin-clipboard-manager';
 	import { coder, compactionProgressLabel, type CoderRow } from '../coder.svelte';
 	import { groupToolRows, type TranscriptItem } from '../toolGroups';
 	import {
@@ -22,7 +21,6 @@
 	import { frontendLog } from '../logs.svelte';
 	import { workspace } from '../state.svelte';
 	import { openLightbox } from '../imageLightbox.svelte';
-	import { openInIdeBrowser } from '../browserOpen';
 	import { copyImageToClipboard } from '../copyImage';
 	import CoderConnectModal from './CoderConnectModal.svelte';
 	import CoderMarkdown from './CoderMarkdown.svelte';
@@ -572,10 +570,10 @@
 		await coder.send();
 	}
 
-	// Our own right-click menu for links and images in the transcript.
-	// Links: open in the IDE browser as well as the system one. Images
-	// (replies, tool screenshots, pasted attachments): WebKitGTK's
-	// "Copy Image" copies a `data:` image as its URL text.
+	// Our own right-click menu for images in the transcript (replies,
+	// tool screenshots, pasted attachments): WebKitGTK's "Copy Image"
+	// copies a `data:` image as its URL text. Links have the app-wide
+	// menu (`LinkMenu.svelte`).
 	let panelMenu = $state<{ items: ContextMenuItem[]; x: number; y: number } | null>(null);
 
 	function onPanelContextMenu(event: MouseEvent): void {
@@ -583,7 +581,7 @@
 		if (!(target instanceof Element)) {
 			return;
 		}
-		const items = linkMenuItems(target.closest('a')) ?? imageMenuItems(target);
+		const items = imageMenuItems(target);
 		if (items === null) {
 			return;
 		}
@@ -599,35 +597,6 @@
 		el.addEventListener('contextmenu', onPanelContextMenu);
 		return () => el.removeEventListener('contextmenu', onPanelContextMenu);
 	});
-
-	function linkMenuItems(anchor: HTMLAnchorElement | null): ContextMenuItem[] | null {
-		const href = anchor?.getAttribute('href') ?? '';
-		if (!/^https?:\/\//i.test(href)) {
-			return null;
-		}
-		return [
-			{
-				id: 'open-link-ide',
-				label: 'Open in IDE browser',
-				onSelect: () => {
-					openInIdeBrowser(href).catch((err: unknown) => {
-						workspace.flash(`Couldn't open the tab: ${formatError(err)}`);
-					});
-				},
-			},
-			{ id: 'open-link', label: 'Open in system browser', onSelect: () => void openUrl(href) },
-			{
-				id: 'copy-link',
-				label: 'Copy link',
-				onSelect: () => {
-					clipboardWriteText(href).then(
-						() => workspace.flash('Link copied'),
-						(err: unknown) => workspace.flash(`Copy failed: ${formatError(err)}`),
-					);
-				},
-			},
-		];
-	}
 
 	function imageMenuItems(target: Element): ContextMenuItem[] | null {
 		if (!(target instanceof HTMLImageElement) || target.currentSrc === '') {

@@ -83,6 +83,7 @@
 					type="button"
 					class="wf-url tool-link"
 					title={`Open ${url} in browser`}
+					data-href={url}
 					onclick={() => void openUrl(url)}
 				>
 					{url}

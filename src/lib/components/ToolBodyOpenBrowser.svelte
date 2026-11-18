@@ -38,6 +38,7 @@
 			type="button"
 			class="ob-url tool-link"
 			title="Open in IDE browser tab"
+			data-href={opened.url}
 			onclick={() => void ipc.browser.open(opened.url, opened.inContainer, true)}
 		>
 			{opened.url}
