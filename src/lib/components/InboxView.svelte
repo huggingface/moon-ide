@@ -522,7 +522,15 @@
 		</p>
 	{/if}
 
-	<div class="scroll" bind:this={list} tabindex="0" role="listbox" aria-label="GitHub inbox" onkeydown={onKeydown}>
+	<div
+		class="scroll"
+		class:grouped={inbox.groupByTopic}
+		bind:this={list}
+		tabindex="0"
+		role="listbox"
+		aria-label="GitHub inbox"
+		onkeydown={onKeydown}
+	>
 		{#each sections as section (section.name ?? '')}
 			{#if inbox.groupByTopic}
 				<!-- A click must not take focus from the list: the keys keep working. -->
@@ -693,6 +701,11 @@
 		padding: var(--m-space-2) var(--m-space-2) var(--m-space-4);
 		outline: none;
 		container-type: inline-size;
+	}
+	/* A group's heading sticks to the top of the content box, so any
+	   padding above it is a strip the rows scroll through. */
+	.scroll.grouped {
+		padding-top: 0;
 	}
 
 	.chips {
