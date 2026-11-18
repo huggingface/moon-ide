@@ -121,7 +121,7 @@
 		openingId = item.id;
 		try {
 			if (!here) {
-				await workspace.setActiveFolder(project);
+				await workspace.setActiveFolder(project, { recordNav: false });
 			}
 			if (workspace.activeProjectPath !== project) {
 				return;
@@ -736,7 +736,7 @@
 		padding: 0 var(--m-space-2);
 		border-radius: var(--m-radius-md);
 		border: 1px solid transparent;
-		cursor: default;
+		cursor: pointer;
 		outline: none;
 	}
 	.row:hover {

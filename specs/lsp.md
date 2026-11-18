@@ -270,6 +270,14 @@ history suppresses its own pushes. Cross-folder restores switch the
 active folder first and bail gracefully (with a flash) if the folder
 was unbound; `removeFolder` prunes stale entries.
 
+Switching folders is a navigation too: both the place left and the
+place arrived at are recorded (without a caret, so going back leaves
+the buffer where its own view state has it), and pseudo-tabs (inbox,
+pull request, review) are places like any file. The chord works from
+anywhere except a terminal, which keeps it for the shell's word
+motion; on macOS text fields keep it too (Option+Arrow moves by
+word), elsewhere the coder composer and search boxes navigate.
+
 Cross-folder goto-definition: a target outside the active folder's
 root comes back as `externalUri`; the frontend walks the bound-folder
 list (longest prefix first) and rewrites it into a

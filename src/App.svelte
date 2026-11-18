@@ -65,6 +65,22 @@
 		return tag === 'INPUT' || tag === 'TEXTAREA';
 	}
 
+	const isMac =
+		typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
+
+	// Whether Alt+Left / Alt+Right from `target` should stay with
+	// the surface instead of navigating history. A terminal always
+	// keeps it (the shell's word motion). Text fields keep it on
+	// macOS only, where Option+Arrow moves by word; elsewhere the
+	// chord does nothing in a field, so the coder composer and the
+	// search boxes can navigate too.
+	function keepsAltArrow(target: EventTarget | null): boolean {
+		if (isFocusInsideTerminal()) {
+			return true;
+		}
+		return isMac && isTextInputTarget(target);
+	}
+
 	// True when DOM focus currently sits inside an xterm.js
 	// surface (the helper textarea xterm uses for input, the
 	// `.xterm-screen` content layer, the `.term-host` wrapper).
@@ -122,12 +138,12 @@
 			// stopPropagation), regardless of whether there's
 			// anywhere to navigate to: a stale "Alt+Left on a fresh
 			// session" shouldn't leak through to CM's word-motion
-			// default and silently move the caret. Inputs /
-			// textareas are exempt so word-motion still works inside
-			// the command palette and similar surfaces.
+			// default and silently move the caret. Terminals, and
+			// text fields on macOS, keep the chord for word motion
+			// (see `keepsAltArrow`).
 			if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
 				const arrow = event.key === 'ArrowLeft' ? 'back' : event.key === 'ArrowRight' ? 'forward' : null;
-				if (arrow !== null && !isTextInputTarget(event.target)) {
+				if (arrow !== null && !keepsAltArrow(event.target)) {
 					event.preventDefault();
 					event.stopPropagation();
 					if (arrow === 'back' && workspace.canNavigateBack) {

@@ -769,13 +769,18 @@
 		color: var(--m-fg);
 		background: var(--m-bg-1);
 	}
-	/* The pinned tab stays put while the others scroll under it. */
+	/* The pinned tab stays put while the others scroll under it. The
+	   ring in the strip's colour masks what would otherwise show
+	   through the strip's left padding and around the pill's rounded
+	   corners; the second shadow fades tabs out as they slide under. */
 	.tab.pinned {
 		position: sticky;
 		left: 0;
 		z-index: 1;
 		background: var(--m-bg);
-		box-shadow: 6px 0 6px -2px var(--m-bg);
+		box-shadow:
+			0 0 0 6px var(--m-bg),
+			12px 0 6px -2px var(--m-bg);
 	}
 	.tab.pinned:hover {
 		background: var(--m-bg-1);

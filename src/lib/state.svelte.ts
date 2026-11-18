@@ -106,7 +106,11 @@ export type EditorSelectionSnapshot = {
  */
 export type NavEntry = {
 	folder: string;
+	/** Empty for "the folder, with no tab showing". */
 	path: string;
+	/** Negative when the caret isn't known: the entry was recorded on
+	 * a folder switch, and going back leaves the buffer wherever its
+	 * own view state has it. */
 	line: number;
 	character: number;
 };
@@ -1374,9 +1378,17 @@ class WorkspaceState {
 	 * folder's persisted state without losing the previous folder's
 	 * buffers.
 	 */
-	async setActiveFolder(path: string) {
+	async setActiveFolder(path: string, options: { recordNav?: boolean } = {}) {
 		if (this.activeFolderPath === path) {
 			return;
+		}
+		// A folder switch is a navigation: Alt+Left comes back to
+		// what was showing here. Callers that switch only to open
+		// something next pass `recordNav: false` for the arrival, so
+		// the thing they open is the one new entry.
+		const recordNav = !this.suppressNavPush;
+		if (recordNav && this.activeFolderPath !== null) {
+			this.pushPlaceEntry(this.activeFolderPath, this.activePath ?? '');
 		}
 		// Snapshot the currently-active bottom-panel terminal (if
 		// any) as the remembered pick for the folder we're leaving,
@@ -1408,6 +1420,9 @@ class WorkspaceState {
 			performance.measure('moon:setActiveFolder.ipc', 'moon:setActiveFolder.start');
 			performance.mark('moon:setActiveFolder.adopt.start');
 			await this.adoptWorkspaceSnapshot(ws);
+			if (recordNav && options.recordNav !== false && this.activeFolderPath === path) {
+				this.pushPlaceEntry(path, this.activePath ?? '');
+			}
 			const tAdopt = performance.now();
 			performance.measure('moon:setActiveFolder.adopt', 'moon:setActiveFolder.adopt.start');
 			this.persistAppState();
@@ -4835,7 +4850,7 @@ class WorkspaceState {
 			const opened = await ipc.inbox.openPr(folderPath, branch);
 			await this.adoptWorkspaceSnapshot(opened.workspace);
 			this.persistAppState();
-			await this.setActiveFolder(opened.folderPath);
+			await this.setActiveFolder(opened.folderPath, { recordNav: false });
 			if (this.activeFolderPath !== opened.folderPath) {
 				return false;
 			}
@@ -6577,6 +6592,22 @@ class WorkspaceState {
 	}
 
 	/**
+	 * Record that the user is at `path` of `folder` without a caret
+	 * (a folder switch, where nothing was clicked). A no-op when that
+	 * is already the tip, so its caret is kept.
+	 */
+	private pushPlaceEntry(folder: string, path: string) {
+		const tip = this.navIndex >= 0 ? this.navStack[this.navIndex] : undefined;
+		if (tip && tip.folder === folder && tip.path === path) {
+			return;
+		}
+		const trimmed = this.navStack.slice(0, this.navIndex + 1);
+		trimmed.push({ folder, path, line: -1, character: 0 });
+		this.navStack = trimmed;
+		this.navIndex = trimmed.length - 1;
+	}
+
+	/**
 	 * Record a mouse click / explicit jump inside a file. Unlike
 	 * `pushFileSwitchEntry`, this always pushes a fresh entry even
 	 * when the path is already the tip — the whole point of position
@@ -6686,16 +6717,20 @@ class WorkspaceState {
 			this.flash(`Folder no longer in workspace: ${entry.folder}`);
 			return;
 		}
-		const key = navKey(entry.folder, entry.path);
-		const next = new SvelteMap(this.pendingJumps);
-		next.set(key, { line: entry.line, character: entry.character });
-		this.pendingJumps = next;
+		if (entry.line >= 0) {
+			const key = navKey(entry.folder, entry.path);
+			const next = new SvelteMap(this.pendingJumps);
+			next.set(key, { line: entry.line, character: entry.character });
+			this.pendingJumps = next;
+		}
 		this.suppressNavPush = true;
 		try {
 			if (this.activeFolderPath !== entry.folder) {
 				await this.setActiveFolder(entry.folder);
 			}
-			await this.openFile(entry.path);
+			if (entry.path !== '') {
+				await this.openFile(entry.path);
+			}
 		} finally {
 			this.suppressNavPush = false;
 		}
