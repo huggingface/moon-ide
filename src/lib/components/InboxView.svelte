@@ -902,7 +902,12 @@
 	.number,
 	.meta,
 	.time,
-	.comments,
+	.comments {
+		flex-shrink: 0;
+		color: var(--m-fg-subtle);
+		font-size: var(--m-text-sm);
+		white-space: nowrap;
+	}
 	.meta {
 		min-width: 0;
 		max-width: 30%;

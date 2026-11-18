@@ -145,7 +145,9 @@
 			<h3>
 				{issue.comments.length} comment{issue.comments.length === 1 ? '' : 's'}
 			</h3>
-			<Conversation comments={issue.comments} repoUrl={repoUrlOf(issue.url)} />
+			<div class="comments">
+				<Conversation comments={issue.comments} repoUrl={repoUrlOf(issue.url)} />
+			</div>
 		{/if}
 	{/if}
 </div>
@@ -208,6 +210,9 @@
 		max-width: 860px;
 		margin-top: var(--m-space-4);
 		overflow-wrap: anywhere;
+	}
+	.comments {
+		max-width: 860px;
 	}
 	.none {
 		margin: var(--m-space-4) 0 0;

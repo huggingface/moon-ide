@@ -1,4 +1,5 @@
 import MarkdownIt from 'markdown-it';
+import { full as emojiShortcodes } from 'markdown-it-emoji';
 import DOMPurify from 'dompurify';
 
 // markdown-it's types use `export =` (CommonJS), so the `Token`
@@ -197,7 +198,7 @@ function applyMentionRule(md: MarkdownIt): void {
 	});
 }
 
-function buildMarkdownIt(linkify: boolean, breaks = false, html = false, mentions = false): MarkdownIt {
+function buildMarkdownIt(linkify: boolean, breaks = false, html = false, github = false): MarkdownIt {
 	const md = new MarkdownIt({
 		html,
 		linkify,
@@ -218,8 +219,11 @@ function buildMarkdownIt(linkify: boolean, breaks = false, html = false, mention
 	if (linkify) {
 		applyIssueRefRule(md);
 	}
-	if (mentions) {
+	if (github) {
 		applyMentionRule(md);
+		// `:robot:` and the rest of GitHub's names. Not the plugin's
+		// smiley shortcuts: GitHub leaves `:)` and `:/` as typed.
+		md.use(emojiShortcodes, { shortcuts: {} });
 	}
 	return md;
 }
@@ -403,8 +407,8 @@ const mdLinkified = buildMarkdownIt(true);
 const mdLinkifiedBreaks = buildMarkdownIt(true, true);
 // Text written on GitHub (PR descriptions, review comments): raw HTML
 // is part of the dialect there (`<details>`, `<sup>`, `<img>`, and
-// comments used as markers), bare URLs link, and a newline breaks the
-// line. DOMPurify is the XSS layer for this parser; see
+// comments used as markers), bare URLs link, a newline breaks the
+// line, and `@login` and `:emoji:` mean something. DOMPurify is the XSS layer for this parser; see
 // `GITHUB_SANITISE`.
 const mdGithub = buildMarkdownIt(true, true, true, true);
 
@@ -1029,6 +1033,7 @@ export const __test = {
 	applyInlineAnchorRule,
 	applyMentionRule,
 	frontmatterToHtml,
+	githubParser: mdGithub,
 	keepRendererClasses,
 	splitTopLevelBlocks,
 };

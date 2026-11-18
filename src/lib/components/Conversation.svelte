@@ -85,13 +85,12 @@
 		display: flex;
 		flex-direction: column;
 		gap: var(--m-space-2);
-		max-width: 860px;
 	}
 	.entry {
 		padding: var(--m-space-2) var(--m-space-3);
 		border: 1px solid var(--m-border);
 		border-radius: var(--m-radius-md);
-		background: var(--m-bg);
+		background: var(--m-bg-1);
 	}
 	.meta {
 		display: flex;
@@ -111,6 +110,7 @@
 	.body {
 		margin-top: var(--m-space-2);
 		min-width: 0;
+		max-width: 860px;
 		overflow-wrap: anywhere;
 	}
 	.body.clamped {

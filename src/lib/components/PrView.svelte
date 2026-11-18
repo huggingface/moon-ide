@@ -929,7 +929,8 @@
 	}
 	/* The panel brings its own side margins for the review tab's
 	 * narrower gutter; here the scroller already has them. */
-	.main :global(section.pr) {
+	.main :global(section.pr),
+	.main :global(details.talk) {
 		margin: var(--m-space-3) 0;
 	}
 	/* Room below the last file, so any of them can be brought up

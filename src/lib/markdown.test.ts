@@ -401,6 +401,33 @@ describe('GitHub mentions', () => {
 	});
 });
 
+describe('GitHub emoji names', () => {
+	const render = (source: string) => __test.githubParser.render(source);
+	const ROBOT = String.fromCodePoint(0x1f916);
+
+	it('become the emoji in prose', () => {
+		expect(render('Also my :robot: says: fine')).toContain(`Also my ${ROBOT} says: fine`);
+		expect(render(':+1:')).toContain(String.fromCodePoint(0x1f44d));
+	});
+
+	it('are left alone in code, in addresses and when unknown', () => {
+		expect(render('type `:robot:` to get one')).toContain('<code>:robot:</code>');
+		expect(render('```\n:robot:\n```')).toContain(':robot:');
+		expect(render('see https://example.test/a:robot:b')).not.toContain(ROBOT);
+		expect(render('a :not_an_emoji: here')).toContain(':not_an_emoji:');
+	});
+
+	it('do not turn smileys into pictures', () => {
+		expect(render('fine :) or not :/ at 10:30')).toContain('fine :) or not :/ at 10:30');
+	});
+
+	it('sit next to a mention without breaking it', () => {
+		const html = render(':robot: cc @alex');
+		expect(html).toContain(ROBOT);
+		expect(html).toMatch(/class="md-mention"[^>]*>@alex<\/a>/);
+	});
+});
+
 describe('keepRendererClasses', () => {
 	function filter(value: string) {
 		const data = { attrName: 'class', attrValue: value, keepAttr: true };

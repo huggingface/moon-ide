@@ -117,13 +117,6 @@
 		</details>
 	{/if}
 
-	{#if pr.conversation.length > 0}
-		<details class="block" open>
-			<summary>Conversation <span class="count">{pr.conversation.length}</span></summary>
-			<Conversation comments={pr.conversation} {repoUrl} />
-		</details>
-	{/if}
-
 	{#if pr.minorNotes.length > 0}
 		<details class="block" open>
 			<summary>
@@ -224,6 +217,15 @@
 	{/if}
 </section>
 
+<!-- What others said, apart from what the author wrote: each comment
+	 is a card of its own under the pull request's. -->
+{#if pr.conversation.length > 0}
+	<details class="talk" open>
+		<summary>Conversation <span class="count">{pr.conversation.length}</span></summary>
+		<Conversation comments={pr.conversation} {repoUrl} />
+	</details>
+{/if}
+
 <style>
 	.pr {
 		margin: var(--m-space-3) var(--m-space-3) var(--m-space-2);
@@ -290,6 +292,10 @@
 		margin-top: var(--m-space-3);
 		padding-top: var(--m-space-2);
 		border-top: 1px solid var(--m-border);
+	}
+	.talk {
+		margin: var(--m-space-3) var(--m-space-3) var(--m-space-2);
+		font-size: var(--m-text-md);
 	}
 	summary {
 		display: flex;
