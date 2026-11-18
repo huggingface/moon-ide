@@ -9,6 +9,7 @@ pub mod browser;
 pub mod coder_hub;
 pub mod coder_mcp;
 pub mod coder_models;
+pub mod coder_slack;
 pub mod container;
 pub mod editorconfig;
 pub mod error;

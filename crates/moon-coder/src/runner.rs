@@ -1255,10 +1255,12 @@ impl CoderHandle {
 		let models = models::shared(initial_models);
 		let inference = InferenceClient::new(auth.clone(), models.clone(), provider_keys.clone())?;
 		let web = crate::web::WebClient::new()?;
+		let slack = crate::slack::SlackClient::new(workspaces.id())?;
 		let tools = ToolRegistry::new(
 			workspaces.clone(),
 			workspaces_dir.clone(),
 			web,
+			slack,
 			terminals,
 			models.clone(),
 		);
@@ -1347,6 +1349,12 @@ impl CoderHandle {
 	/// Tauri layer for the user's own tab actions and the UI mirror.
 	pub fn browser_tabs(&self) -> Arc<crate::BrowserTabRegistry> {
 		self.state.tools.browser_tabs().clone()
+	}
+
+	/// This workspace's read-only Slack connection (ADR 0122): status,
+	/// connect and disconnect for the settings UI.
+	pub fn slack(&self) -> &crate::slack::SlackClient {
+		self.state.tools.slack()
 	}
 
 	/// True iff a Tavily API key is currently stored in the

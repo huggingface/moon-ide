@@ -708,6 +708,17 @@ impl BridgeRpcHandler for BridgeRpc {
 				self.coder.clear_web_search_key().map_err(|e| e.to_string())?;
 				to_value(&true)
 			}
+			// Read-only Slack for the agent (ADR 0122). The token lives
+			// in this host's keyring, per workspace.
+			"coder_slack_status" => to_value(&self.coder.slack().status().await.map_err(|e| e.to_string())?),
+			"coder_slack_connect" => {
+				let p: SlackConnectParams = parse_params(params)?;
+				to_value(&self.coder.slack().connect(&p.token).await.map_err(|e| e.to_string())?)
+			}
+			"coder_slack_disconnect" => {
+				self.coder.slack().disconnect().map_err(|e| e.to_string())?;
+				to_value(&true)
+			}
 			"coder_probe_provider" => {
 				let p: ProbeProviderParams = parse_params(params)?;
 				let key = if p.api_key.is_empty() {
@@ -1044,6 +1055,11 @@ struct WebSearchKeyParams {
 }
 
 #[derive(serde::Deserialize)]
+struct SlackConnectParams {
+	token: String,
+}
+
+#[derive(serde::Deserialize)]
 struct ProbeProviderParams {
 	base_url: String,
 	#[serde(default)]
@@ -1260,6 +1276,9 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_web_search_configured",
 	"coder_set_web_search_key",
 	"coder_clear_web_search_key",
+	"coder_slack_status",
+	"coder_slack_connect",
+	"coder_slack_disconnect",
 	"coder_probe_provider",
 	"coder_add_provider",
 	"workspace_launch",

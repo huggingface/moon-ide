@@ -397,6 +397,11 @@ impl WorkspaceRegistry {
 	pub async fn workspace_id(&self) -> WorkspaceId {
 		self.id.clone()
 	}
+
+	/// The workspace id, for callers that can't await.
+	pub fn id(&self) -> &str {
+		&self.id
+	}
 }
 
 #[cfg(test)]

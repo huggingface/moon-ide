@@ -37,6 +37,7 @@ pub mod providers;
 mod request_compression;
 pub mod runner;
 pub mod sessions;
+pub mod slack;
 pub mod subagent;
 mod terminal_context;
 pub mod todo;

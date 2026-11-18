@@ -191,6 +191,66 @@
 	// competing with the catalog-search input visually — users
 	// were clicking the wrong one when filtering models.
 	let webKeyEditing = $state(false);
+	// Slack section state (ADR 0122). The token goes straight to the
+	// keyring through `connectSlack`; only the draft lives here.
+	let slackDraft = $state('');
+	let slackBusy = $state(false);
+	let slackFormError = $state<string | null>(null);
+	let slackManifestCopied = $state(false);
+	// Not connected, the section is one line until asked for: the
+	// card is as tall as the window allows, and every line here is
+	// taken from the model catalog.
+	let slackSetupOpen = $state(false);
+	const slackExpanded = $derived(slackSetupOpen || coder.slackError !== null);
+	const slackConnection = $derived(coder.slack?.connection ?? null);
+	// Pasted into "Create an app → From a manifest", this sets every
+	// scope in one go.
+	const slackManifest = $derived(
+		[
+			'display_information:',
+			'  name: moon-ide (read-only)',
+			'oauth_config:',
+			'  scopes:',
+			'    user:',
+			...(coder.slack?.scopes ?? []).map((scope) => `      - ${scope}`),
+			'',
+		].join('\n'),
+	);
+
+	async function onConnectSlack(): Promise<void> {
+		slackBusy = true;
+		slackFormError = null;
+		try {
+			await coder.connectSlack(slackDraft.trim());
+			slackDraft = '';
+			slackSetupOpen = false;
+		} catch (err) {
+			slackFormError = formatError(err);
+		} finally {
+			slackBusy = false;
+		}
+	}
+
+	async function onDisconnectSlack(): Promise<void> {
+		slackBusy = true;
+		slackFormError = null;
+		try {
+			await coder.disconnectSlack();
+		} catch (err) {
+			slackFormError = formatError(err);
+		} finally {
+			slackBusy = false;
+		}
+	}
+
+	async function copySlackManifest(): Promise<void> {
+		await navigator.clipboard.writeText(slackManifest);
+		slackManifestCopied = true;
+		window.setTimeout(() => {
+			slackManifestCopied = false;
+		}, 1500);
+	}
+
 	// MCP servers section state. The rows themselves live on
 	// `coder.mcpServers` (loaded on mount); enable toggles write
 	// through immediately (per-workspace `session.json`, not part
@@ -345,6 +405,7 @@
 			void coder.loadModels();
 		}
 		void coder.loadWebSearchConfigured();
+		void coder.loadSlack();
 		void coder.loadMcpServers();
 	});
 
@@ -1911,6 +1972,92 @@
 				{/if}
 			</section>
 
+			<!-- Slack, read-only and per workspace (ADR 0122): a user
+				 token in the OS keyring gives the agent `slack_search`
+				 and `slack_read`. Nothing here can post. -->
+			<section class="web-key" aria-label="Slack">
+				{#if slackConnection !== null}
+					<div class="web-key-summary">
+						<span class="label-name">Slack (read-only)</span>
+						<span class="key-status configured" title="Token stored in OS keyring, for this workspace only">
+							{slackConnection.team} as {slackConnection.user}
+						</span>
+						<span class="flex-spacer"></span>
+						<button type="button" class="secondary" onclick={onDisconnectSlack} disabled={slackBusy}>
+							Disconnect
+						</button>
+					</div>
+				{:else if !slackExpanded}
+					<div class="web-key-summary">
+						<span class="label-name">Slack (read-only)</span>
+						{#if coder.slack !== null}
+							<span class="key-status missing">not connected</span>
+						{/if}
+						<span class="flex-spacer"></span>
+						<button type="button" class="secondary" onclick={() => (slackSetupOpen = true)}>Set up</button>
+					</div>
+				{:else}
+					<div class="label-row">
+						<span class="label-name">Slack (read-only)</span>
+						{#if coder.slackError !== null}
+							<span class="key-status missing">token rejected</span>
+						{:else if coder.slack !== null}
+							<span class="key-status missing">not connected</span>
+						{/if}
+					</div>
+					<div class="web-key-row">
+						<input
+							type="password"
+							bind:value={slackDraft}
+							placeholder="xoxp-..."
+							spellcheck="false"
+							autocomplete="off"
+							disabled={slackBusy}
+						/>
+						<button
+							type="button"
+							class="primary"
+							onclick={onConnectSlack}
+							disabled={slackBusy || slackDraft.trim().length === 0}
+						>
+							{slackBusy ? 'Checking…' : 'Connect'}
+						</button>
+						{#if coder.slackError !== null}
+							<button type="button" class="secondary" onclick={onDisconnectSlack} disabled={slackBusy}>
+								Forget token
+							</button>
+						{:else}
+							<button
+								type="button"
+								class="secondary"
+								onclick={() => {
+									slackSetupOpen = false;
+									slackDraft = '';
+									slackFormError = null;
+								}}
+								disabled={slackBusy}
+							>
+								Cancel
+							</button>
+						{/if}
+					</div>
+					<span class="hint">
+						Lets agents in this workspace search and read your Slack (<code>slack_search</code>,
+						<code>slack_read</code>): everything you can see, DMs included. They cannot post; the token has no write
+						scope. At <code>api.slack.com/apps</code>, create an app <em>from a manifest</em>
+						(<button type="button" class="link" onclick={copySlackManifest}
+							>{slackManifestCopied ? 'copied' : 'copy the manifest'}</button
+						>), install it to your workspace, and paste its <em>User OAuth Token</em> here. Stored in your OS keyring for
+						this workspace only.
+					</span>
+					{#if slackFormError !== null}
+						<span class="error">{slackFormError}</span>
+					{:else if coder.slackError !== null}
+						<span class="error">{coder.slackError}</span>
+					{/if}
+				{/if}
+			</section>
+
 			<!-- MCP servers. Per-workspace enable set — toggles write
 				 through immediately (session.json), independent of the
 				 modal's Save. The model sees enabled servers through
@@ -2485,6 +2632,17 @@
 		gap: 4px;
 		padding-top: 10px;
 		border-top: 1px solid var(--m-border);
+	}
+	.hint .link {
+		padding: 0;
+		border: none;
+		background: transparent;
+		color: var(--m-accent);
+		font: inherit;
+		cursor: pointer;
+	}
+	.hint .link:hover {
+		text-decoration: underline;
 	}
 	.web-key-summary {
 		display: flex;

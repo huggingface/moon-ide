@@ -37,6 +37,7 @@ import {
 	type HubUploadAllSummary,
 	type ImageAttachmentPayload,
 	type McpServerStatus,
+	type SlackStatus,
 	type OpenRouterCredits,
 	type ProviderKind,
 	type ProviderModelSummary,
@@ -1244,6 +1245,36 @@ export class CoderPanelState {
 			this.modelsError = formatError(err);
 			throw err;
 		}
+	}
+
+	/** This workspace's read-only Slack connection (ADR 0122), for the
+	 *  settings modal. `null` until first loaded. */
+	slack = $state<SlackStatus | null>(null);
+	/** Why the last status read failed: usually a token Slack no
+	 *  longer accepts. */
+	slackError = $state<string | null>(null);
+
+	async loadSlack(): Promise<void> {
+		try {
+			this.slack = await ipc.coder.slackStatus();
+			this.slackError = null;
+		} catch (err) {
+			this.slackError = formatError(err);
+		}
+	}
+
+	/** Check `token` with Slack and keep it for this workspace.
+	 *  Throws with Slack's reason so the modal can show it inline. */
+	async connectSlack(token: string): Promise<void> {
+		const connection = await ipc.coder.slackConnect(token);
+		this.slack = { connection, scopes: this.slack?.scopes ?? [] };
+		this.slackError = null;
+	}
+
+	async disconnectSlack(): Promise<void> {
+		await ipc.coder.slackDisconnect();
+		this.slackError = null;
+		await this.loadSlack();
 	}
 
 	/** Cached "Bound folders" descriptions populated by

@@ -12,6 +12,8 @@ import type {
 	HubNamespace,
 	HubUploadAllSummary,
 	McpServerStatus,
+	SlackConnection,
+	SlackStatus,
 	ChatGptAccount,
 	ChatGptDeviceCode,
 	OpenRouterCredits,
@@ -533,6 +535,10 @@ export const ipc = {
 		webSearchConfigured: () => call<boolean>('coder_web_search_configured'),
 		setWebSearchKey: (key: string) => call<void>('coder_set_web_search_key', { key }),
 		clearWebSearchKey: () => call<void>('coder_clear_web_search_key'),
+		/** Read-only Slack for the agent, per workspace (ADR 0122). */
+		slackStatus: () => call<SlackStatus>('coder_slack_status'),
+		slackConnect: (token: string) => call<SlackConnection>('coder_slack_connect', { token }),
+		slackDisconnect: () => call<void>('coder_slack_disconnect'),
 		hubListNamespaces: () => call<HubNamespace[]>('coder_hub_list_namespaces'),
 		hubGetBinding: () => call<CoderHubBucket | null>('coder_hub_get_binding'),
 		hubCreateBucket: (namespace: string, name: string, isPrivate: boolean) =>

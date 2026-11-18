@@ -36,6 +36,7 @@
 	import IssueIcon from './icons/IssueIcon.svelte';
 	import PullRequestIcon from './icons/PullRequestIcon.svelte';
 	import RefreshIcon from './icons/RefreshIcon.svelte';
+	import SpinnerIcon from './icons/SpinnerIcon.svelte';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -484,7 +485,7 @@
 			{/if}
 			<span class="spacer"></span>
 			{#if inbox.grouping}
-				<span class="grouping">Grouping…</span>
+				<span class="grouping"><SpinnerIcon size={12} />Grouping…</span>
 			{:else if inbox.groupByTopic}
 				<button
 					class="chip-clear"
@@ -746,6 +747,9 @@
 		flex: 1;
 	}
 	.grouping {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
 		color: var(--m-fg-subtle);
 		font-size: var(--m-text-sm);
 	}

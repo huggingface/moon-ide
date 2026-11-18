@@ -7,6 +7,7 @@
 	import ChevronDownIcon from './icons/ChevronDownIcon.svelte';
 	import ChevronRightIcon from './icons/ChevronRightIcon.svelte';
 	import CloseIcon from './icons/CloseIcon.svelte';
+	import SpinnerIcon from './icons/SpinnerIcon.svelte';
 	import ContainerIcon from './icons/ContainerIcon.svelte';
 	import MergeIcon from './icons/MergeIcon.svelte';
 	import QuestionBubbleIcon from './icons/QuestionBubbleIcon.svelte';
@@ -144,6 +145,7 @@
 	{#each orderedFolders as row (row.folder.path)}
 		{@const folder = row.folder}
 		{@const isWorktree = row.depth > 0}
+		{@const removing = workspace.removingFolders[folder.path] === true}
 		{@const isActive = folder.path === activePath}
 		{@const snap = projectCompose.snapshotFor(folder.path)}
 		{@const hasCompose = snap?.compose_file != null}
@@ -298,6 +300,7 @@
 					class="merge-worktree"
 					title={`Merge ${row.branch} into ${defaultBranchShort} and remove worktree`}
 					aria-label={`Merge ${row.branch} into ${defaultBranchShort} and remove worktree`}
+					disabled={removing}
 					onclick={(event) => {
 						event.stopPropagation();
 						void workspace.mergeAndRemoveWorktree(folder.path, defaultBranchShort);
@@ -309,14 +312,16 @@
 			<button
 				type="button"
 				class="remove"
-				title="Remove from workspace"
-				aria-label="Remove {folder.name} from workspace"
+				class:busy={removing}
+				title={removing ? 'Removing the worktree…' : 'Remove from workspace'}
+				aria-label={removing ? `Removing ${folder.name}` : `Remove ${folder.name} from workspace`}
+				disabled={removing}
 				onclick={(event) => {
 					event.stopPropagation();
 					void workspace.removeFolder(folder.path);
 				}}
 			>
-				<CloseIcon size={14} />
+				{#if removing}<SpinnerIcon size={14} />{:else}<CloseIcon size={14} />{/if}
 			</button>
 			{#if popoverOpen && hasCompose}
 				<ProjectComposePopover
@@ -648,9 +653,17 @@
 	.remove:focus-visible {
 		opacity: 1;
 	}
-	.remove:hover {
+	.remove:hover:not(:disabled) {
 		color: var(--m-danger);
 		background: var(--m-bg-overlay);
+	}
+	/* Stays in sight while the removal runs, hovered or not. */
+	.remove.busy {
+		opacity: 1;
+		cursor: default;
+	}
+	.merge-worktree:disabled {
+		cursor: default;
 	}
 	.add {
 		display: flex;

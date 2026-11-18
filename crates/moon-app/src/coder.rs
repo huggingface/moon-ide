@@ -14,6 +14,7 @@ use moon_protocol::coder_models::{
 	ChatGptAccount, ChatGptDeviceCode, CoderModelSettings, CoderProviderConfig, CoderProviderLock, OpenRouterCredits,
 	ProviderModelSummary, ProviderProbeResult, RouterModel,
 };
+use moon_protocol::coder_slack::{SlackConnection, SlackStatus};
 use moon_protocol::MoonError;
 use serde::Deserialize;
 
@@ -1545,6 +1546,38 @@ pub async fn coder_clear_web_search_key(app: &AppCore) -> Result<(), MoonError> 
 	app.coder.clear_web_search_key().map_err(MoonError::from)
 }
 
+/// The Slack workspace this workspace's agents can read (ADR 0122),
+/// if it has a token, and the scopes a token needs. Errors when Slack
+/// no longer accepts the stored one.
+pub async fn coder_slack_status(app: &AppCore) -> Result<SlackStatus, MoonError> {
+	app
+		.coder
+		.slack()
+		.status()
+		.await
+		.map_err(|err| MoonError::invalid(err.to_string()))
+}
+
+/// Check a Slack user token and keep it for this workspace, in the OS
+/// keyring. The next agent turn sees `slack_search` / `slack_read`.
+pub async fn coder_slack_connect(app: &AppCore, token: String) -> Result<SlackConnection, MoonError> {
+	app
+		.coder
+		.slack()
+		.connect(&token)
+		.await
+		.map_err(|err| MoonError::invalid(err.to_string()))
+}
+
+/// Forget this workspace's Slack token. Idempotent.
+pub async fn coder_slack_disconnect(app: &AppCore) -> Result<(), MoonError> {
+	app
+		.coder
+		.slack()
+		.disconnect()
+		.map_err(|err| MoonError::invalid(err.to_string()))
+}
+
 /// The workspace's MCP server list: presets + custom entries,
 /// each with its per-workspace enabled flag. Cheap `session.json`
 /// read; no workspace bound degrades to the preset list with
@@ -1715,6 +1748,9 @@ crate::commands! {
 	coder_hub_session_url([app] session_id: String),
 	coder_set_web_search_key([app] key: String),
 	coder_clear_web_search_key([app]),
+	coder_slack_status([app]),
+	coder_slack_connect([app] token: String),
+	coder_slack_disconnect([app]),
 	coder_mcp_servers([app]),
 	coder_mcp_set_enabled([app] id: String, enabled: bool),
 	coder_mcp_add_custom([app] server: AddMcpServerArgs),

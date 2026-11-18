@@ -2457,6 +2457,15 @@ export type UploadedMarker = {
  *  Mirrors `moon_protocol::coder_hub::HubNamespace`. */
 export type HubNamespace = { kind: 'user'; name: string } | { kind: 'org'; name: string };
 
+/** The Slack workspace and user behind this workspace's read-only
+ *  Slack token. Mirrors `moon_protocol::coder_slack::SlackConnection`. */
+export type SlackConnection = { team: string; user: string; url: string };
+
+/** `connection` is `null` when the workspace has no token; `scopes`
+ *  are the user-token scopes the Slack app needs. Mirrors
+ *  `moon_protocol::coder_slack::SlackStatus`. */
+export type SlackStatus = { connection: SlackConnection | null; scopes: string[] };
+
 /** One row of the MCP settings list: a preset or per-workspace
  *  custom server plus its enabled flag. Mirrors
  *  `moon_protocol::coder_mcp::McpServerStatus` (with its flattened

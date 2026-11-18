@@ -1677,17 +1677,27 @@ class WorkspaceState {
 		}
 	}
 
+	/** Worktree folders being removed right now (git is pruning the
+	 *  checkout, which takes a moment on a large one). Their folder
+	 *  bar shows it instead of looking like the click was lost. */
+	removingFolders = $state<Record<string, boolean>>({});
+
 	private async pruneWorktree(path: string, force: boolean) {
 		const perf = perfTimer('pruneWorktree');
-		const ws = await ipc.coder.discardWorktree(path, force);
-		perf.lap('discardWorktree');
-		this.folderStates.delete(path);
-		this.pruneNavEntriesForFolder(path);
-		projectCompose.forget(path);
-		forgetTerminalMemoryFor(path);
-		await this.adoptWorkspaceSnapshot(ws);
-		perf.lap('adoptWorkspaceSnapshot');
-		this.persistAppState();
+		this.removingFolders[path] = true;
+		try {
+			const ws = await ipc.coder.discardWorktree(path, force);
+			perf.lap('discardWorktree');
+			this.folderStates.delete(path);
+			this.pruneNavEntriesForFolder(path);
+			projectCompose.forget(path);
+			forgetTerminalMemoryFor(path);
+			await this.adoptWorkspaceSnapshot(ws);
+			perf.lap('adoptWorkspaceSnapshot');
+			this.persistAppState();
+		} finally {
+			delete this.removingFolders[path];
+		}
 		perf.done();
 	}
 
@@ -1714,6 +1724,7 @@ class WorkspaceState {
 		if (!ok) {
 			return;
 		}
+		this.removingFolders[path] = true;
 		try {
 			const ws = await ipc.coder.mergeAndRemoveWorktree(path, baseBranch);
 			this.folderStates.delete(path);
@@ -1725,6 +1736,8 @@ class WorkspaceState {
 			this.flash(`Merged ${branch} into ${baseBranch} and removed worktree + branch.`);
 		} catch (err) {
 			this.flash(`Could not merge & remove worktree: ${formatError(err)}`);
+		} finally {
+			delete this.removingFolders[path];
 		}
 	}
 

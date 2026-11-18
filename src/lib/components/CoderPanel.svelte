@@ -2138,8 +2138,12 @@
 			case 'grep': {
 				return typeof o.pattern === 'string' ? firstLine(o.pattern) : null;
 			}
-			case 'web_search': {
+			case 'web_search':
+			case 'slack_search': {
 				return typeof o.query === 'string' ? firstLine(o.query) : null;
+			}
+			case 'slack_read': {
+				return typeof o.target === 'string' ? o.target : null;
 			}
 			case 'web_fetch':
 			case 'open_browser': {
