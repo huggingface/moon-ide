@@ -406,8 +406,18 @@
 				// in the bottom panel. We swallow the event regardless
 				// of focus so the user can hit it from anywhere.
 				event.preventDefault();
+				// Stopped here too: a focused terminal, still alive
+				// under the hidden panel, would send the shell the
+				// line feed that Ctrl+J is.
+				event.stopPropagation();
 				const wasVisible = bottomPanel.visible;
 				bottomPanel.toggle();
+				// The panel stays in the document while hidden; a
+				// terminal left focused there would keep taking keys.
+				const focused = document.activeElement;
+				if (wasVisible && focused instanceof HTMLElement && focused.closest('[data-region="bottom-panel"]') !== null) {
+					focused.blur();
+				}
 				// Auto-spawn a terminal when the user opens an empty
 				// panel — same default the launch-time
 				// `spawnInitialBottomPanelTerminal` applies, just on
@@ -632,6 +642,9 @@
 			{:else}
 				<Welcome onPickFolder={pickFolder} />
 			{/if}
+			<!-- Hidden, not unmounted: a terminal's screen and scrollback
+				 live in its xterm instance, and would be gone when the
+				 panel came back. -->
 			{#if bottomPanel.visible}
 				<div
 					class="resize bottom-resize"
@@ -642,10 +655,10 @@
 					tabindex="-1"
 					onpointerdown={startBottomResize}
 				></div>
-				<div class="bottom-host" style:height="{bottomPanel.height}px">
-					<BottomPanel />
-				</div>
 			{/if}
+			<div class="bottom-host" class:hidden={!bottomPanel.visible} style:height="{bottomPanel.height}px">
+				<BottomPanel />
+			</div>
 		</main>
 		<!-- The file tree, opt-in at the far right. Needs a folder:
 			 without one there is no tree to show. -->
@@ -753,6 +766,9 @@
 		min-height: 0;
 		display: flex;
 		flex-direction: column;
+	}
+	.bottom-host.hidden {
+		display: none;
 	}
 
 	.pane-divider {

@@ -38,7 +38,8 @@
 //! The bottom-panel chrome keeps every tab body mounted (just
 //! display-hidden when inactive) so the xterm Terminal stays
 //! alive across tab switches and keeps its scrollback. See
-//! `BottomPanel.svelte`.
+//! `BottomPanel.svelte`. The panel itself is hidden the same way
+//! (`App.svelte`), for the same reason.
 
 import { subscribe, type Unsubscribe } from './transport';
 import { SvelteMap } from 'svelte/reactivity';
