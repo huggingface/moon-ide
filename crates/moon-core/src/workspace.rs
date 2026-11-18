@@ -316,9 +316,11 @@ impl WorkspaceRegistry {
 	/// checkouts back with it.
 	///
 	/// If the active folder was removed (directly or via the
-	/// cascade), the entry before it in insertion order takes over
-	/// (or the new first); when no folders remain the workspace is
-	/// empty and `active_folder` is `None`.
+	/// cascade), a removed worktree hands over to its project, so the
+	/// user stays in the repository they were working in. Otherwise
+	/// the entry before it in insertion order takes over (or the new
+	/// first); when no folders remain the workspace is empty and
+	/// `active_folder` is `None`.
 	pub async fn remove_folder(&self, path: &str) -> MoonResult<()> {
 		let mut inner = self.inner.write().await;
 		let pos = inner
@@ -326,6 +328,10 @@ impl WorkspaceRegistry {
 			.iter()
 			.position(|e| e.folder.path == path)
 			.ok_or_else(|| MoonError::NotFound(format!("folder {path}")))?;
+		let project = match &inner.folders[pos].folder.origin {
+			FolderOrigin::Worktree { parent_path, .. } => Some(parent_path.clone()),
+			FolderOrigin::UserPicked => None,
+		};
 		inner.folders.retain(|e| {
 			if e.folder.path == path {
 				return false;
@@ -338,7 +344,9 @@ impl WorkspaceRegistry {
 			.is_some_and(|active| inner.folders.iter().any(|e| e.folder.path == active));
 		if !active_still_bound {
 			let new_idx = pos.saturating_sub(1).min(inner.folders.len().saturating_sub(1));
-			inner.active_folder_path = inner.folders.get(new_idx).map(|e| e.folder.path.clone());
+			inner.active_folder_path = project
+				.filter(|project| inner.folders.iter().any(|e| &e.folder.path == project))
+				.or_else(|| inner.folders.get(new_idx).map(|e| e.folder.path.clone()));
 		}
 		Ok(())
 	}
@@ -505,6 +513,37 @@ mod tests {
 			&wt_entry.folder.origin,
 			FolderOrigin::Worktree { branch, .. } if branch == "moon/agent-1"
 		));
+	}
+
+	/// Worktrees are bound after every project, so "the entry before"
+	/// a removed one is whichever project or worktree happened to be
+	/// added last: not where the user was.
+	#[tokio::test]
+	async fn removing_the_active_worktree_goes_back_to_its_project() {
+		let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+		let path = |i: usize| Utf8PathBuf::from_path_buf(dirs[i].path().to_path_buf()).unwrap();
+
+		let registry = test_registry();
+		let project = registry.add_folder(path(0)).await.unwrap();
+		let other = registry.add_folder(path(1)).await.unwrap();
+		let wt = registry
+			.add_worktree_folder(path(2), project.folder.path.clone(), "feature".into())
+			.await
+			.unwrap();
+		let sibling = registry
+			.add_worktree_folder(path(3), project.folder.path.clone(), "other-feature".into())
+			.await
+			.unwrap();
+		let active = || async { registry.snapshot().await.active_folder };
+
+		registry.set_active_folder(&sibling.folder.path).await.unwrap();
+		registry.remove_folder(&sibling.folder.path).await.unwrap();
+		assert_eq!(active().await.as_deref(), Some(project.folder.path.as_str()));
+
+		// Removing a worktree the user isn't on leaves them where they are.
+		registry.set_active_folder(&other.folder.path).await.unwrap();
+		registry.remove_folder(&wt.folder.path).await.unwrap();
+		assert_eq!(active().await.as_deref(), Some(other.folder.path.as_str()));
 	}
 
 	#[tokio::test]
