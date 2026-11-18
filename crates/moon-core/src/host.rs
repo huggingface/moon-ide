@@ -2413,6 +2413,7 @@ impl WorkspaceHost for LocalHost {
 				.map(|entry| {
 					let (additions, deletions) = sizes.remove(&entry.path).flatten().unzip();
 					PrDiffFile {
+						is_test: crate::pull_request::is_test_path(&entry.path),
 						path: entry.path,
 						status: entry.status,
 						additions,

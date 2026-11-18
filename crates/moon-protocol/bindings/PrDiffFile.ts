@@ -8,4 +8,8 @@ export type PrDiffFile = { path: string, status: GitFileStatus,
 /**
  * Lines added and removed. `None` for a binary file.
  */
-additions: number | null, deletions: number | null, };
+additions: number | null, deletions: number | null, 
+/**
+ * A test file, going by its path (ADR 0123).
+ */
+isTest: boolean, };

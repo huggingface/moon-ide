@@ -34,13 +34,23 @@
 	// folds a file away and opens the next, and nothing open to begin
 	// with when there are many.
 	import { onMount, tick } from 'svelte';
-	import { attentionCounts, LARGE_PR_FILES, nextUnviewed, startsCollapsed, type FileOutline } from '../prFiles';
+	import {
+		attentionCounts,
+		LARGE_PR_FILES,
+		nextUnviewed,
+		reviewSize,
+		startsCollapsed,
+		type FileOutline,
+	} from '../prFiles';
 	import { ipc } from '../ipc';
 	import { formatError, type ReviewEvent } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
+	import { statusColor } from '../fileIcon';
 	import { parsePrPath } from '../util/prPath';
 	import CommitSection from './CommitSection.svelte';
 	import DiffStat from './DiffStat.svelte';
+	import FileIcon from './FileIcon.svelte';
+	import TabTitle from './TabTitle.svelte';
 	import PullRequestPanel from './PullRequestPanel.svelte';
 	import CheckIcon from './icons/CheckIcon.svelte';
 
@@ -86,10 +96,7 @@
 	let folded = $state<Record<string, boolean>>({});
 	const attention = $derived(detail === null ? new Map<string, number>() : attentionCounts(detail));
 	const viewedCount = $derived(files.filter((file) => viewed[file.path]).length);
-	const totals = $derived({
-		additions: files.reduce((sum, file) => sum + (file.additions ?? 0), 0),
-		deletions: files.reduce((sum, file) => sum + (file.deletions ?? 0), 0),
-	});
+	const size = $derived(reviewSize(files));
 
 	function isCollapsed(file: PrDiffFile): boolean {
 		return folded[file.path] ?? (viewed[file.path] === true || startsCollapsed(file, files.length));
@@ -127,6 +134,7 @@
 		return {
 			additions: file.additions,
 			deletions: file.deletions,
+			isTest: file.isTest,
 			attention: attention.get(file.path) ?? 0,
 			collapsed: isCollapsed(file),
 			viewed: viewed[file.path] === true,
@@ -242,8 +250,6 @@
 			setViewed(activePath, viewed[activePath] !== true);
 		}
 	}
-
-	const STATUS_LETTER: Record<string, string> = { added: 'A', modified: 'M', deleted: 'D', renamed: 'R' };
 
 	function baseName(path: string): string {
 		return path.slice(path.lastIndexOf('/') + 1);
@@ -458,7 +464,11 @@
 		<nav class="rail" class:floating={!docked} aria-label="Files changed">
 			<div class="rail-head">
 				<span>{viewedCount} / {files.length} viewed</span>
-				<DiffStat additions={totals.additions} deletions={totals.deletions} />
+				<DiffStat
+					additions={size.additions}
+					deletions={size.deletions}
+					tests={{ additions: size.testAdditions, deletions: size.testDeletions }}
+				/>
 			</div>
 			<div class="rail-list" bind:this={railList}>
 				<button type="button" class="rail-item" class:active={activePath === null} onclick={toOverview}>
@@ -470,11 +480,17 @@
 						class="rail-item"
 						class:active={activePath === file.path}
 						class:viewed={viewed[file.path]}
-						title={file.path}
+						title={`${file.path} (${file.status})`}
 						onclick={() => void jumpTo(file.path)}
 					>
-						<span class="rail-status status-{file.status}">{STATUS_LETTER[file.status] ?? '?'}</span>
-						<span class="rail-name">{baseName(file.path)}</span>
+						<FileIcon path={file.path} size={14} />
+						<span
+							class="rail-name"
+							class:gone={file.status === 'deleted'}
+							style:color={viewed[file.path] ? undefined : statusColor(file.status)}
+						>
+							{baseName(file.path)}
+						</span>
 						<span class="rail-dir">{dirName(file.path)}</span>
 						{#if (attention.get(file.path) ?? 0) > 0}
 							<span class="rail-attention">{attention.get(file.path)}</span>
@@ -482,7 +498,7 @@
 						{#if viewed[file.path]}
 							<span class="rail-check"><CheckIcon size={12} /></span>
 						{:else}
-							<DiffStat additions={file.additions} deletions={file.deletions} />
+							<DiffStat additions={file.additions} deletions={file.deletions} muted={file.isTest} />
 						{/if}
 					</button>
 				{/each}
@@ -493,7 +509,7 @@
 	<div class="main" bind:this={scroller} tabindex="0" role="region" aria-label="Pull request" onscroll={spy}>
 		{#if detail === null}
 			<div class="banner">
-				<span class="title">{tabName || (number === null ? 'Pull request' : `#${number}`)}</span>
+				<span class="title"><TabTitle name={tabName || (number === null ? 'Pull request' : `#${number}`)} /></span>
 			</div>
 			<div class="empty" class:error={loadError !== ''}>
 				{#if loadError !== ''}
@@ -505,7 +521,7 @@
 			</div>
 		{:else}
 			<div class="banner">
-				<span class="title">#{detail.number} {detail.title}</span>
+				<span class="title"><TabTitle name={`#${detail.number} ${detail.title}`} /></span>
 				{#if elsewhere && folder !== null}
 					<span class="project" title={`A pull request of ${folder}, not of the folder you are in`}>
 						{baseName(folder)}
@@ -738,22 +754,11 @@
 	.rail-item.viewed .rail-dir {
 		color: var(--m-fg-subtle);
 	}
-	.rail-status {
-		flex-shrink: 0;
-		width: 12px;
-		font-family: var(--m-font-mono, monospace);
-		font-size: 10px;
-		font-weight: 600;
-		text-align: center;
+	.rail-item.viewed :global(.file-icon) {
+		opacity: 0.45;
 	}
-	.status-added {
-		color: var(--m-green);
-	}
-	.status-modified {
-		color: var(--m-blue);
-	}
-	.status-deleted {
-		color: var(--m-red);
+	.rail-name.gone {
+		text-decoration: line-through;
 	}
 	.rail-name {
 		flex-shrink: 0;

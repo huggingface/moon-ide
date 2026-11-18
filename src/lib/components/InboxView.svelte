@@ -22,8 +22,10 @@
 		type InboxRow,
 		type InboxSection,
 	} from '../inboxSections';
+	import { rowSize } from '../prFiles';
 	import type { InboxItem, InboxSource } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
+	import DiffStat from './DiffStat.svelte';
 	import Pill from './Pill.svelte';
 	import BellIcon from './icons/BellIcon.svelte';
 	import CheckIcon from './icons/CheckIcon.svelte';
@@ -358,8 +360,12 @@
 			 they line up down the list. -->
 		<span class="diffstat">
 			{#if item.additions !== null && item.deletions !== null}
-				<span class="add">+{item.additions}</span>
-				<span class="del">−{item.deletions}</span>
+				{@const size = rowSize({ additions: item.additions, deletions: item.deletions }, digest)}
+				<DiffStat
+					additions={size.additions}
+					deletions={size.deletions}
+					tests={{ additions: size.testAdditions, deletions: size.testDeletions }}
+				/>
 			{/if}
 		</span>
 		<span class="comments" title={item.commentCount ? `${item.commentCount} comments` : undefined}>
@@ -924,12 +930,6 @@
 		font-family: var(--m-font-mono);
 		font-size: var(--m-text-xs);
 		font-variant-numeric: tabular-nums;
-	}
-	.add {
-		color: var(--m-success);
-	}
-	.del {
-		color: var(--m-danger);
 	}
 	.comments {
 		display: inline-flex;

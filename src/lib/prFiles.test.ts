@@ -1,9 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { attentionCounts, LARGE_FILE_LINES, LARGE_PR_FILES, nextUnviewed, startsCollapsed } from './prFiles';
+import {
+	attentionCounts,
+	LARGE_FILE_LINES,
+	LARGE_PR_FILES,
+	nextUnviewed,
+	reviewSize,
+	rowSize,
+	startsCollapsed,
+} from './prFiles';
 import type { PrDiffFile } from './protocol';
 
 function file(path: string, over: Partial<PrDiffFile> = {}): PrDiffFile {
-	return { path, status: 'modified', additions: 3, deletions: 1, ...over };
+	return { path, status: 'modified', additions: 3, deletions: 1, isTest: false, ...over };
 }
 
 describe('startsCollapsed', () => {
@@ -24,6 +32,36 @@ describe('startsCollapsed', () => {
 		expect(startsCollapsed(file('logo.png', { additions: null, deletions: null }), 2)).toBe(true);
 		expect(startsCollapsed(file('src/a.ts', { additions: LARGE_FILE_LINES, deletions: 1 }), 2)).toBe(true);
 		expect(startsCollapsed(file('src/lockfile.ts'), 2)).toBe(false);
+	});
+});
+
+describe('test files', () => {
+	it('start collapsed, however small', () => {
+		expect(startsCollapsed(file('server/test/a.ts', { isTest: true }), 2)).toBe(true);
+	});
+
+	it('are counted apart from the rest', () => {
+		const files = [
+			file('src/a.ts', { additions: 15, deletions: 18 }),
+			file('src/b.ts', { additions: 18, deletions: 9 }),
+			file('server/test/a.ts', { additions: 60, deletions: 0, isTest: true }),
+			file('logo.png', { additions: null, deletions: null }),
+		];
+		expect(reviewSize(files)).toEqual({ additions: 33, deletions: 27, testAdditions: 60, testDeletions: 0 });
+	});
+
+	it('come off an inbox row once its digest says how much they are', () => {
+		const totals = { additions: 93, deletions: 27 };
+		expect(rowSize(totals, undefined)).toEqual({ additions: 93, deletions: 27, testAdditions: 0, testDeletions: 0 });
+		expect(rowSize(totals, { testAdditions: null, testDeletions: null }).additions).toBe(93);
+		expect(rowSize(totals, { testAdditions: 60, testDeletions: 0 })).toEqual({
+			additions: 33,
+			deletions: 27,
+			testAdditions: 60,
+			testDeletions: 0,
+		});
+		// A digest read after a push can be ahead of the row.
+		expect(rowSize(totals, { testAdditions: 120, testDeletions: 30 })).toMatchObject({ additions: 0, deletions: 0 });
 	});
 });
 

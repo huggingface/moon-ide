@@ -510,6 +510,24 @@ pub async fn fetch_current(root: &Utf8Path) -> Option<PullRequestDetail> {
 	}
 }
 
+/// Whether `path` is a test file, going by where it is and what it is
+/// called (ADR 0123): under a `test`, `tests` or `__tests__` directory,
+/// or named `*.test.*`, `*.spec.*`, `*_test.*` or `test_*.py`. Tests
+/// written inside a source file can't be told from here.
+pub fn is_test_path(path: &str) -> bool {
+	let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+	if dirs.split('/').any(|dir| matches!(dir, "test" | "tests" | "__tests__")) {
+		return true;
+	}
+	let Some((stem, extension)) = name.rsplit_once('.') else {
+		return false;
+	};
+	stem.ends_with("_test")
+		|| stem.contains(".test")
+		|| stem.contains(".spec")
+		|| (extension == "py" && stem.starts_with("test_"))
+}
+
 /// The diff of pull request `number` for a tab that needs no checkout
 /// of the branch: bring its commits into the repository behind `host`
 /// and diff `head_sha` against where it left `base_ref`.
@@ -525,6 +543,34 @@ pub async fn diff(host: &dyn WorkspaceHost, number: u32, base_ref: &str, head_sh
 mod tests {
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn test_files_are_told_by_their_path() {
+		for path in [
+			"server/test/end_to_end_auth.ts",
+			"tests/it.rs",
+			"src/lib/__tests__/a.ts",
+			"src/lib/prFiles.test.ts",
+			"e2e/login.spec.tsx",
+			"types/api.test-d.ts",
+			"pkg/store/store_test.go",
+			"hub/test_download.py",
+		] {
+			assert!(is_test_path(path), "{path}");
+		}
+		for path in [
+			"src/latest/a.ts",
+			"specs/protocol.md",
+			"src/contest.ts",
+			"src/test.ts",
+			"src/testing/harness.ts",
+			"test_data.json",
+			"Makefile",
+			"docs/_test",
+		] {
+			assert!(!is_test_path(path), "{path}");
+		}
+	}
 
 	#[test]
 	fn minor_notes_are_split_from_the_description() {
@@ -748,6 +794,7 @@ mod tests {
 			status,
 			additions: Some(additions),
 			deletions: Some(deletions),
+			is_test: false,
 		};
 		assert_eq!(
 			opened.files,

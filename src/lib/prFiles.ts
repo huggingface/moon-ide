@@ -19,13 +19,48 @@ const GENERATED =
 /** Whether `file` starts collapsed in a pull request of `fileCount`
  *  files. The reader's own toggles and viewed marks override this. */
 export function startsCollapsed(file: PrDiffFile, fileCount: number): boolean {
-	if (fileCount > LARGE_PR_FILES || file.status === 'deleted' || GENERATED.test(file.path)) {
+	if (fileCount > LARGE_PR_FILES || file.isTest || file.status === 'deleted' || GENERATED.test(file.path)) {
 		return true;
 	}
 	if (file.additions === null || file.deletions === null) {
 		return true;
 	}
 	return file.additions + file.deletions > LARGE_FILE_LINES;
+}
+
+/** A pull request's size as the reader should weigh it: lines changed
+ *  outside test files, with the tests' share kept apart (ADR 0123). */
+export type ReviewSize = { additions: number; deletions: number; testAdditions: number; testDeletions: number };
+
+export function reviewSize(files: readonly PrDiffFile[]): ReviewSize {
+	const size = { additions: 0, deletions: 0, testAdditions: 0, testDeletions: 0 };
+	for (const file of files) {
+		if (file.isTest) {
+			size.testAdditions += file.additions ?? 0;
+			size.testDeletions += file.deletions ?? 0;
+		} else {
+			size.additions += file.additions ?? 0;
+			size.deletions += file.deletions ?? 0;
+		}
+	}
+	return size;
+}
+
+/** The same, from an inbox row's totals and its digest's test share.
+ *  Until the digest is in, or when it couldn't tell, the totals
+ *  stand as they are. */
+export function rowSize(
+	totals: { additions: number; deletions: number },
+	tests: { testAdditions: number | null; testDeletions: number | null } | undefined,
+): ReviewSize {
+	const testAdditions = Math.min(tests?.testAdditions ?? 0, totals.additions);
+	const testDeletions = Math.min(tests?.testDeletions ?? 0, totals.deletions);
+	return {
+		additions: totals.additions - testAdditions,
+		deletions: totals.deletions - testDeletions,
+		testAdditions,
+		testDeletions,
+	};
 }
 
 /** The file to move to once `from` is marked viewed: the next
@@ -69,6 +104,7 @@ export function attentionCounts(pr: {
 export type FileOutline = {
 	additions: number | null;
 	deletions: number | null;
+	isTest: boolean;
 	attention: number;
 	collapsed: boolean;
 	viewed: boolean;

@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
+	import { statusColor } from '../fileIcon';
 	import { workspace, type SplitSide } from '../state.svelte';
+	import FileIcon from './FileIcon.svelte';
 	import ReviewSection from './ReviewSection.svelte';
 	import PullRequestPanel from './PullRequestPanel.svelte';
 	import {
@@ -400,22 +402,6 @@
 	// Single-letter status glyph for the files-menu rows. Mirrors
 	// `ReviewSection`'s `statusLabel` minus the unknown-status fallback
 	// (the review view only renders known statuses).
-	function statusInitial(s: GitFileStatus): string {
-		switch (s) {
-			case 'added':
-				return 'A';
-			case 'modified':
-				return 'M';
-			case 'deleted':
-				return 'D';
-			case 'untracked':
-				return 'U';
-			case 'conflicted':
-				return 'C';
-			default:
-				return '·';
-		}
-	}
 	// "L42" or "L10–14" — the anchor label shown in the publish preview.
 	function lineLabel(c: ReviewComment): string {
 		const { startLine, endLine } = c.anchor;
@@ -869,12 +855,18 @@
 									type="button"
 									class="files-row"
 									class:current={visiblePath === entry.path}
-									title={entry.path}
+									title={`${entry.path} (${entry.status})`}
 									onclick={() => pickFile(entry.path)}
 								>
-									<span class="status status-{entry.status}">{statusInitial(entry.status)}</span>
+									<FileIcon path={entry.path} size={14} />
 									{#if dirName(entry.path)}<span class="dir">{dirName(entry.path)}/</span>{/if}
-									<span class="name">{fileName(entry.path)}</span>
+									<span
+										class="name"
+										class:gone={entry.status === 'deleted'}
+										style:color={visiblePath === entry.path ? undefined : statusColor(entry.status)}
+									>
+										{fileName(entry.path)}
+									</span>
 								</button>
 							</li>
 						{/each}
@@ -1214,7 +1206,7 @@
 	}
 	.files-row {
 		display: inline-flex;
-		align-items: baseline;
+		align-items: center;
 		gap: 4px;
 		width: 100%;
 		padding: 4px 6px;
@@ -1234,30 +1226,8 @@
 	.files-row.current {
 		color: var(--m-accent, #4ec9b0);
 	}
-	.files-row .status {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		min-width: 14px;
-		font-size: 10px;
-		font-weight: 600;
-		flex-shrink: 0;
-	}
-	.files-row .status-modified {
-		color: var(--m-git-modified, #e2c08d);
-	}
-	.files-row .status-added {
-		color: var(--m-git-added, #4ec9b0);
-	}
-	.files-row .status-deleted {
-		color: var(--m-git-deleted, #f48771);
-	}
-	.files-row .status-untracked,
-	.files-row .status-ignored {
-		color: var(--m-fg-muted);
-	}
-	.files-row .status-conflicted {
-		color: var(--m-warning, #e2c08d);
+	.files-row .name.gone {
+		text-decoration: line-through;
 	}
 	.files-row .dir {
 		color: var(--m-fg-muted);

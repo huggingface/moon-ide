@@ -512,8 +512,11 @@ async fn hydrate_prs(subjects: &[(String, u32)]) -> HashMap<String, InboxItem> {
 	hydrated
 }
 
-const DIGEST_FIELDS: &str =
-	"body reviewThreads(first: 100) { nodes { isResolved } } files(first: 30) { nodes { path } }";
+const DIGEST_FIELDS: &str = "body reviewThreads(first: 100) { nodes { isResolved } } \
+	 files(first: 100) { totalCount nodes { path additions deletions } }";
+
+/// How many changed paths [`InboxPrDigest::paths`] keeps.
+const DIGEST_PATHS: usize = 30;
 
 /// How much of a description [`InboxPrDigest::summary`] keeps.
 const SUMMARY_CHARS: usize = 400;
@@ -524,7 +527,15 @@ struct RawDigest {
 	#[serde(default)]
 	body: String,
 	review_threads: RawNodes<RawDigestThread>,
-	files: Option<RawNodes<RawDigestFile>>,
+	files: Option<RawDigestFiles>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDigestFiles {
+	#[serde(default)]
+	total_count: usize,
+	nodes: Vec<RawDigestFile>,
 }
 
 #[derive(Deserialize)]
@@ -541,6 +552,10 @@ struct RawDigestThread {
 #[derive(Deserialize)]
 struct RawDigestFile {
 	path: String,
+	#[serde(default)]
+	additions: u32,
+	#[serde(default)]
+	deletions: u32,
 }
 
 /// A description as one line of plain-ish text: HTML comments (bot
@@ -569,6 +584,20 @@ fn digest_from_node(id: String, node: Value) -> Option<InboxPrDigest> {
 		.iter()
 		.filter(|thread| !thread.is_resolved)
 		.count();
+	// Lines in test files, known only when every file was read.
+	let in_tests = raw
+		.files
+		.as_ref()
+		.filter(|files| files.total_count <= files.nodes.len())
+		.map(|files| {
+			files
+				.nodes
+				.iter()
+				.filter(|file| crate::pull_request::is_test_path(&file.path))
+				.fold((0, 0), |(added, removed), file| {
+					(added + file.additions, removed + file.deletions)
+				})
+		});
 	Some(InboxPrDigest {
 		id,
 		minor_notes: notes.len() as u32,
@@ -576,9 +605,18 @@ fn digest_from_node(id: String, node: Value) -> Option<InboxPrDigest> {
 		resolved_threads: (raw.review_threads.nodes.len() - open) as u32,
 		paths: raw
 			.files
-			.map(|files| files.nodes.into_iter().map(|file| file.path).collect())
+			.map(|files| {
+				files
+					.nodes
+					.into_iter()
+					.take(DIGEST_PATHS)
+					.map(|file| file.path)
+					.collect()
+			})
 			.unwrap_or_default(),
 		summary: summarise(&prose),
+		test_additions: in_tests.map(|(added, _)| added),
+		test_deletions: in_tests.map(|(_, removed)| removed),
 	})
 }
 
@@ -940,15 +978,20 @@ mod tests {
 			json!({
 				"body": body,
 				"reviewThreads": { "nodes": [{ "isResolved": false }, { "isResolved": true }, { "isResolved": false }] },
-				"files": { "nodes": [{ "path": "src/a.rs" }, { "path": "src/b.rs" }] },
+				"files": { "totalCount": 3, "nodes": [
+					{ "path": "src/a.rs", "additions": 10, "deletions": 4 },
+					{ "path": "src/b.rs", "additions": 1, "deletions": 0 },
+					{ "path": "server/test/a.ts", "additions": 60, "deletions": 2 },
+				] },
 			}),
 		)
 		.expect("a digest");
+		assert_eq!((digest.test_additions, digest.test_deletions), (Some(60), Some(2)));
 		assert_eq!(
 			(digest.minor_notes, digest.open_threads, digest.resolved_threads),
 			(2, 2, 1)
 		);
-		assert_eq!(digest.paths, ["src/a.rs", "src/b.rs"]);
+		assert_eq!(digest.paths, ["src/a.rs", "src/b.rs", "server/test/a.ts"]);
 		assert!(
 			digest.summary.starts_with("Fixes the cursor. word word"),
 			"{}",
@@ -956,6 +999,20 @@ mod tests {
 		);
 		assert!(digest.summary.ends_with('…') && digest.summary.chars().count() == SUMMARY_CHARS + 1);
 		assert!(!digest.summary.contains("template") && !digest.summary.contains("Minor notes"));
+	}
+
+	#[test]
+	fn digest_does_not_guess_test_lines_from_a_partial_file_list() {
+		let digest = digest_from_node(
+			"acme/app#8".to_owned(),
+			json!({
+				"body": "",
+				"reviewThreads": { "nodes": [] },
+				"files": { "totalCount": 240, "nodes": [{ "path": "tests/a.rs", "additions": 5, "deletions": 5 }] },
+			}),
+		)
+		.expect("a digest");
+		assert_eq!((digest.test_additions, digest.test_deletions), (None, None));
 	}
 
 	#[test]

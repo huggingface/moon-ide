@@ -6,6 +6,7 @@
 	import { highlightSelectionMatches } from '@codemirror/search';
 	import { searchAsYouType } from '../editor/searchAsYouType';
 	import { MergeView, diff as rawDiff, unifiedMergeView } from '@codemirror/merge';
+	import { statusColor } from '../fileIcon';
 	import { ipc } from '../ipc';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { highlightTabs } from '../editor/highlightTabs';
@@ -21,6 +22,8 @@
 	import type { FileOutline } from '../prFiles';
 	import type { DiffLayout, EditorConfig, GitFileStatus, PullRequestDetail } from '../protocol';
 	import DiffStat from './DiffStat.svelte';
+	import FileIcon from './FileIcon.svelte';
+	import StatusWord from './StatusWord.svelte';
 	import ChevronDownIcon from './icons/ChevronDownIcon.svelte';
 	import ChevronRightIcon from './icons/ChevronRightIcon.svelte';
 
@@ -114,21 +117,6 @@
 	function dirName(p: string): string {
 		const slash = p.lastIndexOf('/');
 		return slash === -1 ? '' : p.slice(0, slash);
-	}
-
-	function statusLabel(s: GitFileStatus): string {
-		switch (s) {
-			case 'added':
-				return 'A';
-			case 'modified':
-				return 'M';
-			case 'deleted':
-				return 'D';
-			case 'conflicted':
-				return '!';
-			default:
-				return s[0]?.toUpperCase() ?? '?';
-		}
 	}
 
 	function firstLineOf(text: string): string {
@@ -515,17 +503,21 @@
 				{#if collapsed}<ChevronRightIcon size={14} />{:else}<ChevronDownIcon size={14} />{/if}
 			</button>
 		{/if}
-		<span class="status status-{status}" title={`Status: ${status}`} aria-label={`Status ${status}`}>
-			{statusLabel(status)}
-		</span>
-		<button type="button" class="path" title={`Open ${path}`} onclick={() => void openInEditor()}>
-			{#if dirName(path)}<span class="dir">{dirName(path)}/</span>{/if}<span class="name">{fileName(path)}</span>
+		<FileIcon {path} />
+		<button type="button" class="path" title={`Open ${path} (${status})`} onclick={() => void openInEditor()}>
+			{#if dirName(path)}<span class="dir">{dirName(path)}/</span>{/if}<span
+				class="name"
+				class:gone={status === 'deleted'}
+				style:color={statusColor(status)}>{fileName(path)}</span
+			>
 		</button>
+		<StatusWord {status} />
+		<span class="grow"></span>
 		{#if outline !== undefined}
 			{#if outline.attention > 0}
 				<span class="attention" title="Unresolved threads and notes on this file">{outline.attention}</span>
 			{/if}
-			<DiffStat additions={outline.additions} deletions={outline.deletions} />
+			<DiffStat additions={outline.additions} deletions={outline.deletions} muted={outline.isTest} />
 			<label class="viewed" title="Mark as viewed and move to the next file (v)">
 				<input
 					type="checkbox"
@@ -574,36 +566,14 @@
 		 * longer clips its children. */
 		border-radius: 5px 5px 0 0;
 	}
-	.status {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		min-width: 16px;
-		height: 16px;
-		padding: 0 4px;
-		font-size: 10px;
-		font-weight: 600;
-		border-radius: 3px;
-		font-family: var(--m-font-mono, monospace);
+	.name.gone {
+		text-decoration: line-through;
 	}
-	.status-added {
-		color: var(--m-green);
-		background: color-mix(in srgb, var(--m-green) 14%, transparent);
-	}
-	.status-modified {
-		color: var(--m-blue);
-		background: color-mix(in srgb, var(--m-blue) 14%, transparent);
-	}
-	.status-deleted {
-		color: var(--m-red);
-		background: color-mix(in srgb, var(--m-red) 14%, transparent);
-	}
-	.status-conflicted {
-		color: var(--m-warning);
-		background: color-mix(in srgb, var(--m-warning) 14%, transparent);
+	.grow {
+		flex: 1;
 	}
 	.path {
-		flex: 1;
+		flex: 0 1 auto;
 		min-width: 0;
 		background: transparent;
 		border: none;

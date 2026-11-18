@@ -21,4 +21,10 @@ paths: Array<string>,
 /**
  * The start of the description, as plain text.
  */
-summary: string, };
+summary: string, 
+/**
+ * Lines added and removed in test files, to take off the row's
+ * totals (ADR 0123). `None` when the pull request changes more
+ * files than were read.
+ */
+testAdditions: number | null, testDeletions: number | null, };

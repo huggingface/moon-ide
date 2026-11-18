@@ -249,6 +249,11 @@ pub struct InboxPrDigest {
 	pub paths: Vec<String>,
 	/// The start of the description, as plain text.
 	pub summary: String,
+	/// Lines added and removed in test files, to take off the row's
+	/// totals (ADR 0123). `None` when the pull request changes more
+	/// files than were read.
+	pub test_additions: Option<u32>,
+	pub test_deletions: Option<u32>,
 }
 
 /// A named set of pull requests to review together.

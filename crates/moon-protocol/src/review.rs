@@ -274,6 +274,8 @@ pub struct PrDiffFile {
 	/// Lines added and removed. `None` for a binary file.
 	pub additions: Option<u32>,
 	pub deletions: Option<u32>,
+	/// A test file, going by its path (ADR 0123).
+	pub is_test: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

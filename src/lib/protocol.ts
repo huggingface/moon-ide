@@ -462,12 +462,14 @@ export type PrDiff = {
 	files: PrDiffFile[];
 };
 
-/** One file of a `PrDiff`. The counts are `null` for a binary file. */
+/** One file of a `PrDiff`. The counts are `null` for a binary file;
+ *  `isTest` is the core's reading of the path. */
 export type PrDiffFile = {
 	path: string;
 	status: GitFileStatus;
 	additions: number | null;
 	deletions: number | null;
+	isTest: boolean;
 };
 
 /**
@@ -1149,6 +1151,10 @@ export type InboxPrDigest = {
 	resolvedThreads: number;
 	paths: string[];
 	summary: string;
+	/** Lines in test files, taken off the row's totals; `null` when
+	 *  the pull request has more files than were read. */
+	testAdditions: number | null;
+	testDeletions: number | null;
 };
 
 /** A named set of pull requests to review together. */

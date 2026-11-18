@@ -59,3 +59,13 @@ export function prTabName(number: number, title: string): string {
 	const shown = trimmed.length > MAX_TITLE ? `${trimmed.slice(0, MAX_TITLE - 1).trimEnd()}…` : trimmed;
 	return `#${number} ${shown}`;
 }
+
+/** A `#<number> <title>` tab name in its two parts, for showing the
+ *  number apart; `null` for a name of another shape. */
+export function splitTabName(name: string): { ref: string; title: string } | null {
+	const match = /^(#\d+)(?: ([\s\S]*))?$/.exec(name);
+	if (match === null) {
+		return null;
+	}
+	return { ref: match[1] ?? '', title: match[2] ?? '' };
+}

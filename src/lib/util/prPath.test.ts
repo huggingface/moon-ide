@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isPrPath, parsePrPath, prPath, prTabName } from './prPath';
+import { isPrPath, parsePrPath, prPath, prTabName, splitTabName } from './prPath';
 
 describe('prPath', () => {
 	it('round-trips the folder and the number', () => {
@@ -27,5 +27,12 @@ describe('prPath', () => {
 		expect(prTabName(7, '  ')).toBe('#7');
 		const long = prTabName(7, 'x'.repeat(80));
 		expect(long).toBe(`#7 ${'x'.repeat(47)}…`);
+	});
+
+	it('splits a tab name back into number and title', () => {
+		expect(splitTabName('#21155 Prevent two accounts')).toEqual({ ref: '#21155', title: 'Prevent two accounts' });
+		expect(splitTabName('#7')).toEqual({ ref: '#7', title: '' });
+		expect(splitTabName('README.md')).toBeNull();
+		expect(splitTabName('#notes.md')).toBeNull();
 	});
 });

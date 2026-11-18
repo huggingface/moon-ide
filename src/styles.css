@@ -97,6 +97,11 @@
 	--m-success: #5fd6a3;
 	--m-warning: #f0b86e;
 	--m-danger: #ff7a8a;
+	/* A file's name by git status, in the file tree (fed to it just
+	   below) and wherever else files are listed. */
+	--m-git-added: #00cab1;
+	--m-git-modified: #08c0ef;
+	--m-git-deleted: #ff6762;
 	/* A merged pull request: the one forge state with no twin above. */
 	--m-merged: #b392f0;
 
@@ -219,6 +224,10 @@
 	   rows. Pierre's default is 16px, which leaves a wide empty
 	   gutter beside every row in a narrow panel. */
 	--trees-padding-inline-override: var(--m-space-2);
+	--trees-git-added-color-override: var(--m-git-added);
+	--trees-git-untracked-color-override: var(--m-git-added);
+	--trees-git-modified-color-override: var(--m-git-modified);
+	--trees-git-deleted-color-override: var(--m-git-deleted);
 
 	--m-font-ui: 'Inter', -apple-system, system-ui, 'Segoe UI', Roboto, sans-serif;
 	/* Fantasque Sans Mono is bundled (see the `@font-face` block at
@@ -263,6 +272,9 @@
 	--m-accent: var(--m-accent-light, #4360c8);
 	--m-accent-strong: var(--m-accent-strong-light, #2a3fa1);
 	--m-warning: var(--m-warning-light, #b45309);
+	--m-git-added: #16a994;
+	--m-git-modified: #1ca1c7;
+	--m-git-deleted: #ff2e3f;
 	--m-merged: #8250df;
 	--m-canvas: var(--m-bg-3);
 	--m-shadow-pop: 0 8px 24px color-mix(in srgb, #000 14%, transparent);

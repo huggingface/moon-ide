@@ -26,7 +26,10 @@
 	import { lspLanguageFor } from '../editor/lspLanguage';
 	import { commentsForSide, reanchorComments, ReviewWiring } from '../editor/reviewComments';
 	import { annotationsFor, PrAnnotationWiring } from '../editor/prAnnotations';
+	import { statusColor } from '../fileIcon';
 	import type { EditorConfig, GitFileStatus, ReviewSide } from '../protocol';
+	import FileIcon from './FileIcon.svelte';
+	import StatusWord from './StatusWord.svelte';
 
 	type Props = {
 		path: string;
@@ -797,21 +800,6 @@
 		return slash === -1 ? '' : p.slice(0, slash);
 	}
 
-	function statusLabel(s: GitFileStatus): string {
-		switch (s) {
-			case 'added':
-				return 'A';
-			case 'modified':
-				return 'M';
-			case 'deleted':
-				return 'D';
-			case 'untracked':
-				return 'U';
-			default:
-				return '';
-		}
-	}
-
 	function openInEditor() {
 		// Deleted rows can't open as a normal editor tab (there's
 		// nothing to edit). Skip the action — the section already
@@ -889,12 +877,16 @@
 		>
 			<span aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
 		</button>
-		<span class="status status-{status}" title={`Status: ${status}`} aria-label={`Status ${status}`}>
-			{statusLabel(status)}
-		</span>
-		<button type="button" class="path" title={`Open ${path}`} onclick={openInEditor}>
-			{#if dirName(path)}<span class="dir">{dirName(path)}/</span>{/if}<span class="name">{fileName(path)}</span>
+		<FileIcon {path} />
+		<button type="button" class="path" title={`Open ${path} (${status})`} onclick={openInEditor}>
+			{#if dirName(path)}<span class="dir">{dirName(path)}/</span>{/if}<span
+				class="name"
+				class:gone={status === 'deleted'}
+				style:color={statusColor(status)}>{fileName(path)}</span
+			>
 		</button>
+		<StatusWord {status} />
+		<span class="grow"></span>
 		{#if backingDirty}
 			<span class="dirty" title="Unsaved edits — Ctrl+S to save" aria-label="Unsaved edits">●</span>
 		{/if}
@@ -975,36 +967,14 @@
 	.caret:hover {
 		color: var(--m-fg);
 	}
-	.status {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		min-width: 16px;
-		height: 16px;
-		padding: 0 4px;
-		font-size: 10px;
-		font-weight: 600;
-		border-radius: 3px;
-		font-family: var(--m-font-mono, monospace);
+	.name.gone {
+		text-decoration: line-through;
 	}
-	.status-added {
-		color: var(--m-git-added, #4ec9b0);
-		background: color-mix(in srgb, var(--m-git-added, #4ec9b0) 18%, transparent);
-	}
-	.status-modified {
-		color: var(--m-git-modified, #e2c08d);
-		background: color-mix(in srgb, var(--m-git-modified, #e2c08d) 18%, transparent);
-	}
-	.status-deleted {
-		color: var(--m-git-deleted, #f48771);
-		background: color-mix(in srgb, var(--m-git-deleted, #f48771) 18%, transparent);
-	}
-	.status-untracked {
-		color: var(--m-fg-muted);
-		background: color-mix(in srgb, var(--m-fg-muted) 18%, transparent);
+	.grow {
+		flex: 1;
 	}
 	.path {
-		flex: 1;
+		flex: 0 1 auto;
 		min-width: 0;
 		display: inline-flex;
 		align-items: baseline;

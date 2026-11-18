@@ -5,9 +5,11 @@
 	import { isCommitPath } from '../util/commitPath';
 	import { isInboxPath } from '../util/inboxPath';
 	import { isMarkdownPath } from '../util/markdown';
+	import { isIssuePath } from '../util/issuePath';
 	import { isPrPath } from '../util/prPath';
 	import ContextMenu from './ContextMenu.svelte';
 	import type { ContextMenuItem } from './contextMenu';
+	import TabTitle from './TabTitle.svelte';
 	import CloseIcon from './icons/CloseIcon.svelte';
 	import InboxIcon from './icons/InboxIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
@@ -625,7 +627,9 @@
 					/>
 				{:else}
 					{#if isPinned(file.path)}<InboxIcon size={13} />{/if}
-					<span class="name">{file.name}</span>
+					<span class="name">
+						{#if isPrPath(file.path) || isIssuePath(file.path)}<TabTitle name={file.name} />{:else}{file.name}{/if}
+					</span>
 				{/if}
 				{#if file.pendingEdit}
 					<span
