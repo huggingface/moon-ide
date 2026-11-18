@@ -56,6 +56,14 @@ pub async fn inbox_digests(subjects: Vec<InboxPrRef>) -> Result<Vec<InboxPrDiges
 	Ok(inbox::digests(&subjects).await)
 }
 
+/// Loadable, short-lived URLs for images attached to a pull request
+/// or an issue of the private repository `repo` (`owner/name`), which
+/// GitHub serves to nobody but a signed-in browser. One answer per
+/// address, `None` where there is nothing to sign.
+pub async fn github_asset_urls(repo: String, urls: Vec<String>) -> Result<Vec<Option<String>>, MoonError> {
+	moon_core::github_assets::sign_asset_urls(&repo, &urls).await
+}
+
 /// Sort `request.items` into groups to review together (ADR 0119):
 /// one model call, through the coder's inference. Errors when the
 /// coder isn't signed in or the model's answer can't be read.
@@ -176,6 +184,7 @@ crate::commands! {
 	issue_open([app] folder_path: String, number: u32),
 	inbox_fetch([app] watched_authors: Vec<String>),
 	inbox_digests(subjects: Vec<InboxPrRef>),
+	github_asset_urls(repo: String, urls: Vec<String>),
 	inbox_group([app] request: InboxGroupRequest),
 	inbox_mark_read(thread_id: String),
 	inbox_open_pr([app] folder_path: String, branch: String),

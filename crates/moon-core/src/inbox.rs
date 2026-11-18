@@ -55,7 +55,7 @@ pub(crate) struct GhOutput {
 	pub(crate) stderr: String,
 }
 
-async fn run_gh(args: &[&str]) -> Result<GhOutput, GhError> {
+pub(crate) async fn run_gh(args: &[&str]) -> Result<GhOutput, GhError> {
 	run_gh_in(None, args).await
 }
 

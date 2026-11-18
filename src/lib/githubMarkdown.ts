@@ -2,6 +2,7 @@
 // element, for the pull-request and issue views.
 
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { loadPrivateAssets } from './githubAssets';
 import { inbox } from './inbox.svelte';
 import { getCachedMarkdown, renderMarkdown } from './markdown';
 
@@ -35,9 +36,10 @@ function markOwnMentions(el: HTMLElement): void {
  *  source text until the render resolves. */
 export function githubMarkdown(el: HTMLElement, source: GithubText): { update: (source: GithubText) => void } {
 	let current: GithubText | null = null;
-	const paint = (html: string) => {
+	const paint = (html: string, repoUrl: string | null) => {
 		el.innerHTML = html;
 		markOwnMentions(el);
+		loadPrivateAssets(el, repoUrl);
 	};
 	const render = (next: GithubText) => {
 		// Repainting would close a `<details>` the reader opened.
@@ -48,13 +50,13 @@ export function githubMarkdown(el: HTMLElement, source: GithubText): { update: (
 		const options = { github: true, repoUrl: next.repoUrl };
 		const cached = getCachedMarkdown(next.text, options);
 		if (cached !== undefined) {
-			paint(cached);
+			paint(cached, next.repoUrl);
 			return;
 		}
 		el.textContent = next.text;
 		void renderMarkdown(next.text, options).then((html) => {
 			if (el.isConnected && current === next) {
-				paint(html);
+				paint(html, next.repoUrl);
 			}
 		});
 	};

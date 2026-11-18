@@ -1208,6 +1208,10 @@ Mapping notes (details live in `sessions.rs`):
   `EMPTY_RESPONSE_RETRIES` times, then fails the turn with
   `CoderError::EmptyResponse` — previously the turn ended as a
   phantom success and a sub-agent reported an empty result.
+  A turn that was reasoning and nothing else is kept (its thoughts
+  are shown), but reasoning is never replayed, so it is left out of
+  the request history: a role-only assistant message makes strict
+  providers reject every later request.
 - The per-assistant `provider` + `model` stamp reflects the route
   that actually served that round-trip, not the header's seed.
 - `Usage` folds onto the prior assistant line's `usage` block on

@@ -11,6 +11,7 @@ pub mod app_state;
 pub mod editorconfig;
 pub mod forge;
 pub mod format;
+pub mod github_assets;
 pub mod host;
 pub mod inbox;
 pub mod issue;

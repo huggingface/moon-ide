@@ -368,16 +368,16 @@
 	// Review dialog: closed → form → busy (the GitHub round trip) →
 	// done (the outcome). Verdict and summary only; the tab has no
 	// draft comments.
-	let reviewPhase = $state<'closed' | 'form' | 'busy' | 'done'>('closed');
+	let reviewPhase = $state<'closed' | 'form' | 'busy'>('closed');
 	let reviewEvent = $state<ReviewEvent>('comment');
 	let reviewSummary = $state('');
-	let reviewOutcome = $state('');
+	let reviewError = $state('');
 	const reviewBlocked = $derived(reviewEvent !== 'approve' && reviewSummary.trim() === '');
 
 	function openReview() {
 		reviewEvent = 'comment';
 		reviewSummary = '';
-		reviewOutcome = '';
+		reviewError = '';
 		reviewPhase = 'form';
 	}
 
@@ -393,6 +393,7 @@
 			return;
 		}
 		reviewPhase = 'busy';
+		reviewError = '';
 		const event = reviewEvent;
 		try {
 			const result = await ipc.fs.publishPrReview(
@@ -404,19 +405,24 @@
 				},
 				folder ?? undefined,
 			);
-			if (result.kind === 'no_pr') {
-				reviewOutcome = `Pull request #${current.number} could not be found on the remote.`;
-			} else if (result.reviewUrl === '') {
-				reviewOutcome = 'Nothing was posted.';
-			} else {
-				reviewOutcome =
-					event === 'approve' ? 'Approved.' : event === 'request_changes' ? 'Requested changes.' : 'Posted the review.';
+			if (result.kind === 'published' && result.reviewUrl !== '') {
+				// The pull request, re-read, shows what was posted.
+				reviewPhase = 'closed';
+				workspace.flash(
+					event === 'approve' ? 'Approved.' : event === 'request_changes' ? 'Requested changes.' : 'Posted the review.',
+				);
 				void load();
+				return;
 			}
+			reviewError =
+				result.kind === 'no_pr'
+					? `Pull request #${current.number} could not be found on the remote.`
+					: 'Nothing was posted.';
 		} catch (err) {
-			reviewOutcome = `Posting failed: ${formatError(err)}`;
+			reviewError = `Posting failed: ${formatError(err)}`;
 		}
-		reviewPhase = 'done';
+		// Back to the form, with what was written still in it.
+		reviewPhase = 'form';
 	}
 
 	function focusSummary(el: HTMLTextAreaElement) {
@@ -703,58 +709,54 @@
 				<h2>Review #{detail.number}</h2>
 				<button type="button" class="close" aria-label="Close" onclick={closeReview}>×</button>
 			</header>
-			{#if reviewPhase === 'done'}
-				<p class="outcome">{reviewOutcome}</p>
-				<div class="actions">
-					<button type="button" class="btn primary" onclick={() => (reviewPhase = 'closed')}>Done</button>
-				</div>
-			{:else}
-				<p class="lede">Posts a verdict, or a summary alone, on the pull request. Nothing is attached to a line.</p>
-				<div class="events" role="radiogroup" aria-label="Review verdict">
-					{#each VERDICTS as [value, label] (value)}
-						<label class="event" class:selected={reviewEvent === value}>
-							<input
-								type="radio"
-								name="pr-review-event"
-								{value}
-								bind:group={reviewEvent}
-								disabled={reviewPhase === 'busy'}
-							/>
-							{label}
-						</label>
-					{/each}
-				</div>
-				<textarea
-					class="summary"
-					bind:value={reviewSummary}
-					rows="4"
-					{@attach focusSummary}
-					placeholder={reviewEvent === 'approve'
-						? 'Optional summary…'
-						: reviewEvent === 'request_changes'
-							? 'What needs to change…'
-							: 'Your comment…'}
-					disabled={reviewPhase === 'busy'}
-				></textarea>
-				<div class="actions">
-					<button type="button" class="btn" onclick={closeReview} disabled={reviewPhase === 'busy'}>Cancel</button>
-					<button
-						type="button"
-						class="btn primary"
-						onclick={() => void postReview()}
-						disabled={reviewPhase === 'busy' || reviewBlocked}
-						title={reviewBlocked ? 'Write a summary first' : undefined}
-					>
-						{reviewPhase === 'busy'
-							? 'Posting…'
-							: reviewEvent === 'approve'
-								? 'Approve'
-								: reviewEvent === 'request_changes'
-									? 'Request changes'
-									: 'Comment'}
-					</button>
-				</div>
+			<p class="lede">Posts a verdict, or a summary alone, on the pull request. Nothing is attached to a line.</p>
+			<div class="events" role="radiogroup" aria-label="Review verdict">
+				{#each VERDICTS as [value, label] (value)}
+					<label class="event" class:selected={reviewEvent === value}>
+						<input
+							type="radio"
+							name="pr-review-event"
+							{value}
+							bind:group={reviewEvent}
+							disabled={reviewPhase === 'busy'}
+						/>
+						{label}
+					</label>
+				{/each}
+			</div>
+			<textarea
+				class="summary"
+				bind:value={reviewSummary}
+				rows="4"
+				{@attach focusSummary}
+				placeholder={reviewEvent === 'approve'
+					? 'Optional summary…'
+					: reviewEvent === 'request_changes'
+						? 'What needs to change…'
+						: 'Your comment…'}
+				disabled={reviewPhase === 'busy'}
+			></textarea>
+			{#if reviewError !== ''}
+				<p class="outcome">{reviewError}</p>
 			{/if}
+			<div class="actions">
+				<button type="button" class="btn" onclick={closeReview} disabled={reviewPhase === 'busy'}>Cancel</button>
+				<button
+					type="button"
+					class="btn primary"
+					onclick={() => void postReview()}
+					disabled={reviewPhase === 'busy' || reviewBlocked}
+					title={reviewBlocked ? 'Write a summary first' : undefined}
+				>
+					{reviewPhase === 'busy'
+						? 'Posting…'
+						: reviewEvent === 'approve'
+							? 'Approve'
+							: reviewEvent === 'request_changes'
+								? 'Request changes'
+								: 'Comment'}
+				</button>
+			</div>
 		</div>
 	</div>
 {/if}
@@ -1025,7 +1027,7 @@
 		line-height: 1.5;
 	}
 	.outcome {
-		color: var(--m-fg);
+		color: var(--m-danger);
 	}
 	.events {
 		display: flex;

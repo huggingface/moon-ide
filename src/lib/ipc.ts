@@ -256,6 +256,9 @@ export const ipc = {
 		fetch: (watchedAuthors: string[]) => call<InboxSnapshot>('inbox_fetch', { watchedAuthors }),
 		markRead: (threadId: string) => call<void>('inbox_mark_read', { threadId }),
 		digests: (subjects: InboxPrRef[]) => call<InboxPrDigest[]>('inbox_digests', { subjects }),
+		/** Signed, short-lived URLs for a private repository's attached
+		 * images; `null` where GitHub gave none. */
+		assetUrls: (repo: string, urls: string[]) => call<(string | null)[]>('github_asset_urls', { repo, urls }),
 		/** One model call; fails when the coder isn't signed in. */
 		group: (request: InboxGroupRequest) => call<InboxGrouping>('inbox_group', { request }),
 		openPr: (folderPath: string, branch: string) => call<InboxOpenedPr>('inbox_open_pr', { folderPath, branch }),

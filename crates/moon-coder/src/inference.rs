@@ -491,6 +491,16 @@ fn build_wire_messages<'a>(
 			ChatMessage::Assistant {
 				content, tool_calls, ..
 			} => {
+				// A reply that was reasoning and nothing else is kept in
+				// the session (its thoughts are shown), but reasoning is
+				// not replayed, so here it would be a bare
+				// `{"role":"assistant"}`. Strict providers 400 the whole
+				// request on that, at every round-trip from then on.
+				// Left out, like the Anthropic encoder leaves it out.
+				let has_text = content.as_deref().is_some_and(|text| !text.trim().is_empty());
+				if tool_calls.is_empty() && !has_text {
+					continue;
+				}
 				// `thinking_blocks` is Anthropic-native-only and never
 				// rides on the OpenAI-compat wire, so it's dropped here.
 				// `cache_breakpoint_indexes` never targets an
@@ -3417,6 +3427,63 @@ mod tests {
 			json,
 			r#"[{"role":"assistant","content":"running it","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/a\"}"}}]}]"#
 		);
+	}
+
+	#[test]
+	fn wire_leaves_out_an_assistant_turn_with_nothing_to_send() {
+		// A model that answered in its reasoning field alone (seen with
+		// an open model behind the HF router): kept in the session,
+		// but on this wire it has no content, no reasoning and no
+		// tool calls, which a strict provider rejects outright.
+		let user = |text: &str| ChatMessage::User {
+			content: text.into(),
+			images: Vec::new(),
+		};
+		let assistant = |content: Option<&str>, tool_calls: Vec<ToolCall>| ChatMessage::Assistant {
+			content: content.map(Into::into),
+			thinking_blocks: Vec::new(),
+			tool_calls,
+		};
+		let call = ToolCall {
+			id: "call_1".into(),
+			kind: "function".into(),
+			function: FunctionCall {
+				name: "task_steer".into(),
+				arguments: "{}".into(),
+			},
+		};
+		let messages = vec![
+			user("first"),
+			assistant(None, vec![call]),
+			ChatMessage::Tool {
+				tool_call_id: "call_1".into(),
+				tool_name: None,
+				content: "ok".into(),
+				images: Vec::new(),
+			},
+			assistant(None, Vec::new()),
+			assistant(Some("  \n"), Vec::new()),
+			user("a sub-agent report"),
+			assistant(Some("an answer"), Vec::new()),
+		];
+		let wire = serde_json::to_value(build_wire_messages(&messages, &[], true)).unwrap();
+		let shape: Vec<(&str, bool)> = wire
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|message| (message["role"].as_str().unwrap(), message.get("tool_calls").is_some()))
+			.collect();
+		assert_eq!(
+			shape,
+			[
+				("user", false),
+				("assistant", true),
+				("tool", false),
+				("user", false),
+				("assistant", false)
+			]
+		);
+		assert_eq!(wire[4]["content"], "an answer");
 	}
 
 	#[test]

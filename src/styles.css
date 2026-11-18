@@ -604,6 +604,9 @@ button:focus-visible {
 }
 .markdown-body img {
 	max-width: 100%;
+	/* Keeps the proportions of an image given a `width` and `height`
+	   wider than the column. */
+	height: auto;
 }
 
 /* Leading YAML frontmatter (`---` … `---`) is split out of the body
