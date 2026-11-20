@@ -112,3 +112,50 @@ export function replyPrompt(thread: NoteThread, question: string): string {
 		`Answer with \`review_note\` on the same path and line.`
 	);
 }
+
+/** What a question asked from the pull request's tab is about, beyond
+ *  the pull request itself. */
+export type TalkAbout =
+	| { kind: 'comment'; author: string | null; body: string; url: string }
+	| { kind: 'thread'; path: string; line: number | null; author: string | null; body: string };
+
+export type TalkEntry = { from: 'you' | 'agent'; text: string; about: string | null };
+
+/** A question asked from the tab, and what came back. */
+export type Talk = { entries: readonly TalkEntry[]; waiting: boolean };
+
+const QUOTE_MAX = 2_000;
+
+/** How `about` reads on the user's own card. */
+export function aboutLabel(about: TalkAbout): string {
+	const who = about.author ?? 'someone';
+	return about.kind === 'comment'
+		? `About ${who}'s comment`
+		: `About ${who}'s thread on ${about.path}${about.line === null ? '' : `:${about.line}`}`;
+}
+
+function quote(text: string): string {
+	const cut = text.length > QUOTE_MAX ? `${text.slice(0, QUOTE_MAX)}…` : text;
+	return cut
+		.trim()
+		.split('\n')
+		.map((line) => `> ${line}`)
+		.join('\n');
+}
+
+/** What the agent is told when the user asks from the tab. The answer
+ *  is the turn's reply, shown in the tab. */
+export function talkPrompt(pr: { number: number; title: string }, question: string, about: TalkAbout | null): string {
+	let context = '';
+	if (about?.kind === 'comment') {
+		context = `\n\nIt is about this comment by ${about.author ?? 'someone'} (${about.url}):\n\n${quote(about.body)}`;
+	} else if (about?.kind === 'thread') {
+		const where = `\`${about.path}\`${about.line === null ? '' : ` line ${about.line}`}`;
+		context = `\n\nIt is about this review thread on ${where}, started by ${about.author ?? 'someone'}:\n\n${quote(about.body)}`;
+	}
+	return (
+		`I'm reviewing pull request #${pr.number} (${pr.title}) and ask you, from its review tab: ${question.trim()}${context}\n\n` +
+		`Answer in your reply, briefly: it is shown in the tab. Look at whatever you need to be sure. ` +
+		`Use \`review_note\` as well only when pointing at a line of the diff helps.`
+	);
+}

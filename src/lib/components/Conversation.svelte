@@ -6,6 +6,7 @@
 	import { githubMarkdown, openMarkdownLinks } from '../githubMarkdown';
 	import { relativeTime } from '../inboxSections';
 	import type { ConversationComment } from '../protocol';
+	import Avatar from './Avatar.svelte';
 	import Pill from './Pill.svelte';
 	import ExternalLinkIcon from './icons/ExternalLinkIcon.svelte';
 
@@ -13,8 +14,10 @@
 		comments: readonly ConversationComment[];
 		/** The repository the comments were written in. */
 		repoUrl: string | null;
+		/** Ask the pull request's agent about a comment. */
+		onAsk?: ((comment: ConversationComment) => void) | undefined;
 	};
-	let { comments, repoUrl }: Props = $props();
+	let { comments, repoUrl, onAsk }: Props = $props();
 
 	const REVIEW = {
 		approved: ['success', 'approved'],
@@ -48,12 +51,16 @@
 		{@const id = key(comment)}
 		<li class="entry" class:review={comment.review !== null}>
 			<div class="meta">
+				<Avatar login={comment.author} />
 				<strong>{comment.author ?? 'someone'}</strong>
 				{#if comment.review !== null}
 					<Pill tone={REVIEW[comment.review][0]}>{REVIEW[comment.review][1]}</Pill>
 				{/if}
 				<span class="time" title={comment.createdAt}>{relativeTime(comment.createdAt, now)}</span>
 				<span class="spacer"></span>
+				{#if onAsk !== undefined}
+					<button class="ask" title="Ask the agent about this comment" onclick={() => onAsk(comment)}>Ask</button>
+				{/if}
 				<button class="icon-btn" title="Open on GitHub" onclick={() => void openUrl(comment.url)}>
 					<ExternalLinkIcon size={12} />
 				</button>
@@ -128,8 +135,24 @@
 		font-size: var(--m-text-sm);
 		cursor: pointer;
 	}
-	.more:hover {
+	.more:hover,
+	.ask:hover {
 		background: var(--m-bg-2);
+	}
+	.ask {
+		padding: 0 var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-accent);
+		font: inherit;
+		font-size: var(--m-text-sm);
+		cursor: pointer;
+		visibility: hidden;
+	}
+	.entry:hover .ask,
+	.ask:focus-visible {
+		visibility: visible;
 	}
 	.icon-btn {
 		display: inline-flex;

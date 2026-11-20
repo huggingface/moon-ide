@@ -5,6 +5,7 @@
 	// review scroll, above the file sections.
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { githubMarkdown, openMarkdownLinks, repoUrlOf } from '../githubMarkdown';
+	import type { TalkAbout } from '../reviewNotes';
 	import type { PrCheckState, PrThread, PullRequestDetail } from '../protocol';
 	import Conversation from './Conversation.svelte';
 	import Pill from './Pill.svelte';
@@ -20,8 +21,22 @@
 		refreshing: boolean;
 		onJump: (path: string) => void;
 		onRefresh: () => void | Promise<void>;
+		/** Ask the pull request's agent about a comment or a thread;
+		 *  absent where there is no agent to ask. */
+		onAsk?: ((about: TalkAbout) => void) | undefined;
 	};
-	let { pr, paths, refreshing, onJump, onRefresh }: Props = $props();
+	let { pr, paths, refreshing, onJump, onRefresh, onAsk }: Props = $props();
+
+	function askAboutThread(thread: PrThread) {
+		const first = thread.comments[0];
+		onAsk?.({
+			kind: 'thread',
+			path: thread.path,
+			line: thread.line,
+			author: first?.author ?? null,
+			body: thread.comments.map((comment) => `${comment.author ?? 'someone'}: ${comment.body}`).join('\n\n'),
+		});
+	}
 
 	const repoUrl = $derived(repoUrlOf(pr.url));
 
@@ -178,6 +193,11 @@
 							{#if thread.resolved}<span class="hint">resolved</span>{/if}
 							{#if thread.outdated}<span class="hint">outdated</span>{/if}
 						</span>
+						{#if onAsk !== undefined}
+							<button class="ask" title="Ask the agent about this thread" onclick={() => askAboutThread(thread)}>
+								Ask
+							</button>
+						{/if}
 						<button
 							class="icon-btn"
 							title="Open this thread on GitHub"
@@ -222,7 +242,13 @@
 {#if pr.conversation.length > 0}
 	<details class="talk" open>
 		<summary>Conversation <span class="count">{pr.conversation.length}</span></summary>
-		<Conversation comments={pr.conversation} {repoUrl} />
+		<Conversation
+			comments={pr.conversation}
+			{repoUrl}
+			onAsk={onAsk === undefined
+				? undefined
+				: (comment) => onAsk({ kind: 'comment', author: comment.author, body: comment.body, url: comment.url })}
+		/>
 	</details>
 {/if}
 
@@ -292,6 +318,25 @@
 		margin-top: var(--m-space-3);
 		padding-top: var(--m-space-2);
 		border-top: 1px solid var(--m-border);
+	}
+	.ask {
+		flex-shrink: 0;
+		padding: 0 var(--m-space-2);
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-accent);
+		font: inherit;
+		font-size: var(--m-text-sm);
+		cursor: pointer;
+		visibility: hidden;
+	}
+	li:hover .ask,
+	.ask:focus-visible {
+		visibility: visible;
+	}
+	.ask:hover {
+		background: var(--m-bg-2);
 	}
 	.talk {
 		margin: var(--m-space-3) var(--m-space-3) var(--m-space-2);

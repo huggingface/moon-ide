@@ -1605,16 +1605,17 @@ class WorkspaceState {
 	/**
 	 * Start the agent a pull request is reviewed with (ADR 0124): a
 	 * session in the checkout of `branch`, which is made as a worktree
-	 * of the project at `folderPath` when there is none. The project
-	 * must be the active one, since the session opens in its panel.
-	 * Returns the session, or `null` when it could not be started.
+	 * of the project at `folderPath` when there is none. It is asked
+	 * from the pull request's tab and stays out of the coder panel
+	 * until opened from the sessions list. Returns the session, or
+	 * `null` when it could not be started.
 	 */
 	async newCoderReviewSession(folderPath: string, branch: string): Promise<CoderSessionSummary | null> {
 		try {
 			const result = await ipc.coder.newReviewSession(folderPath, branch);
+			coder.keepInBackground(result.session.id);
 			await this.adoptWorkspaceSnapshot(result.workspace);
 			this.persistAppState();
-			coder.adoptCreatedSession(result.session);
 			return result.session;
 		} catch (err) {
 			this.flash(`Could not start an agent on ${branch}: ${formatError(err)}`);

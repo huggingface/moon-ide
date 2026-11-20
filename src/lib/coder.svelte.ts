@@ -2203,6 +2203,15 @@ export class CoderPanelState {
 		}
 	}
 
+	#background = new Set<string>();
+
+	/** Session `id` is driven from elsewhere (a pull request tab):
+	 *  its first events must not make it the panel's session. Opening
+	 *  it from the sessions list still does. */
+	keepInBackground(id: string): void {
+		this.#background.add(id);
+	}
+
 	/** Open a persisted session by id. The backend emits
 	 *  `session_loaded` + per-record replay events on the
 	 *  `coder:event` channel; we just rebind the visible-session
@@ -4097,7 +4106,10 @@ export class CoderPanelState {
 				// `sessionStateFor`. For a worker, they land in the
 				// worker's own bucket without disturbing the
 				// coordinator's view.
-				if (!isWorker) {
+				// A session worked from somewhere else (a pull
+				// request's agent) doesn't take the panel either.
+				const elsewhere = isWorker || this.#background.has(event.id);
+				if (!elsewhere) {
 					folder.visibleSessionId = event.id;
 				}
 				// Reopening a session that's already on screen (a
@@ -4127,7 +4139,7 @@ export class CoderPanelState {
 					worktree_branch: event.worktree_branch ?? null,
 					committed_branch: event.committed_branch ?? null,
 				};
-				if (!isWorker) {
+				if (!elsewhere) {
 					folder.view = 'session';
 				}
 				return;

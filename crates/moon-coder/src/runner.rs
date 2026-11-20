@@ -2525,8 +2525,9 @@ impl CoderHandle {
 	}
 
 	/// Mint a session that works in the bound folder at `folder_path`
-	/// and make it the visible one (ADR 0124): the agent a pull
-	/// request is reviewed with, in the checkout of its branch. A
+	/// (ADR 0124): the agent a pull request is reviewed with, in the
+	/// checkout of its branch. It is talked to from the pull request's
+	/// tab, so the session the user has open stays the visible one. A
 	/// worktree folder gets the worktree routing; a project folder is
 	/// an ordinary session there.
 	pub async fn create_session_in_folder(&self, folder_path: &str) -> Result<SessionSummary, CoderError> {
@@ -2545,9 +2546,7 @@ impl CoderHandle {
 		}
 		let summary = blank.summary();
 		let id = blank.header.id.clone();
-		fs.insert_runtime(id.clone(), Arc::new(SessionRuntime::new(blank)))
-			.await;
-		fs.set_visible(id).await;
+		fs.insert_runtime(id, Arc::new(SessionRuntime::new(blank))).await;
 		Ok(summary)
 	}
 

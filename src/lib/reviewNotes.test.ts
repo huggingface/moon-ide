@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { addNote, askAt, dismiss, explainPrompt, replyPrompt, settle, type NoteThread } from './reviewNotes';
+import {
+	aboutLabel,
+	addNote,
+	askAt,
+	dismiss,
+	explainPrompt,
+	replyPrompt,
+	settle,
+	talkPrompt,
+	type NoteThread,
+} from './reviewNotes';
 
 const A = { path: 'src/a.ts', side: 'working', line: 10 } as const;
 const B = { path: 'src/b.ts', side: 'working', line: 3 } as const;
@@ -51,5 +61,29 @@ describe('review notes', () => {
 		expect(explainPrompt(pr, 'src/a.ts', null)).toContain('the first changed line');
 		const thread = addNote([], A, 'a')[0];
 		expect(thread && replyPrompt(thread, 'Why?')).toContain('`src/a.ts` line 10: Why?');
+	});
+});
+
+describe('asking from the pull request tab', () => {
+	const pr = { number: 7, title: 'Jitter the reset' };
+
+	it('quotes what the question is about', () => {
+		const prompt = talkPrompt(pr, 'why seconds?', {
+			kind: 'comment',
+			author: 'alex',
+			body: 'more granular than seconds\nplease',
+			url: 'https://example.test/c1',
+		});
+		expect(prompt).toContain('#7 (Jitter the reset)');
+		expect(prompt).toContain('why seconds?');
+		expect(prompt).toContain('by alex (https://example.test/c1)');
+		expect(prompt).toContain('> more granular than seconds\n> please');
+	});
+
+	it('labels the card with what it was about', () => {
+		expect(aboutLabel({ kind: 'thread', path: 'src/a.ts', line: 12, author: 'sam', body: '' })).toBe(
+			"About sam's thread on src/a.ts:12",
+		);
+		expect(aboutLabel({ kind: 'comment', author: null, body: '', url: '' })).toBe("About someone's comment");
 	});
 });

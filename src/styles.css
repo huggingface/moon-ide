@@ -1164,3 +1164,10 @@ button:focus-visible {
 	background-color: rgba(255, 167, 38, 0.7);
 	color: #11151f;
 }
+
+/* The PR tab's find: its current hit on a removed line of a unified
+   diff, which lies outside the editor's text (`prFind.ts`). Same
+   colour as the editor's selected search match. */
+::highlight(pr-find-removed) {
+	background-color: rgba(240, 184, 110, 0.45);
+}

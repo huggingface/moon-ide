@@ -46,13 +46,25 @@
 	import { formatError, type ReviewEvent } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
 	import { statusColor } from '../fileIcon';
-	import { explainPrompt, replyPrompt, type FileNotes, type NotePlace } from '../reviewNotes';
+	import {
+		aboutLabel,
+		explainPrompt,
+		replyPrompt,
+		talkPrompt,
+		type FileNotes,
+		type NotePlace,
+		type TalkAbout,
+	} from '../reviewNotes';
 	import { reviewNotes } from '../reviewNotes.svelte';
 	import { parsePrPath } from '../util/prPath';
 	import CommitSection from './CommitSection.svelte';
 	import DiffStat from './DiffStat.svelte';
 	import FileIcon from './FileIcon.svelte';
 	import TabTitle from './TabTitle.svelte';
+	import { repoUrlOf } from '../githubMarkdown';
+	import { diff as lineDiff } from '@codemirror/merge';
+	import { findInFiles, removedLines, type FindFile, type FindHit } from '../prFind';
+	import PrAgentTalk from './PrAgentTalk.svelte';
 	import PullRequestPanel from './PullRequestPanel.svelte';
 	import CheckIcon from './icons/CheckIcon.svelte';
 
@@ -357,6 +369,180 @@
 		};
 	});
 
+	// Find across the files (Ctrl+F): the text of every file is read
+	// once per head commit, searched here, and each section shows its
+	// own hits. An editor's own search only knows its file, and not
+	// the lines folded away or the files not loaded yet.
+	const findShows = new Map<string, (hits: FindHit[], current: number) => Promise<void>>();
+	let findOpen = $state(false);
+	let findQuery = $state('');
+	let findCase = $state(false);
+	let findHits = $state.raw<FindHit[]>([]);
+	let findIndex = $state(-1);
+	let findLoading = $state(false);
+	let findInput = $state<HTMLInputElement | null>(null);
+	let findTexts: { sha: string; files: Promise<FindFile[]> } | null = null;
+	let markedPaths = new Set<string>();
+
+	function registerFind(path: string, show: ((hits: FindHit[], current: number) => Promise<void>) | null) {
+		if (show === null) {
+			findShows.delete(path);
+			return;
+		}
+		findShows.set(path, show);
+	}
+
+	async function readOne(rev: string, path: string): Promise<string> {
+		if (rev === '') {
+			return '';
+		}
+		try {
+			return (await ipc.fs.gitRefContent(rev, path, folder ?? undefined)) ?? '';
+		} catch {
+			return '';
+		}
+	}
+
+	function findFiles(): Promise<FindFile[]> {
+		const current = detail;
+		const changes = diff;
+		if (current === null || changes === null) {
+			return Promise.resolve([]);
+		}
+		const sha = `${changes.mergeBase}..${current.headSha}`;
+		if (findTexts?.sha === sha) {
+			return findTexts.files;
+		}
+		const list = changes.files;
+		const read = async (): Promise<FindFile[]> => {
+			const out: FindFile[] = [];
+			// A few at a time: a large pull request is hundreds of reads.
+			for (let start = 0; start < list.length; start += 8) {
+				const batch = await Promise.all(
+					list.slice(start, start + 8).map(async (file) => {
+						const [base, after] = await Promise.all([
+							readOne(changes.mergeBase, file.path),
+							readOne(current.headSha, file.path),
+						]);
+						return { path: file.path, base, after, removed: removedLines(base, after, lineDiff(base, after)) };
+					}),
+				);
+				out.push(...batch);
+			}
+			return out;
+		};
+		findTexts = { sha, files: read() };
+		return findTexts.files;
+	}
+
+	async function openFind() {
+		const picked = window.getSelection()?.toString() ?? '';
+		if (picked !== '' && !picked.includes('\n')) {
+			findQuery = picked;
+		}
+		findOpen = true;
+		await tick();
+		findInput?.focus();
+		findInput?.select();
+	}
+
+	function clearMarks() {
+		for (const path of markedPaths) {
+			void findShows.get(path)?.([], -1);
+		}
+		markedPaths = new Set();
+	}
+
+	function closeFind() {
+		findOpen = false;
+		clearMarks();
+		findHits = [];
+		findIndex = -1;
+		scroller?.focus();
+	}
+
+	let findSearchToken = 0;
+	$effect(() => {
+		const query = findQuery;
+		const caseSensitive = findCase;
+		const open = findOpen;
+		void diff;
+		if (!open) {
+			return;
+		}
+		const token = ++findSearchToken;
+		const timer = setTimeout(() => {
+			findLoading = true;
+			void findFiles().then((texts) => {
+				if (token !== findSearchToken) {
+					return;
+				}
+				findLoading = false;
+				findHits = findInFiles(texts, query, caseSensitive);
+				clearMarks();
+				findIndex = -1;
+				if (findHits.length > 0) {
+					void showHit(0);
+				}
+			});
+		}, 150);
+		return () => clearTimeout(timer);
+	});
+
+	async function showHit(index: number) {
+		const hit = findHits[index];
+		if (hit === undefined) {
+			return;
+		}
+		findIndex = index;
+		const file = files.find((one) => one.path === hit.path);
+		if (file !== undefined && isCollapsed(file)) {
+			folded[hit.path] = false;
+			await tick();
+		}
+		const inFile = findHits.filter((one) => one.path === hit.path);
+		for (const path of markedPaths) {
+			if (path !== hit.path) {
+				void findShows.get(path)?.([], -1);
+			}
+		}
+		markedPaths = new Set([hit.path]);
+		setActive(hit.path);
+		await findShows.get(hit.path)?.(inFile, inFile.indexOf(hit));
+	}
+
+	function stepFind(delta: 1 | -1) {
+		if (findHits.length === 0) {
+			return;
+		}
+		void showHit((findIndex + delta + findHits.length) % findHits.length);
+	}
+
+	function onFindKeydown(event: KeyboardEvent) {
+		if (event.key === 'Enter') {
+			event.preventDefault();
+			stepFind(event.shiftKey ? -1 : 1);
+			return;
+		}
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			closeFind();
+		}
+	}
+
+	// Ahead of the diff editors' own Ctrl+F.
+	function onKeydownCapture(event: KeyboardEvent) {
+		if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey || event.key.toLowerCase() !== 'f') {
+			return;
+		}
+		if (diff === null || files.length === 0) {
+			return;
+		}
+		event.preventDefault();
+		event.stopPropagation();
+		void openFind();
+	}
+
 	function registerSection(path: string, el: HTMLElement | null) {
 		if (el === null) {
 			sectionEls.delete(path);
@@ -468,8 +654,8 @@
 
 	let startingAgent = $state(false);
 	/** The session to ask, started (with its checkout) when there is
-	 *  none. The pull request's project becomes the active one, since
-	 *  that is where the session shows; this tab comes along. */
+	 *  none. It is talked to from here: the coder panel keeps the
+	 *  session and project the user has open. */
 	async function ensureAgent(): Promise<{ sessionId: string; root: string } | null> {
 		if (agent !== undefined) {
 			return agent;
@@ -479,12 +665,6 @@
 		}
 		startingAgent = true;
 		try {
-			if (workspace.activeProjectPath !== folder) {
-				await workspace.setActiveFolder(folder);
-				if (workspace.activeProjectPath !== folder) {
-					return null;
-				}
-			}
 			const session = await workspace.newCoderReviewSession(folder, detail.headRef);
 			if (session === null) {
 				return null;
@@ -517,6 +697,32 @@
 		}
 	}
 
+	const talk = $derived(reviewNotes.talkFor(tabPath));
+	let askingAbout = $state<TalkAbout | null>(null);
+
+	/** A question typed in the tab: the answer is the turn's reply,
+	 *  shown here as a comment. */
+	async function askFromTab(question: string) {
+		const current = detail;
+		const tab = tabPath;
+		if (current === null || tab === null) {
+			return;
+		}
+		const about = askingAbout;
+		askingAbout = null;
+		const target = await ensureAgent();
+		if (target === null) {
+			return;
+		}
+		reviewNotes.askFromTab(tab, target.sessionId, question, about === null ? null : aboutLabel(about));
+		try {
+			await ipc.coder.send(talkPrompt(current, question, about), [], target.sessionId);
+		} catch (err) {
+			reviewNotes.failTalk(tab, target.sessionId, `Could not reach the agent: ${formatError(err)}`);
+			reviewNotes.forgetAgent(tab);
+		}
+	}
+
 	function notesFor(path: string): FileNotes | undefined {
 		const current = detail;
 		if (current === null || current.isCrossRepository) {
@@ -542,7 +748,40 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions (j / k / v move through the files; every control they reach is also a button) -->
-<div class="pr-view" bind:clientWidth={width} onkeydown={onKeydown}>
+<div class="pr-view" bind:clientWidth={width} onkeydown={onKeydown} onkeydowncapture={onKeydownCapture}>
+	{#if findOpen}
+		<div class="find" role="search">
+			<input
+				bind:this={findInput}
+				bind:value={findQuery}
+				placeholder="Find in the changed files"
+				spellcheck="false"
+				onkeydown={onFindKeydown}
+			/>
+			<button
+				type="button"
+				class="find-btn"
+				class:on={findCase}
+				aria-pressed={findCase}
+				title="Match case"
+				onclick={() => (findCase = !findCase)}>Aa</button
+			>
+			<span class="find-count">
+				{#if findLoading}
+					reading…
+				{:else if findQuery === ''}
+					&nbsp;
+				{:else if findHits.length === 0}
+					no results
+				{:else}
+					{findIndex + 1} / {findHits.length}
+				{/if}
+			</span>
+			<button type="button" class="find-btn" title="Previous (Shift+Enter)" onclick={() => stepFind(-1)}>↑</button>
+			<button type="button" class="find-btn" title="Next (Enter)" onclick={() => stepFind(1)}>↓</button>
+			<button type="button" class="find-btn" title="Close (Escape)" onclick={closeFind}>×</button>
+		</div>
+	{/if}
 	{#if railShown && detail !== null}
 		<nav class="rail" class:floating={!docked} aria-label="Files changed">
 			<div class="rail-head">
@@ -655,6 +894,16 @@
 				refreshing={loading}
 				onJump={(path) => void jumpTo(path)}
 				onRefresh={load}
+				onAsk={detail.isCrossRepository ? undefined : (about) => (askingAbout = about)}
+			/>
+			<PrAgentTalk
+				{talk}
+				repoUrl={repoUrlOf(detail.url)}
+				about={askingAbout}
+				onClearAbout={() => (askingAbout = null)}
+				onAsk={(question) => void askFromTab(question)}
+				unavailable={detail.isCrossRepository ? FORK_TITLE : null}
+				starting={startingAgent}
 			/>
 			{#if diff === null}
 				<div class="empty" class:error={diffError !== ''}>
@@ -681,6 +930,7 @@
 							folderPath={folder ?? undefined}
 							notes={notesFor(entry.path)}
 							{registerSection}
+							{registerFind}
 							{side}
 						/>
 					{/each}
@@ -762,6 +1012,56 @@
 {/if}
 
 <style>
+	.find {
+		position: absolute;
+		top: calc(37px + var(--m-space-2));
+		right: var(--m-space-4);
+		z-index: 6;
+		display: flex;
+		align-items: center;
+		gap: var(--m-space-1);
+		padding: var(--m-space-1) var(--m-space-2);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg-1);
+		box-shadow: var(--m-shadow-pop);
+		font-size: var(--m-text-sm);
+	}
+	.find input {
+		width: 240px;
+		padding: 3px 6px;
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-sm);
+		background: var(--m-bg);
+		color: var(--m-fg);
+		font: inherit;
+	}
+	.find input:focus {
+		outline: none;
+		border-color: var(--m-accent);
+	}
+	.find-count {
+		min-width: 64px;
+		color: var(--m-fg-subtle);
+		text-align: center;
+		font-variant-numeric: tabular-nums;
+	}
+	.find-btn {
+		min-width: 24px;
+		height: 24px;
+		padding: 0 4px;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-fg-muted);
+		font: inherit;
+		cursor: pointer;
+	}
+	.find-btn:hover,
+	.find-btn.on {
+		background: var(--m-bg-3);
+		color: var(--m-fg);
+	}
 	.pr-view {
 		position: relative;
 		flex: 1;

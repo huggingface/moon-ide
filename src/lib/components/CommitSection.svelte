@@ -16,7 +16,8 @@
 	import { diffPureChangeExtension } from '../editor/diffPureChange';
 	import { diffGutterTintExtension } from '../editor/diffGutterTint';
 	import { diffBlockAlign } from '../editor/diffBlockAlign';
-	import { collapsedLines, diffCollapse, diffCollapseAsk, restoreCollapsed } from '../editor/diffCollapse';
+	import { collapsedLines, diffCollapse, diffCollapseAsk, restoreCollapsed, revealLines } from '../editor/diffCollapse';
+	import { findMarks, markRemovedHit, setFindMarks, type FindHit } from '../prFind';
 	import { effectiveDiffLayout, gutterDigits } from '../editor/diffLayout';
 	import { wireHorizontalScrollSync } from '../editor/hScrollSync';
 	import { annotationsFor, PrAnnotationWiring, type PrAnnotation } from '../editor/prAnnotations';
@@ -56,6 +57,11 @@
 		// The agent's notes on this file and the ways to ask it more
 		// (ADR 0124). Absent where there is no agent to ask.
 		notes?: FileNotes | undefined;
+		// The PR tab's find across files: hands it the way to show
+		// this file's hits.
+		registerFind?:
+			| ((path: string, show: ((hits: FindHit[], current: number) => Promise<void>) | null) => void)
+			| undefined;
 	};
 
 	let {
@@ -70,6 +76,7 @@
 		outline,
 		folderPath,
 		notes,
+		registerFind,
 	}: Props = $props();
 
 	const collapsed = $derived(outline?.collapsed ?? false);
@@ -256,6 +263,7 @@
 			diffPureChangeExtension,
 			highlightSelectionMatches(),
 			searchAsYouType(),
+			findMarks(),
 			highlightTabs(),
 			(isA ? themeA : themeB).of(moonEditorTheme(workspace.effectiveTheme)),
 			(isA ? langA : langB).of(lang),
@@ -331,6 +339,70 @@
 			merge = view;
 		}
 		builtLayout = next;
+	}
+
+	/** Marks this file's `hits` and brings `hits[current]` into view,
+	 *  opening the diff and the collapsed lines it is in. No hits
+	 *  clears the marks. */
+	async function showFind(hits: FindHit[], current: number): Promise<void> {
+		if (hits.length === 0) {
+			merge?.a.dispatch({ effects: setFindMarks.of(null) });
+			paneB?.dispatch({ effects: setFindMarks.of(null) });
+			if (unified !== undefined) {
+				markRemovedHit(unified, null);
+			}
+			return;
+		}
+		inView = true;
+		// The editors are built once the file's text is in.
+		for (let waited = 0; waited < 100; waited++) {
+			if (paneB !== undefined) {
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		const b = paneB;
+		if (b === undefined) {
+			return;
+		}
+		const a = merge?.a;
+		const hit = hits[current];
+		if (hit !== undefined) {
+			const line = hit.side === 'b' ? hit.line : hit.anchor;
+			restoreCollapsed(b, revealLines(collapsedLines(b.state), { from: line, to: line }));
+		}
+		const marksFor = (view: EditorView, pane: 'a' | 'b') => {
+			const shown = hits.filter((one) => one.side === pane);
+			const ranges = shown.map((one) => {
+				const line = view.state.doc.line(Math.min(one.line, view.state.doc.lines));
+				return { from: line.from + one.from, to: Math.min(line.to, line.from + one.to) };
+			});
+			view.dispatch({ effects: setFindMarks.of({ ranges, current: hit === undefined ? -1 : shown.indexOf(hit) }) });
+		};
+		marksFor(b, 'b');
+		if (a !== undefined) {
+			marksFor(a, 'a');
+		}
+		if (hit === undefined) {
+			return;
+		}
+		// After the reveal has been laid out.
+		await new Promise((resolve) => requestAnimationFrame(resolve));
+		const target = hit.side === 'a' && a !== undefined ? a : b;
+		const lineNo = target === b ? (hit.side === 'b' ? hit.line : hit.anchor) : hit.line;
+		const line = target.state.doc.line(Math.min(Math.max(lineNo, 1), target.state.doc.lines));
+		const pos = target === b && hit.side === 'a' ? line.from : Math.min(line.to, line.from + hit.from);
+		// From the left edge, so a hit near the start of its line doesn't
+		// show where the previous one, further right, left the pane.
+		target.scrollDOM.scrollLeft = 0;
+		target.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'center' }) });
+		if (unified !== undefined) {
+			const removedLine = markRemovedHit(unified, hit.side === 'a' ? hit : null);
+			if (removedLine !== null) {
+				await new Promise((resolve) => requestAnimationFrame(resolve));
+				removedLine.scrollIntoView({ block: 'center' });
+			}
+		}
 	}
 
 	function destroyViews() {
@@ -493,6 +565,7 @@
 
 	onMount(() => {
 		registerSection(path, sectionEl ?? null);
+		registerFind?.(path, showFind);
 		// A frame later, not inside the callback: crossing the narrow
 		// threshold rebuilds the editors, and resizing observed
 		// elements from their own callback is a "ResizeObserver loop"
@@ -533,6 +606,7 @@
 			resize.disconnect();
 			cancelAnimationFrame(frame);
 			registerSection(path, null);
+			registerFind?.(path, null);
 			buildToken++;
 			destroyViews();
 			clearOurSelection();
