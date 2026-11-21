@@ -11,6 +11,7 @@
 	import { workspace } from '../state.svelte';
 	import { openLightbox } from '../imageLightbox.svelte';
 	import { visibleOnce } from '../actions/visibleOnce';
+	import { mountHtmlPreviews } from '../htmlPreview';
 
 	/** `breaks`: single newlines are line breaks — for user-typed
 	 *  text, which isn't written as markdown paragraphs. */
@@ -49,6 +50,7 @@
 		void blocks;
 		if (article !== undefined) {
 			void resolveCoderImages(article);
+			mountHtmlPreviews(article, openPreviewLink);
 		}
 	});
 
@@ -146,6 +148,18 @@
 	 *     no document; the model nearly always names files
 	 *     workspace-relative anyway (`src/foo.rs`).
 	 */
+	/** A link clicked in an HTML preview: external ones open outside,
+	 *  anything else is a workspace path. */
+	function openPreviewLink(href: string) {
+		if (openExternalMarkdownLink(href)) {
+			return;
+		}
+		const stripped = href.replace(/^\/+/, '').split('?')[0]?.split('#')[0] ?? '';
+		if (stripped !== '') {
+			void workspace.openFile(stripped);
+		}
+	}
+
 	function onArticleClick(event: MouseEvent) {
 		const target = event.target;
 		if (!(target instanceof HTMLElement)) {
@@ -250,6 +264,28 @@
 	.coder-md :global(pre) {
 		max-width: 100%;
 		overflow: auto;
+	}
+	.coder-md :global(.md-html-preview) {
+		margin: 6px 0 0;
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg);
+		overflow: hidden;
+	}
+	.coder-md :global(.md-html-preview iframe) {
+		display: block;
+		width: 100%;
+		height: 120px;
+		border: none;
+	}
+	.coder-md :global(.md-html-source) {
+		margin: 2px 0 6px;
+	}
+	.coder-md :global(.md-html-source > summary) {
+		width: fit-content;
+		color: var(--m-fg-subtle);
+		font-size: var(--m-text-xs);
+		cursor: pointer;
 	}
 	/* The transcript's own skin over the shared rules: in a
 	   conversation, blocks are set apart by surface and space, so

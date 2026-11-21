@@ -2093,6 +2093,12 @@ copy is shown instead. The system prompt tells the model to
 show screenshots and generated images this way rather than only
 naming the path.
 
+A fence tagged `html preview` in an agent's reply is drawn as a
+sandboxed frame with its source folded under it: no script runs and
+nothing loads from the network; the IDE's theme variables are passed
+in. Plain `html` fences stay code, and the user's own messages never
+draw. See [ADR 0127](decisions/0127-html-previews-in-the-transcript.md).
+
 The pop-out has a composer (`coder_continue_subagent`) with two
 behaviours keyed off the run state:
 

@@ -401,8 +401,58 @@ function applyFenceCopyRule(parser: MarkdownIt): void {
 	};
 }
 
+/** The fence info that asks for a rendered preview. Plain `html`
+ *  stays code: an agent quotes HTML far more often than it draws. */
+const HTML_PREVIEW_INFO = /^html\s+preview\b/;
+
+/** The preview's HTML as the slot carries it: base64, so the
+ *  sanitiser, which strips markup out of attributes, leaves it be. */
+function encodePreview(html: string): string {
+	let binary = '';
+	for (const byte of new TextEncoder().encode(html)) {
+		binary += String.fromCharCode(byte);
+	}
+	return btoa(binary);
+}
+
+/** Is `info` the fence info of an HTML preview? */
+export function isHtmlPreviewInfo(info: string): boolean {
+	return HTML_PREVIEW_INFO.test(info.trim());
+}
+
+/** A fence the agent wrote as `html preview` (ADR 0127): a slot the
+ *  transcript fills with a sandboxed frame (`htmlPreview.ts`), and
+ *  the source under it, folded. Only once the fence is closed: while
+ *  it streams it is code, so the frame isn't rebuilt on every delta.
+ *  `env.blockText` is the block's source, from the block renderer. */
+function applyHtmlPreviewRule(parser: MarkdownIt): void {
+	const fence = parser.renderer.rules.fence;
+	if (fence === undefined) {
+		return;
+	}
+	parser.renderer.rules.fence = (tokens, idx, options, env, self) => {
+		const code = fence(tokens, idx, options, env, self);
+		const token = tokens[idx];
+		const blockText: unknown = env !== null && typeof env === 'object' ? Reflect.get(env, 'blockText') : undefined;
+		if (token === undefined || !isHtmlPreviewInfo(token.info) || typeof blockText !== 'string') {
+			return code;
+		}
+		const lines = blockText.trimEnd().split('\n');
+		const closed = lines.length > 1 && (lines.at(-1) ?? '').trim().startsWith(token.markup);
+		if (!closed) {
+			return code;
+		}
+		return (
+			`<div class="md-html-preview" data-html="${encodePreview(token.content)}"></div>` +
+			`<details class="md-html-source"><summary>Source</summary>${code}</details>`
+		);
+	};
+}
+
 const md = buildMarkdownIt(false);
 const mdLinkified = buildMarkdownIt(true);
+// The agent's replies; the user's own text (below) is never drawn.
+applyHtmlPreviewRule(mdLinkified);
 // User-typed chat text: a single newline is a line break, as typed.
 const mdLinkifiedBreaks = buildMarkdownIt(true, true);
 // Text written on GitHub (PR descriptions, review comments): raw HTML
@@ -913,7 +963,7 @@ function renderBlock(
 	if (cached !== undefined) {
 		return { key, html: cached };
 	}
-	const raw = parser.renderer.render(tokens, parser.options, {});
+	const raw = parser.renderer.render(tokens, parser.options, { blockText: sourceText });
 	const sanitised = DOMPurify.sanitize(raw, {
 		ALLOW_UNKNOWN_PROTOCOLS: false,
 		RETURN_TRUSTED_TYPE: false,
