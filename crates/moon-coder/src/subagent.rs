@@ -1322,6 +1322,11 @@ async fn run_subagent_loop(
 				Err(err) => (json!({ "error": err.to_string() }).to_string(), true, Vec::new()),
 			};
 			let payload: Value = serde_json::from_str(&content).unwrap_or_else(|_| Value::String(content.clone()));
+			let for_model = if is_error {
+				content.clone()
+			} else {
+				crate::tool_text::for_model(Some(&call.function.name), &payload)
+			};
 			sink.send(wrap_inner(
 				&id,
 				CoderEvent::ToolResult {
@@ -1334,7 +1339,7 @@ async fn run_subagent_loop(
 			messages.push(ChatMessage::Tool {
 				tool_call_id: call.id.clone(),
 				tool_name: Some(call.function.name.clone()),
-				content: content.clone(),
+				content: for_model,
 				images: images.clone(),
 			});
 			persist_subagent(

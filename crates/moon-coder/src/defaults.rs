@@ -242,7 +242,7 @@ A sub-agent does **not** see your conversation history; describe the task self-c
 
 - `read_file` returns each line prefixed with `<line_number>|<line>`. The prefix is metadata, not part of the file — strip it before quoting content back to the user or feeding it to `edit_file`'s `find`.
 - For large files, pass `start_line` / `end_line` to read just the slice you need. `grep` results give you exact line numbers, so a typical workflow is `grep` → `read_file` with a range around the match → `edit_file`.
-- A response with `truncated: true` means you hit the byte cap; ask for a narrower range.
+- A result ending in `[truncated …]` hit the size cap; ask for a narrower range.
 
 ## Editing rules
 

@@ -41,6 +41,7 @@ pub mod slack;
 pub mod subagent;
 mod terminal_context;
 pub mod todo;
+pub mod tool_text;
 pub mod tools;
 pub mod web;
 pub mod worktree_tool;

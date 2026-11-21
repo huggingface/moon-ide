@@ -3616,14 +3616,11 @@ impl CoderHandle {
 					duration_ms: _,
 					images,
 				} => {
+					let tool_name = (!tool_name.is_empty()).then(|| tool_name.clone());
 					messages.push(ChatMessage::Tool {
 						tool_call_id: tool_call_id.clone(),
-						tool_name: if tool_name.is_empty() {
-							None
-						} else {
-							Some(tool_name.clone())
-						},
-						content: content.clone(),
+						content: crate::tool_text::for_model_from_stored(tool_name.as_deref(), content),
+						tool_name,
 						images: images.clone(),
 					});
 				}
@@ -10590,14 +10587,17 @@ async fn emit_tool_result(
 			// projection. The panel event keeps the full value;
 			// the UI renders what it wants.
 			let (images, text_value) = split_tool_images(value.clone());
-			let content = text_value.to_string();
+			// The session file keeps JSON, which a reopened transcript
+			// renders from; the model reads `tool_text`'s projection.
+			let stored = text_value.to_string();
+			let content = crate::tool_text::for_model(Some(tool_name), &text_value);
 			sink.send(CoderEvent::ToolResult {
 				id: tool_call_id.to_string(),
 				result: value,
 				is_error: false,
 				duration_ms,
 			});
-			persist_tool_record(rt, tool_call_id, tool_name, &content, duration_ms, &images).await;
+			persist_tool_record(rt, tool_call_id, tool_name, &stored, duration_ms, &images).await;
 			Ok(ChatMessage::Tool {
 				tool_call_id: tool_call_id.to_string(),
 				tool_name: Some(tool_name.to_string()),

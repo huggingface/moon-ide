@@ -742,6 +742,16 @@ the workspace has no enabled servers, and neither is mode-gated
   (`/workspace/<folder>/…`) are rewritten to host paths before the
   model sees them, for every bound folder's mount, so a reported
   screenshot path feeds straight into `read_file`.
+- **`bash` and `read_file` results reach the model as plain text**
+  (`tool_text.rs`): the output as printed, stderr under `[stderr]`,
+  then `[exit code N, on host]`; a file's numbered lines, then
+  `[lines a-b of n]` / `[truncated …]` when they apply. As JSON every
+  newline and quote was escaped, which cost tokens on every later
+  call. Other results, and these in a shape not recognised, stay
+  JSON. The session file keeps JSON (a reopened transcript renders
+  from it); the text is derived when the history is rebuilt.
+  Compaction's transcript indents tool lines starting with `#` so
+  output can't pass for a `### user` turn.
 - **Tool-result images are first-class.** MCP `image` content
   blocks (screenshots) and `read_file` on an image file (png /
   jpg / gif / webp, ≤ 3 MB) both reach the model as typed image
