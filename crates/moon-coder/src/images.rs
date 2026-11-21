@@ -416,6 +416,15 @@ pub(crate) fn webp_to_png(webp_bytes: &[u8]) -> Option<Vec<u8>> {
 /// Convert an attachment whose mime is `image/webp` back to PNG,
 /// for replaying histories captured while the webp re-encode was on.
 /// Anything else passes through unchanged.
+/// A stored image as the model is sent it: histories captured while
+/// the webp re-encode was on hold webp payloads that strict vision
+/// loaders (Kimi K3) 400 on, so they go back to PNG, and anything
+/// over the edge cap is scaled down. Decoding is the cost, so this
+/// runs on the history the model gets, not on every load.
+pub(crate) fn for_model(attachment: ImageAttachment) -> ImageAttachment {
+	fit_attachment(webp_attachment_to_png(attachment))
+}
+
 pub(crate) fn webp_attachment_to_png(attachment: ImageAttachment) -> ImageAttachment {
 	if attachment.mime != "image/webp" {
 		return attachment;
@@ -540,6 +549,31 @@ mod tests {
 			pixels.as_slice(),
 			"lossless re-encode must be pixel-identical"
 		);
+	}
+
+	#[test]
+	fn stored_images_load_as_stored_and_reach_the_model_as_png() {
+		let (png, _) = sample_png(64, 64);
+		let webp_att = attachment_from_bytes(&png, PNG_MIME);
+		let payload = webp_att.data_url.split_once(";base64,").unwrap().1;
+		let row = serde_json::json!({
+			"type": "message",
+			"message": {
+				"role": "toolResult",
+				"toolCallId": "c1",
+				"toolName": "read_file",
+				"content": [{ "type": "image", "data": payload, "mimeType": "image/webp" }],
+			},
+		});
+		// Loading doesn't decode: a long session holds many of these.
+		let records = crate::sessions::pi_wire_to_records(&row);
+		let crate::sessions::SessionRecord::Tool { images, .. } = &records[0] else {
+			panic!("expected a tool record");
+		};
+		assert_eq!(images[0], webp_att);
+		let sent = for_model(images[0].clone());
+		assert_eq!(sent.mime, PNG_MIME);
+		assert!(sent.data_url.starts_with("data:image/png;base64,"));
 	}
 
 	#[test]

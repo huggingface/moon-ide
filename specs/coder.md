@@ -1257,7 +1257,17 @@ Mapping notes (details live in `sessions.rs`):
   in-memory `messages` slice on reload — an error ended the turn, so
   it isn't history the next turn sends.
 - Image attachments split the data-URL into pi's `data` + `mimeType`
-  on write and re-prefix on load.
+  on write and re-prefix on load. Load keeps them as stored; the
+  WebP-to-PNG and edge-cap pass runs on the history rebuilt for the
+  model (what compaction left), not on every image of the
+  transcript, which made a long session with screenshots take
+  seconds to open or revert.
+- **The file is only appended to**, except by revert / resume, which
+  cut it. A header change (bash-target override, worktree attached
+  or cleared) is a `moon_header` row carrying the whole header; the
+  last one wins over line 1 on load, and the summary trailer carries
+  the header too so its fast path doesn't read a stale line 1. A
+  revert rewrites line 1 with the current header.
 
 The header carries pi-required keys plus our extras; pi's schemas
 tolerate unknown keys. The system prompt isn't persisted — reopening
@@ -1274,7 +1284,8 @@ header-only read is wrong and a full read is O(transcript bytes
 parsed) per session per refresh. The structural fix is a
 `SummaryState` record (`moon_summary`) appended **when a turn
 settles** (complete / abort / error, plus the auto-rename's
-`TitleUpdate`), carrying the fold plus a `bytes_len` anchor: the
+`TitleUpdate`), carrying the fold, the current header and a
+`bytes_len` anchor: the
 file's byte length at the moment the record was written (a
 self-reference the writer converges with a small fixpoint over the
 JSON digit count). `load_summary` reads an 8 KiB tail window and

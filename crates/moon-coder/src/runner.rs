@@ -2636,7 +2636,7 @@ impl CoderHandle {
 		// driving a browser in the *old* environment is worse.
 		self.state.tools.mcp().drop_all_connections().await;
 		if let Some(dir) = session_dir {
-			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+			if let Err(err) = sessions::append_header(&dir, &header).await {
 				tracing::warn!(?err, "failed to persist bash_target_override header rewrite");
 			}
 		}
@@ -2656,7 +2656,7 @@ impl CoderHandle {
 			(session.session_dir.clone(), session.header.clone())
 		};
 		if let Some(dir) = session_dir {
-			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+			if let Err(err) = sessions::append_header(&dir, &header).await {
 				tracing::warn!(?err, "failed to persist reasoning_effort header rewrite");
 			}
 		}
@@ -2679,7 +2679,7 @@ impl CoderHandle {
 			(session.session_dir.clone(), session.header.clone())
 		};
 		if let Some(dir) = session_dir {
-			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+			if let Err(err) = sessions::append_header(&dir, &header).await {
 				tracing::warn!(?err, "failed to persist model_override header rewrite");
 			}
 		}
@@ -2716,7 +2716,7 @@ impl CoderHandle {
 			(session.session_dir.clone(), session.summary(), session.header.clone())
 		};
 		if let Some(dir) = session_dir {
-			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+			if let Err(err) = sessions::append_header(&dir, &header).await {
 				tracing::warn!(?err, "failed to persist committed_branch header rewrite");
 			}
 		}
@@ -2758,7 +2758,7 @@ impl CoderHandle {
 			(session.session_dir.clone(), session.summary(), session.header.clone())
 		};
 		if let Some(dir) = session_dir {
-			if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+			if let Err(err) = sessions::append_header(&dir, &header).await {
 				tracing::warn!(?err, "failed to persist worktree-move header rewrite");
 			}
 		}
@@ -2900,7 +2900,7 @@ impl CoderHandle {
 					}
 				};
 				if let Some(dir) = session_dir {
-					if let Err(err) = sessions::rewrite_header(&dir, &needs_clear).await {
+					if let Err(err) = sessions::append_header(&dir, &needs_clear).await {
 						tracing::warn!(?err, "failed to clear worktree routing on session");
 					}
 				}
@@ -3660,6 +3660,15 @@ impl CoderHandle {
 				// SummaryState indexes the sessions list — never chat
 				// history.
 				SessionRecord::SummaryState { .. } => {}
+			}
+		}
+		// What compaction left is what the model is sent.
+		for message in &mut messages {
+			if let ChatMessage::User { images, .. } | ChatMessage::Tool { images, .. } = message {
+				*images = std::mem::take(images)
+					.into_iter()
+					.map(crate::images::for_model)
+					.collect();
 			}
 		}
 		RebuiltMessages {
@@ -5769,7 +5778,7 @@ impl CoderHandle {
 			)
 		};
 		if let Some(dir) = worker_dir {
-			if let Err(err) = sessions::rewrite_header(&dir, &worker_header).await {
+			if let Err(err) = sessions::append_header(&dir, &worker_header).await {
 				tracing::warn!(?err, worker_id, "attach: failed to persist worker header rewrite");
 			}
 		}
@@ -6290,7 +6299,7 @@ async fn handle_enter_worktree(
 		)
 	};
 	if let Some(dir) = session_dir {
-		if let Err(err) = sessions::rewrite_header(&dir, &header).await {
+		if let Err(err) = sessions::append_header(&dir, &header).await {
 			tracing::warn!(?err, "failed to persist enter_worktree header rewrite");
 		}
 	}

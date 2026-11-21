@@ -253,6 +253,11 @@ const PI_MESSAGE_TYPE: &str = "message";
 const PI_COMPACTION_TYPE: &str = "compaction";
 
 const CUSTOM_TYPE_TITLE_UPDATE: &str = "moon_title_update";
+/// The session header as it is now. The file's first line is the
+/// header it was created with; a change (a bash-target override, a
+/// worktree attached or cleared) is appended as one of these rather
+/// than rewriting the file, and the last one wins on read.
+const CUSTOM_TYPE_HEADER: &str = "moon_header";
 const CUSTOM_TYPE_TODOS_UPDATE: &str = "moon_todos_update";
 const CUSTOM_TYPE_SUBAGENT_SPAWNED: &str = "moon_subagent_spawned";
 const CUSTOM_TYPE_SUBAGENT_FINISHED: &str = "moon_subagent_finished";
@@ -580,6 +585,7 @@ pub(crate) fn record_to_pi_wire(
 			last_error,
 			interrupted,
 			bytes_len,
+			header,
 		} => pi_message_envelope(
 			pi_custom_message(
 				CUSTOM_TYPE_SUMMARY,
@@ -588,6 +594,7 @@ pub(crate) fn record_to_pi_wire(
 					"last_error": last_error,
 					"interrupted": interrupted,
 					"bytes_len": bytes_len,
+					"header": header,
 				}),
 			),
 			timestamp_ms,
@@ -1012,10 +1019,13 @@ fn parse_pi_user(msg: &serde_json::Value) -> Option<SessionRecord> {
 					.and_then(|v| v.as_str())
 					.unwrap_or("image/png")
 					.to_string();
-				images.push(crate::images::fit_attachment(crate::inference::ImageAttachment {
+				// As stored: the history sent to the model fits its images
+				// when it is rebuilt (`images::for_model`), so a load
+				// doesn't transcode every screenshot of the transcript.
+				images.push(crate::inference::ImageAttachment {
 					data_url: format!("data:{mime};base64,{data}"),
 					mime,
-				}));
+				});
 			}
 			_ => {}
 		}
@@ -1160,14 +1170,11 @@ fn parse_pi_tool_result(msg: &serde_json::Value) -> Option<SessionRecord> {
 						.and_then(|v| v.as_str())
 						.unwrap_or("image/png")
 						.to_string();
-					// Histories captured while the webp re-encode was on
-					// hold webp payloads that strict vision loaders (Kimi
-					// K3) 400 on; convert back to PNG on the way in.
-					let att = crate::images::webp_attachment_to_png(crate::inference::ImageAttachment {
+					// As stored, like a user message's images.
+					images.push(crate::inference::ImageAttachment {
 						data_url: format!("data:{mime};base64,{data}"),
 						mime,
 					});
-					images.push(crate::images::fit_attachment(att));
 				}
 				_ => {}
 			}
@@ -1285,6 +1292,10 @@ fn parse_pi_custom(msg: &serde_json::Value) -> Option<SessionRecord> {
 			last_error: details.get("last_error").and_then(|v| v.as_bool()).unwrap_or(false),
 			interrupted: details.get("interrupted").and_then(|v| v.as_bool()).unwrap_or(false),
 			bytes_len: details.get("bytes_len").and_then(|v| v.as_u64()).unwrap_or(0),
+			header: details
+				.get("header")
+				.and_then(|h| serde_json::from_value::<SessionHeader>(h.clone()).ok())
+				.map(Box::new),
 		}),
 		_ => None,
 	}
@@ -1589,6 +1600,10 @@ pub enum SessionRecord {
 		last_error: bool,
 		interrupted: bool,
 		bytes_len: u64,
+		/// The header as it was when the trailer was written, so the
+		/// fast path doesn't read a stale one off line 1. `None` on
+		/// trailers written before it was carried.
+		header: Option<Box<SessionHeader>>,
 	},
 }
 
@@ -2176,6 +2191,15 @@ fn record_matches(record: &SessionRecord, needle: &str) -> bool {
 /// runs once per relaunch / once per `SessionListChanged` event.
 /// We tolerate broken trailing lines (incomplete final record from
 /// a crash mid-write) rather than refuse the whole summary.
+/// The header a `moon_header` row carries, if `value` is one.
+fn header_update(value: &serde_json::Value) -> Option<SessionHeader> {
+	let msg = value.get("message")?;
+	if msg.get("customType").and_then(|v| v.as_str()) != Some(CUSTOM_TYPE_HEADER) {
+		return None;
+	}
+	serde_json::from_value(msg.get("details")?.clone()).ok()
+}
+
 pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError> {
 	let file = tokio::fs::File::open(path.as_std_path())
 		.await
@@ -2203,6 +2227,9 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 	// the full fold below.
 	if let Some(len) = file_len {
 		if let Some(summary) = read_summary_state_trailer(path, len, &header).await {
+			if let Some(current) = summary.3 {
+				header = *current;
+			}
 			return Ok(SessionSummary {
 				id: header.id,
 				title: summary.0,
@@ -2236,8 +2263,8 @@ pub async fn load_summary(path: &Utf8Path) -> Result<SessionSummary, CoderError>
 /// Fold the transcript body for the sessions-list summary state —
 /// the pre-trailer scan, still the fallback for files without a
 /// valid `SummaryState` anchor. Reads the remaining lines of
-/// `reader` (positioned just past the header) and updates
-/// `header.title` in place on `TitleUpdate`. Returns
+/// `reader` (positioned just past the header) and updates `header`
+/// in place on header and title updates. Returns
 /// `(last_error, interrupted)`.
 async fn fold_summary_state(
 	reader: &mut BufReader<tokio::fs::File>,
@@ -2294,6 +2321,11 @@ async fn fold_summary_state(
 				interrupted = true;
 			}
 			"custom" => match msg.get("customType").and_then(|v| v.as_str()) {
+				Some(CUSTOM_TYPE_HEADER) => {
+					if let Some(current) = header_update(&value) {
+						*header = current;
+					}
+				}
 				Some(CUSTOM_TYPE_TITLE_UPDATE) => {
 					if let Some(title) = msg.get("details").and_then(|d| d.get("title")).and_then(|v| v.as_str()) {
 						header.title = title.to_string();
@@ -2323,13 +2355,13 @@ async fn fold_summary_state(
 /// (the trailer is written at settlement, so it sits at the very
 /// end; the window only has to cover the trailer plus whatever a
 /// crash left half-appended after it). Returns
-/// `(title, last_error, interrupted)` on a valid anchor, `None` to
+/// `(title, last_error, interrupted, header)` on a valid anchor, `None` to
 /// fall back to the full fold.
 async fn read_summary_state_trailer(
 	path: &Utf8Path,
 	file_len: u64,
 	header: &SessionHeader,
-) -> Option<(String, bool, bool)> {
+) -> Option<(String, bool, bool, Option<Box<SessionHeader>>)> {
 	// 8 KiB is generous for one summary line (a title is a handful
 	// of words); a crash-torn tail beyond that just falls back.
 	const TAIL_WINDOW: u64 = 8 * 1024;
@@ -2363,11 +2395,12 @@ async fn read_summary_state_trailer(
 				last_error,
 				interrupted,
 				bytes_len,
+				header: current,
 			} = record
 			{
 				if bytes_len == file_len {
 					let title = if title.is_empty() { header.title.clone() } else { title };
-					return Some((title, last_error, interrupted));
+					return Some((title, last_error, interrupted, current));
 				}
 				// A trailer whose anchor no longer matches is stale
 				// (appends landed after it); newer lines may still
@@ -2405,12 +2438,6 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 	reader.read_line(&mut header_line).await.map_err(CoderError::from)?;
 	let mut header: SessionHeader = serde_json::from_str(header_line.trim_end())
 		.map_err(|err| CoderError::decode(path.as_str(), format!("could not parse session header: {err}")))?;
-	// Override the frozen header timestamp with the file's mtime so
-	// the restored in-memory session + the `session_loaded` event
-	// agree with the sessions-list ordering (also mtime-derived).
-	if let Some(mtime_ms) = mtime_ms {
-		header.updated_at_ms = mtime_ms;
-	}
 	let mut records: Vec<SessionRecord> = Vec::new();
 	let mut record_timestamps: Vec<i64> = Vec::new();
 	let mut line = String::new();
@@ -2426,6 +2453,10 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 		}
 		match serde_json::from_str::<serde_json::Value>(trimmed) {
 			Ok(value) => {
+				if let Some(current) = header_update(&value) {
+					header = current;
+					continue;
+				}
 				let line_ts = wire_line_timestamp_ms(&value).unwrap_or(header.created_at_ms);
 				for rec in pi_wire_to_records(&value) {
 					if let SessionRecord::TitleUpdate { title } = &rec {
@@ -2446,6 +2477,12 @@ pub async fn load(dir: &Utf8Path, id: &str) -> Result<LoadedSession, CoderError>
 	// so every consumer — replay, orphan recovery, resume,
 	// truncation rewrites — sees unambiguous ids.
 	dedupe_record_tool_call_ids(&mut records);
+	// Override the frozen header timestamp with the file's mtime so
+	// the restored in-memory session + the `session_loaded` event
+	// agree with the sessions-list ordering (also mtime-derived).
+	if let Some(mtime_ms) = mtime_ms {
+		header.updated_at_ms = mtime_ms;
+	}
 	Ok(LoadedSession {
 		header,
 		records,
@@ -2563,38 +2600,29 @@ pub async fn append_record(dir: &Utf8Path, header: &SessionHeader, record: &Sess
 /// full-fold fallback, never a hard error.
 pub async fn append_summary_state(dir: &Utf8Path, header: &SessionHeader) -> Result<(), CoderError> {
 	// The fold's two flags live in the transcript records (not the
-	// in-memory session), so recompute them from disk — same fold
-	// `load_summary` does.
-	let loaded = load(dir, &header.id).await?;
-	let mut last_error = false;
-	let mut interrupted = false;
-	for record in &loaded.records {
-		match record {
-			SessionRecord::Error { .. } => {
-				last_error = true;
-				interrupted = false;
-			}
-			SessionRecord::User { .. } => {
-				last_error = false;
-				interrupted = true;
-			}
-			SessionRecord::Assistant { tool_calls, .. } => {
-				last_error = false;
-				interrupted = !tool_calls.is_empty();
-			}
-			SessionRecord::Tool { .. } => {
-				last_error = false;
-				interrupted = true;
-			}
-			SessionRecord::Compaction { .. } => {
-				last_error = false;
-			}
-			_ => {}
+	// in-memory session), so recompute them from disk with the same
+	// fold `load_summary` falls back to: it reads the rows' kinds and
+	// never parses their payloads.
+	let path = session_path(dir, &header.id);
+	let mut folded = header.clone();
+	let (last_error, interrupted) = match tokio::fs::File::open(path.as_std_path()).await {
+		Ok(file) => {
+			let mut reader = BufReader::new(file);
+			let mut first = String::new();
+			reader.read_line(&mut first).await.map_err(CoderError::from)?;
+			fold_summary_state(&mut reader, &mut folded).await?
 		}
-	}
-	let title = loaded.header.title.clone();
+		// Nothing persisted yet: a trailer must not create the file.
+		Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(err) => return Err(err.into()),
+	};
+	let title = folded.title.clone();
+	// What this process holds is newer than anything on disk.
+	let current = Box::new(SessionHeader {
+		title: title.clone(),
+		..header.clone()
+	});
 
-	let path = session_path(dir, &loaded.header.id);
 	let lock = append_lock_for(&path);
 	let _append_guard = lock.lock().await;
 	if let Some(parent) = path.parent() {
@@ -2620,7 +2648,7 @@ pub async fn append_summary_state(dir: &Utf8Path, header: &SessionHeader) -> Res
 	let header_bytes = if exists {
 		0
 	} else {
-		serde_json::to_string(&loaded.header).map_err(CoderError::from)?.len() + 1
+		serde_json::to_string(header).map_err(CoderError::from)?.len() + 1
 	};
 	let prefix_len = size_before + header_bytes as u64;
 
@@ -2633,8 +2661,9 @@ pub async fn append_summary_state(dir: &Utf8Path, header: &SessionHeader) -> Res
 			last_error,
 			interrupted,
 			bytes_len,
+			header: Some(current.clone()),
 		};
-		let wire = record_to_pi_wire(&record, &loaded.header, now_ms());
+		let wire = record_to_pi_wire(&record, header, now_ms());
 		line = serde_json::to_string(&wire).map_err(CoderError::from)?;
 		line.push('\n');
 		let next = prefix_len + line.len() as u64;
@@ -2646,7 +2675,7 @@ pub async fn append_summary_state(dir: &Utf8Path, header: &SessionHeader) -> Res
 
 	let mut buf = String::new();
 	if !exists {
-		buf.push_str(&serde_json::to_string(&loaded.header).map_err(CoderError::from)?);
+		buf.push_str(&serde_json::to_string(header).map_err(CoderError::from)?);
 		buf.push('\n');
 	}
 	buf.push_str(&line);
@@ -2655,45 +2684,30 @@ pub async fn append_summary_state(dir: &Utf8Path, header: &SessionHeader) -> Res
 	Ok(())
 }
 
-/// Rewrite the header (first line) of an already-persisted
-/// session JSONL in place. No-op (returns `Ok(())`) when the file
-/// doesn't exist yet — a not-yet-persisted session carries the
-/// header in memory and writes it on its first
-/// [`append_record`], so there's nothing on disk to fix.
-///
-/// Used by the per-session bash-target override toggle: flipping
-/// it mutates the in-memory header, and this keeps the on-disk
-/// copy truthful so a reload restores the choice. Reads the file
-/// fully (session JSONLs are small), swaps line 1 for the
-/// re-serialised header, and writes the whole thing back. The
-/// body lines are byte-preserved.
-pub async fn rewrite_header(dir: &Utf8Path, header: &SessionHeader) -> Result<(), CoderError> {
+/// Record a changed header (a bash-target override flipped, a
+/// worktree attached or cleared) so a reload restores it. Appended
+/// as a `moon_header` row, never written over line 1: the file is
+/// only ever appended to, whatever its size. A session not yet on
+/// disk carries its header in memory and writes it with its first
+/// record, so there is nothing to do for one.
+pub async fn append_header(dir: &Utf8Path, header: &SessionHeader) -> Result<(), CoderError> {
 	let path = session_path(dir, &header.id);
-	// Full read-modify-write: must hold the same per-file lock as
-	// `append_record` or a concurrent append lands between the read
-	// and the write and silently vanishes.
 	let lock = append_lock_for(&path);
 	let _append_guard = lock.lock().await;
 	if !tokio::fs::try_exists(path.as_std_path()).await.unwrap_or(false) {
 		return Ok(());
 	}
-	let content = tokio::fs::read_to_string(path.as_std_path())
+	let details = serde_json::to_value(header).map_err(CoderError::from)?;
+	let wire = pi_message_envelope(pi_custom_message(CUSTOM_TYPE_HEADER, details), now_ms());
+	let mut line = serde_json::to_string(&wire).map_err(CoderError::from)?;
+	line.push('\n');
+	let mut file = OpenOptions::new()
+		.append(true)
+		.open(path.as_std_path())
 		.await
 		.map_err(CoderError::from)?;
-	let header_line = serde_json::to_string(header).map_err(CoderError::from)?;
-	let mut out = String::with_capacity(content.len() + header_line.len());
-	out.push_str(&header_line);
-	// Re-attach every line after the first verbatim (including the
-	// trailing newline shape of the original).
-	if let Some(rest_start) = content.find('\n') {
-		out.push_str(&content[rest_start..]);
-	} else {
-		// Degenerate: file held only a header with no newline.
-		out.push('\n');
-	}
-	tokio::fs::write(path.as_std_path(), out.as_bytes())
-		.await
-		.map_err(CoderError::from)?;
+	file.write_all(line.as_bytes()).await.map_err(CoderError::from)?;
+	file.flush().await.map_err(CoderError::from)?;
 	Ok(())
 }
 
@@ -3602,7 +3616,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn rewrite_header_updates_first_line_and_preserves_body() {
+	async fn header_changes_are_appended_and_win_on_load() {
 		let tmp = tempfile::tempdir().unwrap();
 		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 		let mut header = make_test_header("sess-rewrite");
@@ -3618,14 +3632,28 @@ mod tests {
 		.await
 		.unwrap();
 
-		// Flip the override and rewrite the header in place.
+		let path = session_path(&dir, "sess-rewrite");
+		let before = tokio::fs::read_to_string(path.as_std_path()).await.unwrap();
+
 		header.bash_target_override = Some(BashTargetOverride::ForceHost);
-		rewrite_header(&dir, &header).await.unwrap();
+		header.worktree_branch = Some("moon/x".into());
+		append_header(&dir, &header).await.unwrap();
+
+		// Appended, never rewritten: what was there is untouched.
+		let after = tokio::fs::read_to_string(path.as_std_path()).await.unwrap();
+		assert!(after.starts_with(&before), "the file was rewritten");
 
 		let loaded = load(&dir, "sess-rewrite").await.unwrap();
 		assert_eq!(loaded.header.bash_target_override, Some(BashTargetOverride::ForceHost));
-		// Body record survived the rewrite untouched.
-		assert_eq!(loaded.records.len(), 1);
+		assert_eq!(loaded.records.len(), 1, "a header row is not a record");
+
+		// The sessions list sees it, folding the body or reading the
+		// trailer a settled turn leaves.
+		let folded = load_summary(&path).await.unwrap();
+		assert_eq!(folded.worktree_branch.as_deref(), Some("moon/x"));
+		append_summary_state(&dir, &header).await.unwrap();
+		let trailed = load_summary(&path).await.unwrap();
+		assert_eq!(trailed.worktree_branch.as_deref(), Some("moon/x"));
 	}
 
 	#[tokio::test]
@@ -3678,12 +3706,12 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn rewrite_header_is_a_noop_for_unpersisted_session() {
+	async fn append_header_is_a_noop_for_unpersisted_session() {
 		let tmp = tempfile::tempdir().unwrap();
 		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
 		let header = make_test_header("sess-absent");
 		// No file on disk yet — must not error or create one.
-		rewrite_header(&dir, &header).await.unwrap();
+		append_header(&dir, &header).await.unwrap();
 		assert!(!tokio::fs::try_exists(session_path(&dir, "sess-absent").as_std_path())
 			.await
 			.unwrap());
