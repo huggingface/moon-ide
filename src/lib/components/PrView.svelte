@@ -45,7 +45,6 @@
 	import { ipc } from '../ipc';
 	import { formatError, type ReviewEvent } from '../protocol';
 	import { workspace, type SplitSide } from '../state.svelte';
-	import { statusColor } from '../fileIcon';
 	import {
 		aboutLabel,
 		explainPrompt,
@@ -59,7 +58,7 @@
 	import { parsePrPath } from '../util/prPath';
 	import CommitSection from './CommitSection.svelte';
 	import DiffStat from './DiffStat.svelte';
-	import FileIcon from './FileIcon.svelte';
+	import FileRail from './FileRail.svelte';
 	import TabTitle from './TabTitle.svelte';
 	import { repoUrlOf } from '../githubMarkdown';
 	import { diff as lineDiff } from '@codemirror/merge';
@@ -204,13 +203,6 @@
 	const docked = $derived(width >= DOCK_PX);
 	const railShown = $derived(files.length > 1 && (railWanted ?? docked));
 
-	let railList: HTMLDivElement | undefined = $state();
-	// Keeps the current file in sight in a list longer than the pane.
-	$effect(() => {
-		void activePath;
-		void tick().then(() => railList?.querySelector('.rail-item.active')?.scrollIntoView({ block: 'nearest' }));
-	});
-
 	function leaveRail() {
 		if (!docked) {
 			railWanted = null;
@@ -272,11 +264,6 @@
 
 	function baseName(path: string): string {
 		return path.slice(path.lastIndexOf('/') + 1);
-	}
-
-	function dirName(path: string): string {
-		const cut = path.lastIndexOf('/');
-		return cut === -1 ? '' : path.slice(0, cut);
 	}
 
 	/** Re-read the pull request. Resolves once the detail is in (or
@@ -783,49 +770,35 @@
 		</div>
 	{/if}
 	{#if railShown && detail !== null}
-		<nav class="rail" class:floating={!docked} aria-label="Files changed">
-			<div class="rail-head">
+		<FileRail
+			{files}
+			{activePath}
+			floating={!docked}
+			label="Files changed"
+			onPick={(path) => void jumpTo(path)}
+			onOverview={toOverview}
+			done={(path) => viewed[path] === true}
+		>
+			{#snippet head()}
 				<span>{viewedCount} / {files.length} viewed</span>
 				<DiffStat
 					additions={size.additions}
 					deletions={size.deletions}
 					tests={{ additions: size.testAdditions, deletions: size.testDeletions }}
 				/>
-			</div>
-			<div class="rail-list" bind:this={railList}>
-				<button type="button" class="rail-item" class:active={activePath === null} onclick={toOverview}>
-					<span class="rail-name">Overview</span>
-				</button>
-				{#each files as file (file.path)}
-					<button
-						type="button"
-						class="rail-item"
-						class:active={activePath === file.path}
-						class:viewed={viewed[file.path]}
-						title={`${file.path} (${file.status})`}
-						onclick={() => void jumpTo(file.path)}
-					>
-						<FileIcon path={file.path} size={14} />
-						<span
-							class="rail-name"
-							class:gone={file.status === 'deleted'}
-							style:color={viewed[file.path] ? undefined : statusColor(file.status)}
-						>
-							{baseName(file.path)}
-						</span>
-						<span class="rail-dir">{dirName(file.path)}</span>
-						{#if (attention.get(file.path) ?? 0) > 0}
-							<span class="rail-attention">{attention.get(file.path)}</span>
-						{/if}
-						{#if viewed[file.path]}
-							<span class="rail-check"><CheckIcon size={12} /></span>
-						{:else}
-							<DiffStat additions={file.additions} deletions={file.deletions} muted={file.isTest} />
-						{/if}
-					</button>
-				{/each}
-			</div>
-		</nav>
+			{/snippet}
+			{#snippet trailing(path)}
+				{@const file = files.find((one) => one.path === path)}
+				{#if (attention.get(path) ?? 0) > 0}
+					<span class="rail-attention">{attention.get(path)}</span>
+				{/if}
+				{#if viewed[path]}
+					<span class="rail-check"><CheckIcon size={12} /></span>
+				{:else if file !== undefined}
+					<DiffStat additions={file.additions} deletions={file.deletions} muted={file.isTest} />
+				{/if}
+			{/snippet}
+		</FileRail>
 	{/if}
 	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 	<div class="main" bind:this={scroller} tabindex="0" role="region" aria-label="Pull request" onscroll={spy}>
@@ -1070,91 +1043,6 @@
 		display: flex;
 		background: var(--m-bg);
 		color: var(--m-fg);
-	}
-	.rail {
-		display: flex;
-		flex-direction: column;
-		flex-shrink: 0;
-		width: 232px;
-		min-height: 0;
-		border-right: 1px solid var(--m-border);
-		background: var(--m-bg-1);
-		font-size: var(--m-text-sm);
-	}
-	.rail.floating {
-		position: absolute;
-		top: 37px;
-		bottom: 0;
-		left: 0;
-		z-index: 4;
-		width: min(320px, 90%);
-		box-shadow: var(--m-shadow-pop);
-	}
-	.rail-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: var(--m-space-2);
-		box-sizing: border-box;
-		height: 37px;
-		flex-shrink: 0;
-		padding: 0 var(--m-space-3);
-		border-bottom: 1px solid var(--m-border);
-		color: var(--m-fg-muted);
-		font-variant-numeric: tabular-nums;
-	}
-	.rail-list {
-		flex: 1;
-		min-height: 0;
-		overflow-y: auto;
-		padding: var(--m-space-1);
-	}
-	.rail-item {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		width: 100%;
-		height: 26px;
-		padding: 0 var(--m-space-2);
-		border: none;
-		border-radius: var(--m-radius-sm);
-		background: transparent;
-		color: var(--m-fg);
-		font: inherit;
-		text-align: left;
-		cursor: pointer;
-	}
-	.rail-item:hover {
-		background: var(--m-bg-2);
-	}
-	.rail-item.active {
-		background: var(--m-bg-3);
-	}
-	.rail-item.viewed .rail-name,
-	.rail-item.viewed .rail-dir {
-		color: var(--m-fg-subtle);
-	}
-	.rail-item.viewed :global(.file-icon) {
-		opacity: 0.45;
-	}
-	.rail-name.gone {
-		text-decoration: line-through;
-	}
-	.rail-name {
-		flex-shrink: 0;
-		max-width: 60%;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.rail-dir {
-		flex: 1;
-		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		color: var(--m-fg-subtle);
-		font-size: var(--m-text-xs);
 	}
 	.rail-attention {
 		flex-shrink: 0;

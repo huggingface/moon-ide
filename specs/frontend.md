@@ -184,6 +184,7 @@ The split matters because Pierre Diffs is display-only — forcing it to also ed
   - Marking a file viewed folds it and opens the next unviewed one. Marks last until the IDE closes or the PR's head moves.
   - With more than 8 files nothing starts open and going to a file closes the others. Deleted, binary, generated (lockfiles, snapshots, minified), very large and test files start collapsed in any PR.
   - A file is shown as in the file tree, in the list and on its diff's header (here, in a commit tab and in Review changes): the icon of its kind, its name in its git status colour, struck through when deleted. A header also says "new" / "deleted" in words. The status colours are the `--m-git-*` tokens, which the tree is fed too.
+  - A commit tab has the same list of its files beside the diffs (`FileRail.svelte`, shared): the file under the top of the pane highlighted, a click jumps to it, docked when the pane is wide, else opened over the diffs from the banner's **Files** button.
   - The list's total counts lines outside test files; a test file's own count is shown greyed ([ADR 0123](decisions/0123-test-files-step-back-in-review.md)).
   - `j` / `k` go to the next / previous file, `v` toggles viewed on the current one.
 
