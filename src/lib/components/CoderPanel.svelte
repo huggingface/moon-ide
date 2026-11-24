@@ -738,6 +738,7 @@
 	// time the user drags the scrollbar.
 	let stickyBottom = true;
 	let lastRowCount = 0;
+	let lastScrollTop = 0;
 	const STICKY_BOTTOM_THRESHOLD_PX = 24;
 
 	// Windowed (tail) transcript rendering. We only mount the last
@@ -810,10 +811,22 @@
 			return;
 		}
 		const distance = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+		const movedUp = scrollEl.scrollTop < lastScrollTop;
+		lastScrollTop = scrollEl.scrollTop;
 		// Only treat the bottom as "sticky" when the window is
 		// actually anchored to the live tail; a detached window
 		// scrolled to its own bottom edge is not at the latest row.
-		stickyBottom = bottomClip === 0 && distance <= STICKY_BOTTOM_THRESHOLD_PX;
+		// Leaving it takes a move up: the page growing under our own
+		// scroll-to-bottom (a reply rendering a frame after its text
+		// arrived) reads as "far from the bottom" by the time that
+		// scroll's event lands, and used to let go of the tail.
+		if (bottomClip !== 0) {
+			stickyBottom = false;
+		} else if (distance <= STICKY_BOTTOM_THRESHOLD_PX) {
+			stickyBottom = true;
+		} else if (movedUp) {
+			stickyBottom = false;
+		}
 		if (applyingAnchor) {
 			// This scroll event is our own anchor-compensation write,
 			// not a user gesture — don't let it trigger another grow.
@@ -1195,6 +1208,37 @@
 				scrollEl.scrollTop = scrollEl.scrollHeight;
 			}
 		});
+	});
+
+	// Anything that changes the page's height while it follows the
+	// tail keeps it at the bottom: a reply's markdown rendered a frame
+	// after its text, a thinking block opening or closing, a card
+	// growing, the plan strip taking room from the viewport. The rows
+	// are the transcript's children, so those are what is watched.
+	$effect(() => {
+		const el = scrollEl;
+		if (el === undefined) {
+			return;
+		}
+		const follow = new ResizeObserver(() => {
+			if (stickyBottom && bottomClip === 0 && !applyingAnchor) {
+				el.scrollTop = el.scrollHeight;
+			}
+		});
+		const watch = () => {
+			follow.disconnect();
+			follow.observe(el);
+			for (const child of el.children) {
+				follow.observe(child);
+			}
+		};
+		watch();
+		const rows = new MutationObserver(watch);
+		rows.observe(el, { childList: true });
+		return () => {
+			rows.disconnect();
+			follow.disconnect();
+		};
 	});
 
 	// `@`-mention autocomplete state. `mention` is non-null while

@@ -21,15 +21,40 @@
 	// absorb subpixel scroll positions on HiDPI.
 	const PIN_THRESHOLD_PX = 24;
 	let pinned = $state(true);
+	let lastTop = 0;
 
+	// Unpinned only by a move up: our own scroll-to-bottom's event can
+	// land after the next chunk rendered, far from the new bottom.
 	function onBodyScroll(): void {
 		const el = bodyEl;
 		if (!el) {
 			return;
 		}
 		const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-		pinned = distance <= PIN_THRESHOLD_PX;
+		if (distance <= PIN_THRESHOLD_PX) {
+			pinned = true;
+		} else if (el.scrollTop < lastTop) {
+			pinned = false;
+		}
+		lastTop = el.scrollTop;
 	}
+
+	// The text renders as markdown a frame after it arrives, so its
+	// growth is followed where it happens.
+	$effect(() => {
+		const el = bodyEl;
+		const content = el?.firstElementChild;
+		if (!el || !content || !streaming) {
+			return;
+		}
+		const follow = new ResizeObserver(() => {
+			if (pinned) {
+				el.scrollTop = el.scrollHeight;
+			}
+		});
+		follow.observe(content);
+		return () => follow.disconnect();
+	});
 
 	// Snap to the bottom on every text change *if* the user is
 	// pinned and the message is still streaming. Reading the
