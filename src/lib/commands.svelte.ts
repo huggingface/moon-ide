@@ -100,7 +100,8 @@ export function searchPaletteInitialQuery(): string {
 	return palette.lastContentQuery;
 }
 
-export type PaletteMode = 'commands' | 'files' | 'search';
+/** `browser`: the input is an address to open in a browser tab. */
+export type PaletteMode = 'commands' | 'files' | 'search' | 'browser';
 
 class PaletteState {
 	open = $state(false);
@@ -245,6 +246,11 @@ export const builtInCommands: Command[] = [
 			}
 			workspace.newUntitledTab();
 		},
+	},
+	{
+		id: 'browser.open',
+		title: 'Open Browser Tab…',
+		run: () => palette.show('browser'),
 	},
 	{
 		id: 'editor.save',

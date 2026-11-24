@@ -8,6 +8,8 @@
 		runContentReplace,
 		type Command,
 	} from '../commands.svelte';
+	import { normalizeBrowserUrl, openInIdeBrowser } from '../browserOpen';
+	import { formatError } from '../protocol';
 	import { workspace } from '../state.svelte';
 	import FileIcon from './icons/FileIcon.svelte';
 
@@ -60,7 +62,7 @@
 		void palette.searchWholeWord;
 		void palette.searchRegex;
 		void palette.searchInclude;
-		if (mode === 'commands') {
+		if (mode === 'commands' || mode === 'browser') {
 			return;
 		}
 
@@ -86,9 +88,15 @@
 		selected = 0;
 	});
 
+	// Browser mode: the address typed, as it will be opened.
+	const browserUrl = $derived(palette.mode === 'browser' ? normalizeBrowserUrl(palette.query) : null);
+
 	const totalRows: number = $derived.by(() => {
 		if (palette.mode === 'commands') {
 			return commandList.length;
+		}
+		if (palette.mode === 'browser') {
+			return browserUrl === null ? 0 : 1;
 		}
 		if (palette.mode === 'files') {
 			return palette.fileResults.length;
@@ -136,10 +144,22 @@
 		if (palette.mode === 'files') {
 			return 'Search files by name…';
 		}
+		if (palette.mode === 'browser') {
+			return 'Address to open in a browser tab, e.g. localhost:5173';
+		}
 		return 'Search in files…';
 	}
 
 	function activate(index: number) {
+		if (palette.mode === 'browser') {
+			const url = browserUrl;
+			if (url === null) {
+				return;
+			}
+			palette.hide();
+			openInIdeBrowser(url).catch((err: unknown) => workspace.flash(`Couldn't open the tab: ${formatError(err)}`));
+			return;
+		}
 		if (palette.mode === 'commands') {
 			const cmd = commandList[index];
 			if (!cmd) {
@@ -282,6 +302,7 @@
 				<span class="prefix">
 					{#if palette.mode === 'commands'}>
 					{:else if palette.mode === 'files'}@
+					{:else if palette.mode === 'browser'}↗
 					{:else}/
 					{/if}
 				</span>
@@ -413,6 +434,15 @@
 					{/each}
 					{#if commandList.length === 0}
 						<li class="empty">No commands match.</li>
+					{/if}
+				{:else if palette.mode === 'browser'}
+					{#if browserUrl !== null}
+						<!-- svelte-ignore a11y_click_events_have_key_events -->
+						<li class="result selected" role="option" aria-selected="true" onclick={() => activate(0)}>
+							<span class="title">Open {browserUrl}</span>
+						</li>
+					{:else}
+						<li class="empty">Type an http(s) address. A local one opens from the dev container when it runs.</li>
 					{/if}
 				{:else if palette.mode === 'files'}
 					{#each palette.fileResults as hit, i (hit.path + i)}

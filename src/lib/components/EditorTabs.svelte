@@ -16,6 +16,7 @@
 	import InboxIcon from './icons/InboxIcon.svelte';
 	import RevertIcon from './icons/RevertIcon.svelte';
 	import { formatError } from '../protocol';
+	import { palette } from '../commands.svelte';
 
 	type Props = { side: SplitSide };
 	let { side }: Props = $props();
@@ -585,6 +586,52 @@
 		});
 		activeTabMenuHost = host;
 	}
+
+	/** The strip's "+": what a new tab can be, opened in this pane. */
+	function openNewMenu(event: MouseEvent) {
+		event.stopPropagation();
+		disposeTabMenu();
+		const button = event.currentTarget;
+		if (!(button instanceof HTMLElement)) {
+			return;
+		}
+		const items: ContextMenuItem[] = [
+			{
+				id: 'new-file',
+				label: 'New file',
+				title: 'Ctrl+N',
+				disabled: !workspace.workspace,
+				onSelect: () => workspace.newUntitledTab(side),
+			},
+			{
+				id: 'browser',
+				label: 'Browser tab…',
+				onSelect: () => {
+					workspace.focusedSide = side;
+					palette.show('browser');
+				},
+			},
+		];
+		const host = document.createElement('div');
+		host.setAttribute('data-tab-context-menu-root', 'true');
+		host.style.position = 'fixed';
+		host.style.top = '0';
+		host.style.left = '0';
+		host.style.width = '0';
+		host.style.height = '0';
+		host.style.zIndex = '9999';
+		document.body.appendChild(host);
+		const rect = button.getBoundingClientRect();
+		activeTabMenu = mountComponent(ContextMenu, {
+			target: host,
+			props: {
+				items,
+				anchorRect: { left: rect.left, top: rect.bottom, width: rect.width, height: 0 },
+				onClose: () => disposeTabMenu(),
+			},
+		});
+		activeTabMenuHost = host;
+	}
 </script>
 
 <!--
@@ -663,6 +710,9 @@
 			</div>
 		{/each}
 	</div>
+	<button type="button" class="new-tab" title="New file or browser tab" aria-label="New tab" onclick={openNewMenu}>
+		+
+	</button>
 	{#if showToolbar}
 		<div class="view-toggle" role="group" aria-label="View mode">
 			{#if showViewToggle}
@@ -742,6 +792,26 @@
 		background: var(--m-bg);
 		border-bottom: 1px solid var(--m-border);
 		flex-shrink: 0;
+	}
+	.new-tab {
+		flex-shrink: 0;
+		align-self: center;
+		width: 24px;
+		height: 24px;
+		margin: 0 var(--m-space-1);
+		padding: 0;
+		border: none;
+		border-radius: var(--m-radius-sm);
+		background: transparent;
+		color: var(--m-fg-subtle);
+		font: inherit;
+		font-size: 16px;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.new-tab:hover {
+		background: var(--m-bg-2);
+		color: var(--m-fg);
 	}
 	.tabs {
 		display: flex;

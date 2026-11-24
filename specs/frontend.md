@@ -147,6 +147,8 @@ The split matters because Pierre Diffs is display-only — forcing it to also ed
 
 `browser://<id>` synthetic tabs (`BrowserView.svelte`): URL bar, reload, open-in-system-browser, and an `<iframe>` on the URL resolved by `browser_resolve_url` — unchanged for host URLs, a loopback tunnel into the workspace shell for container ones. The tab set is a mirror of the backend registry (`browser:tabs` event), which the coder's browser tools and the user's own actions both mutate. `browserBridge.ts` relays the coder's `browser:page_request`s into the iframe's injected page bridge over `postMessage` and reports in-page navigation back to the registry. Not persisted. See [ADR 0088](decisions/0088-in-ide-browser-tab.md).
 
+Opened by the user from **Open Browser Tab…** in the command palette (the palette takes the address; a local one dials from the dev container when it runs), from the empty pane, or from the **+** at the end of a pane's tab strip, which also makes a new file. Either way the tab lands in that pane.
+
 ### Inbox tab
 
 `inbox://github` (`InboxView.svelte`; opened with `Ctrl+Shift+G`, the Inbox button at the top of the sidebar, or `Inbox: Open GitHub Inbox`) lists the pull requests and notification threads that want the user in the workspace's GitHub repositories. See [ADR 0112](decisions/0112-github-inbox.md) for the sources and why.
