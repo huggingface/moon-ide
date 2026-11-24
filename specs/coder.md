@@ -2092,6 +2092,13 @@ a browser tab or screenshot it instead of describing it, and **Go**
 sends "Go" to approve what the agent proposed. The reasoning
 picker sits at the other end of that row.
 
+**Later** (or Alt+Enter) parks the composer's text instead of sending
+it: a note above the composer, with Send, Edit (back into the
+composer) and delete. Notes are the session's (`notes` in its header,
+so a reload or revert keeps them) and never part of what the model is
+sent until one is. For reminders during a long task that shouldn't
+interrupt it.
+
 Next to it, a **mic** button dictates into the composer: click to
 record, click again to transcribe, Esc to discard. The text lands at
 the caret and is never sent by itself. Recording is desktop-local

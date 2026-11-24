@@ -44,6 +44,7 @@
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
 	import OpenRouterKeyMeter from './OpenRouterKeyMeter.svelte';
+	import CoderLaterNotes from './CoderLaterNotes.svelte';
 	import PlanUsageMeter from './PlanUsageMeter.svelte';
 	import CoderPlanStrip from './CoderPlanStrip.svelte';
 	import SessionRenameInput from './SessionRenameInput.svelte';
@@ -1695,6 +1696,11 @@
 			await coder.unqueueLatestSteer();
 			return;
 		}
+		if (event.key === 'Enter' && event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
+			event.preventDefault();
+			await coder.parkDraft();
+			return;
+		}
 		if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
 			event.preventDefault();
 			await coder.send();
@@ -3210,6 +3216,7 @@
 		</div>
 		<div class="composer">
 			<CoderPlanStrip />
+			<CoderLaterNotes />
 			{#if coder.hasBackgroundWork || coder.runningWorkers.length > 0}
 				<!-- Background work that will wake this session (ADR 0102),
 					 plus a coordinator's running workers. -->
@@ -3471,6 +3478,15 @@
 							Show me
 						</button>
 					{/if}
+					<button
+						type="button"
+						class="ship-it"
+						disabled={coder.draft.trim() === ''}
+						title="Keep this message for later, without sending it (Alt+Enter)"
+						onclick={() => void coder.parkDraft()}
+					>
+						Later
+					</button>
 					<button
 						type="button"
 						class="voice"
@@ -6183,9 +6199,13 @@
 		cursor: pointer;
 		height: var(--m-icon-btn);
 	}
-	.ship-it:hover {
+	.ship-it:hover:not(:disabled) {
 		color: var(--m-fg);
 		background: var(--m-bg-3);
+	}
+	.ship-it:disabled {
+		opacity: 0.5;
+		cursor: default;
 	}
 	.reasoning-pick {
 		display: inline-flex;

@@ -613,6 +613,7 @@ async fn run_subagent_in_dir(
 		committed_branch: None,
 		reasoning_effort: None,
 		model_override: None,
+		notes: Vec::new(),
 	};
 
 	// Best-effort: persistence failures log at warn but never

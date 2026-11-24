@@ -100,6 +100,7 @@ import type {
 	WorkspaceMeta,
 	WorkspaceSession,
 	WriteFileResult,
+	SessionNote,
 } from './protocol';
 
 // Single auditable surface for all workspace-process commands. Components
@@ -512,6 +513,7 @@ export const ipc = {
 		moveSessionToWorktree: () => call<NewWorktreeSession>('coder_move_session_to_worktree'),
 		setBashTargetOverride: (forceHost: boolean) => call<boolean>('coder_set_bash_target_override', { forceHost }),
 		setSessionReasoningEffort: (effort: string | null) => call<void>('coder_set_session_reasoning_effort', { effort }),
+		setSessionNotes: (notes: SessionNote[]) => call<void>('coder_set_session_notes', { notes }),
 		setSessionModel: (model: string | null) => call<void>('coder_set_session_model', { model }),
 		openSession: (id: string) => call<CoderSessionSummary>('coder_open_session', { id }),
 		deleteSession: (id: string) => call<void>('coder_delete_session', { id }),

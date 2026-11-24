@@ -1843,7 +1843,12 @@ export type CoderStatus = {
 	/** The visible session's model override (under the active
 	 *  provider); absent when it follows the model settings. */
 	session_model?: string | null;
+	/** The visible session's messages parked for later. */
+	session_notes?: SessionNote[];
 };
+
+/** A message parked for later. Mirrors `moon_coder::sessions::SessionNote`. */
+export type SessionNote = { id: string; text: string };
 
 /**
  * Tagged-union of agent-loop events emitted on the `coder:event`

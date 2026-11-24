@@ -597,4 +597,7 @@ pub struct CoderStatus {
 	/// to the active provider; `None` follows the model settings.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub session_model: Option<String>,
+	/// The visible session's messages parked for later.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub session_notes: Vec<crate::sessions::SessionNote>,
 }

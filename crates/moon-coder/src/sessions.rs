@@ -209,6 +209,16 @@ pub struct SessionHeader {
 	/// while the provider it was chosen under is active. `None`
 	/// follows the default.
 	pub model_override: Option<crate::models::SessionModel>,
+	/// Messages the user parked to send later. Kept with the session,
+	/// never sent to the model until the user sends one.
+	pub notes: Vec<SessionNote>,
+}
+
+/// A message parked for later (`SessionHeader::notes`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNote {
+	pub id: String,
+	pub text: String,
 }
 
 /// Per-session override for the `bash` tool's execution target.
@@ -310,6 +320,9 @@ impl Serialize for SessionHeader {
 		if let Some(v) = &self.model_override {
 			map.serialize_entry("model_override", v)?;
 		}
+		if !self.notes.is_empty() {
+			map.serialize_entry("notes", &self.notes)?;
+		}
 		if let Some(v) = &self.worktree_root {
 			map.serialize_entry("worktree_root", v)?;
 		}
@@ -366,6 +379,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			#[serde(default)]
 			model_override: Option<crate::models::SessionModel>,
 			#[serde(default)]
+			notes: Vec<SessionNote>,
+			#[serde(default)]
 			worktree_root: Option<String>,
 			#[serde(default)]
 			worktree_branch: Option<String>,
@@ -396,6 +411,7 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			committed_branch: raw.committed_branch,
 			reasoning_effort: raw.reasoning_effort,
 			model_override: raw.model_override,
+			notes: raw.notes,
 		})
 	}
 }
@@ -3286,6 +3302,7 @@ mod tests {
 			committed_branch: None,
 			reasoning_effort: None,
 			model_override: None,
+			notes: Vec::new(),
 		}
 	}
 
@@ -5459,5 +5476,31 @@ mod tests {
 		};
 		assert_eq!(thinking.as_deref(), Some("thought about it"));
 		assert_eq!(thinking_blocks, &vec![details]);
+	}
+
+	#[tokio::test]
+	async fn parked_notes_ride_the_header_and_survive_a_reload() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+		let mut header = make_test_header("sess-notes");
+		append_record(
+			&dir,
+			&header,
+			&SessionRecord::User {
+				text: "hi".into(),
+				images: Vec::new(),
+				from_coordinator: false,
+			},
+		)
+		.await
+		.unwrap();
+		header.notes = vec![SessionNote {
+			id: "n1".into(),
+			text: "run the full suite after the refactor".into(),
+		}];
+		append_header(&dir, &header).await.unwrap();
+		let loaded = load(&dir, "sess-notes").await.unwrap();
+		assert_eq!(loaded.header.notes, header.notes);
+		assert_eq!(loaded.records.len(), 1, "a note is not a record");
 	}
 }

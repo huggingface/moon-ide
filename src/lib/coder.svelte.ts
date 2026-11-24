@@ -40,6 +40,7 @@ import {
 	type SlackStatus,
 	type OpenRouterCredits,
 	type ProviderKind,
+	type SessionNote,
 	type ProviderModelSummary,
 	type ProviderProbeResult,
 	type RouterModel,
@@ -862,6 +863,33 @@ export class CoderPanelState {
 
 	/** Set the visible session's reasoning effort only; other
 	 *  sessions keep the model settings' default. */
+	/** Messages the user parked in the visible session, to send later.
+	 *  Never part of what the model sees until one is sent. */
+	get notes(): SessionNote[] {
+		return this.status?.session_notes ?? [];
+	}
+
+	async setNotes(notes: SessionNote[]): Promise<void> {
+		if (this.status !== null) {
+			this.status = { ...this.status, session_notes: notes };
+		}
+		try {
+			await ipc.coder.setSessionNotes(notes);
+		} finally {
+			await this.refreshStatus();
+		}
+	}
+
+	/** Park the composer's text as a note and empty the composer. */
+	async parkDraft(): Promise<void> {
+		const text = this.draft.trim();
+		if (text === '') {
+			return;
+		}
+		this.draft = '';
+		await this.setNotes([...this.notes, { id: crypto.randomUUID(), text }]);
+	}
+
 	async setSessionReasoningEffort(effort: string | null): Promise<void> {
 		await ipc.coder.setSessionReasoningEffort(effort);
 		await this.refreshStatus();

@@ -939,6 +939,7 @@ impl Session {
 				committed_branch: None,
 				reasoning_effort: None,
 				model_override: None,
+				notes: Vec::new(),
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System { content: system_prompt }],
@@ -1977,9 +1978,9 @@ impl CoderHandle {
 			}
 			_ => (None, false),
 		};
-		let (session_reasoning_effort, session_model) = match &coder_root_fs {
+		let (session_reasoning_effort, session_model, session_notes) = match &coder_root_fs {
 			Some(fs) => self.visible_session_overrides(fs).await,
-			None => (None, None),
+			None => (None, None, Vec::new()),
 		};
 		Ok(CoderStatus {
 			signed_in,
@@ -1989,6 +1990,7 @@ impl CoderHandle {
 			force_host_override,
 			session_reasoning_effort,
 			session_model,
+			session_notes,
 		})
 	}
 
@@ -2673,6 +2675,24 @@ impl CoderHandle {
 		Ok(())
 	}
 
+	/// Replace the active folder's visible session's parked messages
+	/// (`SessionHeader::notes`). Persisted in the session header;
+	/// never part of what the model is sent.
+	pub async fn set_session_notes(&self, notes: Vec<sessions::SessionNote>) -> Result<(), CoderError> {
+		let (rt, _, _) = self.state.active_visible_runtime().await?;
+		let (session_dir, header) = {
+			let mut session = rt.session.lock().await;
+			session.header.notes = notes.into_iter().filter(|n| !n.text.trim().is_empty()).collect();
+			(session.session_dir.clone(), session.header.clone())
+		};
+		if let Some(dir) = session_dir {
+			if let Err(err) = sessions::append_header(&dir, &header).await {
+				tracing::warn!(?err, "failed to persist session notes");
+			}
+		}
+		Ok(())
+	}
+
 	/// Set the standard model of the active folder's visible session
 	/// only (`None` = follow the model settings). Recorded with the
 	/// active provider, and only applied while that provider is
@@ -2941,22 +2961,26 @@ impl CoderHandle {
 
 	/// The visible session's reasoning-effort and model overrides; the
 	/// model only when it was picked under the active provider.
-	async fn visible_session_overrides(&self, fs: &Arc<FolderSession>) -> (Option<String>, Option<String>) {
+	async fn visible_session_overrides(
+		&self,
+		fs: &Arc<FolderSession>,
+	) -> (Option<String>, Option<String>, Vec<sessions::SessionNote>) {
 		let Some(id) = fs.visible_session_id().await else {
-			return (None, None);
+			return (None, None, Vec::new());
 		};
 		let Some(rt) = fs.runtime(&id).await else {
-			return (None, None);
+			return (None, None, Vec::new());
 		};
-		let (effort, model) = {
+		let (effort, model, notes) = {
 			let session = rt.session.lock().await;
 			(
 				session.header.reasoning_effort.clone(),
 				session.header.model_override.clone(),
+				session.header.notes.clone(),
 			)
 		};
 		let active = self.state.models.read().await.active_provider.clone();
-		(effort, model.filter(|m| m.provider == active).map(|m| m.model))
+		(effort, model.filter(|m| m.provider == active).map(|m| m.model), notes)
 	}
 
 	/// Revert the active folder's visible session back to just
@@ -13816,6 +13840,7 @@ mod tests {
 			committed_branch: None,
 			reasoning_effort: None,
 			model_override: None,
+			notes: Vec::new(),
 		}
 	}
 

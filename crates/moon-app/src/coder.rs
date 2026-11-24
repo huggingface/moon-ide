@@ -925,6 +925,14 @@ pub async fn coder_set_session_reasoning_effort(app: &AppCore, effort: Option<St
 		.map_err(MoonError::from)
 }
 
+/// Replace the visible session's messages parked for later.
+pub async fn coder_set_session_notes(
+	app: &AppCore,
+	notes: Vec<moon_coder::sessions::SessionNote>,
+) -> Result<(), MoonError> {
+	app.coder.set_session_notes(notes).await.map_err(MoonError::from)
+}
+
 /// Transcribe a base64 WAV clip recorded by the desktop side (the
 /// composer's voice input).
 pub async fn coder_transcribe(app: &AppCore, wav_base64: String) -> Result<String, MoonError> {
@@ -1732,6 +1740,7 @@ crate::commands! {
 	coder_associate_branch([app]),
 	coder_set_bash_target_override([app] force_host: bool),
 	coder_set_session_reasoning_effort([app] effort: Option<String>),
+	coder_set_session_notes([app] notes: Vec<moon_coder::sessions::SessionNote>),
 	coder_set_session_model([app] model: Option<String>),
 	coder_transcribe([app] wav_base64: String),
 	coder_open_session([app] id: String),
