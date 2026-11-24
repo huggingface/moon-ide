@@ -195,6 +195,9 @@ pub enum ResolvedProvider {
 	/// ChatGPT subscription via the Codex backend (Responses API,
 	/// OAuth bundle in the keyring slot). See [`crate::chatgpt`].
 	ChatGpt { id: String, base_url: String },
+	/// Gemini API through its OpenAI-compatible endpoint. Wire path
+	/// is [`Self::Custom`]'s; named so the transcript says `google`.
+	Gemini { id: String, base_url: String },
 }
 
 impl ResolvedProvider {
@@ -204,9 +207,11 @@ impl ResolvedProvider {
 	pub fn provider_id(&self) -> Option<&str> {
 		match self {
 			Self::HuggingFace => None,
-			Self::Custom { id, .. } | Self::OpenRouter { id, .. } | Self::Anthropic { id, .. } | Self::ChatGpt { id, .. } => {
-				Some(id.as_str())
-			}
+			Self::Custom { id, .. }
+			| Self::OpenRouter { id, .. }
+			| Self::Anthropic { id, .. }
+			| Self::ChatGpt { id, .. }
+			| Self::Gemini { id, .. } => Some(id.as_str()),
 		}
 	}
 
@@ -218,7 +223,8 @@ impl ResolvedProvider {
 			Self::Custom { base_url, .. }
 			| Self::OpenRouter { base_url, .. }
 			| Self::Anthropic { base_url, .. }
-			| Self::ChatGpt { base_url, .. } => Some(base_url.as_str()),
+			| Self::ChatGpt { base_url, .. }
+			| Self::Gemini { base_url, .. } => Some(base_url.as_str()),
 		}
 	}
 
@@ -233,6 +239,7 @@ impl ResolvedProvider {
 			Self::Anthropic { .. } => "anthropic",
 			Self::OpenRouter { .. } => "openrouter",
 			Self::ChatGpt { .. } => "openai-codex",
+			Self::Gemini { .. } => "google",
 			Self::Custom { id, .. } => id.as_str(),
 		}
 	}
@@ -343,6 +350,10 @@ impl CoderModels {
 					base_url: entry.base_url.clone(),
 				},
 				ProviderKind::ChatGpt => ResolvedProvider::ChatGpt {
+					id: entry.id.clone(),
+					base_url: entry.base_url.clone(),
+				},
+				ProviderKind::Gemini => ResolvedProvider::Gemini {
 					id: entry.id.clone(),
 					base_url: entry.base_url.clone(),
 				},

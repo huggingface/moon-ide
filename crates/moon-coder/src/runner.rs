@@ -1484,6 +1484,14 @@ impl CoderHandle {
 		mut providers: Vec<moon_protocol::coder_models::CoderProviderConfig>,
 		active: Option<String>,
 	) {
+		// A provider another window added has its key in the OS
+		// keyring but not in this process's cache yet.
+		let unseen: Vec<String> = providers
+			.iter()
+			.filter(|p| !self.state.provider_keys.has_key(&p.id))
+			.map(|p| p.id.clone())
+			.collect();
+		self.state.provider_keys.warm(unseen);
 		for p in &mut providers {
 			p.has_api_key = self.state.provider_keys.has_key(&p.id);
 		}
@@ -1663,7 +1671,8 @@ impl CoderHandle {
 			ResolvedProvider::Custom { id, .. }
 			| ResolvedProvider::OpenRouter { id, .. }
 			| ResolvedProvider::Anthropic { id, .. }
-			| ResolvedProvider::ChatGpt { id, .. } => {
+			| ResolvedProvider::ChatGpt { id, .. }
+			| ResolvedProvider::Gemini { id, .. } => {
 				match self.list_provider_models(&id).await {
 					Ok(_) => {
 						// `list_provider_models` already merged the fresh
@@ -1907,7 +1916,8 @@ impl CoderHandle {
 			ResolvedProvider::ChatGpt { id, .. } => self.state.provider_keys.has_key(id),
 			ResolvedProvider::Custom { id, base_url }
 			| ResolvedProvider::OpenRouter { id, base_url }
-			| ResolvedProvider::Anthropic { id, base_url } => {
+			| ResolvedProvider::Anthropic { id, base_url }
+			| ResolvedProvider::Gemini { id, base_url } => {
 				if self.state.provider_keys.has_key(id) {
 					true
 				} else {
@@ -3449,7 +3459,8 @@ impl CoderHandle {
 			}
 			ResolvedProvider::Custom { id, base_url }
 			| ResolvedProvider::OpenRouter { id, base_url }
-			| ResolvedProvider::Anthropic { id, base_url } => {
+			| ResolvedProvider::Anthropic { id, base_url }
+			| ResolvedProvider::Gemini { id, base_url } => {
 				if !self.state.provider_keys.has_key(id) && !is_local_base_url(base_url) {
 					return Err(CoderError::NotSignedIn);
 				}
@@ -13264,6 +13275,7 @@ mod tests {
 					name: name.to_string(),
 					arguments: arguments.to_string(),
 				},
+				extra_content: None,
 			}],
 		}
 	}
@@ -14053,6 +14065,7 @@ mod tests {
 						name: "bash".into(),
 						arguments: "{}".into(),
 					},
+					extra_content: None,
 				},
 				crate::inference::ToolCall {
 					id: "bash:1".into(),
@@ -14061,6 +14074,7 @@ mod tests {
 						name: "bash".into(),
 						arguments: "{}".into(),
 					},
+					extra_content: None,
 				},
 			],
 		}];
@@ -14072,6 +14086,7 @@ mod tests {
 					name: "bash".into(),
 					arguments: "{}".into(),
 				},
+				extra_content: None,
 			},
 			crate::inference::ToolCall {
 				id: "bash:1".into(),
@@ -14080,6 +14095,7 @@ mod tests {
 					name: "bash".into(),
 					arguments: "{}".into(),
 				},
+				extra_content: None,
 			},
 		];
 		dedupe_response_tool_call_ids(&messages, &mut fresh);
@@ -14099,6 +14115,7 @@ mod tests {
 					name: "bash".into(),
 					arguments: "{}".into(),
 				},
+				extra_content: None,
 			}],
 		}];
 		let mut fresh = vec![crate::inference::ToolCall {
@@ -14108,6 +14125,7 @@ mod tests {
 				name: "bash".into(),
 				arguments: "{}".into(),
 			},
+			extra_content: None,
 		}];
 		dedupe_response_tool_call_ids(&messages, &mut fresh);
 		assert_eq!(fresh[0].id, "call_2");
@@ -14178,6 +14196,7 @@ mod tests {
 					name: "bash".into(),
 					arguments: "{}".into(),
 				},
+				extra_content: None,
 			}],
 			usage: None,
 			stop_reason: None,
@@ -14289,6 +14308,7 @@ mod tests {
 					name: "read_file".into(),
 					arguments: "{}".into(),
 				},
+				extra_content: None,
 			}],
 		};
 		session.messages = vec![
@@ -14405,6 +14425,7 @@ mod tests {
 						name: "read_file".into(),
 						arguments: "{}".into(),
 					},
+					extra_content: None,
 				}],
 			},
 			ChatMessage::Tool {

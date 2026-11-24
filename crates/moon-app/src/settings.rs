@@ -141,10 +141,37 @@ pub async fn add_provider(
 	get_model_settings(coder, ctx).await
 }
 
+/// Take up the providers as `state.json` has them now. Every window
+/// is its own process and writes the whole list on save, so one that
+/// kept its boot-time list would neither offer a provider another
+/// window added nor keep it past its next save. The active provider
+/// stays this window's own.
+async fn adopt_providers_from_disk(coder: &CoderHandle, ctx: &SettingsContext) {
+	let on_disk = match app_state_store::load(&ctx.config_dir).await {
+		Ok(state) => state.coder.providers,
+		Err(err) => {
+			tracing::warn!(error = %err, "model settings: could not re-read the providers");
+			return;
+		}
+	};
+	let models = coder.current_models().await;
+	let same = models.providers.len() == on_disk.len()
+		&& models.providers.iter().zip(&on_disk).all(|(live, disk)| {
+			let mut live = live.clone();
+			live.has_api_key = disk.has_api_key;
+			live == *disk
+		});
+	if same {
+		return;
+	}
+	coder.set_providers(on_disk, models.active_provider).await;
+}
+
 /// Current model/provider settings: the runner's live view plus the
 /// workspace's provider lock. The read/write payload of the picker
 /// and the companion's provider card.
 pub async fn get_model_settings(coder: &CoderHandle, ctx: &SettingsContext) -> Result<CoderModelSettings, MoonError> {
+	adopt_providers_from_disk(coder, ctx).await;
 	let models = coder.current_models().await;
 	let provider_lock = workspace_provider_lock(ctx).await;
 	// Resolve before the fields move out of `models` below.

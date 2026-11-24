@@ -680,9 +680,17 @@ fn pi_assistant_message(
 	// the round-trip survives reload and we can replay it verbatim.
 	// Otherwise fall back to the plain `thinking` summary string the
 	// non-Anthropic providers produce.
-	let signed_thinking = thinking_blocks
-		.iter()
-		.any(|b| !matches!(b, crate::inference::ThinkingBlock::ResponsesOutput { .. }));
+	// Opaque provider state (ChatGPT's Responses output, OpenRouter's
+	// reasoning details) is written whatever else is: it carries no
+	// readable summary of its own.
+	use crate::inference::ThinkingBlock;
+	let opaque = |b: &&ThinkingBlock| {
+		matches!(
+			b,
+			ThinkingBlock::ResponsesOutput { .. } | ThinkingBlock::ReasoningDetails { .. }
+		)
+	};
+	let signed_thinking = thinking_blocks.iter().any(|b| !opaque(&b));
 	if !signed_thinking {
 		if let Some(thinking) = thinking {
 			if !thinking.is_empty() {
@@ -691,6 +699,9 @@ fn pi_assistant_message(
 					"thinking": thinking,
 				}));
 			}
+		}
+		for block in thinking_blocks.iter().filter(opaque) {
+			blocks.push(pi_thinking_block(block));
 		}
 	} else {
 		for block in thinking_blocks {
@@ -765,6 +776,10 @@ fn pi_thinking_block(block: &crate::inference::ThinkingBlock) -> serde_json::Val
 			"model": model,
 			"items": items,
 		}),
+		ThinkingBlock::ReasoningDetails { items } => serde_json::json!({
+			"type": "reasoning_details",
+			"items": items,
+		}),
 	}
 }
 
@@ -803,12 +818,16 @@ fn pi_tool_call_block(call: &ToolCall) -> serde_json::Value {
 		Ok(v) => v,
 		Err(_) => serde_json::json!({ "_raw": call.function.arguments }),
 	};
-	serde_json::json!({
+	let mut block = serde_json::json!({
 		"type": "toolCall",
 		"id": call.id,
 		"name": call.function.name,
 		"arguments": args,
-	})
+	});
+	if let Some(extra) = &call.extra_content {
+		block["extraContent"] = extra.clone();
+	}
+	block
 }
 
 /// Split a `"provider/model"`-shaped header model string into its
@@ -1065,7 +1084,7 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 					thinking_blocks.push(parsed);
 				}
 			}
-			"responses_output" => {
+			"responses_output" | "reasoning_details" => {
 				if let Ok(parsed) = serde_json::from_value(block.clone()) {
 					thinking_blocks.push(parsed);
 				}
@@ -1090,6 +1109,7 @@ fn parse_pi_assistant(msg: &serde_json::Value) -> Vec<SessionRecord> {
 					id,
 					kind: "function".into(),
 					function: crate::inference::FunctionCall { name, arguments },
+					extra_content: block.get("extraContent").cloned(),
 				});
 			}
 			_ => {}
@@ -3569,6 +3589,7 @@ mod tests {
 				name: "read_file".to_owned(),
 				arguments: "{}".to_owned(),
 			},
+			extra_content: None,
 		};
 		// A plain answer between two tool-calling assistants: the
 		// ordinal must skip it (that mismatch is what broke resumes
@@ -3898,6 +3919,7 @@ mod tests {
 						name: "bash".into(),
 						arguments: r#"{"command":"ls"}"#.into(),
 					},
+					extra_content: None,
 				}],
 			},
 		)
@@ -4647,6 +4669,7 @@ mod tests {
 				name: name.into(),
 				arguments: "{}".into(),
 			},
+			extra_content: None,
 		}
 	}
 
@@ -5238,6 +5261,7 @@ mod tests {
 					name: "bash".into(),
 					arguments: r#"{"cmd":"ls"}"#.into(),
 				},
+				extra_content: None,
 			}],
 			model: Some("anthropic/claude-fable-5".into()),
 			stop_reason: None,
@@ -5387,5 +5411,53 @@ mod tests {
 		let back: SessionHeader = serde_json::from_value(json).unwrap();
 		assert_eq!(back.id, "sess-old-coord");
 		assert!(!serde_json::to_string(&back).unwrap().contains("\"mode\""));
+	}
+
+	#[test]
+	fn a_tool_call_keeps_its_provider_data_on_disk() {
+		let call = ToolCall {
+			id: "c1".into(),
+			kind: "function".into(),
+			function: crate::inference::FunctionCall {
+				name: "read_file".into(),
+				arguments: "{}".into(),
+			},
+			extra_content: Some(serde_json::json!({ "google": { "thought_signature": "sig==" } })),
+		};
+		let block = pi_tool_call_block(&call);
+		let msg = serde_json::json!({ "role": "assistant", "content": [block] });
+		let records = parse_pi_assistant(&msg);
+		let Some(SessionRecord::Assistant { tool_calls, .. }) = records.first() else {
+			panic!("expected an assistant record, got {records:?}");
+		};
+		assert_eq!(tool_calls[0].extra_content, call.extra_content);
+	}
+
+	#[test]
+	fn opaque_reasoning_is_kept_on_disk_beside_the_readable_thinking() {
+		let header = make_test_header("sess-opaque");
+		let details = crate::inference::ThinkingBlock::ReasoningDetails {
+			items: vec![serde_json::json!({ "type": "reasoning.encrypted", "data": "sig==" })],
+		};
+		let msg = pi_assistant_message(
+			Some("done"),
+			Some("thought about it"),
+			std::slice::from_ref(&details),
+			&[],
+			&header,
+			None,
+			None,
+		);
+		let records = parse_pi_assistant(&msg);
+		let Some(SessionRecord::Assistant {
+			thinking,
+			thinking_blocks,
+			..
+		}) = records.first()
+		else {
+			panic!("expected an assistant record, got {records:?}");
+		};
+		assert_eq!(thinking.as_deref(), Some("thought about it"));
+		assert_eq!(thinking_blocks, &vec![details]);
 	}
 }

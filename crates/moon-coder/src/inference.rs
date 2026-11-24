@@ -240,6 +240,15 @@ pub enum ThinkingBlock {
 		#[serde(default)]
 		items: Vec<serde_json::Value>,
 	},
+	/// OpenRouter's `reasoning_details` for this turn, merged from the
+	/// stream. Gemini's thought signatures ride in them (encrypted
+	/// entries), and Gemini refuses a replayed tool call without its
+	/// signature, so they go back on the assistant message verbatim.
+	/// Replayed on the OpenRouter route only.
+	ReasoningDetails {
+		#[serde(default)]
+		items: Vec<serde_json::Value>,
+	},
 }
 
 /// One message in the conversation, in the OpenAI chat-completions
@@ -329,6 +338,12 @@ pub struct ToolCall {
 	#[serde(rename = "type", default = "default_tool_type")]
 	pub kind: String,
 	pub function: FunctionCall,
+	/// Provider data a tool call came with that must go back with it
+	/// on replay, verbatim: Gemini's thought signature
+	/// (`{"google": {"thought_signature": …}}`), without which it
+	/// refuses the next request.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub extra_content: Option<serde_json::Value>,
 }
 
 impl ToolCall {
@@ -375,6 +390,8 @@ enum WireMessage<'a> {
 		content: Option<&'a str>,
 		#[serde(skip_serializing_if = "cow_tool_calls_is_empty")]
 		tool_calls: Cow<'a, [ToolCall]>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		reasoning_details: Option<&'a [serde_json::Value]>,
 	},
 	Tool {
 		tool_call_id: &'a str,
@@ -469,10 +486,14 @@ const TOOL_IMAGES_PREAMBLE: &str = "[image(s) attached from the preceding tool r
 /// screenshots in its history usable after a switch to a
 /// text-only model (the HF router 400s the whole request
 /// otherwise).
+/// `replay_reasoning`: send each assistant turn's OpenRouter
+/// `reasoning_details` back with it. Only OpenRouter takes them; a
+/// strict endpoint would refuse the unknown field after a switch.
 fn build_wire_messages<'a>(
 	messages: &'a [ChatMessage],
 	cached_indexes: &[usize],
 	images_ok: bool,
+	replay_reasoning: bool,
 ) -> Vec<WireMessage<'a>> {
 	let mut out = Vec::with_capacity(messages.len());
 	let mut pending_tool_images: Vec<&'a ImageAttachment> = Vec::new();
@@ -489,7 +510,9 @@ fn build_wire_messages<'a>(
 				content: wire_user_content(content, images, cache_here, images_ok),
 			},
 			ChatMessage::Assistant {
-				content, tool_calls, ..
+				content,
+				tool_calls,
+				thinking_blocks,
 			} => {
 				// A reply that was reasoning and nothing else is kept in
 				// the session (its thoughts are shown), but reasoning is
@@ -501,8 +524,8 @@ fn build_wire_messages<'a>(
 				if tool_calls.is_empty() && !has_text {
 					continue;
 				}
-				// `thinking_blocks` is Anthropic-native-only and never
-				// rides on the OpenAI-compat wire, so it's dropped here.
+				// Of `thinking_blocks`, only OpenRouter's reasoning
+				// details ride on this wire (below).
 				// `cache_breakpoint_indexes` never targets an
 				// assistant turn (it skips backwards to the
 				// previous tool / user message), so `cache_here`
@@ -534,6 +557,14 @@ fn build_wire_messages<'a>(
 					// byte-identical wire body (routers prefix-cache
 					// on the literal request bytes).
 					tool_calls: repair_wire_tool_calls(tool_calls),
+					reasoning_details: if replay_reasoning {
+						thinking_blocks.iter().find_map(|block| match block {
+							ThinkingBlock::ReasoningDetails { items } if !items.is_empty() => Some(items.as_slice()),
+							_ => None,
+						})
+					} else {
+						None
+					},
 				}
 			}
 			ChatMessage::Tool {
@@ -1113,6 +1144,8 @@ struct StreamDelta {
 	reasoning: Option<String>,
 	#[serde(default, deserialize_with = "null_or_missing_as_default")]
 	tool_calls: Vec<ToolCallDelta>,
+	#[serde(default, deserialize_with = "null_or_missing_as_default")]
+	reasoning_details: Vec<serde_json::Value>,
 }
 
 /// A streaming tool call shows up across multiple chunks. `index`
@@ -1130,6 +1163,8 @@ struct ToolCallDelta {
 	kind: Option<String>,
 	#[serde(default)]
 	function: Option<FunctionCallDelta>,
+	#[serde(default)]
+	extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1340,7 +1375,10 @@ impl InferenceClient {
 		}
 		let (kind, id, base_url) = match resolved {
 			ResolvedProvider::HuggingFace => unreachable!(),
-			ResolvedProvider::Custom { id, base_url } => (RouteKind::Custom, id, base_url),
+			// Gemini's OpenAI-compatible endpoint takes the custom wire.
+			ResolvedProvider::Custom { id, base_url } | ResolvedProvider::Gemini { id, base_url } => {
+				(RouteKind::Custom, id, base_url)
+			}
 			ResolvedProvider::OpenRouter { id, base_url } => (RouteKind::OpenRouter, id, base_url),
 			ResolvedProvider::Anthropic { id, base_url } => (RouteKind::Anthropic, id, base_url),
 			ResolvedProvider::ChatGpt { id, base_url } => (RouteKind::ChatGpt, id, base_url),
@@ -1384,7 +1422,8 @@ impl InferenceClient {
 			ResolvedProvider::Custom { id, .. }
 			| ResolvedProvider::OpenRouter { id, .. }
 			| ResolvedProvider::Anthropic { id, .. }
-			| ResolvedProvider::ChatGpt { id, .. } => id,
+			| ResolvedProvider::ChatGpt { id, .. }
+			| ResolvedProvider::Gemini { id, .. } => id,
 		};
 		// User providers: budget only when the user configured a
 		// payload cap (local endpoints don't care). Ceiling at 85 %
@@ -1606,7 +1645,17 @@ impl InferenceClient {
 		}
 
 		let raw: provider_catalog::ListBody = crate::auth::decode_body(&endpoint, &body)?;
-		Ok(raw.into_models().into_iter().map(provider_catalog::flatten).collect())
+		let mut models: Vec<_> = raw.into_models().into_iter().map(provider_catalog::flatten).collect();
+		// Gemini lists `models/gemini-…`; the bare name is what the
+		// picker shows and what chat completions documents.
+		if matches!(kind, ProviderKind::Gemini) {
+			for model in &mut models {
+				if let Some(bare) = model.id.strip_prefix("models/") {
+					model.id = bare.to_owned();
+				}
+			}
+		}
+		Ok(models)
 	}
 
 	/// The ChatGPT plan's model catalog for provider `id`.
@@ -1789,7 +1838,7 @@ impl InferenceClient {
 		let images_ok = self.images_supported(model).await;
 		let body = ChatCompletionRequest {
 			model,
-			messages: build_wire_messages(messages, &cache_indexes, images_ok),
+			messages: build_wire_messages(messages, &cache_indexes, images_ok, route.kind == RouteKind::OpenRouter),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			max_tokens: None,
@@ -1888,7 +1937,7 @@ impl InferenceClient {
 		let images_ok = self.images_supported(model).await;
 		let body = ChatCompletionRequest {
 			model,
-			messages: build_wire_messages(messages, &cache_indexes, images_ok),
+			messages: build_wire_messages(messages, &cache_indexes, images_ok, route.kind == RouteKind::OpenRouter),
 			tools,
 			tool_choice: if tools.is_empty() { None } else { Some("auto") },
 			max_tokens,
@@ -1934,7 +1983,12 @@ impl InferenceClient {
 					tracing::warn!("image decode 400; resent the latest webp as png and retrying once");
 					let fallback_body = ChatCompletionRequest {
 						model,
-						messages: build_wire_messages(&fallback_messages, &cache_indexes, images_ok),
+						messages: build_wire_messages(
+							&fallback_messages,
+							&cache_indexes,
+							images_ok,
+							route.kind == RouteKind::OpenRouter,
+						),
 						tools,
 						tool_choice: body.tool_choice,
 						max_tokens,
@@ -2151,6 +2205,7 @@ where
 	let mut content_buf = String::new();
 	let mut thinking_buf = String::new();
 	let mut tool_call_bufs: Vec<ToolCallBuffer> = Vec::new();
+	let mut details: Vec<serde_json::Value> = Vec::new();
 	let mut usage: Option<TokenUsage> = None;
 	let mut finish_reason: Option<String> = None;
 	let mut byte_stream = response.bytes_stream();
@@ -2182,6 +2237,7 @@ where
 						content_buf,
 						thinking_buf,
 						tool_call_bufs,
+						details,
 						usage,
 						finish_reason,
 					));
@@ -2192,7 +2248,13 @@ where
 						format!("could not parse SSE chunk: {err}; raw={}", truncate_for_log(data)),
 					)
 				})?;
-				accumulate_chunk(&chunk, &mut content_buf, &mut thinking_buf, &mut tool_call_bufs);
+				accumulate_chunk(
+					&chunk,
+					&mut content_buf,
+					&mut thinking_buf,
+					&mut tool_call_bufs,
+					&mut details,
+				);
 				if let Some(reason) = chunk.choices.first().and_then(|c| c.finish_reason.clone()) {
 					finish_reason = Some(reason);
 				}
@@ -2214,6 +2276,7 @@ where
 		content_buf,
 		thinking_buf,
 		tool_call_bufs,
+		details,
 		usage,
 		finish_reason,
 	))
@@ -2236,6 +2299,7 @@ struct ToolCallBuffer {
 	kind: String,
 	name: String,
 	arguments: String,
+	extra_content: Option<serde_json::Value>,
 }
 
 fn accumulate_chunk(
@@ -2243,10 +2307,14 @@ fn accumulate_chunk(
 	content: &mut String,
 	thinking: &mut String,
 	tool_calls: &mut Vec<ToolCallBuffer>,
+	details: &mut Vec<serde_json::Value>,
 ) {
 	let Some(choice) = chunk.choices.first() else {
 		return;
 	};
+	for detail in &choice.delta.reasoning_details {
+		merge_reasoning_detail(details, detail);
+	}
 	if let Some(text) = choice.delta.content.as_deref() {
 		content.push_str(text);
 	}
@@ -2271,6 +2339,9 @@ fn accumulate_chunk(
 				kind.clone_into(&mut slot.kind);
 			}
 		}
+		if tc.extra_content.is_some() {
+			slot.extra_content.clone_from(&tc.extra_content);
+		}
 		if let Some(func) = tc.function.as_ref() {
 			if let Some(name) = func.name.as_deref() {
 				if !name.is_empty() {
@@ -2279,6 +2350,39 @@ fn accumulate_chunk(
 			}
 			if let Some(args) = func.arguments.as_deref() {
 				slot.arguments.push_str(args);
+			}
+		}
+	}
+}
+
+/// Fold one streamed `reasoning_details` entry into the turn's list.
+/// A text or summary entry streams in pieces sharing its `index`:
+/// their strings join, and the rest (a `signature` arriving last)
+/// takes the latest non-null value. Anything else is its own entry.
+fn merge_reasoning_detail(details: &mut Vec<serde_json::Value>, detail: &serde_json::Value) {
+	let index = detail.get("index");
+	let kind = detail.get("type");
+	let same = details
+		.last_mut()
+		.filter(|last| index.is_some() && last.get("index") == index && last.get("type") == kind);
+	let (Some(last), Some(piece)) = (same, detail.as_object()) else {
+		details.push(detail.clone());
+		return;
+	};
+	let Some(last) = last.as_object_mut() else {
+		return;
+	};
+	for (key, value) in piece {
+		match (key.as_str(), value) {
+			("text" | "summary" | "data", serde_json::Value::String(more)) => match last.get_mut(key) {
+				Some(serde_json::Value::String(so_far)) => so_far.push_str(more),
+				_ => {
+					last.insert(key.clone(), value.clone());
+				}
+			},
+			(_, serde_json::Value::Null) => {}
+			_ => {
+				last.insert(key.clone(), value.clone());
 			}
 		}
 	}
@@ -2320,6 +2424,7 @@ fn finalize_response(
 	content: String,
 	thinking: String,
 	tool_calls: Vec<ToolCallBuffer>,
+	details: Vec<serde_json::Value>,
 	usage: Option<TokenUsage>,
 	finish_reason: Option<String>,
 ) -> AssistantResponse {
@@ -2333,14 +2438,18 @@ fn finalize_response(
 				name: b.name,
 				arguments: b.arguments,
 			},
+			extra_content: b.extra_content,
 		})
 		.collect();
 	let stop_reason = Some(normalize_stop_reason(finish_reason.as_deref(), !tool_calls.is_empty()));
 	AssistantResponse {
 		content: if content.is_empty() { None } else { Some(content) },
 		thinking: if thinking.is_empty() { None } else { Some(thinking) },
-		// OpenAI-compat providers don't emit signed reasoning blocks.
-		thinking_blocks: Vec::new(),
+		thinking_blocks: if details.is_empty() {
+			Vec::new()
+		} else {
+			vec![ThinkingBlock::ReasoningDetails { items: details }]
+		},
 		tool_calls,
 		usage,
 		stop_reason,
@@ -2828,6 +2937,7 @@ mod tests {
 						name: "bash".into(),
 						arguments: "{}".into(),
 					},
+					extra_content: None,
 				}],
 			},
 			ChatMessage::Tool {
@@ -2837,7 +2947,7 @@ mod tests {
 				images: vec![],
 			},
 		];
-		let wire = build_wire_messages(&msgs, &[], false);
+		let wire = build_wire_messages(&msgs, &[], false, false);
 		let v = serde_json::to_value(&wire).unwrap();
 		assert_eq!(v[1]["role"], "tool");
 		assert_eq!(v[1]["tool_call_id"], "call_1");
@@ -2926,7 +3036,7 @@ mod tests {
 		// gets an id or name. Filter it so the chat-history append
 		// doesn't carry a phantom call.
 		let buf = vec![ToolCallBuffer::default()];
-		let resp = finalize_response(String::new(), String::new(), buf, None, None);
+		let resp = finalize_response(String::new(), String::new(), buf, Vec::new(), None, None);
 		assert!(resp.tool_calls.is_empty());
 		assert!(resp.content.is_none());
 		assert!(resp.thinking.is_none());
@@ -2976,13 +3086,69 @@ mod tests {
 		let mut tcs = Vec::new();
 		for raw in chunks {
 			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
-			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs, &mut Vec::new());
 		}
-		let resp = finalize_response(content, thinking, tcs, None, None);
+		let resp = finalize_response(content, thinking, tcs, Vec::new(), None, None);
 		assert_eq!(resp.tool_calls.len(), 1);
 		assert_eq!(resp.tool_calls[0].id, "call_x");
 		assert_eq!(resp.tool_calls[0].function.name, "read_file");
 		assert_eq!(resp.tool_calls[0].function.arguments, r#"{"path":"foo.rs"}"#);
+	}
+
+	#[test]
+	fn openrouter_reasoning_details_merge_and_go_back_on_openrouter_only() {
+		let chunks = [
+			r#"{"choices":[{"delta":{"reasoning":"Look","reasoning_details":[{"type":"reasoning.text","text":"Look","index":0,"format":"google-gemini-v1"}]}}]}"#,
+			r#"{"choices":[{"delta":{"reasoning":" first.","reasoning_details":[{"type":"reasoning.text","text":" first.","index":0,"signature":null}]}}]}"#,
+			r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"sig==","index":1,"format":"google-gemini-v1"}],"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+		];
+		let mut content = String::new();
+		let mut thinking = String::new();
+		let mut tcs = Vec::new();
+		let mut details = Vec::new();
+		for raw in chunks {
+			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs, &mut details);
+		}
+		let resp = finalize_response(content, thinking, tcs, details, None, None);
+		assert_eq!(resp.thinking.as_deref(), Some("Look first."));
+		let ThinkingBlock::ReasoningDetails { items } = &resp.thinking_blocks[0] else {
+			panic!("expected reasoning details, got {:?}", resp.thinking_blocks);
+		};
+		assert_eq!(items.len(), 2);
+		assert_eq!(items[0]["text"], "Look first.");
+		assert_eq!(items[0]["format"], "google-gemini-v1");
+		assert_eq!(items[1]["data"], "sig==");
+
+		let messages = vec![ChatMessage::Assistant {
+			content: None,
+			thinking_blocks: resp.thinking_blocks.clone(),
+			tool_calls: resp.tool_calls.clone(),
+		}];
+		let sent = serde_json::to_value(build_wire_messages(&messages, &[], true, true)).unwrap();
+		assert_eq!(sent[0]["reasoning_details"][1]["data"], "sig==");
+		let elsewhere = serde_json::to_value(build_wire_messages(&messages, &[], true, false)).unwrap();
+		assert!(elsewhere[0].get("reasoning_details").is_none());
+	}
+
+	#[test]
+	fn a_gemini_thought_signature_goes_back_with_its_call() {
+		let chunks = [
+			r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sig=="}}}]}}]}"#,
+			r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c2","type":"function","function":{"name":"grep","arguments":"{}"}}]}}]}"#,
+		];
+		let mut content = String::new();
+		let mut thinking = String::new();
+		let mut tcs = Vec::new();
+		for raw in chunks {
+			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs, &mut Vec::new());
+		}
+		let resp = finalize_response(content, thinking, tcs, Vec::new(), None, None);
+		let wire = serde_json::to_value(&resp.tool_calls).unwrap();
+		assert_eq!(wire[0]["extra_content"]["google"]["thought_signature"], "sig==");
+		// Only the call it came with: the next one carries nothing.
+		assert!(wire[1].get("extra_content").is_none());
 	}
 
 	#[test]
@@ -3003,12 +3169,12 @@ mod tests {
 		// One initial chunk plus a thousand follow-up chunks each
 		// re-emitting the full id/name alongside one byte of args.
 		let chunk: StreamChunk = serde_json::from_str(id_chunk).unwrap();
-		accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+		accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs, &mut Vec::new());
 		for _ in 0..1000 {
 			let chunk: StreamChunk = serde_json::from_str(arg_chunk_with_id).unwrap();
-			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs, &mut Vec::new());
 		}
-		let resp = finalize_response(content, thinking, tcs, None, None);
+		let resp = finalize_response(content, thinking, tcs, Vec::new(), None, None);
 		assert_eq!(resp.tool_calls.len(), 1);
 		assert_eq!(
 			resp.tool_calls[0].id, "call_x",
@@ -3045,9 +3211,9 @@ mod tests {
 		let mut tcs = Vec::new();
 		for raw in chunks {
 			let chunk: StreamChunk = serde_json::from_str(raw).unwrap();
-			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs);
+			accumulate_chunk(&chunk, &mut content, &mut thinking, &mut tcs, &mut Vec::new());
 		}
-		let resp = finalize_response(content, thinking, tcs, None, None);
+		let resp = finalize_response(content, thinking, tcs, Vec::new(), None, None);
 		assert_eq!(resp.content.as_deref(), Some("Hello"));
 		assert_eq!(resp.thinking.as_deref(), Some("Let me think. Maybe a plan helps."));
 	}
@@ -3135,6 +3301,7 @@ mod tests {
 						name: "ls".into(),
 						arguments: "{}".into(),
 					},
+					extra_content: None,
 				}],
 			},
 		];
@@ -3155,6 +3322,7 @@ mod tests {
 						name: "ls".into(),
 						arguments: "{}".into(),
 					},
+					extra_content: None,
 				}],
 			},
 			ChatMessage::Tool {
@@ -3183,7 +3351,7 @@ mod tests {
 				images: Vec::new(),
 			},
 		];
-		let wire = build_wire_messages(&messages, &[], true);
+		let wire = build_wire_messages(&messages, &[], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(r#"{"role":"system","content":"sys"}"#));
 		assert!(json.contains(r#"{"role":"user","content":"hi"}"#));
@@ -3208,7 +3376,7 @@ mod tests {
 		];
 		// Mark system + tool (typical 2-breakpoint placement for
 		// an in-flight turn). User in between stays string-form.
-		let wire = build_wire_messages(&messages, &[0, 2], true);
+		let wire = build_wire_messages(&messages, &[0, 2], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json
 			.contains(r#"{"role":"system","content":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}]}"#));
@@ -3236,7 +3404,7 @@ mod tests {
 				mime: "image/png".into(),
 			}],
 		}];
-		let wire = build_wire_messages(&messages, &[], true);
+		let wire = build_wire_messages(&messages, &[], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(r#"{"role":"tool","tool_call_id":"call_1","content":"[image file — image/png, attached]"}"#));
 		assert!(json.contains(&format!(
@@ -3264,7 +3432,7 @@ mod tests {
 			tool("c2", "data:image/png;base64,BBBB"),
 			ChatMessage::user("next"),
 		];
-		let wire = build_wire_messages(&messages, &[], true);
+		let wire = build_wire_messages(&messages, &[], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		let hoisted = json.find(TOOL_IMAGES_PREAMBLE).unwrap();
 		assert!(json.find(r#""tool_call_id":"c1""#).unwrap() < hoisted);
@@ -3287,7 +3455,7 @@ mod tests {
 				}],
 			},
 		];
-		let wire = build_wire_messages(&messages, &[], true);
+		let wire = build_wire_messages(&messages, &[], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(r#"{"role":"system","content":"sys"}"#));
 		assert!(json.contains(
@@ -3304,7 +3472,7 @@ mod tests {
 				mime: "image/jpeg".into(),
 			}],
 		}];
-		let wire = build_wire_messages(&messages, &[0], true);
+		let wire = build_wire_messages(&messages, &[0], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(json.contains(r#""type":"text","text":"hi","cache_control":{"type":"ephemeral"}"#));
 		assert!(json.contains(r#""type":"image_url","image_url":{"url":"data:image/jpeg;base64,BBBB"}"#));
@@ -3334,7 +3502,7 @@ mod tests {
 				}],
 			},
 		];
-		let wire = build_wire_messages(&messages, &[], false);
+		let wire = build_wire_messages(&messages, &[], false, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(!json.contains("image_url"));
 		assert!(!json.contains("AAAA"));
@@ -3355,7 +3523,7 @@ mod tests {
 			content: "hi".into(),
 			images: Vec::new(),
 		}];
-		let wire = build_wire_messages(&messages, &[], true);
+		let wire = build_wire_messages(&messages, &[], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert_eq!(json, r#"[{"role":"user","content":"hi"}]"#);
 	}
@@ -3383,6 +3551,7 @@ mod tests {
 						name: "write_file".into(),
 						arguments: r#"{"path":"/a","content":"trunc"#.into(),
 					},
+					extra_content: None,
 				},
 				ToolCall {
 					id: "call_ok".into(),
@@ -3391,10 +3560,11 @@ mod tests {
 						name: "read_file".into(),
 						arguments: r#"{"path":"/b"}"#.into(),
 					},
+					extra_content: None,
 				},
 			],
 		}];
-		let wire = build_wire_messages(&messages, &[], true);
+		let wire = build_wire_messages(&messages, &[], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert!(!json.contains("trunc"));
 		assert!(json.contains(r#""id":"call_broken""#));
@@ -3419,9 +3589,10 @@ mod tests {
 					name: "read_file".into(),
 					arguments: r#"{"path":"/a"}"#.into(),
 				},
+				extra_content: None,
 			}],
 		}];
-		let wire = build_wire_messages(&messages, &[], true);
+		let wire = build_wire_messages(&messages, &[], true, false);
 		let json = serde_json::to_string(&wire).unwrap();
 		assert_eq!(
 			json,
@@ -3451,6 +3622,7 @@ mod tests {
 				name: "task_steer".into(),
 				arguments: "{}".into(),
 			},
+			extra_content: None,
 		};
 		let messages = vec![
 			user("first"),
@@ -3466,7 +3638,7 @@ mod tests {
 			user("a sub-agent report"),
 			assistant(Some("an answer"), Vec::new()),
 		];
-		let wire = serde_json::to_value(build_wire_messages(&messages, &[], true)).unwrap();
+		let wire = serde_json::to_value(build_wire_messages(&messages, &[], true, false)).unwrap();
 		let shape: Vec<(&str, bool)> = wire
 			.as_array()
 			.unwrap()

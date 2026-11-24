@@ -227,7 +227,7 @@ Why HF as primary: the team's home turf, one auth flow, billing via
 the user's HF account, and provider-routed access to everything the
 team uses. Other providers are additive.
 
-### Custom OpenAI-compatible endpoints (OpenRouter, Anthropic, local)
+### Custom OpenAI-compatible endpoints (OpenRouter, Anthropic, Gemini, local)
 
 `AppState.coder.providers` is a `Vec<CoderProviderConfig>`:
 
@@ -235,7 +235,7 @@ team uses. Other providers are additive.
 struct CoderProviderConfig {
     id: String,           // opaque "prov-<unix-ms>-<rand>"
     label: String,
-    kind: ProviderKind,   // custom | open_router | anthropic | chat_gpt
+    kind: ProviderKind,   // custom | open_router | anthropic | chat_gpt | gemini
     base_url: String,     // OpenAI-compat /v1 root, or API host for anthropic
     standard_model: String,
     cheap_model: String,
@@ -278,6 +278,10 @@ rejected: the worst case is one extra round trip per origin per run.
   from `GET /key` — both authenticate with the stored inference key,
   no provisioning key needed. Fetch failures render "unavailable" and
   never block the rest of the modal.
+  A turn's `reasoning_details` (merged from the stream) are kept with
+  the assistant message, on disk too, and sent back with it on this
+  route only: Gemini's thought signatures ride in them and it refuses
+  a replayed tool call without its signature.
 - `anthropic` — Anthropic native (`/v1/messages`) via
   `crates/moon-coder/src/anthropic.rs`: different auth headers,
   system prompt as a top-level field, `tool_use` / `tool_result`
@@ -301,6 +305,16 @@ rejected: the worst case is one extra round trip per origin per run.
   change, after each turn, every 5 minutes and on open. Why
   ChatGPT and not a Claude subscription:
   [ADR 0101](decisions/0101-chatgpt-subscription-provider.md).
+- `gemini` — Google's Gemini API through its OpenAI-compatible
+  endpoint (`generativelanguage.googleapis.com/v1beta/openai`) with an
+  AI Studio key: the `custom` wire. Its model list names
+  `models/gemini-…`; the prefix is dropped. Gemini signs its tool
+  calls (`extra_content.google.thought_signature`) and refuses a
+  replayed call without its signature, so a tool call keeps any
+  `extra_content` it came with, on disk (`extraContent` on the pi
+  `toolCall` block) and on the wire, on every OpenAI-compatible
+  route. The native `generateContent` API was rejected: a fourth
+  wire grammar for the same models.
 
 For the built-in presets the picker locks `base_url` and requires a
 `standard_model` pick before saving (there's no per-preset hardcoded
@@ -317,6 +331,13 @@ opt-out is `WorkspaceSession::coder_provider_lock` (`Hf` or
 effective provider is the lock when set, else the global pick. The
 picker shows the effective value with a "Locked to X" label. A stale
 pin falls back to HF with a `tracing::warn!`.
+
+Each window is its own process with its own runner, so two windows
+can use two keys for the same API: add the preset twice (each entry
+has its own keyring slot; name them apart) and lock each workspace to
+one. Opening the model settings takes up the provider list from
+`state.json` (and the keys of providers another window added), since
+a save writes the whole list and a stale one would drop theirs.
 
 #### Extended / adaptive thinking (native Anthropic)
 

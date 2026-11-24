@@ -825,6 +825,7 @@ impl StreamState {
 					name: c.name,
 					arguments: c.arguments,
 				},
+				extra_content: None,
 			})
 			.collect();
 		let raw_reason = match self.incomplete_reason.as_deref() {
@@ -893,6 +894,7 @@ mod tests {
 				name: "read_file".into(),
 				arguments: args.into(),
 			},
+			extra_content: None,
 		}
 	}
 

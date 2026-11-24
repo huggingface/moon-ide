@@ -327,7 +327,7 @@ fn keep_thinking_block(block: &ThinkingBlock) -> bool {
 	match block {
 		ThinkingBlock::Thinking { signature, .. } => !signature.is_empty(),
 		ThinkingBlock::RedactedThinking { data } => !data.is_empty(),
-		ThinkingBlock::ResponsesOutput { .. } => false,
+		ThinkingBlock::ResponsesOutput { .. } | ThinkingBlock::ReasoningDetails { .. } => false,
 	}
 }
 
@@ -341,7 +341,7 @@ fn thinking_block_to_wire(block: &ThinkingBlock) -> Option<Block<'_>> {
 			signature: signature.as_str(),
 		}),
 		ThinkingBlock::RedactedThinking { data } => Some(Block::RedactedThinking { data: data.as_str() }),
-		ThinkingBlock::ResponsesOutput { .. } => None,
+		ThinkingBlock::ResponsesOutput { .. } | ThinkingBlock::ReasoningDetails { .. } => None,
 	}
 }
 
@@ -959,6 +959,7 @@ impl StreamState {
 						b.arguments
 					},
 				},
+				extra_content: None,
 			})
 			.collect();
 		let stop_reason = Some(crate::inference::normalize_stop_reason(
@@ -1205,6 +1206,7 @@ impl NonStreamResponse {
 						id,
 						kind: "function".into(),
 						function: FunctionCall { name, arguments },
+						extra_content: None,
 					});
 				}
 				NonStreamBlock::Other => {}
@@ -1488,6 +1490,7 @@ mod tests {
 						name: "read_file".into(),
 						arguments: r#"{"path":"foo.txt"}"#.into(),
 					},
+					extra_content: None,
 				}],
 			},
 		];
@@ -1904,6 +1907,7 @@ mod tests {
 						name: "bash".into(),
 						arguments: r#"{"command":"ls"}"#.into(),
 					},
+					extra_content: None,
 				}],
 			},
 		];
@@ -1954,6 +1958,7 @@ mod tests {
 						name: "bash".into(),
 						arguments: r#"{"cmd":"ls"}"#.into(),
 					},
+					extra_content: None,
 				}],
 			},
 		];

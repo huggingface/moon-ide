@@ -265,6 +265,9 @@ pub struct CoderModelSettings {
 ///   backend (OpenAI Responses shape). No API key: the keyring slot
 ///   holds an OAuth bundle from the Codex device-code sign-in
 ///   (ADR 0101).
+/// - [`Self::Gemini`] — Google's Gemini API through its
+///   OpenAI-compatible endpoint, with an AI Studio key. Same wire
+///   as [`Self::Custom`]; the picker pre-fills the URL.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
@@ -282,6 +285,8 @@ pub enum ProviderKind {
 	/// ChatGPT subscription via the Codex backend. `has_api_key`
 	/// means "signed in" for this kind.
 	ChatGpt,
+	/// Gemini API, OpenAI-compatible endpoint.
+	Gemini,
 }
 
 /// A started Codex device-code sign-in for a `chat_gpt` provider.

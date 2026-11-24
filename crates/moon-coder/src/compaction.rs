@@ -919,6 +919,7 @@ mod tests {
 					name: tool.into(),
 					arguments: "{}".into(),
 				},
+				extra_content: None,
 			}],
 		}
 	}

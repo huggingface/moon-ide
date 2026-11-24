@@ -89,6 +89,16 @@
 			},
 		},
 		{
+			kind: 'gemini',
+			label: 'Gemini',
+			base_url: 'https://generativelanguage.googleapis.com/v1beta/openai',
+			key: {
+				placeholder: 'AIza...',
+				dashboard_url: 'https://aistudio.google.com/apikey',
+				dashboard_label: 'aistudio.google.com/apikey',
+			},
+		},
+		{
 			kind: 'chat_gpt',
 			label: 'ChatGPT',
 			base_url: 'https://chatgpt.com/backend-api/codex',
@@ -1100,7 +1110,7 @@
 		onClose();
 	}
 
-	// Built-in providers (OpenRouter, Anthropic, ChatGPT) require an
+	// Built-in providers (OpenRouter, Anthropic, ChatGPT, Gemini) require an
 	// explicit standard-model pick from the catalog before Save
 	// can fire — there's no sensible hardcoded default per
 	// preset, and an empty slug would 404 on the first turn. The

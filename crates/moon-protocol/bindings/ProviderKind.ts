@@ -24,5 +24,8 @@
  *   backend (OpenAI Responses shape). No API key: the keyring slot
  *   holds an OAuth bundle from the Codex device-code sign-in
  *   (ADR 0101).
+ * - [`Self::Gemini`] — Google's Gemini API through its
+ *   OpenAI-compatible endpoint, with an AI Studio key. Same wire
+ *   as [`Self::Custom`]; the picker pre-fills the URL.
  */
-export type ProviderKind = "custom" | "open_router" | "anthropic" | "chat_gpt";
+export type ProviderKind = "custom" | "open_router" | "anthropic" | "chat_gpt" | "gemini";
