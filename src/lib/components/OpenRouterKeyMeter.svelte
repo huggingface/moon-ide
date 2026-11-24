@@ -1,11 +1,11 @@
 <script lang="ts">
-	// What the active OpenRouter key has left under its own spend cap,
-	// next to the context ring, and on click its spend for the day,
-	// week and month. The key, not the account: a team key's cap is
-	// the budget that matters, whatever the account holds. A key with
-	// no cap shows today's spend instead. Refreshed like the ChatGPT
-	// meter: on provider change, after each turn, every 5 minutes and
-	// on open.
+	// What the active OpenRouter key can still spend, next to the
+	// context ring, and on click its spend for the day, week and month.
+	// Its own cap when it has one (a shared key's cap is the budget
+	// that matters, whatever the account holds), else the account's
+	// remaining credits, which is what it draws on. Refreshed like the
+	// ChatGPT meter: on provider change, after each turn, every 5
+	// minutes and on open.
 	import { coder } from '../coder.svelte';
 	import { ipc } from '../ipc';
 	import type { OpenRouterCredits } from '../protocol';
@@ -59,29 +59,40 @@
 		return `${n < 0 ? '-' : ''}$${abs.toFixed(short && abs >= 100 ? 0 : 2)}`;
 	}
 
-	const cap = $derived(credits?.key_limit ?? null);
-	const remaining = $derived(cap === null ? null : Math.max(0, credits?.key_limit_remaining ?? 0));
-	const left = $derived(cap === null || remaining === null || cap <= 0 ? 100 : (remaining / cap) * 100);
-	const tone = $derived<'muted' | 'warning' | 'danger'>(
-		cap === null ? 'muted' : left <= 10 ? 'danger' : left <= 25 ? 'warning' : 'muted',
-	);
-	const resetWord = $derived(credits?.key_limit_reset ? `, resets ${credits.key_limit_reset}` : '');
-	const summary = $derived.by(() => {
+	/** What bounds the key's spending: its cap, or the account. */
+	const budget = $derived.by(() => {
 		if (credits === null) {
-			return '';
+			return null;
 		}
-		if (cap === null || remaining === null) {
-			return `OpenRouter key: ${usd(credits.key_usage_daily)} spent today, no spend cap`;
+		const cap = credits.key_limit;
+		if (cap !== null && cap !== undefined) {
+			const reset = credits.key_limit_reset ? `, resets ${credits.key_limit_reset}` : '';
+			return {
+				total: cap,
+				left: Math.max(0, credits.key_limit_remaining ?? 0),
+				label: `Key cap ${usd(cap)}${reset}`,
+				spent: 'cap reached',
+			};
 		}
-		return `OpenRouter key: ${usd(remaining)} left of ${usd(cap)}${resetWord}`;
+		return {
+			total: credits.total_credits,
+			left: Math.max(0, credits.total_credits - credits.total_usage),
+			label: `Account credits ${usd(credits.total_credits)}`,
+			spent: 'out of credits',
+		};
 	});
+	const left = $derived(budget === null || budget.total <= 0 ? 0 : (budget.left / budget.total) * 100);
+	const tone = $derived<'muted' | 'warning' | 'danger'>(left <= 10 ? 'danger' : left <= 25 ? 'warning' : 'muted');
+	const summary = $derived(
+		budget === null ? '' : `OpenRouter: ${usd(budget.left)} left (${budget.label.toLowerCase()})`,
+	);
 </script>
 
-{#if providerId !== null && credits !== null}
+{#if providerId !== null && credits !== null && budget !== null}
 	{@const key = credits}
 	<UsageGauge
 		{left}
-		value={cap === null ? `${usd(key.key_usage_daily, true)} today` : usd(remaining ?? 0, true)}
+		value={usd(budget.left, true)}
 		{tone}
 		{summary}
 		label="OpenRouter key spend"
@@ -89,26 +100,25 @@
 	>
 		<div class="usage-head">
 			OpenRouter key
-			{#if cap !== null && (remaining ?? 0) <= 0}<span class="usage-reached">cap reached</span>{/if}
+			{#if budget.left <= 0}<span class="usage-reached">{budget.spent}</span>{/if}
 		</div>
-		{#if cap !== null}
-			<div class="usage-window">
-				<div class="usage-row">
-					<span class="usage-label">Cap {usd(cap)}{resetWord}</span>
-					<span class="usage-left">{usd(remaining ?? 0)} left</span>
-				</div>
-				<div class="usage-bar">
-					<div
-						class="usage-fill"
-						class:warning={left <= 25 && left > 10}
-						class:danger={left <= 10}
-						style:width="{left}%"
-					></div>
-				</div>
+		<div class="usage-window">
+			<div class="usage-row">
+				<span class="usage-label">{budget.label}</span>
+				<span class="usage-left">{usd(budget.left)} left</span>
 			</div>
-		{:else}
-			<div class="usage-note">No spend cap on this key: it draws on the account's credits.</div>
-		{/if}
+			<div class="usage-bar">
+				<div
+					class="usage-fill"
+					class:warning={left <= 25 && left > 10}
+					class:danger={left <= 10}
+					style:width="{left}%"
+				></div>
+			</div>
+			{#if key.key_limit === null || key.key_limit === undefined}
+				<div class="usage-note">No spend cap on this key: it draws on the account's credits.</div>
+			{/if}
+		</div>
 		<div class="usage-window">
 			<div class="usage-row"><span class="usage-label">Today</span><span>{usd(key.key_usage_daily)}</span></div>
 			<div class="usage-row"><span class="usage-label">This week</span><span>{usd(key.key_usage_weekly)}</span></div>
