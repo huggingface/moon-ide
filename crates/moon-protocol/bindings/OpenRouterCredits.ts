@@ -32,6 +32,15 @@ key_limit?: number | null,
  */
 key_limit_remaining?: number | null, 
 /**
+ * How often the per-key cap starts over (`daily`, `weekly`,
+ * `monthly`); `None` for a cap that never resets, or no cap.
+ */
+key_limit_reset?: string | null, 
+/**
+ * The key's spend in the current UTC day, week and month.
+ */
+key_usage_daily: number, key_usage_weekly: number, key_usage_monthly: number, 
+/**
  * `true` for keys on OpenRouter's free tier (stricter rate
  * limits; the picker renders a small flag).
  */

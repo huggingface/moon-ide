@@ -2297,6 +2297,11 @@ export type OpenRouterCredits = {
 	key_usage: number;
 	key_limit?: number | null;
 	key_limit_remaining?: number | null;
+	/** `daily` / `weekly` / `monthly`; null when the cap never resets. */
+	key_limit_reset?: string | null;
+	key_usage_daily: number;
+	key_usage_weekly: number;
+	key_usage_monthly: number;
 	is_free_tier: boolean;
 };
 

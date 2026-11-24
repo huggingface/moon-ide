@@ -459,6 +459,14 @@ pub struct OpenRouterCredits {
 	/// Headroom left under the per-key cap. `None` when uncapped.
 	#[ts(optional, type = "number | null")]
 	pub key_limit_remaining: Option<f64>,
+	/// How often the per-key cap starts over (`daily`, `weekly`,
+	/// `monthly`); `None` for a cap that never resets, or no cap.
+	#[ts(optional, type = "string | null")]
+	pub key_limit_reset: Option<String>,
+	/// The key's spend in the current UTC day, week and month.
+	pub key_usage_daily: f64,
+	pub key_usage_weekly: f64,
+	pub key_usage_monthly: f64,
 	/// `true` for keys on OpenRouter's free tier (stricter rate
 	/// limits; the picker renders a small flag).
 	pub is_free_tier: bool,

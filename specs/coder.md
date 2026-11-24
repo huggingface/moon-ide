@@ -278,6 +278,11 @@ rejected: the worst case is one extra round trip per origin per run.
   from `GET /key` — both authenticate with the stored inference key,
   no provisioning key needed. Fetch failures render "unavailable" and
   never block the rest of the modal.
+  Next to the context ring, a gauge shows what the active key has left
+  under its own spend cap (not the account balance: a shared key's cap
+  is the budget), or today's spend for a key without a cap; its card
+  has the key's day / week / month spend. Refreshed like the ChatGPT
+  gauge.
   A turn's `reasoning_details` (merged from the stream) are kept with
   the assistant message, on disk too, and sent back with it on this
   route only: Gemini's thought signatures ride in them and it refuses

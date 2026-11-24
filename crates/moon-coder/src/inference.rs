@@ -1771,6 +1771,10 @@ impl InferenceClient {
 			key_usage: key.data.usage,
 			key_limit: key.data.limit,
 			key_limit_remaining: key.data.limit_remaining,
+			key_limit_reset: key.data.limit_reset,
+			key_usage_daily: key.data.usage_daily,
+			key_usage_weekly: key.data.usage_weekly,
+			key_usage_monthly: key.data.usage_monthly,
 			is_free_tier: key.data.is_free_tier,
 		})
 	}
@@ -2570,6 +2574,14 @@ mod openrouter_credits {
 		pub(super) limit: Option<f64>,
 		#[serde(default)]
 		pub(super) limit_remaining: Option<f64>,
+		#[serde(default)]
+		pub(super) limit_reset: Option<String>,
+		#[serde(default)]
+		pub(super) usage_daily: f64,
+		#[serde(default)]
+		pub(super) usage_weekly: f64,
+		#[serde(default)]
+		pub(super) usage_monthly: f64,
 		#[serde(default)]
 		pub(super) is_free_tier: bool,
 	}

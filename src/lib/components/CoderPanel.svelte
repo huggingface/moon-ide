@@ -43,6 +43,7 @@
 	import { withoutToolImages } from './toolBodyHelpers';
 	import TerminalTargetIcon from './TerminalTargetIcon.svelte';
 	import ContextRing from './ContextRing.svelte';
+	import OpenRouterKeyMeter from './OpenRouterKeyMeter.svelte';
 	import PlanUsageMeter from './PlanUsageMeter.svelte';
 	import CoderPlanStrip from './CoderPlanStrip.svelte';
 	import SessionRenameInput from './SessionRenameInput.svelte';
@@ -2898,6 +2899,7 @@
 				 danger before auto-compaction kicks in, and pulses
 				 while a compaction summary is being written. -->
 			<PlanUsageMeter />
+			<OpenRouterKeyMeter />
 			<ContextRing usage={coder.tokenUsage} compaction={coder.compaction} />
 			{#if coder.busy}
 				<button type="button" class="stop" title="Stop turn (Esc)" onclick={() => coder.abort()}>stop</button>
