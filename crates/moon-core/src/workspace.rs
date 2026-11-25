@@ -351,6 +351,33 @@ impl WorkspaceRegistry {
 		Ok(())
 	}
 
+	/// Move the project at `path` just before the project at
+	/// `before` (`None`: to the end). The bar shows a project's
+	/// worktrees under it whatever their place in the list, so only
+	/// projects are moved, and the saved session follows this order.
+	pub async fn move_folder(&self, path: &str, before: Option<&str>) -> MoonResult<()> {
+		let mut inner = self.inner.write().await;
+		let from = inner
+			.folders
+			.iter()
+			.position(|e| e.folder.path == path)
+			.ok_or_else(|| MoonError::NotFound(format!("folder {path}")))?;
+		if before == Some(path) {
+			return Ok(());
+		}
+		let entry = inner.folders.remove(from);
+		let to = match before {
+			None => inner.folders.len(),
+			Some(target) => inner
+				.folders
+				.iter()
+				.position(|e| e.folder.path == target)
+				.ok_or_else(|| MoonError::NotFound(format!("folder {target}")))?,
+		};
+		inner.folders.insert(to, entry);
+		Ok(())
+	}
+
 	/// Set the active folder. Errors if `path` isn't already in the
 	/// workspace — callers should `add_folder` first if they need
 	/// to bind a new path.
@@ -462,6 +489,37 @@ mod tests {
 		);
 		let snap = registry.snapshot().await;
 		assert_eq!(snap.folders.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn move_folder_reorders_and_keeps_the_active_one() {
+		let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+		let registry = test_registry();
+		let mut paths = Vec::new();
+		for dir in &dirs {
+			let entry = registry
+				.add_folder(Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap())
+				.await
+				.unwrap();
+			paths.push(entry.folder.path.clone());
+		}
+		registry.set_active_folder(&paths[1]).await.unwrap();
+		let order = |snap: WorkspaceRecord| snap.folders.into_iter().map(|f| f.path).collect::<Vec<_>>();
+
+		registry.move_folder(&paths[2], Some(&paths[0])).await.unwrap();
+		assert_eq!(
+			order(registry.snapshot().await),
+			vec![paths[2].clone(), paths[0].clone(), paths[1].clone()]
+		);
+		registry.move_folder(&paths[2], None).await.unwrap();
+		assert_eq!(order(registry.snapshot().await), paths);
+		registry.move_folder(&paths[0], Some(&paths[0])).await.unwrap();
+		assert_eq!(order(registry.snapshot().await), paths);
+		assert_eq!(
+			registry.snapshot().await.active_folder.as_deref(),
+			Some(paths[1].as_str())
+		);
+		assert!(registry.move_folder("/nowhere", None).await.is_err());
 	}
 
 	#[tokio::test]

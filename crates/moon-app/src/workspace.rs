@@ -41,6 +41,17 @@ pub async fn workspace_remove_folder(app: &AppCore, path: String) -> Result<Work
 	Ok(snap)
 }
 
+/// Move a project in the workspace's list, just before `before`
+/// (`None`: to the end). Returns the reordered snapshot.
+pub async fn workspace_move_folder(
+	app: &AppCore,
+	path: String,
+	before: Option<String>,
+) -> Result<WorkspaceRecord, MoonError> {
+	app.workspaces.move_folder(&path, before.as_deref()).await?;
+	Ok(app.workspaces.snapshot().await)
+}
+
 /// Re-stamp the active folder's worktree branch label from its
 /// actual checked-out branch (ADR 0028). The folder bar shows a
 /// worktree's branch from the registry, captured at creation; an
@@ -166,6 +177,7 @@ pub async fn workspace_list(app: &AppCore) -> Result<Vec<WorkspaceRecord>, MoonE
 crate::commands!(
 	workspace_open_local([app] path: String),
 	workspace_remove_folder([app] path: String),
+	workspace_move_folder([app] path: String, before: Option<String>),
 	workspace_set_active_folder([app] path: String),
 	workspace_sync_active_worktree_branch([app]),
 	workspace_active([app]),

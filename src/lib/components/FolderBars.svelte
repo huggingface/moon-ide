@@ -14,6 +14,8 @@
 	import CoordinatorIcon from './icons/CoordinatorIcon.svelte';
 	import SparklesIcon from './icons/SparklesIcon.svelte';
 	import ProjectComposePopover from './ProjectComposePopover.svelte';
+	import ContextMenu from './ContextMenu.svelte';
+	import type { ContextMenuItem } from './contextMenu';
 
 	// Stacked folder bars — one row per folder bound into the workspace
 	// — plus an `+ Add folder` row at the bottom. Click a bar to make
@@ -126,6 +128,89 @@
 		return rows;
 	});
 
+	// Reordering projects: drag a project's bar onto another (it goes
+	// before that one, or after when dropped on its lower half), or
+	// right-click it for Move up / down. Worktree rows aren't moved on
+	// their own; they always sit under their project.
+	const projects = $derived(orderedFolders.filter((row) => row.depth === 0).map((row) => row.folder.path));
+	let dragging = $state<string | null>(null);
+	let dropTarget = $state<{ path: string; after: boolean } | null>(null);
+	let menu = $state<{
+		items: ContextMenuItem[];
+		anchor: { left: number; top: number; width: number; height: number };
+	} | null>(null);
+
+	/** Where a project dropped relative to `path` lands: before the
+	 *  project after `path` (or the end) when `after`. */
+	function beforeFor(path: string, after: boolean): string | null {
+		if (!after) {
+			return path;
+		}
+		const index = projects.indexOf(path);
+		return projects[index + 1] ?? null;
+	}
+
+	function onDragStart(event: DragEvent, path: string) {
+		dragging = path;
+		event.dataTransfer?.setData('text/x-moon-project', path);
+		if (event.dataTransfer) {
+			event.dataTransfer.effectAllowed = 'move';
+		}
+	}
+
+	function onDragOver(event: DragEvent, path: string) {
+		if (dragging === null || dragging === path) {
+			dropTarget = null;
+			return;
+		}
+		event.preventDefault();
+		const target = event.currentTarget;
+		if (!(target instanceof HTMLElement)) {
+			return;
+		}
+		const rect = target.getBoundingClientRect();
+		dropTarget = { path, after: event.clientY > rect.top + rect.height / 2 };
+	}
+
+	function onDrop(event: DragEvent) {
+		event.preventDefault();
+		const moving = dragging;
+		const target = dropTarget;
+		dragging = null;
+		dropTarget = null;
+		if (moving === null || target === null) {
+			return;
+		}
+		void workspace.moveFolder(moving, beforeFor(target.path, target.after));
+	}
+
+	function onDragEnd() {
+		dragging = null;
+		dropTarget = null;
+	}
+
+	function openProjectMenu(event: MouseEvent, path: string) {
+		event.preventDefault();
+		const index = projects.indexOf(path);
+		menu = {
+			anchor: { left: event.clientX, top: event.clientY, width: 0, height: 0 },
+			items: [
+				{
+					id: 'up',
+					label: 'Move up',
+					disabled: index <= 0,
+					onSelect: () => void workspace.moveFolder(path, projects[index - 1] ?? null),
+				},
+				{
+					id: 'down',
+					label: 'Move down',
+					disabled: index < 0 || index >= projects.length - 1,
+					onSelect: () => void workspace.moveFolder(path, projects[index + 2] ?? null),
+				},
+			],
+		};
+	}
+
 	function summaryTitle(added: number, modified: number, deleted: number): string {
 		const parts: string[] = [];
 		if (added > 0) {
@@ -189,7 +274,20 @@
 				: defaultRef.indexOf('/') < 0
 					? defaultRef
 					: defaultRef.slice(defaultRef.indexOf('/') + 1)}
-		<li class="bar" class:active={isActive} class:worktree={isWorktree}>
+		<li
+			class="bar"
+			class:active={isActive}
+			class:worktree={isWorktree}
+			class:dragging={dragging === folder.path}
+			class:drop-before={dropTarget?.path === folder.path && !dropTarget.after}
+			class:drop-after={dropTarget?.path === folder.path && dropTarget.after}
+			draggable={isWorktree ? undefined : 'true'}
+			ondragstart={isWorktree ? undefined : (event) => onDragStart(event, folder.path)}
+			ondragover={isWorktree ? undefined : (event) => onDragOver(event, folder.path)}
+			ondrop={isWorktree ? undefined : onDrop}
+			ondragend={onDragEnd}
+			oncontextmenu={isWorktree ? undefined : (event) => openProjectMenu(event, folder.path)}
+		>
 			<button
 				type="button"
 				class="bar-button"
@@ -345,6 +443,9 @@
 		</button>
 	</li>
 </ul>
+{#if menu !== null}
+	<ContextMenu items={menu.items} anchorRect={menu.anchor} onClose={() => (menu = null)} />
+{/if}
 
 <style>
 	.bars {
@@ -382,6 +483,27 @@
 	}
 	.bar:not(.active):hover {
 		background: var(--m-bg-2);
+	}
+	.bar.dragging {
+		opacity: 0.5;
+	}
+	/* Where a dragged project lands: a line on the edge it goes to. */
+	.bar.drop-before::after,
+	.bar.drop-after::after {
+		content: '';
+		position: absolute;
+		left: var(--m-space-2);
+		right: var(--m-space-2);
+		height: 2px;
+		border-radius: 1px;
+		background: var(--m-accent);
+		pointer-events: none;
+	}
+	.bar.drop-before::after {
+		top: -1px;
+	}
+	.bar.drop-after::after {
+		bottom: -1px;
 	}
 	.bar.active .chev {
 		color: var(--m-ws-accent);

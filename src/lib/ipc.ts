@@ -115,6 +115,7 @@ export const ipc = {
 	workspace: {
 		openLocal: (path: string) => call<Workspace>('workspace_open_local', { path }),
 		removeFolder: (path: string) => call<Workspace>('workspace_remove_folder', { path }),
+		moveFolder: (path: string, before: string | null) => call<Workspace>('workspace_move_folder', { path, before }),
 		setActiveFolder: (path: string) => call<Workspace>('workspace_set_active_folder', { path }),
 		syncActiveWorktreeBranch: () => call<Workspace>('workspace_sync_active_worktree_branch'),
 		active: () => call<Workspace | null>('workspace_active'),

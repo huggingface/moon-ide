@@ -212,6 +212,10 @@ Planned shape (not yet built): a per-file `ViewPlugin` subscribes to moon-core's
 
 Git blame is shaped the same way: a `ViewPlugin` that reads per-line blame from moon-core and decorates the gutter with a soft right-aligned annotation. Both ride the same infra that discard-changes already uses (workspace state → IPC → rust core → surface).
 
+## Project bars
+
+The sidebar's project bars keep the workspace's folder order, which is saved with it. Drag a project's bar onto another to move it there (above or below, by which half it's dropped on), or right-click it for **Move up** / **Move down**. A project's worktree rows stay under it and don't move on their own.
+
 ## File tree
 
 The tree lives in the optional files panel at the far right of the window, closed by default ([ADR 0114](decisions/0114-sessions-in-the-sidebar.md)). `Ctrl+0`, the status bar's `files` entry, `Files: Show / Hide Panel` and turning on the source-control changes-only filter open it; the open state persists (`AppState.files_panel_visible`).

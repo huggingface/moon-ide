@@ -1547,6 +1547,20 @@ class WorkspaceState {
 	 * The folder's `FolderState` (and every buffer in it) is dropped
 	 * — those tabs were exclusive to the folder.
 	 */
+	/** Move a project in the sidebar's list, before `before` (`null`:
+	 *  to the end). The order is the workspace's and is saved with it. */
+	async moveFolder(path: string, before: string | null) {
+		if (path === before) {
+			return;
+		}
+		try {
+			await this.adoptWorkspaceSnapshot(await ipc.workspace.moveFolder(path, before));
+			this.persistAppState();
+		} catch (err) {
+			this.flash(`Could not move the project: ${formatError(err)}`);
+		}
+	}
+
 	async removeFolder(path: string) {
 		const folder = this.workspace?.folders.find((f) => f.path === path);
 		if (!folder) {
