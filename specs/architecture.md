@@ -96,6 +96,12 @@ The desktop process logs to stdout and to `<data_local_dir>/moon-ide/logs/<works
 
 Any host operation can fail because the host is gone (container stopped, network blip). The UI must treat workspace I/O as fallible and surface a degraded state without crashing. The core auto-reconnects to the agent in remote mode.
 
+## Desktop builds
+
+Standalone desktop builds embed the frontend through the default
+`custom-protocol` Cargo feature. `tauri dev` disables that feature to use
+the Vite server; a release executable must launch without Vite running.
+
 ## Build follow-ups
 
 The desktop main bundle exceeds the 2 MB warning budget (about 2.05 MB).
