@@ -2160,9 +2160,14 @@ header shows a stop button (`coder_abort_subagent`) that cancels
 just that sub-agent: a dispatch run's token is a child of the
 parent turn's, so the parent and sibling sub-agents keep going (the
 parent sees the `task` call return `Aborted`). `SubagentSpawned` / `SubagentFinished`
-records on the parent's JSONL rebuild the cards on reload, and the
-sub-agent's own JSONL replays into the pop-out; a missing sub-agent
-file degrades to card-only with a warn.
+records on the parent's JSONL rebuild the cards on reload, the card's
+answer coming from the finish record's preview. A finished sub-agent's
+own JSONL is replayed only when its pop-out opens
+(`coder_subagent_transcript`): inlined into the session's replay, a
+session with a hundred sub-agents was a 20 MB event the webview took
+seconds to take in on every open. A sub-agent with no finish record
+(possibly still running) is replayed with the session. A missing
+sub-agent file degrades to card-only with a warn.
 
 ### Bound folders system-prompt section
 

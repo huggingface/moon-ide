@@ -101,6 +101,7 @@ import type {
 	WorkspaceSession,
 	WriteFileResult,
 	SessionNote,
+	CoderEvent,
 } from './protocol';
 
 // Single auditable surface for all workspace-process commands. Components
@@ -515,6 +516,8 @@ export const ipc = {
 		setBashTargetOverride: (forceHost: boolean) => call<boolean>('coder_set_bash_target_override', { forceHost }),
 		setSessionReasoningEffort: (effort: string | null) => call<void>('coder_set_session_reasoning_effort', { effort }),
 		setSessionNotes: (notes: SessionNote[]) => call<void>('coder_set_session_notes', { notes }),
+		subagentTranscript: (sessionId: string, subagentId: string) =>
+			call<CoderEvent[]>('coder_subagent_transcript', { sessionId, subagentId }),
 		setSessionModel: (model: string | null) => call<void>('coder_set_session_model', { model }),
 		openSession: (id: string) => call<CoderSessionSummary>('coder_open_session', { id }),
 		deleteSession: (id: string) => call<void>('coder_delete_session', { id }),

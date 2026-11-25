@@ -858,6 +858,7 @@ async fn run_subagent_wrapped(
 		subagent_id: id,
 		tokens_used_estimate: outcome.as_ref().ok().map(|r| r.tokens_used_estimate).unwrap_or(0),
 		was_error,
+		result_preview: None,
 	});
 	outcome
 }

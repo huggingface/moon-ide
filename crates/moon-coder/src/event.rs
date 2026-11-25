@@ -422,6 +422,12 @@ pub enum CoderEvent {
 		subagent_id: String,
 		tokens_used_estimate: u32,
 		was_error: bool,
+		/// The sub-agent's answer, for its card, on a replay that
+		/// doesn't carry its transcript (fetched when the card is
+		/// opened, `coder_subagent_transcript`). `None` live, where
+		/// the panel reads it off the streamed transcript.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		result_preview: Option<String>,
 	},
 
 	/// Per-iteration token-usage report. Fires once after every

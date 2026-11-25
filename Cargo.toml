@@ -97,6 +97,7 @@ png = "0.18"
 # screenshot or paste arrives in. Encoding to WebP stays on libwebp.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 ts-rs = { version = "12.0", features = ["serde-compat", "serde-json-impl"] }
+unicode-normalization = "0.1.26"
 lsp-types = "0.97"
 which = "8.0"
 url = "2.5"

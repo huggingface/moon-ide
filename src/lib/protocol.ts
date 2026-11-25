@@ -1990,7 +1990,15 @@ export type CoderEvent =
 			detached?: boolean;
 	  }
 	| { kind: 'subagent_event'; subagent_id: string; inner: CoderEvent }
-	| { kind: 'subagent_finished'; subagent_id: string; tokens_used_estimate: number; was_error: boolean }
+	| {
+			kind: 'subagent_finished';
+			subagent_id: string;
+			tokens_used_estimate: number;
+			was_error: boolean;
+			/** The answer for the card, on a replay that leaves the
+			 *  transcript out (fetched on open). */
+			result_preview?: string | null;
+	  }
 	| {
 			kind: 'token_usage';
 			prompt_tokens: number;

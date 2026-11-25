@@ -4287,7 +4287,7 @@ export class CoderPanelState {
 				const lastAssistant = transcript?.rows
 					.toReversed()
 					.find((row): row is Extract<CoderRow, { kind: 'assistant' }> => row.kind === 'assistant');
-				const preview = lastAssistant?.text.trim() ?? null;
+				const preview = lastAssistant?.text.trim() || event.result_preview?.trim() || null;
 				summaries.set(summary.toolCallId, {
 					...summary,
 					status: event.was_error ? 'error' : 'done',
@@ -4457,8 +4457,15 @@ export class CoderPanelState {
 	 *  back-arrow in `'subagent'` mode returns to the parent's
 	 *  session via [`closeSubagentView`]. */
 	openSubagent(subagentId: string): void {
-		if (!this.subagentTranscripts.has(subagentId)) {
+		const transcript = this.subagentTranscripts.get(subagentId);
+		if (transcript === undefined) {
 			return;
+		}
+		// A replayed session leaves a finished sub-agent's transcript
+		// out; its rows come in on open.
+		const summary = findSummaryById(this.subagentSummaries, subagentId);
+		if (transcript.rows.length === 0 && summary !== null && summary.status !== 'running') {
+			void this.#loadSubagentTranscript(subagentId);
 		}
 		// Drilling into a nested card from an already-open pop-out
 		// pushes the outer id so "← Back" unwinds level by level.
@@ -4467,6 +4474,30 @@ export class CoderPanelState {
 		}
 		this.viewSubagentId = subagentId;
 		this.view = 'subagent';
+	}
+
+	async #loadSubagentTranscript(subagentId: string): Promise<void> {
+		const folderKey = this.activeFolderPath ?? NO_FOLDER_KEY;
+		const sessionId = this.current.visibleSessionId;
+		if (sessionId === null) {
+			return;
+		}
+		let events: CoderEvent[];
+		try {
+			events = await ipc.coder.subagentTranscript(sessionId, subagentId);
+		} catch (err) {
+			frontendLog('coder', 'warn', `could not load sub-agent transcript ${subagentId}: ${formatError(err)}`);
+			return;
+		}
+		const session = this.sessionStateFor(folderKey, sessionId);
+		const transcript = session.subagentTranscripts.get(subagentId);
+		if (transcript === undefined || transcript.rows.length > 0) {
+			return;
+		}
+		const folder = this.bucketFor(folderKey);
+		for (const event of events) {
+			this.#applySessionEvent(session, folder, folderKey, sessionId, event);
+		}
 	}
 
 	/** Switch the folder bar to `folderPath` (if it isn't already

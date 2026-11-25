@@ -3332,6 +3332,7 @@ impl CoderHandle {
 						*worker,
 						*detached,
 						false,
+						true,
 					)
 					.await;
 				}
@@ -3339,12 +3340,13 @@ impl CoderHandle {
 					subagent_id,
 					tokens_used_estimate,
 					was_error,
-					result_preview: _,
+					result_preview,
 				} => {
 					replay_events.push(CoderEvent::SubagentFinished {
 						subagent_id,
 						tokens_used_estimate,
 						was_error,
+						result_preview,
 					});
 				}
 				other => emit_replay_events(&mut replay_events, other, record_ts),
@@ -3916,10 +3918,10 @@ impl CoderHandle {
 		// Sub-agents whose `SubagentFinished` record hasn't landed
 		// yet are still running when the turn is in flight — their
 		// transcripts must not get orphan-error synthesis either.
-		let finished_subagent_ids: std::collections::HashSet<&str> = records
+		let finished_subagent_ids: std::collections::HashSet<String> = records
 			.iter()
 			.filter_map(|r| match r {
-				SessionRecord::SubagentFinished { subagent_id, .. } => Some(subagent_id.as_str()),
+				SessionRecord::SubagentFinished { subagent_id, .. } => Some(subagent_id.clone()),
 				_ => None,
 			})
 			.collect();
@@ -3950,6 +3952,13 @@ impl CoderHandle {
 					ref detached,
 				} => {
 					let still_running = live_subagent_ids.contains(subagent_id.as_str());
+					// A finished sub-agent's transcript stays out of the
+					// replay: with many of them it was most of a payload
+					// the webview took seconds to take in, on every open.
+					// Its card shows the preview on the finish event; the
+					// transcript is fetched when the card is opened
+					// (`Coder::subagent_transcript`).
+					let finished = finished_subagent_ids.contains(subagent_id.as_str());
 					replay_subagent_spawned(
 						&mut all,
 						&subagent_session_dir(dir, session_id),
@@ -3961,6 +3970,7 @@ impl CoderHandle {
 						*worker,
 						*detached,
 						still_running,
+						!finished,
 					)
 					.await;
 				}
@@ -3968,12 +3978,13 @@ impl CoderHandle {
 					subagent_id,
 					tokens_used_estimate,
 					was_error,
-					result_preview: _,
+					result_preview,
 				} => {
 					all.push(CoderEvent::SubagentFinished {
 						subagent_id,
 						tokens_used_estimate,
 						was_error,
+						result_preview,
 					});
 				}
 				other => emit_replay_events(&mut all, other, record_ts),
@@ -4402,6 +4413,7 @@ impl CoderHandle {
 					subagent_id,
 					tokens_used_estimate: 0,
 					was_error,
+					result_preview: None,
 				});
 			}
 		}
@@ -4540,6 +4552,38 @@ impl CoderHandle {
 			}
 		}
 		Ok((summary, observed_replay))
+	}
+
+	/// The transcript of sub-agent `subagent_id` of the active folder's
+	/// session `session_id`, as the events its card's pop-out replays
+	/// (a replay leaves finished sub-agents' transcripts out). Nested
+	/// sub-agents come with it.
+	pub async fn subagent_transcript(&self, session_id: &str, subagent_id: &str) -> Result<Vec<CoderEvent>, CoderError> {
+		sessions::validate_session_id(session_id)?;
+		sessions::validate_session_id(subagent_id)?;
+		let folder_root = match self.state.coder_root_folder().await {
+			Some(f) => Utf8PathBuf::from(f.folder.path.clone()),
+			None => self.state.no_folder_root().await?,
+		};
+		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_root);
+		let mut events = Vec::new();
+		replay_subagent_spawned(
+			&mut events,
+			&subagent_session_dir(&dir, session_id),
+			String::new(),
+			subagent_id.to_owned(),
+			String::new(),
+			String::new(),
+			None,
+			false,
+			false,
+			false,
+			true,
+		)
+		.await;
+		// The spawn itself is already on the card.
+		events.remove(0);
+		Ok(events)
 	}
 
 	/// Delete a persisted session under the active workspace
@@ -12100,6 +12144,7 @@ fn replay_subagent_spawned<'a>(
 	worker: bool,
 	detached: bool,
 	still_running: bool,
+	transcript: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
 	Box::pin(async move {
 		out.push(CoderEvent::SubagentSpawned {
@@ -12111,6 +12156,9 @@ fn replay_subagent_spawned<'a>(
 			worker,
 			detached,
 		});
+		if !transcript {
+			return;
+		}
 
 		let loaded = match sessions::load(sub_dir, &subagent_id).await {
 			Ok(loaded) => loaded,
@@ -12156,6 +12204,7 @@ fn replay_subagent_spawned<'a>(
 						worker,
 						detached,
 						nested_still_running,
+						true,
 					)
 					.await;
 				}
@@ -12163,12 +12212,13 @@ fn replay_subagent_spawned<'a>(
 					subagent_id: nested_id,
 					tokens_used_estimate,
 					was_error,
-					result_preview: _,
+					result_preview,
 				} => {
 					out.push(CoderEvent::SubagentFinished {
 						subagent_id: nested_id,
 						tokens_used_estimate,
 						was_error,
+						result_preview,
 					});
 				}
 				record => {

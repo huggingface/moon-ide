@@ -1217,8 +1217,10 @@
 	// growing, the plan strip taking room from the viewport. The rows
 	// are the transcript's children, so those are what is watched.
 	$effect(() => {
+		// `null` once the transcript unmounts (sessions list, a
+		// sub-agent's pop-out), `undefined` before it first mounts.
 		const el = scrollEl;
-		if (el === undefined) {
+		if (!el) {
 			return;
 		}
 		const follow = new ResizeObserver(() => {

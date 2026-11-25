@@ -194,16 +194,37 @@ pub fn validate_workspace_id(id: &str) -> Result<(), crate::MoonError> {
 }
 
 /// Best-effort conversion of a free-text workspace name into a
-/// valid slug: lowercases, replaces every run of non-`[a-z0-9]`
-/// with a single `-`, trims leading/trailing `-`, and clamps to
-/// [`MAX_WORKSPACE_SLUG_LEN`]. Returns the empty string when no
-/// alphanumeric characters are present — callers should fall
+/// valid slug: drops accents (`Bergère enchantée` →
+/// `bergere-enchantee`), lowercases, replaces every run of
+/// non-`[a-z0-9]` with a single `-`, trims leading/trailing `-`, and
+/// clamps to [`MAX_WORKSPACE_SLUG_LEN`]. Returns the empty string when
+/// no alphanumeric characters are present — callers should fall
 /// back to a default in that case (e.g. let the user pick a
 /// different name).
 pub fn slugify_workspace_name(name: &str) -> String {
+	use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 	let mut out = String::new();
 	let mut prev_dash = true;
-	for ch in name.chars() {
+	// Decomposed, an accented letter is its base letter and a mark;
+	// letters that don't decompose that way are spelled out.
+	let folded = name.nfd().filter(|ch| !is_combining_mark(*ch)).flat_map(|ch| {
+		let spelled: &str = match ch {
+			'æ' | 'Æ' => "ae",
+			'œ' | 'Œ' => "oe",
+			'ß' => "ss",
+			'ø' | 'Ø' => "o",
+			'ł' | 'Ł' => "l",
+			'đ' | 'Đ' => "d",
+			'ı' => "i",
+			_ => "",
+		};
+		if spelled.is_empty() {
+			vec![ch]
+		} else {
+			spelled.chars().collect()
+		}
+	});
+	for ch in folded {
 		let lower = ch.to_ascii_lowercase();
 		if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
 			out.push(lower);
@@ -262,7 +283,9 @@ mod tests {
 		assert_eq!(slugify_workspace_name("ACME Corp."), "acme-corp");
 		assert_eq!(slugify_workspace_name("moon--ide"), "moon-ide");
 		assert_eq!(slugify_workspace_name("---"), "");
-		assert_eq!(slugify_workspace_name("héllo wörld"), "h-llo-w-rld");
+		assert_eq!(slugify_workspace_name("héllo wörld"), "hello-world");
+		assert_eq!(slugify_workspace_name("Bergère enchantée"), "bergere-enchantee");
+		assert_eq!(slugify_workspace_name("Œuvre Straße Łódź"), "oeuvre-strasse-lodz");
 	}
 
 	#[test]

@@ -925,6 +925,20 @@ pub async fn coder_set_session_reasoning_effort(app: &AppCore, effort: Option<St
 		.map_err(MoonError::from)
 }
 
+/// A finished sub-agent's transcript, for its card's pop-out: a
+/// session's replay leaves those out.
+pub async fn coder_subagent_transcript(
+	app: &AppCore,
+	session_id: String,
+	subagent_id: String,
+) -> Result<Vec<moon_coder::CoderEvent>, MoonError> {
+	app
+		.coder
+		.subagent_transcript(&session_id, &subagent_id)
+		.await
+		.map_err(MoonError::from)
+}
+
 /// Replace the visible session's messages parked for later.
 pub async fn coder_set_session_notes(
 	app: &AppCore,
@@ -1741,6 +1755,7 @@ crate::commands! {
 	coder_set_bash_target_override([app] force_host: bool),
 	coder_set_session_reasoning_effort([app] effort: Option<String>),
 	coder_set_session_notes([app] notes: Vec<moon_coder::sessions::SessionNote>),
+	coder_subagent_transcript([app] session_id: String, subagent_id: String),
 	coder_set_session_model([app] model: Option<String>),
 	coder_transcribe([app] wav_base64: String),
 	coder_open_session([app] id: String),
