@@ -110,9 +110,13 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1.11"
 
+# The release binary is rebuilt after every change and run by whoever
+# made it, so it is tuned for build time: whole-program LTO and a
+# single codegen unit cost ~6 min per rebuild (one core optimising the
+# desktop crate, then the LTO link) against ~10 s without, for a ~10%
+# larger binary.
 [profile.release]
-lto = "thin"
-codegen-units = 1
+incremental = true
 strip = "symbols"
 
 [profile.dev]
