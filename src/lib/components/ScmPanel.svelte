@@ -168,6 +168,18 @@
 	const changeCount = $derived(workspace.scmChangeCount);
 	const commits = $derived(workspace.gitCommits);
 	let showAllCommits = $state(false);
+	// Collapsing the commit list gives its rows to the sessions below;
+	// kept across folders and restarts as a per-machine preference.
+	const COMMITS_COLLAPSED_KEY = 'moon-sidebar-commits-collapsed';
+	let commitsCollapsed = $state(localStorage.getItem(COMMITS_COLLAPSED_KEY) === '1');
+	function toggleCommits(): void {
+		commitsCollapsed = !commitsCollapsed;
+		if (commitsCollapsed) {
+			localStorage.setItem(COMMITS_COLLAPSED_KEY, '1');
+		} else {
+			localStorage.removeItem(COMMITS_COLLAPSED_KEY);
+		}
+	}
 	const VISIBLE_COMMITS = 3;
 
 	// Amend-with-empty-message is valid (preserve previous
@@ -1314,7 +1326,13 @@
 		{@const visibleCommits = showAllCommits ? commits : commits.slice(0, VISIBLE_COMMITS)}
 		<div class="commit-list" aria-label="Recent commits">
 			<div class="commit-list-header">
-				<span>Recent commits</span>
+				<button
+					type="button"
+					class="commit-list-toggle"
+					aria-expanded={!commitsCollapsed}
+					title={commitsCollapsed ? 'Show recent commits' : 'Hide recent commits'}
+					onclick={toggleCommits}>{commitsCollapsed ? '▸' : '▾'} Recent commits</button
+				>
 				{#if showAllCommits && commits.length > VISIBLE_COMMITS}
 					<button
 						type="button"
@@ -1326,22 +1344,24 @@
 			</div>
 			<!-- Expanded, the list scrolls inside a capped box so the
 			     file list below stays on screen. -->
-			<div class="commit-rows" class:expanded={showAllCommits}>
-				{#each visibleCommits as commit (commit.sha)}
-					<button
-						type="button"
-						class="commit-list-row"
-						title={`${commit.subject}\n${commit.author} • ${commit.dateRelative}\n${commit.sha}`}
-						disabled={busy}
-						onclick={() => workspace.openCommitTab(commit.sha, commit.subject)}
-					>
-						<span class="commit-sha">{commit.shortSha}</span>
-						<span class="commit-subject">{commit.subject}</span>
-						<span class="commit-date">{commit.dateRelative}</span>
-					</button>
-				{/each}
-			</div>
-			{#if commits.length > VISIBLE_COMMITS && !showAllCommits}
+			{#if !commitsCollapsed}
+				<div class="commit-rows" class:expanded={showAllCommits}>
+					{#each visibleCommits as commit (commit.sha)}
+						<button
+							type="button"
+							class="commit-list-row"
+							title={`${commit.subject}\n${commit.author} • ${commit.dateRelative}\n${commit.sha}`}
+							disabled={busy}
+							onclick={() => workspace.openCommitTab(commit.sha, commit.subject)}
+						>
+							<span class="commit-sha">{commit.shortSha}</span>
+							<span class="commit-subject">{commit.subject}</span>
+							<span class="commit-date">{commit.dateRelative}</span>
+						</button>
+					{/each}
+				</div>
+			{/if}
+			{#if commits.length > VISIBLE_COMMITS && !showAllCommits && !commitsCollapsed}
 				<button type="button" class="commit-more" disabled={busy} onclick={() => (showAllCommits = true)}>
 					{commits.length - VISIBLE_COMMITS} more commit{commits.length - VISIBLE_COMMITS === 1 ? '' : 's'}…
 				</button>
@@ -2044,6 +2064,17 @@
 		display: flex;
 		flex-direction: column;
 		gap: 1px;
+	}
+	.commit-list-toggle {
+		background: none;
+		border: none;
+		padding: 0;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+	}
+	.commit-list-toggle:hover {
+		color: var(--m-fg);
 	}
 	.commit-list-header {
 		display: flex;

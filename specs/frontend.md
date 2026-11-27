@@ -216,6 +216,8 @@ Git blame is shaped the same way: a `ViewPlugin` that reads per-line blame from 
 
 The sidebar's project bars keep the workspace's folder order, which is saved with it. Drag a project's bar onto another to move it there (above or below, by which half it's dropped on), or right-click it for **Move up** / **Move down**. A project's worktree rows stay under it and don't move on their own.
 
+The project list takes what it needs up to 40% of the sidebar, then scrolls, keeping the active project in view; the divider under it resizes that share (double-click resets). The "Recent commits" header collapses its list. Both choices are per-machine preferences, so many bound folders never squeeze out the session list.
+
 ## File tree
 
 The tree lives in the optional files panel at the far right of the window, closed by default ([ADR 0114](decisions/0114-sessions-in-the-sidebar.md)). `Ctrl+0`, the status bar's `files` entry, `Files: Show / Hide Panel` and turning on the source-control changes-only filter open it; the open state persists (`AppState.files_panel_visible`).
