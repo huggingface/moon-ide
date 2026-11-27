@@ -31,9 +31,10 @@ pub enum Incoming {
 	/// A WebSocket upgrade. The 101 response has already been written;
 	/// the caller wraps `stream` with `WebSocketStream::from_raw_socket`.
 	WebSocket,
-	/// A plain GET for `path` (already URL-decoded, leading slash
-	/// kept). The response has not been written yet.
-	Get { path: String },
+	/// A plain GET for `path` (leading slash kept) with its raw
+	/// `query` (empty when absent). The response has not been
+	/// written yet.
+	Get { path: String, query: String },
 }
 
 /// Read and classify the first request on `stream`. For a WS upgrade,
@@ -110,13 +111,37 @@ where
 		return Ok(Some(Incoming::WebSocket));
 	}
 
-	// Strip the query string; we serve static files by path only.
-	let path = target.split(['?', '#']).next().unwrap_or("/").to_owned();
-	Ok(Some(Incoming::Get { path }))
+	let target = target.split('#').next().unwrap_or("/");
+	let (path, query) = target.split_once('?').unwrap_or((target, ""));
+	Ok(Some(Incoming::Get {
+		path: path.to_owned(),
+		query: query.to_owned(),
+	}))
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
 	buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Write a complete response built elsewhere (the OAuth paths).
+pub async fn write_reply<S>(stream: &mut S, reply: &crate::oauth::Reply) -> std::io::Result<()>
+where
+	S: AsyncWrite + Unpin,
+{
+	let header = format!(
+		"HTTP/1.1 {}\r\n\
+		 Content-Type: {}\r\n\
+		 Content-Length: {}\r\n\
+		 Cache-Control: {}\r\n\
+		 X-Content-Type-Options: nosniff\r\n\r\n",
+		reply.status,
+		reply.content_type,
+		reply.body.len(),
+		reply.cache_control
+	);
+	stream.write_all(header.as_bytes()).await?;
+	stream.write_all(&reply.body).await?;
+	stream.flush().await
 }
 
 /// Serve a static file from `web_root` for `request_path`. Falls back

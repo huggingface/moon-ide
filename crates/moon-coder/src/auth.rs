@@ -93,6 +93,12 @@ struct TokenBundle {
 	scope: String,
 	#[serde(default)]
 	token_type: String,
+	/// OAuth client the bundle was issued to, when it isn't moon-ide's
+	/// registered app: a refresh must present the same one. Set by an
+	/// authorization-code sign-in through a client metadata document
+	/// (the headless IDE signed in from the phone).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	client_id: Option<String>,
 }
 
 /// What `/oauth/userinfo` returns, trimmed to what we render +
@@ -429,6 +435,45 @@ impl Authenticator {
 		}
 	}
 
+	/// Finish an authorization-code sign-in (PKCE, public client)
+	/// started elsewhere: exchange `code` and store the bundle, bound
+	/// to `client_id` for later refreshes.
+	pub async fn exchange_authorization_code(
+		&self,
+		client_id: &str,
+		redirect_uri: &str,
+		code: &str,
+		code_verifier: &str,
+	) -> Result<HfIdentity, CoderError> {
+		let endpoint = format!("{HF_HUB_BASE}/oauth/token");
+		let params = [
+			("client_id", client_id),
+			("grant_type", "authorization_code"),
+			("code", code),
+			("redirect_uri", redirect_uri),
+			("code_verifier", code_verifier),
+		];
+		let response = self
+			.http
+			.post(&endpoint)
+			.form(&params)
+			.send()
+			.await
+			.map_err(CoderError::from)?;
+		let status = response.status();
+		let request_id = request_id_of(&response);
+		let body = response.text().await.map_err(CoderError::from)?;
+		if !status.is_success() {
+			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
+		}
+		let mut bundle = parse_token_response(&body, &endpoint)?;
+		bundle.client_id = Some(client_id.to_owned());
+		let identity = self.fetch_userinfo(&bundle.access_token).await?;
+		self.store.save(&bundle)?;
+		*self.cached.write().await = Some(bundle);
+		Ok(identity)
+	}
+
 	/// Hand out a usable access token, refreshing if needed.
 	/// Returns [`CoderError::NotSignedIn`] when there's no bundle and
 	/// no refresh token to recover with.
@@ -461,8 +506,9 @@ impl Authenticator {
 		};
 
 		let endpoint = format!("{HF_HUB_BASE}/oauth/token");
+		let client_id = bundle.client_id.as_deref().unwrap_or(HF_OAUTH_CLIENT_ID);
 		let params = [
-			("client_id", HF_OAUTH_CLIENT_ID),
+			("client_id", client_id),
 			("grant_type", "refresh_token"),
 			("refresh_token", refresh_token.as_str()),
 		];
@@ -486,7 +532,8 @@ impl Authenticator {
 			return Err(CoderError::http(endpoint, status.as_u16(), body, request_id));
 		}
 
-		let new_bundle = parse_token_response(&body, &endpoint)?;
+		let mut new_bundle = parse_token_response(&body, &endpoint)?;
+		new_bundle.client_id = bundle.client_id.clone();
 		self.store.save(&new_bundle)?;
 		let access = new_bundle.access_token.clone();
 		*cached = Some(new_bundle);
@@ -579,6 +626,7 @@ fn parse_token_response(body: &str, endpoint: &str) -> Result<TokenBundle, Coder
 		expires_at_unix: now.saturating_add(lifetime),
 		scope: raw.scope,
 		token_type: raw.token_type,
+		client_id: None,
 	})
 }
 

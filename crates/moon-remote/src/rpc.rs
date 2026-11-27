@@ -375,6 +375,12 @@ impl BridgeRpcHandler for BridgeRpc {
 				let status = self.coder.status().await.map_err(|e| e.to_string())?;
 				to_value(&status)
 			}
+			// Hugging Face sign-in from the phone, for an IDE with no
+			// desktop (see `crate::hf_sign_in`).
+			"coder_sign_in_start" => {
+				let start = crate::hf_sign_in::start(&self.coder).await.map_err(|e| e.to_string())?;
+				to_value(&start)
+			}
 			"coder_list_sessions" => {
 				let p: FolderParams = parse_params(params)?;
 				let sessions = self
@@ -752,6 +758,25 @@ impl BridgeRpcHandler for BridgeRpc {
 					.map_err(|e| e.to_string())?;
 				Ok(serde_json::json!({ "id": id, "settings": settings }))
 			}
+			// Replace the API key of a provider that already exists —
+			// the phone can't otherwise recover one whose key was lost
+			// or rotated. The key never comes back out.
+			"coder_set_provider_api_key" => {
+				let p: SetProviderApiKeyParams = parse_params(params)?;
+				let key = p.key.trim();
+				if key.is_empty() {
+					return Err("empty API key".into());
+				}
+				self.coder.set_provider_api_key(&p.id, key).map_err(|e| e.to_string())?;
+				let mut settings = moon_app::settings::get_model_settings(&self.coder, &self.settings)
+					.await
+					.map_err(|e| e.to_string())?;
+				// The runner flips its own flag asynchronously.
+				for provider in settings.providers.iter_mut().filter(|provider| provider.id == p.id) {
+					provider.has_api_key = true;
+				}
+				to_value(&settings)
+			}
 			"coder_set_model_settings" => {
 				let p: SetModelSettingsParams = parse_params(params)?;
 				moon_app::settings::set_model_settings(&self.coder, &self.settings, p.settings)
@@ -1072,6 +1097,12 @@ struct ProbeProviderParams {
 }
 
 #[derive(serde::Deserialize)]
+struct SetProviderApiKeyParams {
+	id: String,
+	key: String,
+}
+
+#[derive(serde::Deserialize)]
 struct AddProviderParams {
 	label: String,
 	#[serde(default)]
@@ -1253,6 +1284,7 @@ fn to_value<T: serde::Serialize>(value: &T) -> Result<Value, String> {
 /// duplicating the match arms.
 pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_status",
+	"coder_sign_in_start",
 	"coder_list_sessions",
 	"coder_running_sessions",
 	"coder_active_session",
@@ -1285,6 +1317,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_slack_disconnect",
 	"coder_probe_provider",
 	"coder_add_provider",
+	"coder_set_provider_api_key",
 	"workspace_launch",
 	"workspace_scm_status",
 	"workspace_scm_review",

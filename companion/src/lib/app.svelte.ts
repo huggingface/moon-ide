@@ -9,6 +9,10 @@
 import { forgetAll, ideFor, parsePairLink, type PairLink } from './e2e';
 import { BridgeSocket, clearConnection, loadConnection, type Connection } from './transport';
 
+/** The relay's answer to a device token it doesn't hold
+ * (`moon-bridge` `check_token`). */
+const UNKNOWN_DEVICE_TOKEN = 'unknown device token';
+
 // Wire shapes mirror the bridge's read-only method results, which in
 // turn mirror moon-coder / moon-core types. Kept minimal — only the
 // fields the UI renders.
@@ -104,6 +108,9 @@ export type ProjectComposeStatus = {
 export type ProviderEntry = {
 	id: string;
 	label: string;
+	kind?: string;
+	base_url?: string;
+	has_api_key?: boolean;
 	[key: string]: unknown;
 };
 
@@ -578,6 +585,8 @@ class CompanionState {
 	 * (older IDE — the card hides). `web_fetch` (Jina) needs no
 	 * key and is always available. */
 	webSearchConfigured = $state<boolean | null>(null);
+	/** A Hugging Face sign-in waiting for approval in the browser. */
+	signIn = $state<{ userCode: string | null; url: string } | null>(null);
 	#webKeyBusy = false;
 	/** MCP servers for this workspace (presets like playwright plus
 	 * custom entries), or null while loading / on an older IDE. */
@@ -893,7 +902,16 @@ class CompanionState {
 			await this.loadWorkspaces();
 			return true;
 		} catch (e) {
-			this.error = e instanceof Error ? e.message : String(e);
+			const message = e instanceof Error ? e.message : String(e);
+			// The relay no longer knows this phone (its store was reset or
+			// the device revoked). The link's relay code is still unused,
+			// so pair with the relay again instead of dead-ending.
+			if (message.includes(UNKNOWN_DEVICE_TOKEN)) {
+				clearConnection();
+				await this.pair(link, label);
+				return this.error === null;
+			}
+			this.error = message;
 			return false;
 		}
 	}
@@ -1282,6 +1300,41 @@ class CompanionState {
 		}
 	}
 
+	/** Sign the IDE in to Hugging Face. The IDE waits for the approval
+	 * itself (through its bridge, or a device code when it has no
+	 * public bridge); this shows the link, plus the code for the
+	 * device flow, then polls `coder_status` until it reports signed
+	 * in or the attempt expires. */
+	async startSignIn(): Promise<void> {
+		const workspace = this.activeWorkspace;
+		const ide = this.activeIde;
+		if (!workspace || this.signIn) {
+			return;
+		}
+		let started: { user_code?: string; verification_uri: string; expires_in: number };
+		try {
+			started = await this.#call(workspace, 'coder_sign_in_start', {}, ide);
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			return;
+		}
+		this.signIn = { userCode: started.user_code ?? null, url: started.verification_uri };
+		const deadline = Date.now() + started.expires_in * 1000;
+		while (Date.now() < deadline && this.activeWorkspace === workspace && this.signIn) {
+			await new Promise((resolve) => setTimeout(resolve, 3000));
+			try {
+				const status = await this.#call<CoderStatus>(workspace, 'coder_status', {}, ide);
+				if (status.signed_in) {
+					this.coderStatus = status;
+					break;
+				}
+			} catch {
+				// A dropped call is retried on the next tick.
+			}
+		}
+		this.signIn = null;
+	}
+
 	/** Drop the Tavily key. Idempotent server-side. */
 	async clearWebSearchKey(): Promise<void> {
 		if (!this.activeWorkspace || this.#webKeyBusy) {
@@ -1365,6 +1418,38 @@ class CompanionState {
 	 * custom OpenAI-compat) with its API key, then activate it.
 	 * The probe surfaces the upstream failure verbatim ("401
 	 * Unauthorized", DNS, …) before anything is persisted. */
+	/** Replace the API key of an existing provider: checked against
+	 * the provider first, so a typo doesn't silently break it.
+	 * Returns whether it was saved. */
+	async setProviderKey(provider: ProviderEntry, key: string): Promise<boolean> {
+		const workspace = this.activeWorkspace;
+		const trimmed = key.trim();
+		if (!workspace || !trimmed || this.savingProvider) {
+			return false;
+		}
+		this.savingProvider = true;
+		try {
+			await this.#call(
+				workspace,
+				'coder_probe_provider',
+				{ base_url: provider.base_url ?? '', api_key: trimmed, kind: provider.kind ?? 'custom' },
+				this.activeIde,
+			);
+			this.modelSettings = await this.#call<ModelSettings>(
+				workspace,
+				'coder_set_provider_api_key',
+				{ id: provider.id, key: trimmed },
+				this.activeIde,
+			);
+			return true;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+			return false;
+		} finally {
+			this.savingProvider = false;
+		}
+	}
+
 	async addProvider(fields: {
 		kind: 'open_router' | 'anthropic' | 'custom';
 		label: string;

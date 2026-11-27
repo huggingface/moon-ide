@@ -30,6 +30,7 @@ mod discovery;
 mod enrollment;
 mod http;
 mod mdns;
+mod oauth;
 mod pairing;
 mod relay;
 mod serve;

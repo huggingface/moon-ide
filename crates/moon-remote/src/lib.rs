@@ -20,5 +20,6 @@
 //! `moon-app`'s full command surface from here too.
 
 pub mod e2e;
+pub mod hf_sign_in;
 pub mod relay;
 pub mod rpc;

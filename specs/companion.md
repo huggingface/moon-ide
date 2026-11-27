@@ -576,7 +576,10 @@ session. `moon-remote` is an enrolled IDE without a webview — same
 relay protocol, same keyring/enrollment semantics, same companion RPC
 dispatcher (the desktop and the headless binary now share one
 implementation in `crates/moon-remote`'s lib). Setup on the box:
-`moon-remote login` (HF device flow) → `enroll --bridge --code` →
+`moon-remote login` (HF device flow; or later from the phone, whose
+workspace view offers a sign-in when the IDE has none, through the
+bridge's OAuth client, [ADR 0130](decisions/0130-hf-sign-in-through-the-bridge.md))
+→ `enroll --bridge --code` →
 `workspace-add --name --folder` → `serve --workspace <slug>`. The
 phone sees the box as another IDE group in its switcher; relayed event envelopes carry `(ide,
 workspace)` carrier tags so multi-IDE fan-in can't cross-light pips.

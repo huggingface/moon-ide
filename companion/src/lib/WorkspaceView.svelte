@@ -21,7 +21,7 @@
 		manageProjects = false;
 		await app.removeFolder(target.path);
 	}
-	import { app } from './app.svelte';
+	import { app, type ProviderEntry } from './app.svelte';
 
 	function relativeTime(ms: number): string {
 		const diff = Date.now() - ms;
@@ -136,6 +136,22 @@
 	const apReady = $derived(
 		apLabel.trim() !== '' && apBaseUrl.trim() !== '' && apKey.trim() !== '' && apModel.trim() !== '',
 	);
+
+	/** The provider whose API key is being replaced, and the draft. */
+	let keyFor = $state<string | null>(null);
+	let keyDraft = $state('');
+
+	function toggleKeyEditor(id: string): void {
+		keyFor = keyFor === id ? null : id;
+		keyDraft = '';
+	}
+
+	async function saveKey(provider: ProviderEntry): Promise<void> {
+		if (await app.setProviderKey(provider, keyDraft)) {
+			keyFor = null;
+			keyDraft = '';
+		}
+	}
 
 	async function submitProvider(): Promise<void> {
 		if (!apReady || app.savingProvider) {
@@ -311,8 +327,19 @@
 	{/if}
 
 	{#if app.coderStatus && !app.coderStatus.signed_in}
-		<div class="card">
-			<span class="muted">Coder is not signed in on the desktop — sign in there first.</span>
+		<div class="card sign-in">
+			{#if app.signIn}
+				{#if app.signIn.userCode}
+					<span>Approve this sign-in on Hugging Face, with code <strong>{app.signIn.userCode}</strong>.</span>
+				{:else}
+					<span>Approve this sign-in on Hugging Face, then come back here.</span>
+				{/if}
+				<a class="primary" href={app.signIn.url} target="_blank" rel="noopener noreferrer">Open Hugging Face</a>
+				<span class="muted">Waiting for approval…</span>
+			{:else}
+				<span class="muted">The coder is not signed in to Hugging Face.</span>
+				<button class="primary" onclick={() => void app.startSignIn()}>Sign in with Hugging Face</button>
+			{/if}
 		</div>
 	{/if}
 
@@ -331,9 +358,38 @@
 						Hugging Face
 					</button>
 					{#each settings.providers as p (p.id)}
-						<button class="provider-option" class:selected={activeId === p.id} onclick={() => pickProvider(p.id)}>
-							{p.label || p.id}
-						</button>
+						<div class="provider-entry">
+							<button class="provider-option" class:selected={activeId === p.id} onclick={() => pickProvider(p.id)}>
+								{p.label || p.id}
+								{#if p.kind !== 'chat_gpt' && !p.has_api_key}
+									<span class="no-key">no key</span>
+								{/if}
+							</button>
+							{#if p.kind !== 'chat_gpt'}
+								<button
+									class="ghost key-btn"
+									aria-label="Set the API key of {p.label || p.id}"
+									onclick={() => toggleKeyEditor(p.id)}>{keyFor === p.id ? 'Cancel' : 'Key'}</button
+								>
+							{/if}
+						</div>
+						{#if keyFor === p.id}
+							<div class="key-form">
+								<input
+									class="ap-input"
+									bind:value={keyDraft}
+									placeholder="New API key for {p.label || p.id}"
+									type="password"
+									autocomplete="off"
+									spellcheck="false"
+								/>
+								<button
+									class="primary"
+									disabled={keyDraft.trim() === '' || app.savingProvider}
+									onclick={() => void saveKey(p)}>{app.savingProvider ? 'Checking…' : 'Check & save'}</button
+								>
+							</div>
+						{/if}
 					{/each}
 					<button class="provider-option add-provider" onclick={() => (addingProvider = !addingProvider)}>
 						{addingProvider ? '− Cancel' : '+ Add provider…'}
@@ -919,6 +975,25 @@
 </div>
 
 <style>
+	.sign-in {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 8px;
+	}
+
+	/* A link, not a button: a new tab from a click survives iOS's
+	   standalone-PWA popup rules. Looks like `button.primary`. */
+	.sign-in a.primary {
+		display: inline-flex;
+		align-items: center;
+		min-height: 44px;
+		padding: 0.6rem 0.9rem;
+		border-radius: var(--radius);
+		background: var(--accent);
+		color: var(--accent-fg);
+		text-decoration: none;
+	}
 	.head {
 		gap: 0.5rem;
 	}
@@ -1152,6 +1227,32 @@
 	.provider-option.selected {
 		border-color: var(--accent);
 		background: var(--bg-elev-2);
+	}
+	.provider-entry {
+		display: flex;
+		gap: 0.25rem;
+	}
+	.provider-entry .provider-option {
+		flex: 1;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+	}
+	.no-key {
+		color: var(--fg-muted);
+		font-size: 0.8rem;
+	}
+	.key-btn {
+		min-height: 40px;
+		padding: 0.4rem 0.6rem;
+		font-size: 0.85rem;
+	}
+	.key-form {
+		display: flex;
+		gap: 0.25rem;
+	}
+	.key-form .ap-input {
+		flex: 1;
 	}
 	.lock-row {
 		display: flex;

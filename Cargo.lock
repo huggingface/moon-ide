@@ -3543,6 +3543,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "which",
 ]
@@ -3711,6 +3712,7 @@ dependencies = [
  "moon-protocol",
  "moon-terminal",
  "qrcode",
+ "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
@@ -3720,6 +3722,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "x25519-dalek",
 ]

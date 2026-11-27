@@ -2192,6 +2192,22 @@ impl CoderHandle {
 		self.state.auth.poll_device_code(&code).await
 	}
 
+	/// Complete an authorization-code sign-in made through an OAuth
+	/// client metadata document (see `crate::auth`).
+	pub async fn exchange_authorization_code(
+		&self,
+		client_id: &str,
+		redirect_uri: &str,
+		code: &str,
+		code_verifier: &str,
+	) -> Result<HfIdentity, CoderError> {
+		self
+			.state
+			.auth
+			.exchange_authorization_code(client_id, redirect_uri, code, code_verifier)
+			.await
+	}
+
 	pub async fn sign_out(&self) -> Result<(), CoderError> {
 		// Sign-out aborts every in-flight turn across every
 		// folder, since the user is repudiating the auth identity

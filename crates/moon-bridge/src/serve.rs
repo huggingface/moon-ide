@@ -255,6 +255,9 @@ struct ServeCtx {
 	/// IDE-minted pairing payloads (Phase 14.5). Same value the
 	/// startup payload used.
 	advertise_url: String,
+	/// Authorization codes waiting for the IDE that started a
+	/// Hugging Face sign-in (`crate::oauth`).
+	oauth_codes: crate::oauth::ParkedCodes,
 	/// The TLS cert fingerprint for pairing payloads (TOFU pin).
 	fingerprint: String,
 	/// Live enrolled IDE connections. Keyed by a bridge-issued
@@ -419,6 +422,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 		ides,
 		enrollment: Mutex::new(enrollment),
 		advertise_url,
+		oauth_codes: crate::oauth::ParkedCodes::default(),
 		fingerprint: fingerprint.clone(),
 		live_ides: Mutex::new(HashMap::new()),
 		conn_counter: std::sync::atomic::AtomicU64::new(1),
@@ -673,7 +677,12 @@ async fn handle_conn(
 	// Read the first request and branch: static GET (serve the PWA)
 	// or WS upgrade (the companion's data channel).
 	match crate::http::read_request(&mut tls_stream).await? {
-		Some(crate::http::Incoming::Get { path }) => {
+		Some(crate::http::Incoming::Get { path, query }) => {
+			let origin = crate::oauth::public_origin(&ctx.advertise_url);
+			if let Some(reply) = crate::oauth::handle(&path, &query, &origin, &ctx.oauth_codes) {
+				crate::http::write_reply(&mut tls_stream, &reply).await?;
+				return Ok(());
+			}
 			match &ctx.web_root {
 				Some(root) => crate::http::serve_static(&mut tls_stream, root, &path).await?,
 				None => {
