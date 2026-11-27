@@ -222,3 +222,9 @@ A headless install that survives a reinstall: `moon-remote` and `moon-bridge` ru
 Decision: [ADR 0128 — file-backed secrets for headless processes](decisions/0128-file-backed-secrets-for-headless.md).
 
 **Acceptance**: file-backed secrets (17.1); `moon-base`, `moon-remote` and `moon-bridge` images built and published by CI (17.2); providers and workspaces declarable on a fresh install (17.3); `moon-remote` serving from a pod, dev containers included (17.4).
+
+## Phase 18 — Claude plan through Claude Code
+
+Sessions on a Claude Pro/Max plan, with turns delegated to the `claude` CLI in the workspace container and rendered like any other session, on the desktop and the companion. Decision: [ADR 0131](decisions/0131-claude-subscription-through-claude-code.md).
+
+**Acceptance**: `claude_code` provider kind with a `setup-token` token (18.1); delegated turns — install on first use, stream translation, records, steer, stop, resume (18.2); plan usage gauge from Claude Code's rate-limit reports (18.3); moon-ide's own tools over MCP (18.4, not started).

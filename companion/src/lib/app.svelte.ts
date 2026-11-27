@@ -114,6 +114,16 @@ export type ProviderEntry = {
 	[key: string]: unknown;
 };
 
+/** One window of a plan's usage (mirror of `ChatGptUsageWindow`). */
+export type PlanUsageWindow = { used_percent: number; window_seconds?: number | null; resets_at?: number | null };
+
+/** Plan usage of a ChatGPT- or Claude-plan provider (mirror of `ChatGptUsage`). */
+export type PlanUsage = {
+	primary?: PlanUsageWindow | null;
+	secondary?: PlanUsageWindow | null;
+	limit_reached: boolean;
+};
+
 /** Per-workspace provider lock (mirror of `CoderProviderLock`). */
 export type ProviderLock = { kind: 'hf' } | { kind: 'user'; id: string };
 
@@ -1398,6 +1408,33 @@ class CompanionState {
 		} catch {
 			this.modelSettings = null;
 		}
+		void this.loadPlanUsage();
+	}
+
+	/** Plan usage of the active provider when it runs on a ChatGPT or
+	 * Claude plan (mirror of `ChatGptUsage`); null otherwise or before
+	 * any reading. */
+	planUsage = $state<PlanUsage | null>(null);
+
+	async loadPlanUsage(): Promise<void> {
+		const workspace = this.activeWorkspace;
+		const settings = this.modelSettings;
+		const active = settings?.providers.find((p) => p.id === settings.active_provider);
+		if (!workspace || !active || (active.kind !== 'chat_gpt' && active.kind !== 'claude_code')) {
+			this.planUsage = null;
+			return;
+		}
+		try {
+			this.planUsage = await this.#call<PlanUsage>(
+				workspace,
+				'coder_plan_usage',
+				{ provider_id: active.id },
+				this.activeIde,
+			);
+		} catch {
+			// A Claude plan has no reading before its first turn; keep
+			// whatever was shown.
+		}
 	}
 
 	/** Display label for a provider id (`null` = the implicit HF
@@ -1451,7 +1488,7 @@ class CompanionState {
 	}
 
 	async addProvider(fields: {
-		kind: 'open_router' | 'anthropic' | 'custom';
+		kind: 'open_router' | 'anthropic' | 'claude_code' | 'custom';
 		label: string;
 		baseUrl: string;
 		apiKey: string;
@@ -2997,6 +3034,7 @@ class CompanionState {
 					break;
 				}
 				this.busy = false;
+				void this.loadPlanUsage();
 				// Only clear the parked prompt when it was actually
 				// answered — a turn that ended with the user sending
 				// a normal message (the skip path) or the process

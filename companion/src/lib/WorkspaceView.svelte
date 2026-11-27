@@ -113,7 +113,8 @@
 	// Add-provider form. Kind presets pre-fill the endpoint; the
 	// base URL stays editable only for custom entries.
 	let addingProvider = $state(false);
-	let apKind = $state<'open_router' | 'anthropic' | 'custom'>('open_router');
+	type ApKind = 'open_router' | 'anthropic' | 'claude_code' | 'custom';
+	let apKind = $state<ApKind>('open_router');
 	let apLabel = $state('OpenRouter');
 	let apBaseUrl = $state('https://openrouter.ai/api/v1');
 	let apKey = $state('');
@@ -124,18 +125,33 @@
 	const AP_PRESETS = {
 		open_router: { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
 		anthropic: { label: 'Anthropic', baseUrl: 'https://api.anthropic.com' },
+		// Turns run in the `claude` CLI (ADR 0131): no URL to call.
+		claude_code: { label: 'Claude plan', baseUrl: 'claude-code' },
 		custom: { label: '', baseUrl: '' },
 	} as const;
 
-	function pickApKind(kind: 'open_router' | 'anthropic' | 'custom'): void {
+	function pickApKind(kind: ApKind): void {
 		apKind = kind;
 		apLabel = AP_PRESETS[kind].label;
 		apBaseUrl = AP_PRESETS[kind].baseUrl;
 	}
 
 	const apReady = $derived(
-		apLabel.trim() !== '' && apBaseUrl.trim() !== '' && apKey.trim() !== '' && apModel.trim() !== '',
+		apLabel.trim() !== '' &&
+			apBaseUrl.trim() !== '' &&
+			apKey.trim() !== '' &&
+			// Claude Code picks its own model when none is set.
+			(apModel.trim() !== '' || apKind === 'claude_code'),
 	);
+
+	/** When a plan window resets, as a short local time or weekday. */
+	function resetLabel(unixSeconds: number): string {
+		const at = new Date(unixSeconds * 1000);
+		const sameDay = at.toDateString() === new Date().toDateString();
+		return sameDay
+			? at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+			: at.toLocaleDateString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+	}
 
 	/** The provider whose API key is being replaced, and the draft. */
 	let keyFor = $state<string | null>(null);
@@ -447,11 +463,9 @@
 				{#if addingProvider}
 					<div class="ap-form">
 						<div class="ap-kinds">
-							{#each [['open_router', 'OpenRouter'], ['anthropic', 'Anthropic'], ['custom', 'Custom']] as [kind, label] (kind)}
-								<button
-									class="ap-kind"
-									class:selected={apKind === kind}
-									onclick={() => pickApKind(kind as 'open_router' | 'anthropic' | 'custom')}>{label}</button
+							{#each [['open_router', 'OpenRouter'], ['anthropic', 'Anthropic'], ['claude_code', 'Claude plan'], ['custom', 'Custom']] as [kind, label] (kind)}
+								<button class="ap-kind" class:selected={apKind === kind} onclick={() => pickApKind(kind as ApKind)}
+									>{label}</button
 								>
 							{/each}
 						</div>
@@ -465,10 +479,16 @@
 								autocapitalize="off"
 							/>
 						{/if}
+						{#if apKind === 'claude_code'}
+							<span class="muted ap-hint">
+								Uses your Claude Pro/Max plan: turns run in Claude Code itself, installed in the workspace on first use.
+								Run <code>claude setup-token</code> anywhere and paste the token.
+							</span>
+						{/if}
 						<input
 							class="ap-input"
 							bind:value={apKey}
-							placeholder="API key"
+							placeholder={apKind === 'claude_code' ? 'Claude Code token (sk-ant-oat01-…)' : 'API key'}
 							type="password"
 							autocomplete="off"
 							spellcheck="false"
@@ -476,26 +496,30 @@
 						<input
 							class="ap-input"
 							bind:value={apModel}
-							placeholder={apKind === 'anthropic'
-								? 'Model (e.g. claude-sonnet-4-5)'
-								: 'Model (e.g. anthropic/claude-sonnet-4.5)'}
+							placeholder={apKind === 'claude_code'
+								? 'Model (optional: opus, sonnet…)'
+								: apKind === 'anthropic'
+									? 'Model (e.g. claude-sonnet-4-5)'
+									: 'Model (e.g. anthropic/claude-sonnet-4.5)'}
 							spellcheck="false"
 							autocapitalize="off"
 						/>
-						<input
-							class="ap-input"
-							bind:value={apCheapModel}
-							placeholder="Cheap model (optional — titles, summaries)"
-							spellcheck="false"
-							autocapitalize="off"
-						/>
-						<input
-							class="ap-input"
-							bind:value={apPayloadCap}
-							placeholder="Payload cap MB (optional — elides old screenshots)"
-							inputmode="numeric"
-							spellcheck="false"
-						/>
+						{#if apKind !== 'claude_code'}
+							<input
+								class="ap-input"
+								bind:value={apCheapModel}
+								placeholder="Cheap model (optional — titles, summaries)"
+								spellcheck="false"
+								autocapitalize="off"
+							/>
+							<input
+								class="ap-input"
+								bind:value={apPayloadCap}
+								placeholder="Payload cap MB (optional — elides old screenshots)"
+								inputmode="numeric"
+								spellcheck="false"
+							/>
+						{/if}
 						<button
 							class="primary ap-submit"
 							disabled={!apReady || app.savingProvider}
@@ -505,6 +529,23 @@
 						</button>
 					</div>
 				{/if}
+			{/if}
+			{#if app.planUsage}
+				{@const plan = app.planUsage}
+				<div class="plan-usage">
+					<span class="muted">Plan</span>
+					{#each [plan.primary, plan.secondary] as w, i (i)}
+						{#if w}
+							<span class="plan-window" class:low={100 - w.used_percent <= 15}>
+								{i === 0 ? '5h' : 'week'}
+								{Math.round(100 - w.used_percent)}% left{#if w.resets_at}, resets {resetLabel(w.resets_at)}{/if}
+							</span>
+						{/if}
+					{/each}
+					{#if plan.limit_reached}
+						<span class="plan-window low">limit reached</span>
+					{/if}
+				</div>
 			{/if}
 			{#if activeId === null}
 				{@const modelSlug = settings.resolved_standard_model ?? ''}
@@ -1393,6 +1434,18 @@
 	.ap-kind.selected {
 		border-color: var(--accent, #7aa2f7);
 		color: var(--fg);
+	}
+	.plan-usage {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem 0.8rem;
+		font-size: 0.85rem;
+	}
+	.plan-window.low {
+		color: var(--warn);
+	}
+	.ap-hint {
+		font-size: 0.8rem;
 	}
 	.ap-input {
 		width: 100%;

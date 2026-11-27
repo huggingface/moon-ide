@@ -250,6 +250,22 @@ pub async fn probe_provider(
 	kind: ProviderKind,
 	api_key: Option<&str>,
 ) -> Result<ProviderProbeResult, CoderError> {
+	// A Claude Code token is only for the `claude` CLI: moon-ide may
+	// not call Anthropic with it, even to check it (ADR 0131). Its
+	// shape is all there is to check here.
+	if matches!(kind, ProviderKind::ClaudeCode) {
+		let token = api_key.unwrap_or_default().trim();
+		if !token.starts_with("sk-ant-oat") {
+			return Err(CoderError::invalid_args(
+				"coder_probe_provider",
+				"not a Claude Code token: run `claude setup-token` and paste the token it prints (sk-ant-oat…)",
+			));
+		}
+		return Ok(ProviderProbeResult {
+			model_count: 0,
+			sample_model_ids: Vec::new(),
+		});
+	}
 	let trimmed = base_url.trim_end_matches('/');
 	if trimmed.is_empty() {
 		return Err(CoderError::invalid_args(

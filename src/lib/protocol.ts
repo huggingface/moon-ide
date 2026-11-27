@@ -1233,9 +1233,11 @@ export type CoderAppState = {
  * ChatGPT plan via the Codex backend: no API key, the keyring slot
  * holds a device-code sign-in and `has_api_key` means "signed in"
  * (ADR 0101). `gemini` is Google's OpenAI-compatible endpoint, the
- * custom wire with an AI Studio key.
+ * custom wire with an AI Studio key. `claude_code` is a Claude plan:
+ * turns run in the `claude` CLI, the key is a `claude setup-token`
+ * token (ADR 0131).
  */
-export type ProviderKind = 'custom' | 'open_router' | 'anthropic' | 'chat_gpt' | 'gemini';
+export type ProviderKind = 'custom' | 'open_router' | 'anthropic' | 'chat_gpt' | 'gemini' | 'claude_code';
 
 /** A started ChatGPT device-code sign-in. Mirrors `moon_protocol::coder_models::ChatGptDeviceCode`. */
 export type ChatGptDeviceCode = {

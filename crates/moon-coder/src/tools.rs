@@ -2329,7 +2329,18 @@ impl ToolRegistry {
 	/// **active folder first** (servers that take a single
 	/// workspace root use that one), plus the mount pairs needed
 	/// to translate container paths back for the model.
-	async fn mcp_spawn_target(&self, cx: &ToolContext) -> McpSpawnTarget {
+	/// Where the `claude` CLI and its config live when it runs on the
+	/// host (no workspace container): beside the per-workspace state,
+	/// shared by every workspace (ADR 0131).
+	pub(crate) fn claude_home_on_host(&self) -> Utf8PathBuf {
+		self
+			.workspaces_dir
+			.parent()
+			.unwrap_or(&self.workspaces_dir)
+			.join("claude")
+	}
+
+	pub(crate) async fn mcp_spawn_target(&self, cx: &ToolContext) -> McpSpawnTarget {
 		let host_cwd = cx.folder.folder.path.clone();
 		let target = resolve_bash_target(&self.workspaces, &self.workspaces_dir, cx.force_host_bash(), &cx.folder).await;
 		// Bound folders with the active one hoisted to the front.

@@ -777,6 +777,17 @@ impl BridgeRpcHandler for BridgeRpc {
 				}
 				to_value(&settings)
 			}
+			// Plan usage of a ChatGPT- or Claude-plan provider, for the
+			// phone's provider card.
+			"coder_plan_usage" => {
+				let p: ProviderIdParams = parse_params(params)?;
+				let usage = self
+					.coder
+					.chatgpt_usage(&p.provider_id)
+					.await
+					.map_err(|e| e.to_string())?;
+				to_value(&usage)
+			}
 			"coder_set_model_settings" => {
 				let p: SetModelSettingsParams = parse_params(params)?;
 				moon_app::settings::set_model_settings(&self.coder, &self.settings, p.settings)
@@ -1097,6 +1108,11 @@ struct ProbeProviderParams {
 }
 
 #[derive(serde::Deserialize)]
+struct ProviderIdParams {
+	provider_id: String,
+}
+
+#[derive(serde::Deserialize)]
 struct SetProviderApiKeyParams {
 	id: String,
 	key: String,
@@ -1318,6 +1334,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_probe_provider",
 	"coder_add_provider",
 	"coder_set_provider_api_key",
+	"coder_plan_usage",
 	"workspace_launch",
 	"workspace_scm_status",
 	"workspace_scm_review",

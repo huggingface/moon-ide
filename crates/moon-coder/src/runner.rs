@@ -55,6 +55,13 @@ use crate::tools::{CoderMode, ToolContext, ToolRegistry};
 use moon_core::WorkspaceFolderEntry;
 use serde_json::json;
 
+mod claude_code;
+
+/// Rewinding truncates moon-ide's transcript, which Claude Code's own
+/// session wouldn't follow (ADR 0131).
+const CLAUDE_CODE_NO_REWIND: &str =
+	"Rewinding isn't available in a Claude Code session: Claude would keep the dropped messages. Start a new session instead.";
+
 /// Capacity for the broadcast channel the Tauri layer subscribes to.
 /// Each turn produces O(few hundred) events at most; oversizing
 /// avoids back-pressure stalls when the UI is slow to consume.
@@ -122,6 +129,10 @@ struct CoderState {
 	/// not counted — they're fire-and-forget helpers the parent
 	/// collects later, not something the user is waiting on.
 	running_turns: watch::Sender<usize>,
+	/// Claude plan usage per Claude Code provider, as its last
+	/// `rate_limit_event`s reported it (ADR 0131). In memory: the
+	/// next turn reports it again.
+	claude_usage: std::sync::Mutex<HashMap<String, moon_protocol::coder_models::ChatGptUsage>>,
 	/// See [`TurnSettled`].
 	turn_settled: broadcast::Sender<TurnSettled>,
 	/// Per-folder session + turn state. Lazy-created on the first
@@ -940,6 +951,7 @@ impl Session {
 				reasoning_effort: None,
 				model_override: None,
 				notes: Vec::new(),
+				claude_code: None,
 			},
 			session_dir: None,
 			messages: vec![ChatMessage::System { content: system_prompt }],
@@ -1260,6 +1272,7 @@ impl CoderHandle {
 				tools,
 				events,
 				running_turns,
+				claude_usage: std::sync::Mutex::new(HashMap::new()),
 				turn_settled,
 				sessions_by_folder: Arc::new(RwLock::new(HashMap::new())),
 				workspaces,
@@ -1821,7 +1834,11 @@ impl CoderHandle {
 		let base_url = entry.base_url.clone();
 		let kind = entry.kind;
 		drop(snapshot);
-		let catalog = if kind == moon_protocol::coder_models::ProviderKind::ChatGpt {
+		// Claude Code picks among its own aliases (`opus`, `sonnet`, …);
+		// there is no catalog moon-ide may fetch with its token.
+		let catalog = if kind == moon_protocol::coder_models::ProviderKind::ClaudeCode {
+			Vec::new()
+		} else if kind == moon_protocol::coder_models::ProviderKind::ChatGpt {
 			self.state.inference.list_chatgpt_models(provider_id, &base_url).await?
 		} else {
 			let api_key = self.state.provider_keys.get(provider_id);
@@ -1892,6 +1909,13 @@ impl CoderHandle {
 				.iter()
 				.find(|p| p.id == provider_id)
 				.ok_or_else(|| CoderError::Internal(format!("unknown provider id: {provider_id}")))?;
+			if entry.kind == moon_protocol::coder_models::ProviderKind::ClaudeCode {
+				drop(snapshot);
+				return self
+					.state
+					.claude_usage(provider_id)
+					.ok_or_else(|| CoderError::Internal("no Claude plan usage yet: it arrives with the next turn".into()));
+			}
 			if entry.kind != moon_protocol::coder_models::ProviderKind::ChatGpt {
 				return Err(CoderError::Internal(format!(
 					"provider {provider_id} is not a ChatGPT provider"
@@ -1911,8 +1935,15 @@ impl CoderHandle {
 		// payload the picker renders for the "Bill to" dropdown
 		// and the user avatar in the header; off-HF the panel
 		// hides that surface.
-		let route = self.state.models.read().await.resolve_route();
+		let (route, claude) = {
+			let models = self.state.models.read().await;
+			(
+				models.resolve_route(),
+				models.active_claude_code().map(|p| p.id.clone()),
+			)
+		};
 		let signed_in = match &route {
+			_ if claude.is_some() => claude.as_deref().is_some_and(|id| self.state.provider_keys.has_key(id)),
 			ResolvedProvider::HuggingFace => identity.is_some(),
 			ResolvedProvider::ChatGpt { id, .. } => self.state.provider_keys.has_key(id),
 			ResolvedProvider::Custom { id, base_url }
@@ -3041,6 +3072,9 @@ impl CoderHandle {
 			}
 		}
 		let header = rt.session.lock().await.header.clone();
+		if header.claude_code.is_some() {
+			return Err(CoderError::Internal(CLAUDE_CODE_NO_REWIND.into()));
+		}
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		let reverted = sessions::truncate_before_user_record(&dir, &header, user_ordinal).await?;
 
@@ -3087,6 +3121,9 @@ impl CoderHandle {
 			}
 		}
 		let header = rt.session.lock().await.header.clone();
+		if header.claude_code.is_some() {
+			return Err(CoderError::Internal(CLAUDE_CODE_NO_REWIND.into()));
+		}
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		let reverted = sessions::truncate_before_user_record(&dir, &header, user_ordinal).await?;
 
@@ -3266,6 +3303,9 @@ impl CoderHandle {
 			}
 		}
 		let header = rt.session.lock().await.header.clone();
+		if header.claude_code.is_some() {
+			return Err(CoderError::Internal(CLAUDE_CODE_NO_REWIND.into()));
+		}
 		let dir = sessions_dir(&self.state.coder_sessions_dir, &folder_path);
 		let resumed = sessions::truncate_before_assistant_record(&dir, &header, assistant_ordinal).await?;
 
@@ -3485,6 +3525,14 @@ impl CoderHandle {
 	/// fire. `drain_steer_now` skips this gate — the steer it
 	/// drains was already accepted by an authenticated `send`.
 	async fn ensure_can_send(&self) -> Result<(), CoderError> {
+		if let Some(claude) = self.state.models.read().await.active_claude_code() {
+			if !self.state.provider_keys.has_key(&claude.id) {
+				return Err(CoderError::Internal(
+					"Claude is not signed in. Sign in from the model settings.".into(),
+				));
+			}
+			return Ok(());
+		}
 		let route = self.state.models.read().await.resolve_route();
 		match &route {
 			ResolvedProvider::HuggingFace => {
@@ -6918,19 +6966,41 @@ fn spawn_turn_loop(
 							session.header.model_override.clone(),
 						)
 					};
-					let turn = run_turn(
-						&state,
-						&rt_for_turn,
-						&folder_for_turn,
-						&sink_for_turn,
-						cancel_outer.clone(),
-						format_queue.clone(),
-						background.clone(),
-						// Only the first run_turn call gets the resume
-						// tool calls; subsequent loop iterations (steer
-						// drains after an abort) start fresh.
-						resume.take(),
-					);
+					// A session on a Claude plan runs its turn in the
+					// `claude` CLI instead (ADR 0131).
+					let delegated = claude_code::delegated_provider(&state, &rt_for_turn).await;
+					// Only the first run_turn call gets the resume tool
+					// calls; subsequent loop iterations (steer drains
+					// after an abort) start fresh.
+					let resume_now = resume.take();
+					let turn = async {
+						match &delegated {
+							Some(provider_id) => {
+								claude_code::run_claude_code_turn(
+									&state,
+									&rt_for_turn,
+									&folder_for_turn,
+									&sink_for_turn,
+									cancel_outer.clone(),
+									provider_id,
+								)
+								.await
+							}
+							None => {
+								run_turn(
+									&state,
+									&rt_for_turn,
+									&folder_for_turn,
+									&sink_for_turn,
+									cancel_outer.clone(),
+									format_queue.clone(),
+									background.clone(),
+									resume_now,
+								)
+								.await
+							}
+						}
+					};
 					let result = crate::models::SESSION_MODEL
 						.scope(
 							session_model,
@@ -13907,6 +13977,7 @@ mod tests {
 			reasoning_effort: None,
 			model_override: None,
 			notes: Vec::new(),
+			claude_code: None,
 		}
 	}
 

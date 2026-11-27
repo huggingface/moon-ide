@@ -38,6 +38,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 webp = { workspace = true }
 zstd = { workspace = true }
 # Hugging Face Xet client. Used by `hub_sync.rs` to upload coder

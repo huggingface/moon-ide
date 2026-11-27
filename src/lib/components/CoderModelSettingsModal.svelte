@@ -104,6 +104,18 @@
 			base_url: 'https://chatgpt.com/backend-api/codex',
 			key: null,
 		},
+		{
+			// Turns run in the `claude` CLI (ADR 0131); there is no URL,
+			// this one only keeps the field non-empty.
+			kind: 'claude_code',
+			label: 'Claude plan',
+			base_url: 'claude-code',
+			key: {
+				placeholder: 'sk-ant-oat01-...',
+				dashboard_url: 'https://docs.anthropic.com/en/docs/claude-code/setup',
+				dashboard_label: 'Claude Code',
+			},
+		},
 	];
 
 	function presetForKind(kind: ProviderKind): BuiltinPreset | null {
@@ -553,7 +565,9 @@
 		probeMessage = null;
 		try {
 			const result = await coder.probeProvider(baseUrl, providerDraft.api_key.trim(), providerDraft.kind);
-			if (result.model_count > 0) {
+			if (providerDraft.kind === 'claude_code') {
+				probeMessage = 'Looks like a Claude Code token. Claude checks it on the first turn.';
+			} else if (result.model_count > 0) {
 				const sample = result.sample_model_ids.slice(0, 3).join(', ');
 				probeMessage = `OK — ${result.model_count} model${result.model_count === 1 ? '' : 's'} reachable${sample ? ` (e.g. ${sample}).` : '.'}`;
 			} else {
@@ -1331,7 +1345,7 @@
 							autocomplete="off"
 						/>
 					</label>
-					<label class="field">
+					<label class="field" hidden={providerDraft.kind === 'claude_code'}>
 						<span class="label-row">
 							<span class="label-name">Base URL</span>
 							{#if preset !== null}
@@ -1386,7 +1400,7 @@
 					{:else}
 						<label class="field draft-key">
 							<span class="label-row">
-								<span class="label-name">API key</span>
+								<span class="label-name">{providerDraft.kind === 'claude_code' ? 'Claude Code token' : 'API key'}</span>
 								{#if !providerDraft.is_new}
 									{@const existing = providers.find((p) => p.id === providerDraft?.id)}
 									{#if existing?.has_api_key}
@@ -1405,18 +1419,26 @@
 								spellcheck="false"
 								autocomplete="off"
 							/>
-							<span class="hint">
-								{#if preset?.key}
-									Get a key at <a href={preset.key.dashboard_url} target="_blank" rel="noreferrer noopener">
-										{preset.key.dashboard_label}
-									</a>.
-								{/if}
-								Stored in your OS keyring, never read back into this dialog. Leave blank for keyless local servers (<code
-									>localhost</code
-								>, <code>*.local</code>).
-							</span>
+							{#if providerDraft.kind === 'claude_code'}
+								<span class="hint">
+									Uses your Claude Pro/Max plan: turns run in Claude Code itself, in the workspace container, installed
+									there on first use. Run <code>claude setup-token</code> on any machine with Claude Code and paste the token
+									it prints. Stored in your OS keyring, never read back into this dialog.
+								</span>
+							{:else}
+								<span class="hint">
+									{#if preset?.key}
+										Get a key at <a href={preset.key.dashboard_url} target="_blank" rel="noreferrer noopener">
+											{preset.key.dashboard_label}
+										</a>.
+									{/if}
+									Stored in your OS keyring, never read back into this dialog. Leave blank for keyless local servers (<code
+										>localhost</code
+									>, <code>*.local</code>).
+								</span>
+							{/if}
 						</label>
-						<label class="field">
+						<label class="field" hidden={providerDraft.kind === 'claude_code'}>
 							<span class="label-row"><span class="label-name">Payload cap (MB)</span></span>
 							<input
 								type="text"

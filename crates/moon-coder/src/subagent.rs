@@ -614,6 +614,7 @@ async fn run_subagent_in_dir(
 		reasoning_effort: None,
 		model_override: None,
 		notes: Vec::new(),
+		claude_code: None,
 	};
 
 	// Best-effort: persistence failures log at warn but never

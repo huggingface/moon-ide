@@ -235,7 +235,7 @@ team uses. Other providers are additive.
 struct CoderProviderConfig {
     id: String,           // opaque "prov-<unix-ms>-<rand>"
     label: String,
-    kind: ProviderKind,   // custom | open_router | anthropic | chat_gpt | gemini
+    kind: ProviderKind,   // custom | open_router | anthropic | chat_gpt | gemini | claude_code
     base_url: String,     // OpenAI-compat /v1 root, or API host for anthropic
     standard_model: String,
     cheap_model: String,
@@ -307,9 +307,30 @@ rejected: the worst case is one extra round trip per origin per run.
   gauge next to the context ring shows what's left of the tighter
   window, and a click opens each window (5 h / weekly) with its
   reset time, plus credits and banked resets. Refreshed on provider
-  change, after each turn, every 5 minutes and on open. Why
-  ChatGPT and not a Claude subscription:
+  change, after each turn, every 5 minutes and on open. Why a
+  Claude plan works differently:
   [ADR 0101](decisions/0101-chatgpt-subscription-provider.md).
+- `claude_code` — a Claude Pro/Max plan
+  ([ADR 0131](decisions/0131-claude-subscription-through-claude-code.md)).
+  moon-ide sends nothing to Anthropic: each turn of such a session is
+  a `claude -p` process in streaming JSON mode, in the workspace
+  container when it runs (else host-side, like `bash`), resumed by
+  Claude Code's session id kept in the session header. Once a turn
+  ran there the session stays on Claude Code even if the active
+  provider changes, and an earlier moon-ide turn's context isn't
+  carried over. The key is a `claude setup-token` token, passed per
+  process as `CLAUDE_CODE_OAUTH_TOKEN`; the probe only checks its
+  shape. Claude Code is installed on first use into
+  `~/.moon-persist/claude` in the container (host: next to the
+  workspaces dir), with its config there, and refreshed daily. Text,
+  thinking, tool calls and results, usage and errors become the usual
+  events and records (Claude's common tools under moon-ide's names);
+  its sub-agents' traffic is left out. Messages sent mid-turn go to
+  its stdin; stop interrupts it. Its `rate_limit_event`s feed the plan
+  gauge (5 h and weekly windows; known after the first turn). Not in
+  such sessions: rewinding (Claude's own session wouldn't follow),
+  moon-ide's compaction, prompt and fallbacks, and moon-ide's own
+  tools (workers, `ask_user`, the browser tab).
 - `gemini` — Google's Gemini API through its OpenAI-compatible
   endpoint (`generativelanguage.googleapis.com/v1beta/openai`) with an
   AI Studio key: the `custom` wire. Its model list names

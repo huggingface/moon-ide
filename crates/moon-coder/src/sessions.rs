@@ -212,6 +212,19 @@ pub struct SessionHeader {
 	/// Messages the user parked to send later. Kept with the session,
 	/// never sent to the model until the user sends one.
 	pub notes: Vec<SessionNote>,
+	/// Set once a turn of this session ran in the `claude` CLI: every
+	/// later turn does too, resuming the same Claude Code session
+	/// (ADR 0131).
+	pub claude_code: Option<ClaudeCodeSession>,
+}
+
+/// The Claude Code side of a session (`SessionHeader::claude_code`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeCodeSession {
+	/// Provider whose sign-in runs the turns.
+	pub provider_id: String,
+	/// Claude Code's own session id, resumed by the next turn.
+	pub session_id: String,
 }
 
 /// A message parked for later (`SessionHeader::notes`).
@@ -323,6 +336,9 @@ impl Serialize for SessionHeader {
 		if !self.notes.is_empty() {
 			map.serialize_entry("notes", &self.notes)?;
 		}
+		if let Some(v) = &self.claude_code {
+			map.serialize_entry("claude_code", v)?;
+		}
 		if let Some(v) = &self.worktree_root {
 			map.serialize_entry("worktree_root", v)?;
 		}
@@ -381,6 +397,8 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			#[serde(default)]
 			notes: Vec<SessionNote>,
 			#[serde(default)]
+			claude_code: Option<ClaudeCodeSession>,
+			#[serde(default)]
 			worktree_root: Option<String>,
 			#[serde(default)]
 			worktree_branch: Option<String>,
@@ -412,6 +430,7 @@ impl<'de> Deserialize<'de> for SessionHeader {
 			reasoning_effort: raw.reasoning_effort,
 			model_override: raw.model_override,
 			notes: raw.notes,
+			claude_code: raw.claude_code,
 		})
 	}
 }
@@ -3303,6 +3322,7 @@ mod tests {
 			reasoning_effort: None,
 			model_override: None,
 			notes: Vec::new(),
+			claude_code: None,
 		}
 	}
 

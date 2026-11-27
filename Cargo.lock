@@ -3574,6 +3574,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "uuid",
  "webp",
  "zstd",
 ]

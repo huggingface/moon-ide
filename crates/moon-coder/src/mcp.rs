@@ -406,7 +406,7 @@ impl McpSpawnTarget {
 	/// Covers every bound folder's mount, not just the active
 	/// one — a server told about all roots can report a path in
 	/// any of them. No-op for a host spawn.
-	fn host_paths(&self, text: &str) -> String {
+	pub(crate) fn host_paths(&self, text: &str) -> String {
 		let mut out = text.to_owned();
 		for mount in &self.mounts {
 			out = replace_path_prefix(&out, &mount.container_root, &mount.host_root);

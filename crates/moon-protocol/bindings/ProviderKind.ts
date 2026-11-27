@@ -27,5 +27,7 @@
  * - [`Self::Gemini`] — Google's Gemini API through its
  *   OpenAI-compatible endpoint, with an AI Studio key. Same wire
  *   as [`Self::Custom`]; the picker pre-fills the URL.
+ * - [`Self::ClaudeCode`] — a Claude plan; turns are delegated to
+ *   the `claude` CLI rather than sent from moon-ide (ADR 0131).
  */
-export type ProviderKind = "custom" | "open_router" | "anthropic" | "chat_gpt" | "gemini";
+export type ProviderKind = "custom" | "open_router" | "anthropic" | "chat_gpt" | "gemini" | "claude_code";

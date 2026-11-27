@@ -268,6 +268,8 @@ pub struct CoderModelSettings {
 /// - [`Self::Gemini`] — Google's Gemini API through its
 ///   OpenAI-compatible endpoint, with an AI Studio key. Same wire
 ///   as [`Self::Custom`]; the picker pre-fills the URL.
+/// - [`Self::ClaudeCode`] — a Claude plan; turns are delegated to
+///   the `claude` CLI rather than sent from moon-ide (ADR 0131).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
@@ -287,6 +289,11 @@ pub enum ProviderKind {
 	ChatGpt,
 	/// Gemini API, OpenAI-compatible endpoint.
 	Gemini,
+	/// Claude Pro/Max plan through the `claude` CLI, which runs the
+	/// whole turn (ADR 0131). The keyring slot holds a
+	/// `claude setup-token` token; `has_api_key` means "signed in".
+	/// The model is Claude Code's own choice unless one is set.
+	ClaudeCode,
 }
 
 /// A started Codex device-code sign-in for a `chat_gpt` provider.

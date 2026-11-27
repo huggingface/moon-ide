@@ -1,5 +1,5 @@
 <script lang="ts">
-	// ChatGPT plan usage next to the context ring (ADR 0101): a small
+	// ChatGPT or Claude plan usage next to the context ring (ADR 0101, 0131): a small
 	// gauge with what's left of the tighter window, and on click the
 	// 5 h and weekly windows with their reset times. Only for a
 	// signed-in ChatGPT provider. Refreshed when the provider changes,
@@ -14,7 +14,13 @@
 	const providerId = $derived.by(() => {
 		const settings = coder.modelSettings;
 		const active = settings?.providers.find((p) => p.id === settings.active_provider);
-		return active?.kind === 'chat_gpt' && active.has_api_key ? active.id : null;
+		return (active?.kind === 'chat_gpt' || active?.kind === 'claude_code') && active.has_api_key ? active.id : null;
+	});
+	/** Claude plan figures come from Claude Code's own reports during turns (ADR 0131). */
+	const planName = $derived.by(() => {
+		const settings = coder.modelSettings;
+		const active = settings?.providers.find((p) => p.id === settings.active_provider);
+		return active?.kind === 'claude_code' ? 'Claude' : 'ChatGPT';
 	});
 
 	let usage = $state<ChatGptUsage | null>(null);
@@ -113,12 +119,12 @@
 		{left}
 		value={`${Math.round(left)}%`}
 		{tone}
-		summary={`ChatGPT plan: ${summary}`}
-		label="ChatGPT plan usage"
+		summary={`${planName} plan: ${summary}`}
+		label={`${planName} plan usage`}
 		{onOpen}
 	>
 		<div class="usage-head">
-			ChatGPT{plan.plan_type ? ` ${plan.plan_type}` : ''} plan
+			{planName}{plan.plan_type ? ` ${plan.plan_type}` : ''} plan
 			{#if plan.limit_reached}<span class="usage-reached">limit reached</span>{/if}
 		</div>
 		{#each windows as w, i (i)}

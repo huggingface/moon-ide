@@ -361,6 +361,8 @@ impl CoderModels {
 					id: entry.id.clone(),
 					base_url: entry.base_url.clone(),
 				},
+				// Filtered out by `active_provider_entry`.
+				ProviderKind::ClaudeCode => ResolvedProvider::HuggingFace,
 			},
 			None => ResolvedProvider::HuggingFace,
 		}
@@ -372,7 +374,15 @@ impl CoderModels {
 	/// — happens when the entry was deleted on a separate launch
 	/// and the persisted `AppState` survived; we transparently
 	/// fall back to HF in that case.
+	///
+	/// A Claude Code provider is never returned: it runs turns in the
+	/// `claude` CLI, so moon-ide's own calls around them (titles,
+	/// summaries, compaction of other sessions) stay on HF.
 	fn active_provider_entry(&self) -> Option<&CoderProviderConfig> {
+		self.active_entry().filter(|p| p.kind != ProviderKind::ClaudeCode)
+	}
+
+	fn active_entry(&self) -> Option<&CoderProviderConfig> {
 		let id = self.active_provider.as_ref()?;
 		let found = self.providers.iter().find(|p| p.id == *id);
 		if found.is_none() {
@@ -382,6 +392,17 @@ impl CoderModels {
 			);
 		}
 		found
+	}
+
+	/// The active provider when it is a Claude Code one: new turns
+	/// then go to the `claude` CLI (ADR 0131).
+	pub fn active_claude_code(&self) -> Option<&CoderProviderConfig> {
+		self.active_entry().filter(|p| p.kind == ProviderKind::ClaudeCode)
+	}
+
+	/// A provider entry by id.
+	pub fn provider(&self, id: &str) -> Option<&CoderProviderConfig> {
+		self.providers.iter().find(|p| p.id == id)
 	}
 
 	/// Best-effort context-window lookup for `slug`. Tries the
