@@ -65,10 +65,15 @@ exec "$P/.local/bin/claude" "$@"
 /// it is pinned to, or a new one when the active provider is a
 /// Claude Code one.
 pub(super) async fn delegated_provider(state: &Arc<CoderState>, rt: &Arc<SessionRuntime>) -> Option<String> {
-	if let Some(pinned) = &rt.session.lock().await.header.claude_code {
-		return Some(pinned.provider_id.clone());
-	}
-	state.models.read().await.active_claude_code().map(|p| p.id.clone())
+	let pick = {
+		let session = rt.session.lock().await;
+		if let Some(pinned) = &session.header.claude_code {
+			return Some(pinned.provider_id.clone());
+		}
+		session.header.model_override.clone()
+	};
+	let models = state.models.read().await;
+	crate::models::SESSION_MODEL.sync_scope(pick, || models.active_claude_code().map(|p| p.id.clone()))
 }
 
 /// One delegated turn. Sends the user messages not yet answered,

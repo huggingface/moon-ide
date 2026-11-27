@@ -7,6 +7,7 @@ import type {
 	CoderHubBucket,
 	CoderModelSettings,
 	CoderProviderConfig,
+	CoderProviderLock,
 	CoderSessionSummary,
 	CoderStatus,
 	HubNamespace,
@@ -519,6 +520,7 @@ export const ipc = {
 		subagentTranscript: (sessionId: string, subagentId: string) =>
 			call<CoderEvent[]>('coder_subagent_transcript', { sessionId, subagentId }),
 		setSessionModel: (model: string | null) => call<void>('coder_set_session_model', { model }),
+		setSessionProvider: (provider: CoderProviderLock | null) => call<void>('coder_set_session_provider', { provider }),
 		openSession: (id: string) => call<CoderSessionSummary>('coder_open_session', { id }),
 		deleteSession: (id: string) => call<void>('coder_delete_session', { id }),
 		renameSession: (id: string, title: string) => call<CoderSessionSummary>('coder_rename_session', { id, title }),

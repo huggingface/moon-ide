@@ -2654,13 +2654,18 @@ Push events: `coder:event` (every loop event, envelope-wrapped),
   `moon-remote model --reasoning xhigh` (empty string clears).
   Anthropic native route ignores it (its thinking config is
   budget-based, separate). That pick is the default. The composer's
-  model · effort picker overrides the standard model and the effort
-  for the visible session only (`model_override` / `reasoning_effort`
-  in the session header, `None` = follow the settings), applied from
-  the session's next turn. A model override is stored with the
-  provider it was picked under and only applies while that provider
-  is active; the picker lists the provider's catalog when it's short
-  (≤ 30 models). Sub-agents inherit their parent session's picks.
+  provider · model · effort picker overrides them for the visible
+  session only (`model_override` / `reasoning_effort` in the session
+  header, `None` = follow the settings), applied from the session's
+  next turn. `model_override` pins a provider (`provider: None` = HF)
+  and optionally a model (empty = that provider's standard model):
+  while one of its turns runs, routing, the standard and cheap
+  models and bill-to all answer for that provider, whatever the
+  workspace's is. Picking a model alone pins the provider active at
+  that moment. The phone picks the provider from the session header.
+  A Claude Code session can't switch away (ADR 0131). The picker lists
+  the provider's catalog when it's short (≤ 30 models). Sub-agents
+  inherit their parent session's picks.
 - **Compaction cut is tool-boundary-safe** (ADR-worthy): the
   summary cut snaps forward past any Tool run whose owning
   Assistant survived (and drops a leading orphan Tool run), so the

@@ -39,20 +39,27 @@ use tokio::sync::RwLock;
 
 use crate::defaults::{context_window_for, DEFAULT_CHEAP_MODEL, DEFAULT_STANDARD_MODEL};
 
-/// A session's standard-model override and the provider it was picked
-/// under (`None` = the HF route).
+/// A session's own provider and standard model, overriding the
+/// workspace's (`provider: None` = the HF route; an empty `model` =
+/// that provider's standard model).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionModel {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub provider: Option<String>,
+	#[serde(default)]
 	pub model: String,
 }
 
 tokio::task_local! {
-	/// The running session's model override, scoped around each turn
-	/// like `inference::SESSION_REASONING_EFFORT`; [`CoderModels::standard`]
-	/// returns it while its provider is the active one.
+	/// The running session's provider and model, scoped around each
+	/// turn like `inference::SESSION_REASONING_EFFORT`: while set, every
+	/// read of the active provider (routing, standard and cheap models,
+	/// bill-to) answers for the session's instead.
 	pub static SESSION_MODEL: Option<SessionModel>;
+}
+
+fn session_pick() -> Option<SessionModel> {
+	SESSION_MODEL.try_with(Clone::clone).ok().flatten()
 }
 
 #[derive(Debug, Clone)]
@@ -270,11 +277,21 @@ impl CoderModels {
 		self.default_standard().to_owned()
 	}
 
-	/// The running session's model override ([`SESSION_MODEL`]), when
-	/// it was picked under the provider that's active now.
+	/// The running session's model ([`SESSION_MODEL`]), when it picked
+	/// one rather than its provider's default.
 	fn session_model(&self) -> Option<String> {
-		let picked = SESSION_MODEL.try_with(Clone::clone).ok().flatten()?;
-		(picked.provider == self.active_provider).then_some(picked.model)
+		session_pick()
+			.map(|picked| picked.model)
+			.filter(|m| !m.trim().is_empty())
+	}
+
+	/// The provider the running session routes through: its own pick,
+	/// else the workspace's (`None` = HF).
+	pub fn effective_provider_id(&self) -> Option<String> {
+		match session_pick() {
+			Some(picked) => picked.provider,
+			None => self.active_provider.clone(),
+		}
 	}
 
 	/// The standard model from settings, ignoring any session override.
@@ -383,8 +400,8 @@ impl CoderModels {
 	}
 
 	fn active_entry(&self) -> Option<&CoderProviderConfig> {
-		let id = self.active_provider.as_ref()?;
-		let found = self.providers.iter().find(|p| p.id == *id);
+		let id = self.effective_provider_id()?;
+		let found = self.providers.iter().find(|p| p.id == id);
 		if found.is_none() {
 			tracing::warn!(
 				active_provider = %id,
@@ -755,22 +772,52 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn session_model_applies_only_under_its_provider() {
+	async fn a_session_routes_through_its_own_provider() {
+		let provider = |id: &str, kind: ProviderKind, standard: &str| CoderProviderConfig {
+			id: id.into(),
+			label: id.into(),
+			kind,
+			base_url: format!("https://{id}.example"),
+			standard_model: standard.into(),
+			cheap_model: String::new(),
+			payload_cap_mb: None,
+			has_api_key: true,
+		};
 		let models = CoderModels {
-			active_provider: Some("prov-a".into()),
+			active_provider: Some("chatgpt".into()),
+			providers: vec![
+				provider("chatgpt", ProviderKind::ChatGpt, "gpt-x"),
+				provider("openrouter", ProviderKind::OpenRouter, "google/gemini-neon"),
+			],
 			..CoderModels::default()
 		};
-		let default = models.standard();
-		let picked = |provider: &str| {
+		assert_eq!(models.standard(), "gpt-x");
+
+		let pick = |provider: Option<&str>, model: &str| {
 			Some(SessionModel {
-				provider: Some(provider.into()),
-				model: "sol".into(),
+				provider: provider.map(str::to_owned),
+				model: model.into(),
 			})
 		};
-		let under_a = SESSION_MODEL.scope(picked("prov-a"), async { models.standard() }).await;
-		assert_eq!(under_a, "sol");
-		let under_b = SESSION_MODEL.scope(picked("prov-b"), async { models.standard() }).await;
-		assert_eq!(under_b, default);
+		let (route, standard) = SESSION_MODEL
+			.scope(pick(Some("openrouter"), ""), async {
+				(models.resolve_route(), models.standard())
+			})
+			.await;
+		assert!(matches!(route, ResolvedProvider::OpenRouter { .. }), "{route:?}");
+		assert_eq!(standard, "google/gemini-neon", "empty model = the provider's own");
+
+		let standard = SESSION_MODEL
+			.scope(pick(Some("openrouter"), "google/gemini-other"), async {
+				models.standard()
+			})
+			.await;
+		assert_eq!(standard, "google/gemini-other");
+
+		let route = SESSION_MODEL
+			.scope(pick(None, ""), async { models.resolve_route() })
+			.await;
+		assert_eq!(route, ResolvedProvider::HuggingFace);
 	}
 
 	#[test]

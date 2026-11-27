@@ -69,7 +69,13 @@
 	import ChevronDownIcon from './icons/ChevronDownIcon.svelte';
 	import ChevronRightIcon from './icons/ChevronRightIcon.svelte';
 	import { ipc } from '../ipc';
-	import { formatError, type FileSearchResult, type FleetMember, type WorkerLinkState } from '../protocol';
+	import {
+		formatError,
+		type CoderProviderLock,
+		type FileSearchResult,
+		type FleetMember,
+		type WorkerLinkState,
+	} from '../protocol';
 	import { textInputUndo } from '../actions/textInputUndo';
 
 	let scrollEl: HTMLDivElement | undefined = $state();
@@ -435,7 +441,7 @@
 	// The composer's reasoning picker reads levels off the active
 	// provider's catalog; fetch it once if nothing else has.
 	$effect(() => {
-		const id = coder.modelSettings?.active_provider ?? null;
+		const id = coder.turnProvider?.id ?? null;
 		if (id !== null && coder.providerModels[id] === undefined) {
 			void coder.loadProviderModels(id);
 		}
@@ -463,19 +469,50 @@
 	);
 
 	const showEffortChoices = $derived(reasoningChoices.sent && reasoningChoices.levels.length > 0);
-	// Session model choices: the active provider's catalog, when it's
-	// short enough for a menu (ChatGPT's is; OpenRouter's isn't).
+	// Session model choices: the session's provider's catalog, when
+	// it's short enough for a menu (ChatGPT's is; OpenRouter's isn't).
 	const SESSION_MODEL_MENU_MAX = 30;
 	const sessionModelChoices = $derived.by(() => {
-		const settings = coder.modelSettings;
-		const active = settings?.providers.find((p) => p.id === settings.active_provider);
-		const rows = active === undefined ? null : (coder.providerModels[active.id] ?? null);
+		const provider = coder.turnProvider;
+		const rows = provider === null ? null : (coder.providerModels[provider.id] ?? null);
 		return rows !== null && rows.length > 0 && rows.length <= SESSION_MODEL_MENU_MAX ? rows : [];
 	});
+	// Providers a session can switch to: only offered when there is
+	// more than the HF route.
+	const sessionProviderChoices = $derived(coder.modelSettings?.providers ?? []);
 	const showReasoningPick = $derived(
-		coder.modelSettings !== null && (showEffortChoices || sessionModelChoices.length > 0),
+		coder.modelSettings !== null &&
+			(showEffortChoices || sessionModelChoices.length > 0 || sessionProviderChoices.length > 0),
 	);
-	const defaultModelName = $derived(shortModelName(coder.modelSettings?.resolved_standard_model ?? ''));
+	// The model the session uses when it picks none: its provider's.
+	const defaultModelName = $derived.by(() => {
+		const settings = coder.modelSettings;
+		const pick = coder.sessionProvider;
+		if (pick === null) {
+			return shortModelName(settings?.resolved_standard_model ?? '');
+		}
+		return shortModelName(
+			(pick.kind === 'hf' ? settings?.standard_model : coder.turnProvider?.standard_model) || 'default',
+		);
+	});
+	const workspaceProviderName = $derived.by(() => {
+		const settings = coder.modelSettings;
+		return settings?.providers.find((p) => p.id === settings.active_provider)?.label ?? 'Hugging Face';
+	});
+
+	function sessionProviderIs(id: string | null): boolean {
+		const pick = coder.sessionProvider;
+		if (pick === null) {
+			return false;
+		}
+		return id === null ? pick.kind === 'hf' : pick.kind === 'user' && pick.id === id;
+	}
+
+	function setSessionProvider(provider: CoderProviderLock | null): void {
+		coder.setSessionProvider(provider).catch((err: unknown) => {
+			workspace.flash(`Couldn't switch provider: ${formatError(err)}`);
+		});
+	}
 
 	function shortModelName(slug: string): string {
 		return (slug.split(':')[0] ?? '').split('/').at(-1) ?? slug;
@@ -652,6 +689,28 @@
 	// One menu for both session picks: models (with the settings'
 	// standard model as "default"), then reasoning levels.
 	const reasoningMenuItems = $derived<ContextMenuItem[]>([
+		...(sessionProviderChoices.length === 0
+			? []
+			: [
+					{
+						id: 'provider:default',
+						group: 'provider',
+						label: `${coder.sessionProvider === null ? '✓ ' : ''}workspace provider (${workspaceProviderName})`,
+						onSelect: () => setSessionProvider(null),
+					},
+					{
+						id: 'provider:hf',
+						group: 'provider',
+						label: `${sessionProviderIs(null) ? '✓ ' : ''}Hugging Face`,
+						onSelect: () => setSessionProvider({ kind: 'hf' }),
+					},
+					...sessionProviderChoices.map((p) => ({
+						id: `provider:${p.id}`,
+						group: 'provider',
+						label: `${sessionProviderIs(p.id) ? '✓ ' : ''}${p.label || p.id}`,
+						onSelect: () => setSessionProvider({ kind: 'user', id: p.id }),
+					})),
+				]),
 		...(sessionModelChoices.length === 0
 			? []
 			: [
@@ -3514,12 +3573,16 @@
 							<button
 								type="button"
 								class="reasoning-button"
-								title="Model and reasoning effort for this session (the defaults for other sessions are in model settings)"
+								title="Provider, model and reasoning effort for this session (the defaults for other sessions are in model settings)"
 								aria-haspopup="menu"
 								aria-expanded={reasoningMenuAnchor !== null}
 								onpointerdown={(e) => e.stopPropagation()}
 								onclick={toggleReasoningMenu}
 							>
+								{#if coder.sessionProvider !== null}
+									<span class="reasoning-model session-pick">{coder.turnProvider?.label ?? 'Hugging Face'}</span>
+									<span class="reasoning-sep" aria-hidden="true">·</span>
+								{/if}
 								<span class="reasoning-model" class:session-pick={coder.sessionModel !== null}
 									>{coder.currentModelName ?? 'model'}</span
 								>

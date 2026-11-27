@@ -28,6 +28,7 @@ import {
 	type ChatGptAccount,
 	type ChatGptDeviceCode,
 	type CoderProviderConfig,
+	type CoderProviderLock,
 	type ActiveBackgroundProcess,
 	type CoderSessionSummary,
 	type CoderStatus,
@@ -826,8 +827,7 @@ export class CoderPanelState {
 	 *  fixed list. `sent: false` on the Anthropic route, which
 	 *  ignores the setting. */
 	get reasoningChoices(): { levels: readonly string[]; defaultLevel: string | null; sent: boolean } {
-		const settings = this.modelSettings;
-		const active = settings?.providers.find((p) => p.id === settings.active_provider) ?? null;
+		const active = this.turnProvider;
 		const row = active === null ? null : (this.providerModels[active.id]?.find((r) => r.id === this.turnModel) ?? null);
 		return {
 			levels: row?.reasoning_levels ?? FIXED_REASONING_EFFORTS,
@@ -837,9 +837,40 @@ export class CoderPanelState {
 	}
 
 	/** Model the visible session's next turn uses: its own override,
-	 *  else the settings' standard model. */
+	 *  else its provider's standard model. */
 	get turnModel(): string | null {
-		return this.sessionModel ?? this.modelSettings?.resolved_standard_model ?? null;
+		if (this.sessionModel !== null) {
+			return this.sessionModel;
+		}
+		const pick = this.sessionProvider;
+		if (pick === null) {
+			return this.modelSettings?.resolved_standard_model ?? null;
+		}
+		return pick.kind === 'hf'
+			? (this.modelSettings?.standard_model ?? null)
+			: this.turnProvider?.standard_model || null;
+	}
+
+	/** The provider the visible session picked for itself; `null`
+	 *  when it follows the workspace's. */
+	get sessionProvider(): CoderProviderLock | null {
+		return this.status?.session_provider ?? null;
+	}
+
+	/** The user provider the visible session's next turn goes through;
+	 *  `null` for the HF route. */
+	get turnProvider(): CoderProviderConfig | null {
+		const settings = this.modelSettings;
+		const pick = this.sessionProvider;
+		const id = pick === null ? (settings?.active_provider ?? null) : pick.kind === 'user' ? pick.id : null;
+		return settings?.providers.find((p) => p.id === id) ?? null;
+	}
+
+	/** Route the visible session through its own provider (`null` =
+	 *  follow the workspace's), with that provider's standard model. */
+	async setSessionProvider(provider: CoderProviderLock | null): Promise<void> {
+		await ipc.coder.setSessionProvider(provider);
+		await this.refreshStatus();
 	}
 
 	/** The visible session's model override; `null` when it follows

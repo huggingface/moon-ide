@@ -599,10 +599,14 @@ pub struct CoderStatus {
 	/// it follows the model settings' default.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub session_reasoning_effort: Option<String>,
-	/// The visible session's standard-model override, when it applies
-	/// to the active provider; `None` follows the model settings.
+	/// The visible session's standard-model override; `None` follows
+	/// its provider's standard model.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub session_model: Option<String>,
+	/// The provider the visible session routes through when it picked
+	/// its own; `None` follows the workspace's.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub session_provider: Option<moon_protocol::coder_models::CoderProviderLock>,
 	/// The visible session's messages parked for later.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub session_notes: Vec<crate::sessions::SessionNote>,

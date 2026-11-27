@@ -961,6 +961,15 @@ pub async fn coder_set_session_model(app: &AppCore, model: Option<String>) -> Re
 	app.coder.set_session_model(model).await.map_err(MoonError::from)
 }
 
+/// Route the active folder's visible session through its own provider;
+/// `None` follows the workspace's.
+pub async fn coder_set_session_provider(
+	app: &AppCore,
+	provider: Option<moon_protocol::coder_models::CoderProviderLock>,
+) -> Result<(), MoonError> {
+	app.coder.set_session_provider(provider).await.map_err(MoonError::from)
+}
+
 /// Replace the in-memory session with the persisted one
 /// identified by `id`. Backend emits `session_loaded` + per-record
 /// replay events on the `coder:event` channel; the frontend reacts
@@ -1757,6 +1766,7 @@ crate::commands! {
 	coder_set_session_notes([app] notes: Vec<moon_coder::sessions::SessionNote>),
 	coder_subagent_transcript([app] session_id: String, subagent_id: String),
 	coder_set_session_model([app] model: Option<String>),
+	coder_set_session_provider([app] provider: Option<moon_protocol::coder_models::CoderProviderLock>),
 	coder_transcribe([app] wav_base64: String),
 	coder_open_session([app] id: String),
 	coder_session_jsonl_path([app] id: String),

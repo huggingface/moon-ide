@@ -844,6 +844,24 @@
 				onclick={() => void app.loadReview(worktreeRoot)}>⇄</button
 			>
 		{/if}
+		{#if app.modelSettings && app.modelSettings.providers.length > 0}
+			{@const lock = app.sessionProvider}
+			<select
+				class="session-provider"
+				title="Provider for this session"
+				value={lock === null ? '' : lock.kind === 'hf' ? 'hf' : lock.id}
+				onchange={(e) => {
+					const v = e.currentTarget.value;
+					void app.setSessionProvider(v === '' ? null : v === 'hf' ? { kind: 'hf' } : { kind: 'user', id: v });
+				}}
+			>
+				<option value="">Workspace · {app.providerLabel(app.modelSettings.active_provider)}</option>
+				<option value="hf">Hugging Face</option>
+				{#each app.modelSettings.providers as p (p.id)}
+					<option value={p.id}>{p.label || p.id}</option>
+				{/each}
+			</select>
+		{/if}
 		{#if app.busy}
 			<span class="pip live" title="Running"></span>
 		{:else if app.awaitingInput}
@@ -1441,6 +1459,17 @@
 	.back {
 		flex: none;
 		padding: 0.6rem 0.7rem;
+	}
+	.session-provider {
+		flex: none;
+		max-width: 9rem;
+		font: inherit;
+		font-size: 0.8rem;
+		color: var(--fg-muted);
+		background: var(--bg-elev);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 0.25rem 0.4rem;
 	}
 	.session-title {
 		flex: 1;

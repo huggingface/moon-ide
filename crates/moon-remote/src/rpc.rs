@@ -788,6 +788,26 @@ impl BridgeRpcHandler for BridgeRpc {
 					.map_err(|e| e.to_string())?;
 				to_value(&usage)
 			}
+			// A session's own provider (`provider: null` = follow the
+			// workspace's): the phone's session header picker.
+			"coder_session_provider" => {
+				let p: SessionIdParams = parse_params(params)?;
+				let provider = self
+					.coder
+					.session_provider_in(&p.session_id)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(serde_json::json!({ "provider": provider }))
+			}
+			"coder_set_session_provider" => {
+				let p: SetSessionProviderParams = parse_params(params)?;
+				self
+					.coder
+					.set_session_provider_in(&p.session_id, p.provider)
+					.await
+					.map_err(|e| e.to_string())?;
+				Ok(Value::Null)
+			}
 			"coder_set_model_settings" => {
 				let p: SetModelSettingsParams = parse_params(params)?;
 				moon_app::settings::set_model_settings(&self.coder, &self.settings, p.settings)
@@ -1108,6 +1128,18 @@ struct ProbeProviderParams {
 }
 
 #[derive(serde::Deserialize)]
+struct SessionIdParams {
+	session_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SetSessionProviderParams {
+	session_id: String,
+	#[serde(default)]
+	provider: Option<moon_protocol::coder_models::CoderProviderLock>,
+}
+
+#[derive(serde::Deserialize)]
 struct ProviderIdParams {
 	provider_id: String,
 }
@@ -1335,6 +1367,8 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 	"coder_add_provider",
 	"coder_set_provider_api_key",
 	"coder_plan_usage",
+	"coder_session_provider",
+	"coder_set_session_provider",
 	"workspace_launch",
 	"workspace_scm_status",
 	"workspace_scm_review",

@@ -1842,9 +1842,12 @@ export type CoderStatus = {
 	/** The visible session's reasoning-effort override; absent when it
 	 *  follows the model settings' default. */
 	session_reasoning_effort?: string | null;
-	/** The visible session's model override (under the active
-	 *  provider); absent when it follows the model settings. */
+	/** The visible session's model override; absent when it uses
+	 *  its provider's standard model. */
 	session_model?: string | null;
+	/** The provider the visible session picked for itself; absent
+	 *  when it follows the workspace's. */
+	session_provider?: CoderProviderLock | null;
 	/** The visible session's messages parked for later. */
 	session_notes?: SessionNote[];
 };

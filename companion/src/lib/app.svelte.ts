@@ -1411,6 +1411,48 @@ class CompanionState {
 		void this.loadPlanUsage();
 	}
 
+	/** The provider the open session picked for itself; `null` when it
+	 * follows the workspace's. */
+	sessionProvider = $state<ProviderLock | null>(null);
+
+	async loadSessionProvider(): Promise<void> {
+		const workspace = this.activeWorkspace;
+		const session = this.activeSession;
+		this.sessionProvider = null;
+		if (!workspace || !session) {
+			return;
+		}
+		try {
+			const reply = await this.#call<{ provider: ProviderLock | null }>(
+				workspace,
+				'coder_session_provider',
+				{ session_id: session },
+				this.activeIde,
+			);
+			if (this.activeSession === session) {
+				this.sessionProvider = reply.provider;
+			}
+		} catch {
+			// An older IDE without per-session providers: nothing to show.
+		}
+	}
+
+	/** Route the open session through its own provider (`null` = the
+	 * workspace's); applies from its next turn. */
+	async setSessionProvider(provider: ProviderLock | null): Promise<void> {
+		const workspace = this.activeWorkspace;
+		const session = this.activeSession;
+		if (!workspace || !session) {
+			return;
+		}
+		try {
+			await this.#call(workspace, 'coder_set_session_provider', { session_id: session, provider }, this.activeIde);
+			this.sessionProvider = provider;
+		} catch (e) {
+			this.error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	/** Plan usage of the active provider when it runs on a ChatGPT or
 	 * Claude plan (mirror of `ChatGptUsage`); null otherwise or before
 	 * any reading. */
@@ -2200,6 +2242,7 @@ class CompanionState {
 		try {
 			this.#ensureSubscribed(this.activeWorkspace, this.activeIde);
 			await this.#openAndReplay(id);
+			void this.loadSessionProvider();
 			// A session that died mid-turn (restart, abort) gets the
 			// same retry bar an errored one does — the transcript
 			// alone makes it look like the agent just stopped. Only

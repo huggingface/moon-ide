@@ -53,6 +53,7 @@ use crate::sessions::{
 use crate::subagent::{build_subagent_spec, run_subagent, task_tool_definition};
 use crate::tools::{CoderMode, ToolContext, ToolRegistry};
 use moon_core::WorkspaceFolderEntry;
+use moon_protocol::coder_models::CoderProviderLock;
 use serde_json::json;
 
 mod claude_code;
@@ -2009,10 +2010,18 @@ impl CoderHandle {
 			}
 			_ => (None, false),
 		};
-		let (session_reasoning_effort, session_model, session_notes) = match &coder_root_fs {
+		let (session_reasoning_effort, session_pick, session_notes) = match &coder_root_fs {
 			Some(fs) => self.visible_session_overrides(fs).await,
 			None => (None, None, Vec::new()),
 		};
+		let session_model = session_pick
+			.as_ref()
+			.map(|pick| pick.model.clone())
+			.filter(|m| !m.trim().is_empty());
+		let session_provider = session_pick.map(|pick| match pick.provider {
+			Some(id) => CoderProviderLock::User { id },
+			None => CoderProviderLock::Hf,
+		});
 		Ok(CoderStatus {
 			signed_in,
 			identity,
@@ -2021,6 +2030,7 @@ impl CoderHandle {
 			force_host_override,
 			session_reasoning_effort,
 			session_model,
+			session_provider,
 			session_notes,
 		})
 	}
@@ -2741,18 +2751,105 @@ impl CoderHandle {
 	}
 
 	/// Set the standard model of the active folder's visible session
-	/// only (`None` = follow the model settings). Recorded with the
-	/// active provider, and only applied while that provider is
-	/// active. Persisted in the session header; applies from the
-	/// session's next turn.
+	/// only (`None` = its provider's default). The session keeps the
+	/// provider it picked, or pins the active one: a model only makes
+	/// sense with the provider it came from. Persisted in the session
+	/// header; applies from the session's next turn.
 	pub async fn set_session_model(&self, model: Option<String>) -> Result<(), CoderError> {
-		let provider = self.state.models.read().await.active_provider.clone();
+		let active = self.state.models.read().await.active_provider.clone();
 		let (rt, _, _) = self.state.active_visible_runtime().await?;
+		let model = model.filter(|m| !m.trim().is_empty());
+		self
+			.update_session_pick(&rt, |pick| match (pick, model) {
+				(Some(pick), model) => Some(crate::models::SessionModel {
+					model: model.unwrap_or_default(),
+					..pick
+				}),
+				(None, Some(model)) => Some(crate::models::SessionModel {
+					provider: active,
+					model,
+				}),
+				(None, None) => None,
+			})
+			.await;
+		Ok(())
+	}
+
+	/// Route the active folder's visible session through its own
+	/// provider (`None` = follow the workspace's), with that provider's
+	/// standard model. Applies from the session's next turn.
+	pub async fn set_session_provider(&self, provider: Option<CoderProviderLock>) -> Result<(), CoderError> {
+		let (rt, _, _) = self.state.active_visible_runtime().await?;
+		self.set_session_provider_on(&rt, provider).await
+	}
+
+	/// [`Self::set_session_provider`] for a session by id (the companion).
+	pub async fn set_session_provider_in(
+		&self,
+		session_id: &str,
+		provider: Option<CoderProviderLock>,
+	) -> Result<(), CoderError> {
+		let (rt, _) = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
+		self.set_session_provider_on(&rt, provider).await
+	}
+
+	/// The provider a session picked for itself (`None` = it follows
+	/// the workspace's), for the companion's session header.
+	pub async fn session_provider_in(&self, session_id: &str) -> Result<Option<CoderProviderLock>, CoderError> {
+		let (rt, _) = self
+			.state
+			.runtime_for_session(session_id)
+			.await
+			.ok_or_else(|| CoderError::Internal(format!("session `{session_id}` is not mounted")))?;
+		let pick = rt.session.lock().await.header.model_override.clone();
+		Ok(pick.map(|pick| match pick.provider {
+			Some(id) => CoderProviderLock::User { id },
+			None => CoderProviderLock::Hf,
+		}))
+	}
+
+	async fn set_session_provider_on(
+		&self,
+		rt: &Arc<SessionRuntime>,
+		provider: Option<CoderProviderLock>,
+	) -> Result<(), CoderError> {
+		if rt.session.lock().await.header.claude_code.is_some() {
+			return Err(CoderError::Internal(
+				"this session runs in Claude Code and stays there; start a new session for another provider".into(),
+			));
+		}
+		if let Some(CoderProviderLock::User { id }) = &provider {
+			if self.state.models.read().await.provider(id).is_none() {
+				return Err(CoderError::Internal(format!("unknown provider `{id}`")));
+			}
+		}
+		self
+			.update_session_pick(rt, |_| {
+				provider.map(|lock| crate::models::SessionModel {
+					provider: match lock {
+						CoderProviderLock::Hf => None,
+						CoderProviderLock::User { id } => Some(id),
+					},
+					model: String::new(),
+				})
+			})
+			.await;
+		Ok(())
+	}
+
+	async fn update_session_pick(
+		&self,
+		rt: &Arc<SessionRuntime>,
+		change: impl FnOnce(Option<crate::models::SessionModel>) -> Option<crate::models::SessionModel>,
+	) {
 		let (session_dir, header) = {
 			let mut session = rt.session.lock().await;
-			session.header.model_override = model
-				.filter(|m| !m.trim().is_empty())
-				.map(|model| crate::models::SessionModel { provider, model });
+			let current = session.header.model_override.take();
+			session.header.model_override = change(current);
 			(session.session_dir.clone(), session.header.clone())
 		};
 		if let Some(dir) = session_dir {
@@ -2760,7 +2857,6 @@ impl CoderHandle {
 				tracing::warn!(?err, "failed to persist model_override header rewrite");
 			}
 		}
-		Ok(())
 	}
 
 	/// Tag the active folder's **visible** session with the branch its
@@ -3006,12 +3102,15 @@ impl CoderHandle {
 		forced
 	}
 
-	/// The visible session's reasoning-effort and model overrides; the
-	/// model only when it was picked under the active provider.
+	/// The visible session's reasoning-effort and provider/model picks.
 	async fn visible_session_overrides(
 		&self,
 		fs: &Arc<FolderSession>,
-	) -> (Option<String>, Option<String>, Vec<sessions::SessionNote>) {
+	) -> (
+		Option<String>,
+		Option<crate::models::SessionModel>,
+		Vec<sessions::SessionNote>,
+	) {
 		let Some(id) = fs.visible_session_id().await else {
 			return (None, None, Vec::new());
 		};
@@ -3026,8 +3125,7 @@ impl CoderHandle {
 				session.header.notes.clone(),
 			)
 		};
-		let active = self.state.models.read().await.active_provider.clone();
-		(effort, model.filter(|m| m.provider == active).map(|m| m.model), notes)
+		(effort, model, notes)
 	}
 
 	/// Revert the active folder's visible session back to just
@@ -3525,6 +3623,18 @@ impl CoderHandle {
 	/// fire. `drain_steer_now` skips this gate — the steer it
 	/// drains was already accepted by an authenticated `send`.
 	async fn ensure_can_send(&self) -> Result<(), CoderError> {
+		// Answered for the visible session's own provider when it has
+		// one (`SessionModel`).
+		let pick = match self.state.active_visible_runtime().await {
+			Ok((rt, _, _)) => rt.session.lock().await.header.model_override.clone(),
+			Err(_) => None,
+		};
+		crate::models::SESSION_MODEL
+			.scope(pick, self.ensure_can_send_now())
+			.await
+	}
+
+	async fn ensure_can_send_now(&self) -> Result<(), CoderError> {
 		if let Some(claude) = self.state.models.read().await.active_claude_code() {
 			if !self.state.provider_keys.has_key(&claude.id) {
 				return Err(CoderError::Internal(
