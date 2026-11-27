@@ -620,8 +620,10 @@ Both binaries are published as public images
 `moon-bridge` starts the relay on `0.0.0.0:53180` serving the PWA;
 container arguments are appended to `serve` (`--advertise-url wss://…`
 behind a proxy). `moon-remote`
-is `moon-base` plus the binary, with the subcommand as the
-container's arguments (`serve --workspace <slug>`). Both set
+is `moon-base` plus the binary and a docker CLI with compose, which
+drive the host's engine for project containers through a socket in
+`DOCKER_HOST` (docker or podman); the subcommand is the container's
+arguments (`serve --workspace <slug>`). Both set
 `MOON_SECRETS_DIR` inside the volume.
 
 ## Cloud / always-on future

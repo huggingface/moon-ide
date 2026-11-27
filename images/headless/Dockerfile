@@ -66,7 +66,29 @@ EXPOSE 53180
 # adds what is its own (`--advertise-url wss://…`) as arguments.
 ENTRYPOINT ["moon-bridge", "serve", "--bind", "0.0.0.0:53180", "--no-idle-exit", "--web-root", "/usr/share/moon-bridge/companion"]
 
+# moon-remote drives the host's container engine for project
+# containers (a docker or podman socket in `DOCKER_HOST`), which
+# moon-base doesn't ship a client for: the static docker CLI and the
+# compose plugin. Pinned with checksums; bumps are intentional.
+FROM debian:bookworm-slim AS docker-cli
+ARG DOCKER_VERSION=29.10.1
+ARG DOCKER_SHA256=061642059fa7f2ed9b2f04a327a951cff4249585cf04b2661c2a6539197c9962
+ARG COMPOSE_VERSION=5.8.0
+ARG COMPOSE_SHA256=b8840f5008c447f41fce0a57ae3adeab42c89b1eb6e6012524bcabbfb4ffbaf6
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" -o /tmp/docker.tgz \
+ && echo "${DOCKER_SHA256}  /tmp/docker.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/docker.tgz -C /tmp docker/docker \
+ && install -D -m 0755 /tmp/docker/docker /out/bin/docker \
+ && curl -fsSL "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-x86_64" -o /tmp/compose \
+ && echo "${COMPOSE_SHA256}  /tmp/compose" | sha256sum -c - \
+ && install -D -m 0755 /tmp/compose /out/cli-plugins/docker-compose
+
 FROM ${MOON_BASE} AS moon-remote
+COPY --from=docker-cli /out/bin/docker /usr/local/bin/docker
+COPY --from=docker-cli /out/cli-plugins/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
 COPY --from=build /out/moon-remote /usr/local/bin/moon-remote
 ENV MOON_SECRETS_DIR=/home/dev/.local/share/moon-ide/secrets
 ENTRYPOINT ["moon-remote"]

@@ -24,7 +24,8 @@ ADR 0007 wanted from Docker Hub.
   - `moon-bridge` — the relay and the companion PWA on a slim base.
   - `moon-remote` — the headless IDE **on top of `moon-base`**.
     Agents' commands run in its process tree, so the toolchain has
-    to be around it.
+    to be around it. It adds the docker CLI and compose, which
+    moon-base leaves out, to drive the host's engine.
 - The headless images follow moon-ide commits and are `amd64` only:
   every machine they run on is.
 - One credential, `HF_REGISTRY_TOKEN`, pushes all three. The
