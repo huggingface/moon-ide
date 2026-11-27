@@ -126,6 +126,13 @@ moon-bridge serve --bind 127.0.0.1:53180 \
     --no-idle-exit --web-root /path/to/companion-dist
 ```
 
+Or run the published image, which is that command with the PWA inside ([ADR 0129](specs/decisions/0129-published-images.md)):
+
+```bash
+docker run -d -p 127.0.0.1:53180:53180 -v moon-bridge:/home/moon/.local/share/moon-ide \
+    cr.hf.co/huggingface/moon-bridge:dev --advertise-url wss://bridge.example.com
+```
+
 Notes:
 
 - Build the binary on a machine whose glibc is **not newer** than the relay box's (e.g. inside the `moon-base` workspace container, Debian 12) — a binary built against a newer glibc refuses to start there.
@@ -157,6 +164,8 @@ Notes:
 - For boot persistence, run `serve` from a `systemd --user` template unit (with `loginctl enable-linger`), e.g. `moon-remote@<workspace>.service` with `Restart=always` (plus `Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus` when it uses the session keyring).
 - `workspace_launch` from the phone spawns a sibling `serve` process for stopped workspaces; a `workspace-add` while serving shows up on the phone after the unit restarts (Register refresh is a known gap).
 
+The same binary ships as `cr.hf.co/huggingface/moon-remote:dev`, on top of the `moon-base` dev image — see [companion.md § "Headless images"](specs/companion.md#headless-images) for what to keep on volumes.
+
 Workspace management is CLI-first: `workspace-add` binds a folder,
 `workspace-remove-folder` unbinds one, `mcp --workspace <slug>
 [--enable playwright]` lists / toggles MCP servers, and `model`
@@ -176,7 +185,7 @@ docker build -t moon-base:dev images/moon-base/
 
 - **Serve the companion PWA from an origin the relay doesn't control.** End-to-end encryption ([ADR 0087](specs/decisions/0087-companion-end-to-end-encryption.md)) makes the relay a blind pipe for traffic — phones are authorized by each IDE, calls and events are sealed, plaintext calls are refused — but the relay still serves the PWA's JavaScript, so a compromised relay could ship a build that exfiltrates the phone's key. Serve the PWA from a static host built by CI (the relay as a cross-origin WebSocket only), and have the pairing link point there.
 - **Deal with old host gits (< 2.48) or ship our own.** Coordinator worker worktrees are created with `git worktree add --relative-paths` (git ≥ 2.48, enforced at creation time — the devcontainer's git usually satisfies it), which writes `extensions.relativeWorktrees` into the parent repo's config. From that moment an older git — for example the _host's_ `/usr/bin/git` 2.43 on Ubuntu 24.04 / Mint 22 while the worktree was created by the container's newer git — refuses to open the repo **at all**: `status`, `branch`, blame, commit, even `config --get` fail. We hit this in the field (host-side SCM silently dead on every repo a coordinator had touched; `remote_web_url` already sidesteps it by reading `.git/config` as a file). Before release either: detect an old host git up front and surface an actionable "upgrade git" error on folder bind (not a cryptic per-command failure), or bundle/download a modern static git binary and use it for all host-side git. Erroring early is the cheap first step; shipping our own git removes the failure class entirely.
-- **Publish the `moon-base` Docker image to Docker Hub.** The workspace dev image (`huggingface/moon-base`) must actually exist on Docker Hub so a fresh clone can pull it instead of building locally. See [images/moon-base/README.md](images/moon-base/README.md) and [ADR 0007](specs/decisions/0007-compose-and-moon-base.md).
+- **Publish the `moon-base` image and default to it.** The workspace dev image is built for `cr.hf.co/huggingface/moon-base` ([ADR 0129](specs/decisions/0129-published-images.md)), but the IDE still defaults to a locally built `moon-base:dev`; once the first image is out, a fresh clone should pull it instead. See [images/moon-base/README.md](images/moon-base/README.md).
 - **Make PORTS exposing more intuitive** - eg autodetects ports or w/e to prompt exposing them, to avoid debugging (why doesn't my webapp work?). And make them work without --host.
 - **Improve the default model / provider onboarding.** Right now the flow assumes you connect to Hugging Face first, and the default model choice after connecting could be better. Ideally:
   - Pick a sensible default model automatically after connecting to HF.

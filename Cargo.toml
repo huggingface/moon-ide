@@ -22,7 +22,6 @@ edition = "2021"
 # zero benefit.
 rust-version = "1.89"
 license = "MIT"
-publish = false
 
 [workspace.dependencies]
 moon-core = { path = "crates/moon-core" }

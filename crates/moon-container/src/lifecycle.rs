@@ -86,9 +86,9 @@ use crate::status_cache;
 /// `compose.yaml` if the caller doesn't override it.
 ///
 /// Currently a *local* tag (`moon-base:dev`) because moon-base
-/// hasn't been published yet — see ADR 0007. Once the GitHub
-/// Actions workflow ships its first image to Docker Hub this
-/// flips to `huggingface/moon-base:0.1` (or similar).
+/// hasn't been published yet. Once the GitHub Actions workflow
+/// ships its first image this flips to
+/// `cr.hf.co/huggingface/moon-base:dev` (ADR 0129).
 pub const DEFAULT_DEV_IMAGE: &str = "moon-base:dev";
 
 /// Filename of the bound-folder sidecar inside the state dir.

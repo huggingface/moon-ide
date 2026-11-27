@@ -4,7 +4,7 @@
 #
 # What lives here today: WebKitGTK dev libraries (so a fresh
 # moon-ide checkout is buildable per ADR 0005), a recent git (>= 2.48,
-# prebuilt from the git-core PPA — for relative-path worktrees, ADR
+# built from source — for relative-path worktrees, ADR
 # 0029), rustup with the stable toolchain, bun, the polyglot CLIs we
 # use across most repos in the org (gh, fj, uv, hf) plus comfort tooling
 # (ripgrep, fzf, bat, jq), a Playwright browser runtime for the
@@ -33,6 +33,37 @@
 FROM rust:1.98.0-bookworm AS fj-build
 ARG FJ_VERSION=0.6.0
 RUN cargo install forgejo-cli --version "${FJ_VERSION}" --locked
+
+# Builder stage for git. Built from the kernel.org release tarball
+# rather than taken from a package: the git-core PPA only keeps its
+# latest build, so a pinned .deb URL 404s at the next upstream
+# release and the image stops building. kernel.org keeps every
+# version. Same rust image as `fj-build`: git >= 2.56 compiles part
+# of itself with cargo. `NO_OPENSSL` matches Debian's own build
+# (https goes through libcurl; only `imap-send` wants OpenSSL).
+# `INSTALL_SYMLINKS` keeps the ~140 builtins as links — the default
+# hardlinks would each become a full copy across the `COPY --from`.
+# Pin the version and its checksum; bumps are intentional.
+FROM rust:1.98.0-bookworm AS git-build
+ARG GIT_VERSION=2.56.1
+ARG GIT_SHA256=f0b0bf89264b9bd2e1c640363e7529643989da76281600473c50745cd34a607f
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libcurl4-gnutls-dev \
+        libexpat1-dev \
+        libpcre2-dev \
+        zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
+      "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
+      -o /tmp/git.tar.xz \
+ && echo "${GIT_SHA256}  /tmp/git.tar.xz" | sha256sum -c - \
+ && mkdir /tmp/git \
+ && tar -xJf /tmp/git.tar.xz -C /tmp/git --strip-components=1 \
+ && make -C /tmp/git -j"$(nproc)" \
+      prefix=/usr/local DESTDIR=/out \
+      USE_LIBPCRE2=1 NO_OPENSSL=1 NO_GETTEXT=1 NO_TCLTK=1 INSTALL_SYMLINKS=1 \
+      all strip install
 
 FROM debian:bookworm-slim
 
@@ -72,53 +103,23 @@ RUN apt-get update \
         unzip \
  && rm -rf /var/lib/apt/lists/*
 
-# git from the git-core PPA's prebuilt .deb (the same source the host
-# machine uses). moon-ide's isolated worktree sessions create
-# worktrees with `git worktree add --relative-paths` (ADR 0029),
-# which needs git >= 2.48; Debian bookworm ships 2.39 and even
-# backports / trixie don't reach 2.48. The PPA is Ubuntu-only, but
-# its jammy (22.04) build links against glibc >= 2.34 — bookworm's
-# 2.36 satisfies that, and all the shared-lib deps (perl, libpcre2,
-# libcurl3-gnutls, libexpat1, zlib) are satisfiable from bookworm's
-# own repos. We download the .deb, extract it into /usr/local (PATH
-# precedence over any system git), and install the runtime libs it
-# needs. Arm64 is served by the same PPA distro path. Pin the version;
-# bumps are intentional, same as the Go / uv / helm pins.
-ARG GIT_VERSION=2.55.0
-ARG GIT_PPA_BUILD=0ppa1~ubuntu22.04.2
+# A recent git, from the `git-build` stage above. moon-ide's isolated
+# worktree sessions create worktrees with `git worktree add
+# --relative-paths` (ADR 0029), which needs git >= 2.48; Debian
+# bookworm ships 2.39 and even backports / trixie don't reach 2.48.
+# It lives in /usr/local (PATH precedence over any system git) with
+# its helpers at the compiled-in /usr/local/libexec/git-core, so
+# every sub-command resolves to this version.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        dpkg-dev \
         libcurl3-gnutls \
         liberror-perl \
         libexpat1 \
         libpcre2-8-0 \
         perl \
- && curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused \
-      "https://ppa.launchpadcontent.net/git-core/ppa/ubuntu/pool/main/g/git/git_${GIT_VERSION}-${GIT_PPA_BUILD}_$(dpkg --print-architecture).deb" \
-      -o /tmp/git.deb \
- && mkdir -p /tmp/git-deb \
- && dpkg-deb -x /tmp/git.deb /tmp/git-deb \
- && cp -a /tmp/git-deb/usr/bin/git /usr/local/bin/git \
- && cp -a /tmp/git-deb/usr/lib/git-core /usr/local/lib/git-core \
- && cp -a /tmp/git-deb/usr/share/git-core /usr/local/share/git-core \
- && rm -rf /tmp/git.deb /tmp/git-deb \
- && rm -rf /var/lib/apt/lists/* \
- && git --version
-# The PPA .deb is built with a compiled-in exec-path of
-# `/usr/lib/git-core` (Ubuntu's install location), but we just
-# unpacked the helpers into `/usr/local/lib/git-core`. Without
-# redirection, `git` (2.54) shells sub-commands like `git-stash`
-# out to `/usr/lib/git-core/git-stash` → the Debian-packaged git
-# 2.39 — which then refuses repos tagged with
-# `extensions.relativeWorktrees` (set by `git worktree add
-# --relative-paths`, ADR 0029) with `fatal: unknown repository
-# extension found`. That breaks `git stash` outright and, via
-# lint-staged's `git stash create`, the husky pre-commit hook.
-# Point `GIT_EXEC_PATH` at the 2.54 helpers so every git
-# sub-command — stash, request-pull, submodule, etc. — resolves
-# to the same version as `/usr/local/bin/git`.
-ENV GIT_EXEC_PATH=/usr/local/lib/git-core
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=git-build /out/usr/local/ /usr/local/
+RUN git --version && git --exec-path
 
 # Pre-seed system-wide known_hosts with the SSH host keys for the
 # git providers we actually use, so the first `git fetch` /
@@ -267,10 +268,10 @@ RUN curl -fsSL https://bun.sh/install | bash
 # nvm and saner inside non-interactive `docker exec`. The image
 # ships the current LTS as the default Node.
 #
-# Corepack (bundled with Node 16+) is enabled here. Each project's
-# actual pnpm/yarn version resolves on demand from its
-# `packageManager` field in package.json, so we don't bake a pnpm
-# version that'll drift.
+# Corepack is enabled here. Each project's actual pnpm/yarn version
+# resolves on demand from its `packageManager` field in package.json,
+# so we don't bake a pnpm version that'll drift. Node stopped
+# bundling corepack with 25, so it comes from npm.
 ENV FNM_DIR=/home/${USERNAME}/.fnm \
     PATH=/home/${USERNAME}/.fnm/aliases/default/bin:/home/${USERNAME}/.fnm:${PATH}
 
@@ -296,7 +297,8 @@ RUN curl -fsSL https://fnm.vercel.app/install \
 # the image rather than the generated compose because corepack is
 # an image concern and `FROM moon-base` extensions inherit it.
 ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-RUN corepack enable \
+RUN npm install --global corepack \
+ && corepack enable \
  && node --version \
  && npm --version \
  && corepack --version

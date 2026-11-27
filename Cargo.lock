@@ -3524,7 +3524,6 @@ name = "moon-bridge"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "base64 0.21.7",
  "camino",
  "clap",
  "dirs",
@@ -3617,7 +3616,6 @@ dependencies = [
  "lsp-types",
  "moon-container",
  "moon-protocol",
- "notify",
  "regex",
  "regex-syntax",
  "reqwest 0.12.28",
@@ -3630,7 +3628,6 @@ dependencies = [
  "tracing",
  "trash",
  "url",
- "uuid",
  "which",
 ]
 

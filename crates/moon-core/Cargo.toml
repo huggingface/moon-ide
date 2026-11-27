@@ -19,13 +19,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-notify = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }
 keyring = { workspace = true }
 ec4rs = { workspace = true }
 trash = { workspace = true }
-uuid = { version = "1.18", features = ["v4", "serde"] }
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"

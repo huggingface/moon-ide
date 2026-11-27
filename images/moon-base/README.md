@@ -2,7 +2,7 @@
 
 The base image for moon-ide workspace containers. Every team
 that opts into Phase 2's containerised dev shells builds
-`FROM huggingface/moon-base:<tag>` to inherit a working dev
+`FROM cr.hf.co/huggingface/moon-base:<tag>` to inherit a working dev
 environment without relitigating Tauri build deps or
 toolchain installs.
 
@@ -39,7 +39,7 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
 - **In tree** — iterating on the recipe.
 - **CI wired but unpublished.** Multi-arch builds run on PRs
   (no push) and on push to `main`
-  (push to `huggingface/moon-base:dev` + `:sha-<long>`). No
+  (push to `cr.hf.co/huggingface/moon-base:dev` + `:sha-<long>`). No
   versioned tag exists yet; `0.1.0` will be cut once Phase 2.0
   ships end-to-end.
 - **Unprivileged.** `moon-base` does not embed Docker-in-Docker.
@@ -99,10 +99,11 @@ the "polyglot toolchain" tradeoff we picked in ADR 0007.
 - **Comfort tooling**: `ripgrep` (`rg`), `fzf`, `bat` (the
   Debian `batcat` symlinked back to `bat`), `jq`, `vim`,
   `ss` (via `iproute2`).
-- **git from the git-core PPA** (`GIT_VERSION`, >= 2.48) —
-  moon-ide's isolated worktree sessions use `git worktree add
---relative-paths` (ADR 0029), which Debian bookworm's 2.39 predates.
-  The PPA's jammy build runs on bookworm's glibc 2.36.
+- **git built from the kernel.org tarball** (`GIT_VERSION`,
+  > = 2.48) — moon-ide's isolated worktree sessions use `git worktree
+add --relative-paths` (ADR 0029), which Debian bookworm's 2.39
+  > predates. Not a prebuilt package: the git-core PPA drops each
+  > build at the next release, which broke the pinned download.
 - **Standard plumbing**: `curl`, `wget`, `ca-certificates`,
   `build-essential`, `less`, `sudo`, `unzip`, `xz-utils`,
   `openssh-client` (so `git` over SSH works inside the container
@@ -142,7 +143,7 @@ the workflow itself), triggered by pushes to `main`, pull
 requests touching the same paths, or manual dispatch. PR builds
 run the smoke test but do not push — they're a safety net for
 recipe changes. Pushes to `main` go further: they push each
-arch's image by digest to Docker Hub and assemble a multi-arch
+arch's image by digest to `cr.hf.co` and assemble a multi-arch
 manifest under `:dev` (rolling) and `:sha-<commit>` (immutable).
 
 The workflow ([.github/workflows/moon-base.yml](../../.github/workflows/moon-base.yml))
@@ -154,18 +155,17 @@ each per-arch job: `bun install --frozen-lockfile` and
 mounted into the freshly built image. A green merge to `main`
 means, by construction, the published image builds moon-ide.
 
-### Required secrets
+### Required secret
 
-| Secret               | What                                                                     |
-| -------------------- | ------------------------------------------------------------------------ |
-| `DOCKERHUB_USERNAME` | Org/bot Docker Hub account with write access to `huggingface/moon-base`. |
-| `DOCKERHUB_PASSWORD` | Access token / password for that account.                                |
+| Secret              | What                                                                                     |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| `HF_REGISTRY_TOKEN` | Hugging Face access token with write access to the `huggingface/moon-*` container repos. |
 
-Names match the existing `huggingface/Mongoku` publish
-workflow, so the org-level secret pair (if configured) covers
-both repos without setup. Neither secret is referenced in
-PR-mode runs, so PRs from forks build and smoke-test cleanly
-without secret access.
+Shared with the headless images' workflow
+([moon-headless.yml](../../.github/workflows/moon-headless.yml)).
+The container repos are created on the Hub; a push does not create
+them. The secret isn't referenced in PR-mode runs, so PRs from forks
+build and smoke-test cleanly without secret access.
 
 ### Versioned releases (later)
 
@@ -196,7 +196,7 @@ Teams add their own tooling on top with a thin `Dockerfile`
 that lives next to their workspace's `compose.yaml`:
 
 ```dockerfile
-FROM huggingface/moon-base:0.1
+FROM cr.hf.co/huggingface/moon-base:dev
 
 RUN sudo apt-get update \
  && sudo apt-get install -y --no-install-recommends awscli redis-tools \

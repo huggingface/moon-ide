@@ -5,8 +5,14 @@ import { execSync } from 'node:child_process';
 /** Build stamp baked into the bundle (`__BUILD_INFO__`), logged on
  * startup so a phone can verify which build it's actually running —
  * service-worker + browser caches make "did my deploy land?" a real
- * question. Best-effort: an environment without git still builds. */
+ * question. Best-effort: an environment without git still builds; an
+ * image build has no repository and passes the commit in
+ * `MOON_BUILD_SHA` instead. */
 function buildInfo(): string {
+	const stamped = process.env.MOON_BUILD_SHA;
+	if (stamped && stamped !== 'unknown') {
+		return `${stamped} ${new Date().toISOString()}`;
+	}
 	let sha = 'unknown';
 	try {
 		sha = execSync('git rev-parse --short HEAD', { cwd: __dirname }).toString().trim();

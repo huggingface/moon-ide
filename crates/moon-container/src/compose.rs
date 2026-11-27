@@ -447,7 +447,7 @@ pub struct ComposeRenderOptions<'a> {
 	/// Image reference for the `dev` service. While moon-base is
 	/// in tree but unpublished we default callers to
 	/// `moon-base:dev` (a local build). Once a published tag
-	/// exists this'll move to `huggingface/moon-base:<tag>`.
+	/// exists this'll move to `cr.hf.co/huggingface/moon-base:<tag>`.
 	pub dev_image: &'a str,
 	/// Bind-mount entries for the `dev` service. Empty is fine
 	/// (the persist volume is always mounted). In practice the

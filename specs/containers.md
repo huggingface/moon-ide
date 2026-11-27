@@ -247,8 +247,9 @@ is fine — different project names.
 
 ### The `moon-base` image
 
-moon-ide publishes its own base image to Docker Hub
-(`huggingface/moon-base:<tag>`); teams `FROM moon-base` to extend.
+moon-ide publishes its own base image to the Hugging Face container
+registry (`cr.hf.co/huggingface/moon-base:<tag>`); teams
+`FROM moon-base` to extend.
 
 What it ships:
 
@@ -304,7 +305,7 @@ pins a specific tag.
 ### Distribution
 
 Multi-arch manifest (`linux/amd64` + `linux/arm64` — the team is
-Mac-majority) on Docker Hub, built natively on both architectures
+Mac-majority) on `cr.hf.co`, built natively on both architectures
 via GitHub Actions (no QEMU) and combined with
 `buildx imagetools create`. Builds run only on changes to
 moon-base's own sources, with a `bun install && cargo check` smoke
@@ -312,10 +313,11 @@ test inside the fresh image — the contract is "moon-base builds
 moon-ide cleanly when published", not "every moon-ide commit
 re-validates moon-base".
 
-Why Docker Hub: GHCR ties the pull path to a GitHub account, a
-private registry breaks credential-free contributor pulls, and HF
-Spaces' registry is amd64-only. Docker Hub is vendor-neutral,
-public, and multi-arch-native.
+Why `cr.hf.co` ([ADR 0129](decisions/0129-published-images.md)):
+public images pull without a login and it serves multi-arch
+manifests. GHCR ties the pull path to a GitHub account, a private
+registry breaks credential-free contributor pulls, and Docker Hub
+needs an org account and rate-limits anonymous pulls.
 
 ### Why not devcontainer.json features
 

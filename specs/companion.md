@@ -606,6 +606,24 @@ One file per keyring account, named after it with `:` written as `.`:
 ChatGPT sign-ins, relay and pairing tokens) must stay writable; only
 static keys belong in the managed directory.
 
+### Headless images
+
+Both binaries are published as public images
+([ADR 0129](decisions/0129-published-images.md)), `:dev` following
+`main`:
+
+| Image                              | Runs as | Keep on a volume                                                     |
+| ---------------------------------- | ------- | -------------------------------------------------------------------- |
+| `cr.hf.co/huggingface/moon-bridge` | `moon`  | `/home/moon/.local/share/moon-ide` (TLS identity, secrets)           |
+| `cr.hf.co/huggingface/moon-remote` | `dev`   | `~/.config/moon-ide`, `~/.local/share/moon-ide`, and the code itself |
+
+`moon-bridge` starts the relay on `0.0.0.0:53180` serving the PWA;
+container arguments are appended to `serve` (`--advertise-url wss://…`
+behind a proxy). `moon-remote`
+is `moon-base` plus the binary, with the subcommand as the
+container's arguments (`serve --workspace <slug>`). Both set
+`MOON_SECRETS_DIR` inside the volume.
+
 ## Cloud / always-on future
 
 The _next_ shape — "the loop survives with **no** IDE process at all,

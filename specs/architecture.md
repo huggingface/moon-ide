@@ -113,7 +113,7 @@ those selectors when updating the minifier.
 ## Open questions
 
 - Whether `moon-core` should own its own tokio runtime or share Tauri's. Currently shares Tauri's.
-- Whether `moon-base` becomes its own repo or stays in-tree (see [ADR 0007](decisions/0007-compose-and-moon-base.md#open-follow-ups)). Registry is settled: Docker Hub at `huggingface/moon-base`.
+- Whether `moon-base` becomes its own repo or stays in-tree (see [ADR 0007](decisions/0007-compose-and-moon-base.md#open-follow-ups)). Registry is settled: `cr.hf.co/huggingface/moon-base` ([ADR 0129](decisions/0129-published-images.md)).
 
 ## Resolved
 

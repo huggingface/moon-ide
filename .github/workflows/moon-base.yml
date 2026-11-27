@@ -1,5 +1,6 @@
 # Build, smoke-test, and publish the `moon-base` workspace dev
-# image to Docker Hub at `huggingface/moon-base`.
+# image to the Hugging Face container registry at
+# `cr.hf.co/huggingface/moon-base` (public: pulling needs no login).
 #
 # Trigger: only on changes to images/moon-base/** or this
 # workflow itself. Per ADR 0007 the image tracks toolchain
@@ -17,11 +18,11 @@
 # from ADR 0005 — a published image, by construction, builds
 # moon-ide cleanly.
 #
-# Docker Hub credentials live in (likely org-level) secrets:
-#   DOCKERHUB_USERNAME — bot or org account
-#   DOCKERHUB_PASSWORD — access token / password for that account
-# Same names as the Mongoku publish workflow, so an
-# org-level secret pair covers both repos.
+# Registry credentials: one secret, shared with moon-headless.yml.
+#   HF_REGISTRY_TOKEN — a Hugging Face access token with write
+#   access to the `huggingface/moon-*` container repos. The
+#   registry ignores the username. The repos themselves are
+#   created on the Hub; a push does not create them.
 
 name: moon-base
 
@@ -38,7 +39,7 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY_IMAGE: huggingface/moon-base
+  REGISTRY_IMAGE: cr.hf.co/huggingface/moon-base
 
 jobs:
   build:
@@ -103,7 +104,8 @@ jobs:
           '
 
       # 2. The release gate from ADR 0005: a fresh image must
-      #    cleanly build moon-ide. We bind-mount the checkout
+      #    cleanly build moon-ide. The frontend is built first:
+      #    the desktop crate embeds `dist/` at compile time. We bind-mount the checkout
       #    and `chown` it to uid 1000 so the container's `dev`
       #    user can write `target/` and `node_modules/` without
       #    permission gymnastics.
@@ -116,15 +118,17 @@ jobs:
             bash -c '
               set -e
               bun install --frozen-lockfile
+              bun run build:vite
               cargo check --workspace --locked
             '
 
-      - name: Login to Docker Hub
+      - name: Login to cr.hf.co
         if: github.event_name != 'pull_request'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          registry: cr.hf.co
+          username: hf
+          password: ${{ secrets.HF_REGISTRY_TOKEN }}
 
       # 3. With the smoke green, push by digest. The cache-from
       #    GHA scope means almost every layer is a cache hit —
@@ -174,11 +178,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - name: Login to Docker Hub
+      - name: Login to cr.hf.co
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          registry: cr.hf.co
+          username: hf
+          password: ${{ secrets.HF_REGISTRY_TOKEN }}
 
       # Tag list:
       # - `:dev`     for every push to main (moves with HEAD)

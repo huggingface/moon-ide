@@ -1,0 +1,19 @@
+# Only builds with the repo root as context read this file
+# (images/headless); images/moon-base has its own context.
+.git
+.github
+.moon
+.playwright-mcp
+node_modules
+dist
+companion/dist
+target
+target-*
+src-tauri/target
+src-tauri/gen
+coder-export
+images
+specs
+*.log
+.env
+.env.local
