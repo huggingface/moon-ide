@@ -1,15 +1,22 @@
 :root {
-	--bg: #0d1117;
-	--bg-elev: #161b22;
-	--bg-elev-2: #21262d;
-	--border: #30363d;
-	--fg: #e6edf3;
-	--fg-muted: #8b949e;
-	--accent: #2f81f7;
-	--accent-fg: #ffffff;
-	--danger: #f85149;
-	--ok: #3fb950;
-	--radius: 10px;
+	/* moon-ide's own palette (src/styles.css `--m-*`), so the companion
+	   reads as the same product. */
+	--bg: #0d1017;
+	--bg-elev: #11151f;
+	--bg-elev-2: #1c2436;
+	--border: #232a3d;
+	--border-strong: #313a52;
+	--fg: #d6dcec;
+	--fg-muted: #8a93ab;
+	--fg-subtle: #5a6480;
+	--accent: #7ea3ff;
+	--accent-fg: #0d1017;
+	--accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+	--danger: #ff7a8a;
+	--warn: #f0b86e;
+	--ok: #5fd6a3;
+	--radius: 8px;
+	--sidebar-width: 360px;
 	color-scheme: dark;
 }
 
@@ -42,6 +49,14 @@ body {
 	max-width: 720px;
 	margin: 0 auto;
 	min-height: 100%;
+}
+
+/* Wide screens get the desktop IDE's shape (App.svelte): the
+   workspace as a sidebar, the session beside it. */
+@media (min-width: 960px) {
+	#app {
+		max-width: none;
+	}
 }
 
 h1,
@@ -101,6 +116,9 @@ a {
 }
 
 .screen {
+	width: 100%;
+	max-width: 720px;
+	margin: 0 auto;
 	padding: 1.25rem;
 	display: flex;
 	flex-direction: column;
@@ -168,4 +186,50 @@ a {
 
 .pip.live {
 	background: var(--ok);
+}
+
+/* A mouse doesn't need 44 px touch targets: desktop density, like the
+   IDE. */
+@media (hover: hover) and (pointer: fine) {
+	body {
+		font-size: 14px;
+	}
+	button {
+		min-height: 32px;
+		padding: 0.35rem 0.7rem;
+	}
+	input {
+		min-height: 32px;
+		padding: 0.35rem 0.6rem;
+	}
+	.card {
+		padding: 0.7rem 0.8rem;
+	}
+	.screen {
+		padding: 0.9rem;
+		gap: 0.7rem;
+	}
+}
+
+button:hover:not(:disabled) {
+	border-color: var(--border-strong);
+}
+
+button.primary:hover:not(:disabled) {
+	border-color: var(--accent);
+	filter: brightness(1.08);
+}
+
+:focus-visible {
+	outline: 2px solid var(--accent);
+	outline-offset: 1px;
+}
+
+.section-label {
+	margin: 0.4rem 0 -0.2rem;
+	font-size: 0.72rem;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--fg-subtle);
 }

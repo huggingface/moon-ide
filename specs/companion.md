@@ -161,6 +161,12 @@ exact frontend stack and existing coder / SCM components, needs no
 App Store review or distribution signing for an internal-LAN tool,
 and keeps everything in the one framework the team maintains.
 
+It is also used from desktop browsers, so it has two shapes. On a
+phone, one screen at a time: workspaces, a workspace (sessions first,
+then its settings), a session. From 960 px wide it takes the IDE's
+shape: the workspace as a sidebar and the open session beside it, with
+mouse-sized controls. It uses the IDE's palette.
+
 Installability: the manifest ships launcher + maskable icons
 (`companion/artwork/icon.svg` — a crescent moon with an orbit ring
 and spark — rasterized to PNGs by `scripts/gen-companion-icons.mjs`,

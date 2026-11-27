@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { MediaQuery } from 'svelte/reactivity';
 	import { app } from './lib/app.svelte';
 	import PairScreen from './lib/PairScreen.svelte';
 	import WorkspaceList from './lib/WorkspaceList.svelte';
@@ -23,6 +24,9 @@
 			window.removeEventListener('focus', onVisible);
 		};
 	});
+
+	/** Same breakpoint as `#app` in styles.css. */
+	const wide = new MediaQuery('min-width: 960px');
 
 	// Mirror the current view into the URL hash so a refresh restores
 	// it (see `app.routeHash` / `#restoreRoute`). `replaceState`
@@ -51,6 +55,24 @@
 		<button class="ghost" onclick={() => app.unpair()}>Pair a different bridge</button>
 		<button class="primary" onclick={() => app.boot()}>Retry</button>
 	</div>
+{:else if app.activeWorkspace && wide.current}
+	<div class="desk">
+		<aside class="desk-side">
+			<WorkspaceView />
+		</aside>
+		<main class="desk-main">
+			{#if app.activeSession}
+				{#key app.activeSession}
+					<SessionView />
+				{/key}
+			{:else}
+				<div class="desk-empty">
+					<p class="muted">Open a session, or start one.</p>
+					<button class="primary" onclick={() => app.newSession()}>New session</button>
+				</div>
+			{/if}
+		</main>
+	</div>
 {:else if app.activeWorkspace && app.activeSession}
 	<SessionView />
 {:else if app.activeWorkspace}
@@ -67,6 +89,41 @@
 {/if}
 
 <style>
+	.desk {
+		display: grid;
+		grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+		height: 100dvh;
+	}
+	.desk-side {
+		overflow-y: auto;
+		border-right: 1px solid var(--border);
+		background: var(--bg-elev);
+	}
+	.desk-main {
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+	}
+	/* The sidebar is the elevated surface; its cards sit back on the
+	   page colour, as panels do in the IDE. */
+	.desk-side :global(.card) {
+		background: var(--bg);
+	}
+	/* Sessions are picked from the sidebar: no back button, and a
+	   readable column centred in the wide pane. */
+	.desk-main :global(.session) {
+		padding: 0.75rem max(1rem, calc((100% - 920px) / 2));
+	}
+	.desk-main :global(.session-head .back) {
+		display: none;
+	}
+	.desk-empty {
+		margin: auto;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.8rem;
+	}
 	.toast {
 		position: fixed;
 		left: 50%;

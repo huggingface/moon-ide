@@ -1,0 +1,144 @@
+- generic [ref=e30]:
+    - complementary [ref=e31]:
+        - generic [ref=e32]:
+            - generic [ref=e33]:
+                - button "←" [ref=e34] [cursor=pointer]
+                - strong [ref=e35]: boardgamers
+                - button "+ New" [ref=e36] [cursor=pointer]
+            - tablist "Projects" [ref=e37]:
+                - tab "gaia-project" [ref=e38] [cursor=pointer]
+                - tab "powergrid" [ref=e39] [cursor=pointer]
+                - tab "container" [ref=e40] [cursor=pointer]
+                - tab "take6" [ref=e41] [cursor=pointer]
+                - tab "splendor" [ref=e42] [cursor=pointer]
+                - tab "boardgamers-mono" [selected] [ref=e43] [cursor=pointer]
+                - button "✎" [ref=e44] [cursor=pointer]
+            - heading "Sessions" [level=2] [ref=e45]
+            - generic [ref=e47]:
+                - button "Hello there 53d ago" [active] [ref=e48] [cursor=pointer]:
+                    - strong [ref=e50]: Hello there
+                    - generic [ref=e51]: 53d ago
+                - generic "Idle" [ref=e52]
+                - button "×" [ref=e53] [cursor=pointer]
+            - heading "Workspace" [level=2] [ref=e54]
+            - generic [ref=e55]:
+                - button "Provider Hugging Face ▾" [ref=e56] [cursor=pointer]:
+                    - generic [ref=e57]: Provider
+                    - strong [ref=e58]: Hugging Face
+                    - generic [ref=e59]: ▾
+                - button "Model moonshotai/Kimi-K3:fireworks-ai" [ref=e60] [cursor=pointer]:
+                    - generic [ref=e61]: Model
+                    - generic [ref=e62]: moonshotai/Kimi-K3:fireworks-ai
+                - button "Fallbacks (none)" [ref=e63] [cursor=pointer]:
+                    - generic [ref=e64]: Fallbacks
+                    - generic [ref=e65]: (none)
+                - generic [ref=e66]:
+                    - generic [ref=e67]: Reasoning
+                    - generic [ref=e68]:
+                        - button "default" [ref=e69] [cursor=pointer]
+                        - button "medium" [ref=e70] [cursor=pointer]
+                        - button "high" [ref=e71] [cursor=pointer]
+                        - button "xhigh" [ref=e72] [cursor=pointer]
+                        - button "max" [ref=e73] [cursor=pointer]
+                - generic [ref=e74]:
+                    - checkbox "Locked to this workspace" [ref=e75]
+                    - generic [ref=e76]: Locked to this workspace
+            - button "Services dev running · 1 project ▾" [ref=e78] [cursor=pointer]:
+                - generic [ref=e79]: Services
+                - strong [ref=e80]: dev running · 1 project
+                - generic [ref=e81]: ▾
+            - button "MCP 1 on ▾" [ref=e83] [cursor=pointer]:
+                - generic [ref=e84]: MCP
+                - strong [ref=e85]: 1 on
+                - generic [ref=e86]: ▾
+            - generic [ref=e88]:
+                - generic [ref=e89]: Web search
+                - generic [ref=e90]: no key
+                - button "Add key…" [ref=e91] [cursor=pointer]
+            - generic [ref=e92]:
+                - generic [ref=e93]:
+                    - generic [ref=e94]: main
+                    - button "⟳" [ref=e95] [cursor=pointer]
+                    - generic [ref=e96]: 175413a7
+                    - generic "Behind upstream" [ref=e97]: ↓416
+                    - button "Sync" [ref=e98] [cursor=pointer]
+                - generic [ref=e99]: No changes
+    - main [ref=e100]:
+        - generic [ref=e104]:
+            - button [ref=e106]:
+                - strong [ref=e107]: Hello there
+            - generic [ref=e108]:
+                - generic "moonshotai/Kimi-K3:fireworks-ai" [ref=e109]: Kimi-K3:fireworks-ai
+                - button "4% 13 207 / 350 000· ⚡3/4 cached" [ref=e110] [cursor=pointer]:
+                    - generic [ref=e111]: 4%
+                    - generic [ref=e114]: 13 207 / 350 000· ⚡3/4 cached
+            - generic [ref=e115]:
+                - button [ref=e116] [cursor=pointer]:
+                    - button "⧉" [ref=e117]
+                    - text: Hey
+                - group [ref=e118]:
+                    - generic "Thinking…" [ref=e119] [cursor=pointer]
+                - generic "5 oct. 11:18" [ref=e120]:
+                    - button "⧉" [ref=e121] [cursor=pointer]
+                    - paragraph [ref=e123]: Hey! What would you like to work on? I can spin up workers for features, fixes, reviews — just point me at a goal.
+                - button [ref=e124] [cursor=pointer]:
+                    - button "⧉" [ref=e125]
+                    - text: Can you clone the gaia project repo (from GitHub/boardgamers-mono). & Add to workspace
+                - group [ref=e126]:
+                    - generic "Thinking…" [ref=e127] [cursor=pointer]
+                - group [ref=e128]:
+                    - generic "list /workspace/gaia-project ✓" [ref=e129] [cursor=pointer]:
+                        - generic [ref=e131]: list /workspace/gaia-project
+                        - generic [ref=e132]: ✓
+                - group [ref=e133]:
+                    - generic "$ git -C /workspace/gaia-project remote -v 2>/dev/nu… ✓" [ref=e134] [cursor=pointer]:
+                        - generic [ref=e136]: $ git -C /workspace/gaia-project remote -v 2>/dev/nu…
+                        - generic [ref=e137]: ✓
+                - group [ref=e138]:
+                    - generic "Thinking…" [ref=e139] [cursor=pointer]
+                - generic "5 oct. 11:19" [ref=e140]:
+                    - button "⧉" [ref=e141] [cursor=pointer]
+                    - paragraph [ref=e143]:
+                        - text: Good news — it's already here.
+                        - code [ref=e144]: /workspace/gaia-project
+                        - text: is bound to the workspace and is a clone of
+                        - code [ref=e145]: github.com/boardgamers/gaia-project
+                        - text: '. Let me just refresh it:'
+                - group [ref=e146]:
+                    - generic "$ git -C /workspace/gaia-project fetch origin && git… ✓" [ref=e147] [cursor=pointer]:
+                        - generic [ref=e149]: $ git -C /workspace/gaia-project fetch origin && git…
+                        - generic [ref=e150]: ✓
+                - generic "5 oct. 11:19" [ref=e151]:
+                    - button "⧉" [ref=e152] [cursor=pointer]
+                    - generic [ref=e153]:
+                        - paragraph [ref=e154]: 'Already done — the gaia-project repo was previously cloned from GitHub and is bound to your workspace:'
+                        - list [ref=e155]:
+                            - listitem [ref=e156]:
+                                - strong [ref=e157]: Path
+                                - text: ':'
+                                - code [ref=e158]: /workspace/gaia-project
+                                - text: (reachable via
+                                - code [ref=e159]: task
+                                - text: with folder
+                                - code [ref=e160]: gaia-project
+                                - text: )
+                            - listitem [ref=e161]:
+                                - strong [ref=e162]: Remote
+                                - text: ':'
+                                - code [ref=e163]: https://github.com/boardgamers/gaia-project
+                                - text: ✓
+                            - listitem [ref=e164]:
+                                - strong [ref=e165]: State
+                                - text: ': clean working tree, local'
+                                - code [ref=e166]: master
+                                - text: is 22 commits behind
+                                - code [ref=e167]: origin/master
+                                - text: (I fetched; didn't pull since I didn't want to move your checkout without asking)
+                        - paragraph [ref=e168]:
+                            - text: Want me to fast-forward
+                            - code [ref=e169]: master
+                            - text: to latest, or leave it as is? And is there something you want done in that repo — a fix or feature I should put a worker on?
+            - generic [ref=e170]:
+                - button "Attach images" [ref=e171] [cursor=pointer]: 📷
+                - textbox "Message the coder" [ref=e172]
+                - button "Send" [disabled] [ref=e173]

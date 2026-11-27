@@ -1,0 +1,13 @@
+- generic [ref=e3]:
+    - heading "Pair with moon-ide" [level=1] [ref=e4]
+    - paragraph [ref=e5]:
+        - text: Scan the pairing QR from moon-ide's Companion panel (or from
+        - code [ref=e6]: moon-remote pair
+        - text: on a server), or paste its link below.
+    - generic [ref=e7]:
+        - generic [ref=e8]: Pairing link
+        - textbox "Pairing link" [ref=e9]:
+            - /placeholder: https://…/#pair=…&k=…&s=…
+    - paragraph [ref=e10]: could not connect to wss://localhost:5198
+    - button "Pair" [disabled] [ref=e11]
+    - paragraph [ref=e12]: "The link carries the IDE's key and a one-time secret: the relay in between can route traffic but can't read it or pair itself in your place."

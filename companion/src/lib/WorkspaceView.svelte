@@ -343,6 +343,55 @@
 		</div>
 	{/if}
 
+	<h2 class="section-label">Sessions</h2>
+	{#if app.loadingSessions}
+		<p class="muted">Loading…</p>
+	{:else if app.sessions.length === 0}
+		<p class="muted">No coder sessions in this project yet.</p>
+	{:else}
+		<div class="session-list">
+			{#each app.sessions as s (s.id)}
+				<div class="session-row" class:active={app.activeSession === s.id}>
+					<button
+						class="list-item-main"
+						onclick={(e) => {
+							// Ctrl/Cmd-click (and middle-click via auxclick
+							// below): open the session in a fresh browser
+							// tab through its hash route, desktop-browser
+							// style, leaving this tab where it is.
+							if (e.ctrlKey || e.metaKey) {
+								window.open(app.sessionRouteHash(s.id), '_blank');
+								return;
+							}
+							app.openSession(s.id);
+						}}
+						onauxclick={(e) => {
+							if (e.button === 1) {
+								window.open(app.sessionRouteHash(s.id), '_blank');
+							}
+						}}
+					>
+						<span class="title-line">
+							<strong>{s.title || 'Untitled session'}</strong>
+						</span>
+						<span class="muted">{relativeTime(s.updated_at_ms)}</span>
+					</button>
+					{#if app.busySessions.has(s.id)}
+						<span class="pip live" title="Running"></span>
+					{:else if s.last_error}
+						<span class="pip failed" title="Last turn failed — open to retry">!</span>
+					{:else if s.interrupted}
+						<span class="pip interrupted" title="Turn never finished (restart/stop) — open to relaunch">!</span>
+					{:else}
+						<span class="pip" title="Idle"></span>
+					{/if}
+					<button class="ghost danger" title="Delete session" onclick={() => confirmDelete(s.id, s.title)}>×</button>
+				</div>
+			{/each}
+		</div>
+	{/if}
+
+	<h2 class="section-label">Workspace</h2>
 	{#if app.modelSettings}
 		{@const settings = app.modelSettings}
 		{@const activeId = settings.active_provider ?? null}
@@ -925,53 +974,6 @@
 	{:else if app.loadingScm}
 		<div class="card"><span class="muted">Loading SCM…</span></div>
 	{/if}
-
-	{#if app.loadingSessions}
-		<p class="muted">Loading…</p>
-	{:else if app.sessions.length === 0}
-		<p class="muted">No coder sessions in this project yet.</p>
-	{:else}
-		<div class="list">
-			{#each app.sessions as s (s.id)}
-				<div class="card list-item session-row">
-					<button
-						class="list-item-main"
-						onclick={(e) => {
-							// Ctrl/Cmd-click (and middle-click via auxclick
-							// below): open the session in a fresh browser
-							// tab through its hash route, desktop-browser
-							// style, leaving this tab where it is.
-							if (e.ctrlKey || e.metaKey) {
-								window.open(app.sessionRouteHash(s.id), '_blank');
-								return;
-							}
-							app.openSession(s.id);
-						}}
-						onauxclick={(e) => {
-							if (e.button === 1) {
-								window.open(app.sessionRouteHash(s.id), '_blank');
-							}
-						}}
-					>
-						<span class="title-line">
-							<strong>{s.title || 'Untitled session'}</strong>
-						</span>
-						<span class="muted">{relativeTime(s.updated_at_ms)}</span>
-					</button>
-					{#if app.busySessions.has(s.id)}
-						<span class="pip live" title="Running"></span>
-					{:else if s.last_error}
-						<span class="pip failed" title="Last turn failed — open to retry">!</span>
-					{:else if s.interrupted}
-						<span class="pip interrupted" title="Turn never finished (restart/stop) — open to relaunch">!</span>
-					{:else}
-						<span class="pip" title="Idle"></span>
-					{/if}
-					<button class="ghost danger" title="Delete session" onclick={() => confirmDelete(s.id, s.title)}>×</button>
-				</div>
-			{/each}
-		</div>
-	{/if}
 </div>
 
 <style>
@@ -1020,17 +1022,28 @@
 	}
 	.project-chip {
 		flex: none;
-		min-height: 36px;
-		padding: 0.3rem 0.8rem;
+		min-height: 34px;
+		padding: 0.25rem 0.75rem;
 		border-radius: 999px;
 		font-size: 0.85rem;
 		color: var(--fg-muted);
-		background: var(--bg-elev);
+		background: transparent;
 	}
 	.project-chip.active {
-		color: var(--accent-fg);
-		background: var(--accent);
-		border-color: var(--accent);
+		color: var(--accent);
+		background: var(--accent-soft);
+		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+	}
+	/* The desktop sidebar is narrow: wrap instead of a hidden scroll. */
+	@media (hover: hover) and (pointer: fine) {
+		.projects {
+			flex-wrap: wrap;
+		}
+		.project-chip {
+			min-height: 28px;
+			padding: 0.15rem 0.6rem;
+			font-size: 0.8rem;
+		}
 	}
 	.project-chip .pip {
 		margin-left: 0.3rem;
@@ -1041,7 +1054,7 @@
 		font-size: 0.8rem;
 	}
 	.project-chip.active .finished-dot {
-		color: var(--accent-fg);
+		color: var(--accent);
 	}
 	.provider-card {
 		display: flex;
@@ -1665,13 +1678,33 @@
 	.scm-commit-actions .primary {
 		flex: 1;
 	}
+	.session-list {
+		display: flex;
+		flex-direction: column;
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		background: var(--bg-elev);
+		overflow: hidden;
+	}
 	.session-row {
-		/* The global `.list-item` stacks children vertically (for the
-		   one-button workspace cards); a session row is a row — main
-		   button + delete side by side. */
-		flex-direction: row;
+		display: flex;
 		align-items: center;
-		gap: 0.3rem;
+		gap: 0.4rem;
+		padding: 0.55rem 0.4rem 0.55rem 0.75rem;
+		border-left: 2px solid transparent;
+	}
+	.session-row + .session-row {
+		border-top: 1px solid var(--border);
+	}
+	.session-row:hover {
+		background: var(--bg-elev-2);
+	}
+	.session-row.active {
+		background: var(--accent-soft);
+		border-left-color: var(--accent);
+	}
+	.session-row .muted {
+		font-size: 0.8rem;
 	}
 	.list-item-main {
 		flex: 1;
@@ -1701,9 +1734,24 @@
 	}
 	.danger {
 		flex: none;
-		color: var(--danger);
+		color: var(--fg-subtle);
+		background: none;
 		font-size: 1.1rem;
 		padding: 0.2rem 0.5rem;
 		border: none;
+	}
+	.danger:hover {
+		color: var(--danger);
+	}
+	/* With a mouse, delete only shows on the row being pointed at. */
+	@media (hover: hover) and (pointer: fine) {
+		.session-row .danger {
+			min-height: 0;
+			opacity: 0;
+		}
+		.session-row:hover .danger,
+		.session-row .danger:focus-visible {
+			opacity: 1;
+		}
 	}
 </style>

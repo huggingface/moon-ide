@@ -1,0 +1,14 @@
+- generic [ref=e3]:
+    - heading "Pair with moon-ide" [level=1] [ref=e4]
+    - paragraph [ref=e5]:
+        - text: Scan the pairing QR from moon-ide's Companion panel (or from
+        - code [ref=e6]: moon-remote pair
+        - text: on a server), or paste its link below.
+    - generic [ref=e7]:
+        - generic [ref=e8]: Pairing link
+        - textbox "Pairing link" [active] [ref=e9]:
+            - /placeholder: https://…/#pair=…&k=…&s=…
+            - text: https://bridge.coyo.dev/#pair=CD48-C0CC&ide=minipc&ws=boardgamers&k=WADYJBX9kN8n5JpWFkoEDp3ztEDgGZbkrmlxGzshYmE&s=qS6q4uQRMcQKQe3QU5oUQvxqrvt9QXyUgm7L9bI4JUo
+    - paragraph [ref=e10]: could not connect to wss://localhost:5198
+    - button "Pair" [ref=e11] [cursor=pointer]
+    - paragraph [ref=e12]: "The link carries the IDE's key and a one-time secret: the relay in between can route traffic but can't read it or pair itself in your place."

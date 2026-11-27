@@ -1509,6 +1509,7 @@
 	}
 	.bubble.user {
 		background: var(--bg-elev-2);
+		border: 1px solid var(--border);
 		align-self: flex-end;
 		max-width: 85%;
 		/* User text is plain (not markdown) — keep typed newlines. */
@@ -1568,9 +1569,10 @@
 		background: color-mix(in srgb, var(--accent) 22%, transparent);
 		color: var(--accent);
 	}
+	/* Replies read as the page, as in the IDE's transcript; only the
+	   user's own messages are bubbles. */
 	.bubble.assistant {
-		background: var(--bg-elev);
-		border: 1px solid var(--border);
+		padding: 0.2rem 2rem 0.2rem 0.1rem;
 	}
 	.thinking {
 		font-size: 0.8rem;
@@ -2004,6 +2006,17 @@
 		border: 1px solid var(--border);
 		border-radius: 6px;
 		opacity: 0.55;
+	}
+	/* With a mouse, copy appears on the message being pointed at. */
+	@media (hover: hover) and (pointer: fine) {
+		.copy-md {
+			min-height: 0;
+			opacity: 0;
+		}
+		.bubble:hover .copy-md,
+		.copy-md:focus-visible {
+			opacity: 0.8;
+		}
 	}
 	.copy-md:active {
 		opacity: 1;

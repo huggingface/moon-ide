@@ -1,0 +1,14 @@
+- generic [ref=e13]:
+    - generic [ref=e14]:
+        - heading "Workspaces" [level=1] [ref=e15]
+        - button "Refresh" [ref=e16] [cursor=pointer]
+    - heading "minipc" [level=2] [ref=e17]
+    - button "boardgamers running · boardgamers" [ref=e20] [cursor=pointer]:
+        - strong [ref=e23]: boardgamers
+        - generic [ref=e24]: running · boardgamers
+    - generic [ref=e25]:
+        - generic [ref=e26]: Pair another IDE
+        - textbox "Pair another IDE" [ref=e27]:
+            - /placeholder: https://…/#pair=…&k=…&s=…
+        - button "Pair" [disabled] [ref=e28]
+    - button "Unpair this device" [ref=e29] [cursor=pointer]

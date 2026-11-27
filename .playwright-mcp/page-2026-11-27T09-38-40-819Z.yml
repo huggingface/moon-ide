@@ -1,0 +1,63 @@
+- generic [ref=e176]:
+    - generic [ref=e177]:
+        - button "←" [ref=e178] [cursor=pointer]
+        - strong [ref=e179]: boardgamers
+        - button "+ New" [ref=e180] [cursor=pointer]
+    - tablist "Projects" [ref=e181]:
+        - tab "gaia-project" [ref=e182] [cursor=pointer]
+        - tab "powergrid" [ref=e183] [cursor=pointer]
+        - tab "container" [ref=e184] [cursor=pointer]
+        - tab "take6" [ref=e185] [cursor=pointer]
+        - tab "splendor" [ref=e186] [cursor=pointer]
+        - tab "boardgamers-mono" [selected] [ref=e187] [cursor=pointer]
+        - button "✎" [ref=e188] [cursor=pointer]
+    - heading "Sessions" [level=2] [ref=e189]
+    - generic [ref=e191]:
+        - button "Hello there 53d ago" [ref=e192] [cursor=pointer]:
+            - strong [ref=e194]: Hello there
+            - generic [ref=e195]: 53d ago
+        - generic "Idle" [ref=e196]
+        - button "×" [ref=e197] [cursor=pointer]
+    - heading "Workspace" [level=2] [ref=e198]
+    - generic [ref=e199]:
+        - button "Provider Hugging Face ▾" [ref=e200] [cursor=pointer]:
+            - generic [ref=e201]: Provider
+            - strong [ref=e202]: Hugging Face
+            - generic [ref=e203]: ▾
+        - button "Model moonshotai/Kimi-K3:fireworks-ai" [ref=e204] [cursor=pointer]:
+            - generic [ref=e205]: Model
+            - generic [ref=e206]: moonshotai/Kimi-K3:fireworks-ai
+        - button "Fallbacks (none)" [ref=e207] [cursor=pointer]:
+            - generic [ref=e208]: Fallbacks
+            - generic [ref=e209]: (none)
+        - generic [ref=e210]:
+            - generic [ref=e211]: Reasoning
+            - generic [ref=e212]:
+                - button "default" [ref=e213] [cursor=pointer]
+                - button "medium" [ref=e214] [cursor=pointer]
+                - button "high" [ref=e215] [cursor=pointer]
+                - button "xhigh" [ref=e216] [cursor=pointer]
+                - button "max" [ref=e217] [cursor=pointer]
+        - generic [ref=e218]:
+            - checkbox "Locked to this workspace" [ref=e219]
+            - generic [ref=e220]: Locked to this workspace
+    - button "Services dev running · 1 project ▾" [ref=e222] [cursor=pointer]:
+        - generic [ref=e223]: Services
+        - strong [ref=e224]: dev running · 1 project
+        - generic [ref=e225]: ▾
+    - button "MCP 1 on ▾" [ref=e227] [cursor=pointer]:
+        - generic [ref=e228]: MCP
+        - strong [ref=e229]: 1 on
+        - generic [ref=e230]: ▾
+    - generic [ref=e232]:
+        - generic [ref=e233]: Web search
+        - generic [ref=e234]: no key
+        - button "Add key…" [ref=e235] [cursor=pointer]
+    - generic [ref=e236]:
+        - generic [ref=e237]:
+            - generic [ref=e238]: main
+            - button "⟳" [ref=e239] [cursor=pointer]
+            - generic [ref=e240]: 175413a7
+            - generic "Behind upstream" [ref=e241]: ↓416
+            - button "Sync" [ref=e242] [cursor=pointer]
+        - generic [ref=e243]: No changes
