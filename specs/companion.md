@@ -577,10 +577,8 @@ relay protocol, same keyring/enrollment semantics, same companion RPC
 dispatcher (the desktop and the headless binary now share one
 implementation in `crates/moon-remote`'s lib). Setup on the box:
 `moon-remote login` (HF device flow) → `enroll --bridge --code` →
-`workspace-add --name --folder` → `serve --workspace <slug>`. Needs a
-Secret Service for the keyring (ADR 0035's `dbus-run-session` +
-`gnome-keyring-daemon` recipe). The phone sees the box as another IDE
-group in its switcher; relayed event envelopes carry `(ide,
+`workspace-add --name --folder` → `serve --workspace <slug>`. The
+phone sees the box as another IDE group in its switcher; relayed event envelopes carry `(ide,
 workspace)` carrier tags so multi-IDE fan-in can't cross-light pips.
 Folder binds made at runtime (a coordinator's `clone_repo` /
 `init_repo`, worker worktrees, the phone's remove-project) persist to
@@ -588,6 +586,25 @@ Folder binds made at runtime (a coordinator's `clone_repo` /
 does this saving continuously, headless has no frontend, so `serve`
 runs its own reconcile task; without it those binds evaporated on
 restart.
+
+### Secrets without a keyring
+
+A server has no OS keyring. With `MOON_SECRETS_DIR` set, `moon-remote`
+and `moon-bridge` keep their secrets as files instead
+([ADR 0128](decisions/0128-file-backed-secrets-for-headless.md)); the
+desktop app ignores it.
+
+| Variable                   | Directory                                                                                  |
+| -------------------------- | ------------------------------------------------------------------------------------------ |
+| `MOON_SECRETS_DIR`         | Writable, persistent. Created owner-only if missing. Everything is stored here by default. |
+| `MOON_MANAGED_SECRETS_DIR` | Optional, read-only (a mounted secret). Its entries win and can't be changed from the UI.  |
+
+One file per keyring account, named after it with `:` written as `.`:
+`hf-oauth`, `remote-bridge`, `companion-ides`, `companion-devices`,
+`companion-e2e-*`, `coder-provider.<id>`, `coder-web-search.tavily`,
+`coder-slack.<workspace>`. Anything the process rotates itself (HF and
+ChatGPT sign-ins, relay and pairing tokens) must stay writable; only
+static keys belong in the managed directory.
 
 ## Cloud / always-on future
 

@@ -131,7 +131,7 @@ Notes:
 - Build the binary on a machine whose glibc is **not newer** than the relay box's (e.g. inside the `moon-base` workspace container, Debian 12) — a binary built against a newer glibc refuses to start there.
 - `--no-idle-exit` keeps the relay up with zero local workspaces (the local auto-spawned bridge must **not** set it); `--advertise-url` is what pairing QRs point phones at.
 - An enrollment code prints at startup (120 s, single-use). Enter it in the IDE via command palette → "Companion: Connect to remote bridge…"; the IDE stores a token and reconnects on its own from then on. Each open workspace registers itself, so the phone sees them all.
-- The keyring backend needs a Secret Service even headless — run under `dbus-run-session` with an unlocked `gnome-keyring-daemon` (see the ADR).
+- Set `MOON_SECRETS_DIR` to a persistent, private directory: the relay keeps its enrollment and pairing tokens there as files instead of needing a keyring ([ADR 0128](specs/decisions/0128-file-backed-secrets-for-headless.md)).
 - Phone pairing QRs are minted on demand from any enrolled IDE's Companion panel; no relay restart needed.
 
 ## Headless IDE (`moon-remote`)
@@ -153,8 +153,8 @@ moon-remote serve --workspace myproject
 Notes:
 
 - Everything shares the desktop's dirs + keyring (`state.json`, per-workspace `session.json`, coder sessions), so a machine can flip between desktop and headless serving of the same workspaces — `model` edits the same picks as the desktop's picker, and a running `serve` re-reads them on restart.
-- A Secret Service must be reachable: on a desktop box, the login session's keyring (auto-login + an empty-password login keyring make reboots hands-off); on a server, the `dbus-run-session` + `gnome-keyring-daemon` recipe from ADR 0035.
-- For boot persistence, run `serve` from a `systemd --user` template unit (with `loginctl enable-linger`), e.g. `moon-remote@<workspace>.service` with `Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus` and `Restart=always`.
+- Secrets: on a desktop box, the login session's keyring. On a server, set `MOON_SECRETS_DIR` (and optionally `MOON_MANAGED_SECRETS_DIR` for provisioned API keys) on every `moon-remote` command, `login` and `enroll` included — see [companion.md § "Secrets without a keyring"](specs/companion.md#secrets-without-a-keyring).
+- For boot persistence, run `serve` from a `systemd --user` template unit (with `loginctl enable-linger`), e.g. `moon-remote@<workspace>.service` with `Restart=always` (plus `Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus` when it uses the session keyring).
 - `workspace_launch` from the phone spawns a sibling `serve` process for stopped workspaces; a `workspace-add` while serving shows up on the phone after the unit restarts (Register refresh is a known gap).
 
 Workspace management is CLI-first: `workspace-add` binds a folder,

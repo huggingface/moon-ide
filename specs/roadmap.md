@@ -214,3 +214,11 @@ Work on one desktop, pick up on the other: a workspace's whole process (coder se
 Sub-phase work breakdown: [roadmaps/phase-16-remote-workspaces.md](roadmaps/phase-16-remote-workspaces.md). Decision: [ADR 0095 — remote workspaces](decisions/0095-remote-workspaces.md).
 
 **Acceptance**: frontend transport seam (16.1); one dispatched command surface (16.2); server + `attach` + desktop connect (16.3); terminal / LSP / fs / coder streams (16.4); browser-tab and port tunnels (16.5); file transfer (16.6); attach / takeover (16.7). Deferred (session sync, concurrent multi-desktop attach, desktops through the relay) — see the phase doc.
+
+## Phase 17 — Headless deployment
+
+A headless install that survives a reinstall: `moon-remote` and `moon-bridge` run from published images with their secrets and config provisioned, instead of hand-copied binaries and a per-box keyring. The deployment itself (cluster manifests, node setup) lives in the operator's infra repo; this phase is what moon-ide has to provide for it.
+
+Decision: [ADR 0128 — file-backed secrets for headless processes](decisions/0128-file-backed-secrets-for-headless.md).
+
+**Acceptance**: file-backed secrets (17.1); `moon-base`, `moon-remote` and `moon-bridge` images built and published by CI (17.2); providers and workspaces declarable on a fresh install (17.3); `moon-remote` serving from a pod, dev containers included (17.4).

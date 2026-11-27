@@ -21,6 +21,7 @@ pub mod lsp;
 pub mod pre_save;
 pub mod pull_request;
 pub mod search;
+pub mod secrets;
 pub mod session;
 pub mod shell;
 pub mod workspace;

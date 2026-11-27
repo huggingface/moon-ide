@@ -207,6 +207,7 @@ fn main() -> anyhow::Result<()> {
 			tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,moon_remote=debug".into()),
 		)
 		.init();
+	moon_core::secrets::install_from_env()?;
 	let args = Args::parse();
 	let runtime = tokio::runtime::Runtime::new()?;
 	runtime.block_on(async move {

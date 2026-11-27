@@ -3613,6 +3613,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "keyring",
  "lsp-types",
  "moon-container",
  "moon-protocol",
