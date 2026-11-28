@@ -14,7 +14,7 @@
 	// Tab: "local" = this machine runs the bridge (Phase 13 QR flow);
 	// "remote" = the IDE dials out to a relay bridge elsewhere (14.3).
 	// Defaults to local; auto-switches to remote if already connected.
-	let tab = $state<'local' | 'remote'>('local');
+	let tab = $state<'local' | 'remote'>('remote');
 
 	// Phones this host authorized end-to-end (ADR 0087) — host-wide,
 	// so both tabs show the same list.
@@ -54,8 +54,10 @@
 		void refreshPhones();
 		void companion.refresh();
 		void companion.refreshRemote().then(() => {
-			if (companion.remoteStatus?.connected) {
-				tab = 'remote';
+			// Re-enrolling usually means the same relay.
+			const current = companion.remoteStatus?.bridge_url;
+			if (current) {
+				enrollUrl = current;
 			}
 		});
 	});
@@ -96,7 +98,10 @@
 	// Remote-bridge enroll form state (Phase 14.3). The command
 	// resolves only once the handshake succeeds or fails, so the busy
 	// flag covers the real outcome, not just the spawn.
-	let enrollUrl = $state('');
+	// The last relay this machine enrolled with, so a retry or a
+	// re-enroll after Disconnect doesn't mean typing it again.
+	const LAST_RELAY_KEY = 'moon-companion-last-relay';
+	let enrollUrl = $state(localStorage.getItem(LAST_RELAY_KEY) ?? '');
 	let enrollCode = $state('');
 	let enrollError = $state<string | null>(null);
 	let enrolling = $state(false);
@@ -105,10 +110,10 @@
 		event.preventDefault();
 		enrollError = null;
 		enrolling = true;
+		localStorage.setItem(LAST_RELAY_KEY, enrollUrl.trim());
 		try {
 			await ipc.companion.enroll(enrollUrl, enrollCode, 'moon-ide');
 			await companion.refreshRemote();
-			enrollUrl = '';
 			enrollCode = '';
 		} catch (err) {
 			enrollError = formatError(err);
@@ -139,6 +144,10 @@
 		}
 	}
 
+	function hostOf(url: string): string {
+		return url.replace(/^wss?:\/\//, '').replace(/\/$/, '');
+	}
+
 	function relativeTime(ms: number): string {
 		const mins = Math.round((Date.now() - ms) / 60000);
 		if (mins < 1) {
@@ -159,170 +168,193 @@
 	{/if}
 	<div class="link-row">
 		<code class="link">{pair.payload}</code>
-		<button type="button" class="copy" onclick={() => copyLink(pair.payload)}>{copied ? 'Copied' : 'Copy link'}</button>
+		<button type="button" class="secondary" onclick={() => copyLink(pair.payload)}>{copied ? 'Copied' : 'Copy'}</button>
 	</div>
 	<p class="hint">
-		Scan it, or paste the link into the companion. Single use, valid 15 minutes. It carries this IDE's key and a
-		one-time secret, so the relay can't pair itself or read the session — share it only with the phone you're pairing.
+		Single use, valid 15 minutes. It carries this IDE's key: share it only with the phone you're pairing.
 	</p>
 {/snippet}
 
-{#snippet allowedPhones()}
-	<h3>Phones allowed to control this IDE</h3>
-	{#if phonesError}
-		<p class="hint" style="color: var(--danger, #f85149)">{phonesError}</p>
-	{:else if phones.length === 0}
-		<p class="hint">None yet. Pair one with a QR above.</p>
+{#snippet error(message: string)}
+	<p class="error">{message}</p>
+{/snippet}
+
+{#snippet deviceList(rows: { id: string; label: string; at: number }[], onRevoke: (id: string) => void, empty: string)}
+	{#if rows.length === 0}
+		<p class="hint">{empty}</p>
 	{:else}
 		<ul class="devices">
-			{#each phones as p (p.id)}
+			{#each rows as row (row.id)}
 				<li>
-					<span class="label">{p.label}</span>
-					<span class="meta">{relativeTime(p.paired_at_ms)}</span>
-					<button type="button" class="revoke" onclick={() => revokePhone(p.id)}>Revoke</button>
+					<span class="device-label">{row.label}</span>
+					<span class="device-meta">{relativeTime(row.at)}</span>
+					<button type="button" class="link-button danger" onclick={() => onRevoke(row.id)}>Revoke</button>
 				</li>
 			{/each}
 		</ul>
 	{/if}
 {/snippet}
 
+{#snippet allowedPhones()}
+	<section>
+		<h3>Paired phones</h3>
+		{#if phonesError}
+			{@render error(phonesError)}
+		{:else}
+			{@render deviceList(
+				phones.map((p) => ({ id: p.id, label: p.label, at: p.paired_at_ms })),
+				(id) => void revokePhone(id),
+				'None yet.',
+			)}
+		{/if}
+	</section>
+{/snippet}
+
 <div class="overlay" role="dialog" aria-modal="true" aria-label="Companion">
 	<div class="card">
 		<header>
 			<h2>Companion</h2>
+			<div class="tabs" role="tablist">
+				<button
+					type="button"
+					role="tab"
+					aria-selected={tab === 'remote'}
+					class:active={tab === 'remote'}
+					onclick={() => {
+						tab = 'remote';
+						void companion.refreshRemote();
+					}}>Remote relay</button
+				>
+				<button
+					type="button"
+					role="tab"
+					aria-selected={tab === 'local'}
+					class:active={tab === 'local'}
+					onclick={() => (tab = 'local')}>Local network</button
+				>
+			</div>
 			<button type="button" class="close" aria-label="Close" onclick={() => companion.close()}>×</button>
 		</header>
 
-		<div class="tabs" role="tablist">
-			<button
-				type="button"
-				role="tab"
-				aria-selected={tab === 'local'}
-				class="tab"
-				class:active={tab === 'local'}
-				onclick={() => (tab = 'local')}
-			>
-				Local bridge
-			</button>
-			<button
-				type="button"
-				role="tab"
-				aria-selected={tab === 'remote'}
-				class="tab"
-				class:active={tab === 'remote'}
-				onclick={() => {
-					tab = 'remote';
-					void companion.refreshRemote();
-				}}
-			>
-				Remote relay
-			</button>
-		</div>
-
-		{#if tab === 'local'}
-			<!-- Local bridge: this machine runs moon-bridge, phones pair to it. -->
-			{#if !status || !status.running}
-				<p class="lede">The companion bridge isn't running yet.</p>
-				<p class="hint">
-					It starts automatically with a release build of moon-ide. In a dev session, run
-					<code>moon-bridge serve --web-root companion/dist</code> in a terminal, then reopen this dialog.
-				</p>
-			{:else}
-				<p class="lede">On your phone (same network/VPN), scan a pairing QR or paste its link into the companion.</p>
-
-				{#if localPair}
-					{@render pairLink(localPair, qrSvg)}
+		{#if tab === 'remote'}
+			{@const remote = companion.remoteStatus}
+			<div class="status" class:ok={remote?.connected} class:bad={!remote?.connected && remote?.error}>
+				<span class="dot" aria-hidden="true"></span>
+				{#if remote?.connected}
+					<span>Connected to <strong>{hostOf(remote.bridge_url)}</strong> as <strong>{remote.ide_id}</strong></span>
+				{:else if remote?.error}
+					<span>Not connected to the relay</span>
 				{:else}
-					<div class="details">
-						<div class="row"><span class="k">Address</span><code>{status.mdns_url ?? status.url}</code></div>
+					<span>Not connected to a relay</span>
+				{/if}
+			</div>
+
+			{#if remote?.connected}
+				<section>
+					<h3>Pair a phone</h3>
+					{#if remotePair}
+						{@render pairLink(remotePair, remotePairQrSvg)}
+					{/if}
+					<div class="actions">
+						<button type="button" class="primary" onclick={() => requestRemotePairCode()}>
+							{remotePair ? 'New pairing link' : 'Show pairing QR'}
+						</button>
 					</div>
-				{/if}
-				<button type="button" onclick={() => requestLocalPairCode()}>
-					{localPair ? 'New pairing link' : 'Show pairing QR'}
-				</button>
-				{#if localPairError}
-					<p class="hint" style="color: var(--danger, #f85149)">{localPairError}</p>
-				{/if}
-
-				<p class="hint fp">
-					First time on a device, accept the self-signed certificate. Fingerprint:<br />
-					<code class="fingerprint">{status.fingerprint}</code>
-				</p>
-
+					{#if remotePairError}
+						{@render error(remotePairError)}
+					{/if}
+				</section>
 				{@render allowedPhones()}
-
-				<h3>Relay routing tokens</h3>
-				{#if status.devices.length === 0}
-					<p class="hint">None yet.</p>
-				{:else}
-					<ul class="devices">
-						{#each status.devices as d (d.id)}
-							<li>
-								<span class="label">{d.label}</span>
-								<span class="meta">{relativeTime(d.paired_at_ms)}</span>
-								<button type="button" class="revoke" onclick={() => revoke(d.id)}>Revoke</button>
-							</li>
-						{/each}
-					</ul>
-				{/if}
-
-				{#if status.ides && status.ides.length > 0}
-					<h3>Enrolled IDEs</h3>
-					<ul class="devices">
-						{#each status.ides as ide (ide.id)}
-							<li>
-								<span class="label">{ide.label}</span>
-								<span class="meta">{relativeTime(ide.enrolled_at_ms)}</span>
-								<button type="button" class="revoke" onclick={() => revokeIde(ide.id)}>Revoke</button>
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			{/if}
-		{:else}
-			<!-- Remote relay: the IDE dials out to a bridge elsewhere. -->
-			{#if companion.remoteStatus?.connected}
-				<p class="lede">
-					Connected to <code>{companion.remoteStatus.bridge_url}</code>
-				</p>
-				{#if companion.remoteStatus.error}
-					<p class="hint" style="color: var(--danger, #f85149)">{companion.remoteStatus.error}</p>
-				{/if}
-				<p class="hint">
-					This IDE is enrolled as <code>{companion.remoteStatus.ide_id}</code>. The relay only routes: calls are
-					end-to-end encrypted, and only phones this IDE paired itself can drive it.
-				</p>
-
-				<h3>Pair a phone</h3>
-				{#if remotePair}
-					{@render pairLink(remotePair, remotePairQrSvg)}
-				{:else}
-					<p class="hint">Mint a single-use pairing link and show it as a QR.</p>
-				{/if}
-				<button type="button" onclick={() => requestRemotePairCode()}>
-					{remotePair ? 'New pairing link' : 'Show pairing QR'}
-				</button>
-				{#if remotePairError}
-					<p class="hint" style="color: var(--danger, #f85149)">{remotePairError}</p>
-				{/if}
-
-				{@render allowedPhones()}
-
-				<button type="button" class="revoke" onclick={() => disconnectRemote()}>Disconnect</button>
+				<footer>
+					<p class="hint">Calls are end-to-end encrypted; the relay only routes them.</p>
+					<button type="button" class="link-button danger" onclick={() => disconnectRemote()}>Disconnect</button>
+				</footer>
 			{:else}
-				<p class="lede">Connect this IDE to a remote relay bridge.</p>
-				<p class="hint">
-					Run <code>moon-bridge serve</code> on the relay box (a machine on the same VPN), note the enrollment code it prints,
-					then enter it here.
-				</p>
-				<form onsubmit={enrollRemote} class="remote-form">
-					<input type="text" placeholder="wss://relay-box:53180" bind:value={enrollUrl} required disabled={enrolling} />
-					<input type="text" placeholder="enrollment code" bind:value={enrollCode} required disabled={enrolling} />
-					<button type="submit" disabled={enrolling}>{enrolling ? 'Enrolling…' : 'Enroll'}</button>
+				{#if remote?.error}
+					{@render error(remote.error)}
+				{/if}
+				<form onsubmit={enrollRemote} class="enroll">
+					<label>
+						<span class="field-label">Relay</span>
+						<input
+							type="text"
+							placeholder="wss://bridge.example.com"
+							bind:value={enrollUrl}
+							required
+							disabled={enrolling}
+							spellcheck="false"
+						/>
+					</label>
+					<label>
+						<span class="field-label">Enrollment code</span>
+						<input
+							type="text"
+							placeholder="XXXX-XXXX"
+							bind:value={enrollCode}
+							required
+							disabled={enrolling}
+							spellcheck="false"
+						/>
+					</label>
+					<p class="hint">
+						Run <code>moon-bridge enroll-code</code> where the relay runs for a code (valid 120 s). Enrollment survives relay
+						restarts, so this is once per machine.
+					</p>
+					<div class="actions">
+						<button type="submit" class="primary" disabled={enrolling}>{enrolling ? 'Enrolling…' : 'Enroll'}</button>
+					</div>
 				</form>
 				{#if enrollError}
-					<p class="hint" style="color: var(--danger, #f85149)">{enrollError}</p>
+					{@render error(enrollError)}
 				{/if}
+			{/if}
+		{:else if !status || !status.running}
+			<div class="status"><span class="dot" aria-hidden="true"></span><span>The local bridge isn't running</span></div>
+			<p class="hint">
+				It starts with a release build of moon-ide. In a dev session, run
+				<code>moon-bridge serve --web-root companion/dist</code>, then reopen this dialog.
+			</p>
+		{:else}
+			<div class="status ok">
+				<span class="dot" aria-hidden="true"></span>
+				<span>Listening on <strong>{status.mdns_url ?? status.url}</strong></span>
+			</div>
+			<section>
+				<h3>Pair a phone on this network</h3>
+				{#if localPair}
+					{@render pairLink(localPair, qrSvg)}
+				{/if}
+				<div class="actions">
+					<button type="button" class="primary" onclick={() => requestLocalPairCode()}>
+						{localPair ? 'New pairing link' : 'Show pairing QR'}
+					</button>
+				</div>
+				{#if localPairError}
+					{@render error(localPairError)}
+				{/if}
+				<p class="hint">
+					First time on a device, accept the self-signed certificate. Fingerprint
+					<code class="fingerprint">{status.fingerprint}</code>
+				</p>
+			</section>
+			{@render allowedPhones()}
+			<section>
+				<h3>Relay routing tokens</h3>
+				{@render deviceList(
+					status.devices.map((d) => ({ id: d.id, label: d.label, at: d.paired_at_ms })),
+					(id) => void revoke(id),
+					'None yet.',
+				)}
+			</section>
+			{#if status.ides && status.ides.length > 0}
+				<section>
+					<h3>IDEs enrolled with this bridge</h3>
+					{@render deviceList(
+						status.ides.map((i) => ({ id: i.id, label: i.label, at: i.enrolled_at_ms })),
+						(id) => void revokeIde(id),
+						'None.',
+					)}
+				</section>
 			{/if}
 		{/if}
 	</div>
@@ -332,181 +364,250 @@
 	.overlay {
 		position: fixed;
 		inset: 0;
-		background: rgba(0, 0, 0, 0.5);
+		background: rgba(0, 0, 0, 0.55);
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		z-index: 1000;
 	}
 	.card {
-		background: var(--surface, #161b22);
-		color: var(--fg, #e6edf3);
-		border: 1px solid var(--border, #30363d);
-		border-radius: 10px;
-		padding: 1.25rem;
-		width: min(420px, 92vw);
-		max-height: 90vh;
+		background: var(--m-bg-1);
+		color: var(--m-fg);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-lg);
+		box-shadow: 0 12px 36px rgba(0, 0, 0, 0.55);
+		padding: 16px 20px 18px;
+		width: min(460px, calc(100% - 32px));
+		max-height: 88vh;
 		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 14px;
+		font-size: var(--m-text-md);
 	}
 	header {
 		display: flex;
-		justify-content: space-between;
 		align-items: center;
+		gap: 12px;
 	}
 	h2 {
 		margin: 0;
-		font-size: 1.1rem;
+		font-size: var(--m-text-lg);
+		font-weight: 600;
 	}
 	h3 {
-		font-size: 0.95rem;
-		margin: 1rem 0 0.4rem;
+		margin: 0 0 6px;
+		font-size: var(--m-text-xs);
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--m-fg-subtle);
+	}
+	section {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.tabs {
+		display: flex;
+		margin-left: auto;
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-md);
+		overflow: hidden;
+	}
+	.tabs button {
+		background: none;
+		border: none;
+		color: var(--m-fg-muted);
+		font: inherit;
+		font-size: var(--m-text-sm);
+		padding: 4px 10px;
+		cursor: pointer;
+	}
+	.tabs button + button {
+		border-left: 1px solid var(--m-border);
+	}
+	.tabs button.active {
+		background: var(--m-bg-3);
+		color: var(--m-fg);
 	}
 	.close {
 		background: none;
 		border: none;
-		color: var(--fg-muted, #8b949e);
-		font-size: 1.4rem;
-		cursor: pointer;
+		color: var(--m-fg-muted);
+		font-size: 18px;
 		line-height: 1;
+		padding: 0 2px;
+		cursor: pointer;
 	}
-	.lede {
-		color: var(--fg, #e6edf3);
-		margin: 0.5rem 0;
+	.close:hover {
+		color: var(--m-fg);
+	}
+	.status {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 8px 10px;
+		border-radius: var(--m-radius-md);
+		background: var(--m-bg-2);
+		color: var(--m-fg-muted);
+	}
+	.status strong {
+		color: var(--m-fg);
+		font-weight: 600;
+	}
+	.dot {
+		flex: none;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--m-fg-subtle);
+	}
+	.status.ok .dot {
+		background: var(--m-success);
+	}
+	.status.bad .dot {
+		background: var(--m-danger);
 	}
 	.hint {
-		color: var(--fg-muted, #8b949e);
-		font-size: 0.85rem;
+		margin: 0;
+		color: var(--m-fg-muted);
+		font-size: var(--m-text-sm);
+		line-height: 1.5;
+	}
+	.error {
+		margin: 0;
+		color: var(--m-danger);
+		font-size: var(--m-text-sm);
+		line-height: 1.5;
+	}
+	.actions {
+		display: flex;
+		gap: 8px;
+	}
+	button.primary,
+	button.secondary {
+		font: inherit;
+		font-size: var(--m-text-sm);
+		border-radius: var(--m-radius-md);
+		padding: 5px 12px;
+		cursor: pointer;
+	}
+	button.primary {
+		background: var(--m-accent);
+		border: 1px solid var(--m-accent);
+		color: var(--m-bg);
+	}
+	button.primary:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	button.secondary {
+		flex: none;
+		background: var(--m-bg-2);
+		border: 1px solid var(--m-border);
+		color: var(--m-fg);
+	}
+	.link-button {
+		background: none;
+		border: none;
+		padding: 0;
+		font: inherit;
+		font-size: var(--m-text-sm);
+		color: var(--m-fg-muted);
+		cursor: pointer;
+	}
+	.link-button.danger:hover {
+		color: var(--m-danger);
 	}
 	.qr {
+		align-self: center;
 		display: flex;
-		justify-content: center;
 		background: #fff;
-		padding: 0.75rem;
-		border-radius: 8px;
-		margin: 0.75rem 0;
+		padding: 10px;
+		border-radius: var(--m-radius-md);
 	}
 	.qr :global(svg) {
 		width: 200px;
 		height: 200px;
 	}
-	.details {
-		display: flex;
-		flex-direction: column;
-		gap: 0.3rem;
-	}
-	.row {
-		display: flex;
-		gap: 0.6rem;
-		align-items: baseline;
-	}
-	.k {
-		color: var(--fg-muted, #8b949e);
-		min-width: 4rem;
-		font-size: 0.85rem;
-	}
-	code {
-		font-family: var(--mono, ui-monospace, monospace);
-		word-break: break-all;
-	}
 	.link-row {
 		display: flex;
-		gap: 0.5rem;
-		align-items: flex-start;
+		align-items: center;
+		gap: 8px;
 	}
 	.link {
 		flex: 1;
-		font-size: 0.7rem;
-		color: var(--fg-muted, #8b949e);
-		max-height: 3.2rem;
+		min-width: 0;
 		overflow: hidden;
-	}
-	.copy {
-		background: var(--accent, #388bfd);
-		border: none;
-		border-radius: 6px;
-		color: white;
-		cursor: pointer;
-		padding: 0.3rem 0.7rem;
-		font-size: 0.8rem;
+		text-overflow: ellipsis;
 		white-space: nowrap;
+		font-size: var(--m-text-xs);
+		color: var(--m-fg-muted);
 	}
 	.fingerprint {
-		font-size: 0.7rem;
-		color: var(--fg-muted, #8b949e);
-	}
-	.fp {
-		margin-top: 0.75rem;
+		word-break: break-all;
+		font-size: var(--m-text-xs);
 	}
 	.devices {
 		list-style: none;
-		padding: 0;
 		margin: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 0.4rem;
+		padding: 0;
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-md);
 	}
 	.devices li {
 		display: flex;
 		align-items: center;
-		gap: 0.6rem;
+		gap: 8px;
+		padding: 6px 10px;
 	}
-	.label {
+	.devices li + li {
+		border-top: 1px solid var(--m-border);
+	}
+	.device-label {
 		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
-	.meta {
-		color: var(--fg-muted, #8b949e);
-		font-size: 0.8rem;
+	.device-meta {
+		color: var(--m-fg-subtle);
+		font-size: var(--m-text-xs);
 	}
-	.revoke {
-		background: none;
-		border: 1px solid var(--border, #30363d);
-		color: var(--danger, #f85149);
-		border-radius: 6px;
-		padding: 0.2rem 0.5rem;
-		cursor: pointer;
-		font-size: 0.8rem;
-	}
-	.tabs {
+	.enroll {
 		display: flex;
-		gap: 0.25rem;
-		margin: 0.75rem 0;
+		flex-direction: column;
+		gap: 10px;
 	}
-	.tab {
-		flex: 1;
-		background: none;
-		border: 1px solid var(--border, #30363d);
-		border-radius: 6px;
-		color: var(--fg-muted, #8b949e);
-		cursor: pointer;
-		padding: 0.4rem 0.5rem;
-		font-size: 0.85rem;
-	}
-	.tab.active {
-		background: var(--bg-input, #161b22);
-		color: var(--fg, #e6edf3);
-		border-color: var(--accent, #388bfd);
-	}
-	.remote-form {
+	.enroll label {
 		display: flex;
-		gap: 0.4rem;
-		margin-top: 0.5rem;
+		flex-direction: column;
+		gap: 4px;
 	}
-	.remote-form input {
-		flex: 1;
-		background: var(--bg-input, #161b22);
-		border: 1px solid var(--border, #30363d);
-		border-radius: 6px;
-		color: var(--fg, #e6edf3);
-		padding: 0.3rem 0.5rem;
-		font-size: 0.85rem;
+	.field-label {
+		font-size: var(--m-text-xs);
+		color: var(--m-fg-subtle);
 	}
-	.remote-form button {
-		background: var(--accent, #388bfd);
-		border: none;
-		border-radius: 6px;
-		color: white;
-		cursor: pointer;
-		padding: 0.3rem 0.8rem;
-		font-size: 0.85rem;
+	.enroll input {
+		font: inherit;
+		background: var(--m-bg);
+		color: var(--m-fg);
+		border: 1px solid var(--m-border);
+		border-radius: var(--m-radius-md);
+		padding: 6px 8px;
+	}
+	.enroll input:focus {
+		outline: none;
+		border-color: var(--m-accent);
+	}
+	footer {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding-top: 10px;
+		border-top: 1px solid var(--m-border);
 	}
 </style>

@@ -256,6 +256,22 @@ pub struct RemoteBridgeHandle {
 	cmd_tx: tokio::sync::mpsc::Sender<HandleCommand>,
 }
 
+/// What the bridge answers a token it doesn't hold
+/// (`moon-bridge` `check_ide_token`).
+const UNKNOWN_IDE_TOKEN: &str = "unknown IDE token";
+
+/// The relay rejected this IDE's token.
+#[derive(Debug)]
+struct NotEnrolled;
+
+impl std::fmt::Display for NotEnrolled {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("the relay no longer knows this IDE (it was reset or revoked): disconnect and enroll again")
+	}
+}
+
+impl std::error::Error for NotEnrolled {}
+
 /// Connection status surfaced to the UI.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RemoteBridgeStatus {
@@ -328,10 +344,13 @@ async fn run_connection_loop(
 	// resulting token.
 	let mut backoff = std::time::Duration::from_secs(1);
 	let mut first_attempt = true;
-	let _ = code; // code is consumed on the first connect only
 
 	loop {
+		// A code means enroll now, even over a stored credential the
+		// relay may have forgotten (re-enrolling after a relay reset).
+		let enroll_now = first_attempt && !code.is_empty();
 		let cred = match load_credential() {
+			_ if enroll_now => None,
 			Ok(Some(c)) => Some(c),
 			Ok(None) if first_attempt => None, // fresh enroll
 			Ok(None) => {
@@ -386,6 +405,19 @@ async fn run_connection_loop(
 				// backoff ladder over.
 				backoff = std::time::Duration::from_secs(1);
 				tokio::time::sleep(backoff).await;
+			}
+			Err(err) if err.is::<NotEnrolled>() => {
+				// Retrying with the same token can't succeed: stop until
+				// the user enrolls again.
+				tracing::warn!("remote-bridge no longer knows this IDE; enroll it again");
+				let _ = status_tx.send(RemoteBridgeStatus {
+					connected: false,
+					bridge_url: bridge_url.clone(),
+					ide_id: ide_id.clone(),
+					error: Some(err.to_string()),
+					connected_phones: 0,
+				});
+				return;
 			}
 			Err(err) => {
 				tracing::warn!(error = %err, "remote-bridge connection lost; reconnecting");
@@ -677,6 +709,15 @@ async fn connect_and_serve(
 				// If a pair-code request is in flight, the error is
 				// its reply (FIFO on this connection); otherwise it's
 				// a register/forward complaint — log it.
+				// The relay doesn't know our token any more (its store
+				// was reset, or this IDE was revoked): the connection is
+				// useless, however open it looks.
+				if message.contains(UNKNOWN_IDE_TOKEN) {
+					for tx in pending_pair.drain(..) {
+						let _ = tx.send(Err(message.clone()));
+					}
+					return Err(NotEnrolled.into());
+				}
 				match pending_pair.pop_front() {
 					Some(tx) => {
 						let _ = tx.send(Err(message));

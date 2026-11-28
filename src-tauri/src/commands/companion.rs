@@ -253,8 +253,11 @@ pub async fn companion_enroll(
 		.collect::<Vec<_>>();
 	let handle = crate::remote_bridge::spawn(bridge_url, code, ide_id, label, workspaces, bridge_rpc.inner().clone());
 	let mut status_rx = handle.status_receiver();
-	// Store the handle so the status/disconnect commands can reach it.
-	*state.remote_bridge.lock().await = Some(handle);
+	// Store the handle so the status/disconnect commands can reach it,
+	// ending the previous connection (a re-enroll replaces it).
+	if let Some(previous) = state.remote_bridge.lock().await.replace(handle) {
+		previous.disconnect();
+	}
 
 	// Wait for the handshake outcome so the UI gets real feedback: a
 	// bad code / unreachable bridge is an error here, not a silent
